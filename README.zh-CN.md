@@ -1,5 +1,7 @@
 # MDBX
 
+语言：[简体中文](README.md) | [English](README.en.md)
+
 这个目录包含 Monica MDBX 的 Rust workspace 和实现接入说明。
 
 MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替代某张密码表，而是提供长期可维护的本地数据库、类 Git 的逻辑历史、同步冲突处理、原生附件、快照恢复和 Tiga 安全模式。
