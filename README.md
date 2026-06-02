@@ -95,6 +95,20 @@ cargo test
 cargo run -p mdbx-cli -- --help
 ```
 
+当前 `mdbx-cli` 是 Rust workspace 的开发/验证入口，已经覆盖：
+
+- `init` / `unlock`
+- project、entry、attachment 基础 CRUD
+- `snapshot create/list/restore`
+- `sync bundle/apply`
+- `health`
+- `benchmark`
+- `import-kdbx-json` / `export-kdbx-json`
+
+注意：`import-kdbx-json` / `export-kdbx-json` 使用的是 KDBX 互操作 JSON 中间表示，不是完整二进制 `.kdbx` 文件解析/写入。配过解锁方式的 vault 在 CLI 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`；否则命令会拒绝继续，避免把生产写入静默降级到明文兼容路径。
+
+当前 CLI 还没有接入真实 FIDO/WebAuthn/security-key 交互，也没有生产级 session token / audit policy；硬件密钥在 storage core 中是 key material 抽象与策略测试，不应宣称为端到端硬件密钥客户端。
+
 ## 实现规则
 
 除非正在修改 storage 层本身，否则客户端代码不要绕过 repo/storage API 直接写底层表。

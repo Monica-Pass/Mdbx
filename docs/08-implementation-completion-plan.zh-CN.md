@@ -27,8 +27,8 @@ MDBX 必须坚持：
 - project、entry、attachment repo 支持创建、更新、软删除和 tombstone。
 - attachment 支持 inline/chunked 内容、chunk hash、整体 hash、改名不改内容。
 - Tiga 解析支持 entry > project > global。
-- Unlock 支持密码/PIN/security key/password_security_key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC。
-- KDBX import/export 具备基本回环。
+- Unlock storage core 支持密码/PIN/security key/password_security_key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC；CLI 当前只支持密码/PIN 解锁，真实 FIDO/WebAuthn/security-key 交互仍是客户端后续边界。
+- KDBX JSON import/export 具备基本回环；这是互操作 JSON 中间表示，不是完整二进制 `.kdbx` 解析/写入。
 - conflict detector 支持 JSON 三方字段合并。
 - snapshot、recovery、benchmark harness 已有 MVP 骨架。
 
@@ -56,12 +56,15 @@ MDBX 必须坚持：
 - Sky 被定义为灵活便携但仍然安全，适合网盘同步和恢复优先场景；Multi 建议安全密钥但保留便携恢复；Power 要求密码 + 安全密钥组合解锁才能完整满足策略。
 - `unlock_methods.method_type` 明确支持 `password_security_key`。
 - 全文搜索只允许使用解锁会话内的临时索引；持久 FTS 不得保存解密后的 project title 或 secret-bearing text。
+- `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
+- 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
+- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；当前写入随机非秘密兼容标记，完整 epoch wrapping/key rotation 仍需在 key management 切片中闭环。
 
 ## 3. 主要差距
 
 ### 3.1 格式与恢复
 
-- `key_epochs.wrapped_epoch_key_ct` 仍有占位使用场景，需要区分测试占位与生产初始化。
+- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；但完整 epoch wrapping、rotation、retirement 仍未闭环。
 - snapshot 当前主要恢复元数据，尚未完整覆盖附件内容 chunk 恢复策略。
 - 缺少格式兼容测试：旧 reader、新 reader、未知字段保留、非关键扩展。
 
@@ -89,7 +92,7 @@ MDBX 必须坚持：
 
 ### 3.5 安全
 
-- 内存清零、明文驻留最小化、密钥文件、硬件密钥、生物识别封装仍需扩展。
+- 内存清零、明文驻留最小化、密钥文件、真实硬件密钥协议、生物识别封装仍需扩展。
 - header/content 全局认证模型还不完整。
 - 加密上下文 AAD 已覆盖字段级，但 commit/bundle/snapshot 的认证边界还需统一记录到规范。
 
@@ -111,7 +114,7 @@ MDBX 必须坚持：
 - recovery 验证 commit integrity tag。（已完成）
 - health check 输出 commit tag mismatch、missing parent、dangling head、chunk mismatch。（已完成）
 - snapshot 明确 payload 加密策略，拒绝已解锁状态下的篡改。
-- 整理“生产初始化不得保留占位密文”的测试边界。
+- 整理“生产初始化不得保留固定占位密文”的测试边界。（固定 `X'00'` 已移除；完整 epoch wrapping 仍后续）
 
 验收：
 
@@ -179,10 +182,10 @@ MDBX 必须坚持：
 
 任务：
 
-- KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments。
+- KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments，并扩展到真实二进制 `.kdbx` 解析/写入。
 - RFC 结构补齐：header、schema、crypto、commit、sync、snapshot、extensions。
 - 兼容性测试矩阵落地。
-- CLI 增加 `health`、`import-kdbx`、`export-kdbx`、`snapshot`、`sync-bundle`。
+- CLI 已增加 `health`、`benchmark`、`snapshot`、`sync bundle/apply`、`import-kdbx-json`、`export-kdbx-json`；后续如要使用 `import-kdbx`/`export-kdbx` 名称，必须先实现真实二进制 `.kdbx` 支持。
 
 验收：
 

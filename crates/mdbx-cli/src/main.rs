@@ -4,8 +4,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::TigaMode;
+use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::VaultConnection;
+use mdbx_storage::import::{KdbxEntry, KdbxExporter, KdbxImporter};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
+use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::CommitContext;
 use mdbx_storage::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
 use mdbx_storage::search::SearchService;
@@ -99,6 +102,24 @@ enum Commands {
     Sync {
         #[command(subcommand)]
         action: SyncAction,
+    },
+    /// 运行 vault 健康检查
+    Health,
+    /// 运行本地 benchmark harness
+    Benchmark {
+        /// 每个 benchmark 的迭代次数
+        #[arg(short, long, default_value_t = 20)]
+        iterations: u32,
+    },
+    /// 从 KDBX JSON 互操作文件导入
+    ImportKdbxJson {
+        /// 输入 JSON 文件，内容为 KdbxEntry 数组
+        file: PathBuf,
+    },
+    /// 导出为 KDBX JSON 互操作文件
+    ExportKdbxJson {
+        /// 输出 JSON 文件
+        output: PathBuf,
     },
 }
 
@@ -328,6 +349,19 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_sync(&mut conn, action)
         }
+        Commands::Health => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_health(&conn)
+        }
+        Commands::Benchmark { iterations } => cmd_benchmark(iterations),
+        Commands::ImportKdbxJson { file } => {
+            let mut conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_import_kdbx_json(&mut conn, file)
+        }
+        Commands::ExportKdbxJson { output } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_export_kdbx_json(&conn, output)
+        }
     }
 }
 
@@ -345,6 +379,7 @@ fn open_or_create_vault(
         let mut conn =
             VaultConnection::open(path).map_err(|e| format!("failed to open vault: {}", e))?;
         apply_unlock_args(&mut conn, unlock)?;
+        require_unlock_if_configured(&conn)?;
         Ok(conn)
     } else {
         Err(format!(
@@ -373,6 +408,18 @@ fn apply_unlock_args(conn: &mut VaultConnection, unlock: UnlockArgs<'_>) -> Resu
         }
         (None, None) => Ok(()),
     }
+}
+
+fn require_unlock_if_configured(conn: &VaultConnection) -> Result<(), String> {
+    let methods = UnlockService::list_methods(conn)
+        .map_err(|e| format!("failed to inspect unlock methods: {}", e))?;
+    if !methods.is_empty() && !conn.is_encrypted() {
+        return Err(
+            "vault has unlock methods configured; pass --unlock-password or --unlock-pin"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1190,113 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
             Ok(())
         }
     }
+}
+
+fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
+    let result = RecoveryVerifier::full_health_check(conn)
+        .map_err(|e| format!("health check failed: {}", e))?;
+
+    if result.issues.is_empty() {
+        println!("Vault health: OK");
+        return Ok(());
+    }
+
+    println!("Vault health: {} issue(s)", result.issues.len());
+    for issue in &result.issues {
+        println!(
+            "  [{}] {}: {}",
+            severity_label(issue.severity),
+            issue.category,
+            issue.description
+        );
+    }
+
+    if result.issues.iter().any(|issue| {
+        matches!(
+            issue.severity,
+            IssueSeverity::Error | IssueSeverity::Critical
+        )
+    }) {
+        Err("vault health check reported errors".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn severity_label(severity: IssueSeverity) -> &'static str {
+    match severity {
+        IssueSeverity::Info => "info",
+        IssueSeverity::Warning => "warning",
+        IssueSeverity::Error => "error",
+        IssueSeverity::Critical => "critical",
+    }
+}
+
+fn cmd_benchmark(iterations: u32) -> Result<(), String> {
+    if iterations == 0 {
+        return Err("iterations must be greater than zero".to_string());
+    }
+    let suite = BenchmarkRunner::run_full_suite(iterations);
+    suite.print();
+    Ok(())
+}
+
+fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(), String> {
+    let bytes =
+        std::fs::read(&file).map_err(|e| format!("failed to read '{}': {}", file.display(), e))?;
+    let entries: Vec<KdbxEntry> = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to parse KDBX JSON '{}': {}", file.display(), e))?;
+    let result = KdbxImporter::import_entries(conn, &ctx(), &entries);
+
+    println!(
+        "Imported KDBX JSON: projects={} entries={} attachments={} skipped={}",
+        result.projects_created,
+        result.entries_created,
+        result.attachments_created,
+        result.entries_skipped
+    );
+    for warning in result.warnings {
+        println!("  warning: {}", warning);
+    }
+    Ok(())
+}
+
+fn cmd_export_kdbx_json(conn: &VaultConnection, output: PathBuf) -> Result<(), String> {
+    let mut entries: Vec<KdbxEntry> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut attachments_exported = 0u32;
+    let mut projects_skipped = 0u32;
+
+    for project in ProjectRepo::list_all(conn).map_err(|e| format!("{}", e))? {
+        match KdbxExporter::export_one(conn, &project) {
+            Ok((entry, attachment_count, project_warnings)) => {
+                entries.push(entry);
+                attachments_exported += attachment_count;
+                warnings.extend(project_warnings);
+            }
+            Err(e) => {
+                projects_skipped += 1;
+                warnings.push(format!("skipped project '{}': {}", project.project_id, e));
+            }
+        }
+    }
+
+    let json = serde_json::to_vec_pretty(&entries)
+        .map_err(|e| format!("failed to serialize KDBX JSON: {}", e))?;
+    std::fs::write(&output, json)
+        .map_err(|e| format!("failed to write '{}': {}", output.display(), e))?;
+
+    println!(
+        "Exported KDBX JSON: entries={} attachments={} skipped={} -> {}",
+        entries.len(),
+        attachments_exported,
+        projects_skipped,
+        output.display()
+    );
+    for warning in warnings {
+        println!("  warning: {}", warning);
+    }
+    Ok(())
 }
 
 fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, String> {
@@ -2210,6 +2364,15 @@ mod tests {
         }
     }
 
+    fn locked_cli(vault: &Path, command: Commands) -> Cli {
+        Cli {
+            vault: vault.to_path_buf(),
+            unlock_password: None,
+            unlock_pin: None,
+            command,
+        }
+    }
+
     fn sync_bundle_path() -> PathBuf {
         std::env::temp_dir().join(format!("mdbx-cli-sync-{}.mdbx-sync", uuid::Uuid::new_v4()))
     }
@@ -2781,5 +2944,95 @@ mod tests {
         assert_eq!(entry_title(&core_entries[0]), "Synced Login");
 
         let _ = std::fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn cli_rejects_configured_vault_without_unlock() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+
+        let result = run(locked_cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::List,
+            },
+        ));
+
+        assert!(result
+            .unwrap_err()
+            .contains("pass --unlock-password or --unlock-pin"));
+    }
+
+    #[test]
+    fn cli_exposes_health_and_benchmark() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+
+        run(cli(&path, Commands::Health)).unwrap();
+        run(cli(&path, Commands::Benchmark { iterations: 1 })).unwrap();
+    }
+
+    #[test]
+    fn cli_can_import_and_export_kdbx_json() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        let import_path =
+            std::env::temp_dir().join(format!("mdbx-cli-import-{}.json", uuid::Uuid::new_v4()));
+        let export_path =
+            std::env::temp_dir().join(format!("mdbx-cli-export-{}.json", uuid::Uuid::new_v4()));
+
+        run(init_cli(&path)).unwrap();
+
+        let entries = vec![KdbxEntry {
+            uuid: "kdbx-entry-1".to_string(),
+            title: "Imported Login".to_string(),
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+            url: "https://example.com".to_string(),
+            notes: "imported note".to_string(),
+            totp_seed: Some("totp-seed".to_string()),
+            custom_fields: vec![("env".to_string(), "prod".to_string())],
+            attachments: vec![],
+            group_path: vec!["Work".to_string(), "Infra".to_string()],
+            icon_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        std::fs::write(&import_path, serde_json::to_vec(&entries).unwrap()).unwrap();
+
+        run(cli(
+            &path,
+            Commands::ImportKdbxJson {
+                file: import_path.clone(),
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let projects = ProjectRepo::list_all(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(project_title(&projects[0]), "Imported Login");
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::ExportKdbxJson {
+                output: export_path.clone(),
+            },
+        ))
+        .unwrap();
+
+        let exported: Vec<KdbxEntry> =
+            serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].title, "Imported Login");
+        assert_eq!(exported[0].username, "alice");
+        assert_eq!(exported[0].password, "secret");
+        assert_eq!(exported[0].group_path, vec!["Work", "Infra"]);
+
+        let _ = std::fs::remove_file(import_path);
+        let _ = std::fs::remove_file(export_path);
     }
 }

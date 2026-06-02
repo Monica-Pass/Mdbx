@@ -20,7 +20,7 @@ const BUNDLE_VERSION: u32 = 1;
 /// │ magic:    [u8; 8]  = b"MDBXSYNC"   │
 /// │ version:  u32 (LE)  = 1             │
 /// │ reserved: [u8; 20]  (zero)          │
-/// │ payload:  <bincode>                 │
+/// │ payload:  <bincode 2 serde>         │
 /// │ hash:     [u8; 32]  SHA-256(body)   │
 /// └──────────────────────────────────────┘
 /// ```
@@ -60,7 +60,7 @@ pub fn build_bundle(
 
 /// 将 SyncBundle 写入文件。
 pub fn write_bundle(bundle: &SyncBundle, writer: &mut impl Write) -> SyncResult<()> {
-    let payload = bincode::serialize(bundle)
+    let payload = bincode::serde::encode_to_vec(bundle, bincode::config::standard())
         .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
 
     // 计算 hash
@@ -143,8 +143,16 @@ pub fn read_bundle(reader: &mut impl Read) -> SyncResult<SyncBundle> {
     }
 
     // 反序列化
-    let bundle: SyncBundle = bincode::deserialize(payload_data)
-        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let (bundle, bytes_read): (SyncBundle, usize) =
+        bincode::serde::decode_from_slice(payload_data, bincode::config::standard()).map_err(
+            |e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )?;
+    if bytes_read != payload_data.len() {
+        return Err(SyncError::BundleFormat(format!(
+            "trailing payload bytes: {}",
+            payload_data.len() - bytes_read
+        )));
+    }
 
     Ok(bundle)
 }

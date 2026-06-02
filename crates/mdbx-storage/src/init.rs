@@ -56,6 +56,8 @@ pub fn initialize_vault(
     let commit_id = Uuid::new_v4().to_string();
     let branch_id = Uuid::new_v4().to_string();
     let key_epoch_id = Uuid::new_v4().to_string();
+    let initial_key_epoch_marker =
+        mdbx_crypto::aead::generate_key().map_err(StorageError::Crypto)?;
 
     db.execute("BEGIN IMMEDIATE", [])
         .map_err(|e| StorageError::Database(e))?;
@@ -118,12 +120,13 @@ pub fn initialize_vault(
             rusqlite::params![params.device_id, commit_id, now],
         )?;
 
-        // 5. 初始 key epoch（占位密文，后续由 crypto crate 替换）
+        // 5. 初始 key epoch。完整 epoch wrapping 仍由后续 key management 流程接管；
+        // 初始化阶段写入随机非秘密标记，避免生产库保留固定 X'00' 占位。
         db.execute(
             "INSERT INTO key_epochs (key_epoch_id, status, wrapped_epoch_key_ct,
              kdf_profile_id, created_at, activated_at)
-             VALUES (?1, 'active', X'00', 'mdbx-default-v1', ?2, ?2)",
-            rusqlite::params![key_epoch_id, now],
+             VALUES (?1, 'active', ?2, 'mdbx-default-v1', ?3, ?3)",
+            rusqlite::params![key_epoch_id, initial_key_epoch_marker, now],
         )?;
 
         Ok(VaultInitResult {
@@ -274,17 +277,46 @@ mod tests {
         let params = VaultInitParams::default();
         let result = initialize_vault(&conn, &params).unwrap();
 
-        let (status, kdf_profile): (String, String) = conn
+        let (status, wrapped_epoch_key_ct, kdf_profile): (String, Vec<u8>, String) = conn
             .inner()
             .query_row(
-                "SELECT status, kdf_profile_id FROM key_epochs WHERE key_epoch_id = ?1",
+                "SELECT status, wrapped_epoch_key_ct, kdf_profile_id FROM key_epochs WHERE key_epoch_id = ?1",
                 rusqlite::params![result.key_epoch_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
 
         assert_eq!(status, "active");
+        assert_eq!(wrapped_epoch_key_ct.len(), 32);
+        assert_ne!(wrapped_epoch_key_ct, vec![0]);
         assert_eq!(kdf_profile, "mdbx-default-v1");
+    }
+
+    #[test]
+    fn test_initial_key_epoch_marker_is_not_fixed() {
+        let conn1 = VaultConnection::open_in_memory().unwrap();
+        let conn2 = VaultConnection::open_in_memory().unwrap();
+        let r1 = initialize_vault(&conn1, &VaultInitParams::default()).unwrap();
+        let r2 = initialize_vault(&conn2, &VaultInitParams::default()).unwrap();
+
+        let marker1: Vec<u8> = conn1
+            .inner()
+            .query_row(
+                "SELECT wrapped_epoch_key_ct FROM key_epochs WHERE key_epoch_id = ?1",
+                rusqlite::params![r1.key_epoch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let marker2: Vec<u8> = conn2
+            .inner()
+            .query_row(
+                "SELECT wrapped_epoch_key_ct FROM key_epochs WHERE key_epoch_id = ?1",
+                rusqlite::params![r2.key_epoch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_ne!(marker1, marker2);
     }
 
     #[test]

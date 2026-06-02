@@ -12,7 +12,9 @@ use crate::crypto_layer::{decrypt_field, encrypt_field};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 
-/// Snapshot 内部负载（MVP 阶段为未加密 JSON）。
+/// Snapshot 内部负载。
+///
+/// 解锁会话中会通过 metadata subkey 加密；未解锁/旧测试路径保留明文兼容。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotPayload {
     vault_id: String,

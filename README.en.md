@@ -95,6 +95,20 @@ Run the CLI during local development:
 cargo run -p mdbx-cli -- --help
 ```
 
+The current `mdbx-cli` is a development and validation entry point for this Rust workspace. It covers:
+
+- `init` / `unlock`
+- basic project, entry, and attachment CRUD
+- `snapshot create/list/restore`
+- `sync bundle/apply`
+- `health`
+- `benchmark`
+- `import-kdbx-json` / `export-kdbx-json`
+
+Note: `import-kdbx-json` / `export-kdbx-json` use a KDBX interoperability JSON intermediate representation. They are not full binary `.kdbx` parsing or writing. Once a vault has unlock methods configured, normal CLI operations must pass `--unlock-password` or `--unlock-pin`; otherwise the command is rejected so production writes do not silently fall back to the legacy plaintext compatibility path.
+
+The current CLI does not yet implement real FIDO/WebAuthn/security-key interaction, production session tokens, or audit policy. Security-key support in storage core is a key-material abstraction with policy tests, not an end-to-end hardware-key client.
+
 ## Implementation Rules
 
 Do not bypass repository/storage APIs from client code unless you are changing the storage layer itself.
