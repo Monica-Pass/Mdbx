@@ -163,6 +163,19 @@ impl EntryRepo {
         )
     }
 
+    pub fn list_by_project_and_type(
+        conn: &VaultConnection,
+        project_id: &str,
+        entry_type: EntryType,
+    ) -> StorageResult<Vec<Entry>> {
+        let type_str = entry_type.to_string();
+        EntryRepo::list_where(
+            conn,
+            "deleted = 0 AND project_id = ?1 AND entry_type = ?2",
+            rusqlite::params![project_id, type_str],
+        )
+    }
+
     pub fn list_by_type(
         conn: &VaultConnection,
         entry_type: EntryType,
@@ -177,6 +190,30 @@ impl EntryRepo {
 
     pub fn list_deleted(conn: &VaultConnection) -> StorageResult<Vec<Entry>> {
         EntryRepo::list_where(conn, "deleted = 1", [])
+    }
+
+    pub fn list_deleted_by_project(
+        conn: &VaultConnection,
+        project_id: &str,
+    ) -> StorageResult<Vec<Entry>> {
+        EntryRepo::list_where(
+            conn,
+            "deleted = 1 AND project_id = ?1",
+            rusqlite::params![project_id],
+        )
+    }
+
+    pub fn list_deleted_by_project_and_type(
+        conn: &VaultConnection,
+        project_id: &str,
+        entry_type: EntryType,
+    ) -> StorageResult<Vec<Entry>> {
+        let type_str = entry_type.to_string();
+        EntryRepo::list_where(
+            conn,
+            "deleted = 1 AND project_id = ?1 AND entry_type = ?2",
+            rusqlite::params![project_id, type_str],
+        )
     }
 
     fn list_where(
@@ -436,6 +473,41 @@ impl EntryRepo {
             ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
 
             Ok(())
+        })
+    }
+
+    pub fn restore(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        entry_id: &str,
+    ) -> StorageResult<Entry> {
+        conn.with_immediate_transaction(|| {
+            let entry = EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+
+            if !entry.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "entry is not deleted".to_string(),
+                ));
+            }
+            ensure_active_project(conn, &entry.project_id)?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let commit_id =
+                ctx.commit_object_change(conn, "entries", entry_id, "restore", "entry")?;
+            let object_clock = bump_clock(&entry.object_clock);
+
+            conn.inner().execute(
+                "UPDATE entries SET deleted = 0, object_clock = ?2,
+             head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
+             WHERE entry_id = ?1",
+                params![entry_id, object_clock, commit_id, now, ctx.device_id],
+            )?;
+
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+
+            EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))
         })
     }
     // -----------------------------------------------------------------------
@@ -728,6 +800,45 @@ mod tests {
     }
 
     #[test]
+    fn test_list_by_project_and_type() {
+        let (conn, ctx, project_id) = setup();
+        let other = ProjectRepo::create(&conn, &ctx, "Other", None, None).unwrap();
+        EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Login,
+            Some("Project Login"),
+            &login_payload(),
+        )
+        .unwrap();
+        EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Note,
+            Some("Project Note"),
+            &serde_json::json!({"text": "note"}),
+        )
+        .unwrap();
+        EntryRepo::create(
+            &conn,
+            &ctx,
+            &other.project_id,
+            EntryType::Login,
+            Some("Other Login"),
+            &login_payload(),
+        )
+        .unwrap();
+
+        let logins =
+            EntryRepo::list_by_project_and_type(&conn, &project_id, EntryType::Login).unwrap();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].project_id, project_id);
+        assert_eq!(logins[0].entry_type, EntryType::Login);
+    }
+
+    #[test]
     fn test_list_excludes_deleted() {
         let (conn, ctx, project_id) = setup();
         let e = EntryRepo::create(
@@ -950,6 +1061,51 @@ mod tests {
 
         EntryRepo::soft_delete(&conn, &ctx, &entry.entry_id).unwrap();
         assert!(EntryRepo::soft_delete(&conn, &ctx, &entry.entry_id).is_err());
+    }
+
+    #[test]
+    fn test_list_deleted_by_project_and_type() {
+        let (conn, ctx, project_id) = setup();
+        let other = ProjectRepo::create(&conn, &ctx, "Other", None, None).unwrap();
+        let deleted_login = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Login,
+            Some("Deleted Login"),
+            &login_payload(),
+        )
+        .unwrap();
+        let deleted_note = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Note,
+            Some("Deleted Note"),
+            &serde_json::json!({"text": "gone"}),
+        )
+        .unwrap();
+        let other_deleted_login = EntryRepo::create(
+            &conn,
+            &ctx,
+            &other.project_id,
+            EntryType::Login,
+            Some("Other Deleted Login"),
+            &login_payload(),
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &deleted_login.entry_id).unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &deleted_note.entry_id).unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &other_deleted_login.entry_id).unwrap();
+
+        let project_deleted = EntryRepo::list_deleted_by_project(&conn, &project_id).unwrap();
+        assert_eq!(project_deleted.len(), 2);
+
+        let project_deleted_logins =
+            EntryRepo::list_deleted_by_project_and_type(&conn, &project_id, EntryType::Login)
+                .unwrap();
+        assert_eq!(project_deleted_logins.len(), 1);
+        assert_eq!(project_deleted_logins[0].entry_id, deleted_login.entry_id);
     }
 
     // -----------------------------------------------------------------------

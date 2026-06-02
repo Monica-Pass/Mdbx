@@ -1,0 +1,21 @@
+[package]
+name = "mdbx-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mdbx_ffi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+mdbx-core = { path = "../mdbx-core" }
+mdbx-storage = { path = "../mdbx-storage" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uniffi = "0.31.1"
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { workspace = true }
