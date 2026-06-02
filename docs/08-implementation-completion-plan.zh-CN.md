@@ -61,6 +61,9 @@ MDBX 必须坚持：
 - 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
+- project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
+- project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
+- `project_tags` 已分类为用户可见元数据：tracked tag API 会产生 project 级 commit；sync state 携带每个 project 的完整 tag 集合；临时 FTS/search index 保持解锁会话内临时状态，不进入历史。
 
 ## 3. 主要差距
 
@@ -78,12 +81,12 @@ MDBX 必须坚持：
 - 已补充“同一秘密字段并发修改必须冲突”和“不同字段并发修改自动合并”的 storage 回归测试。
 - 已补充删除/修改并发回归：远端删除/本地修改会保留 tombstone 并产生 `deleted` conflict；本地删除/远端修改不会复活 entry。
 - project/attachment 字段级三方合并已完成：project 不同字段并发修改会自动写 merge commit，同字段并发修改会产生字段级 conflict；attachment 元数据可字段级合并，双方同时改内容且内容不同会产生 `content_hash` conflict，只有 incoming 改内容时才替换 incoming chunks。
-- `custom/manual merge` 在 Rust storage core 已有显式 merged payload API；Android 合并编辑器尚未接入。
+- `custom/manual merge` 在 Rust storage core 已有显式 merged payload/row API；Android 合并编辑器尚未接入。
 
 ### 3.3 变更历史覆盖
 
-- 部分维护/搜索/tag 类操作是否需要 commit 还未统一分类。
-- repo mutation 已开始推进 `device_heads` 与 `branches.main`，但多数仍不是单事务包裹“写对象 + 写 commit + 更新 head”，崩溃窗口还需收窄。
+- 搜索类临时索引已明确不写 commit；用户可见 tag 修改已有 tracked API。仍需为未来新增维护操作逐项分类是否属于用户可见历史。
+- project、entry、attachment、conflict resolution、tracked tag 的主要写入链路已收窄崩溃窗口。后续仍需为 snapshot restore、bulk import、batch move/copy 等批量用户级 mutation 设计更高层的合并 commit API。
 
 ### 3.4 性能与增量
 
@@ -101,7 +104,7 @@ MDBX 必须坚持：
 ### 3.6 Android 接入
 
 - Android 侧当前不应把 MDBX 当作普通 Room 表的附属字段；最终应直接调用 MDBX 操作层。
-- Android MDBX 管理页已有冲突队列和 local/incoming 解决入口；entry 冲突解决已收紧为写回 MDBX 历史，不再只改 `conflicts.resolution`。
+- Android MDBX 管理页已有冲突队列和 local/incoming 解决入口；entry/project/attachment 冲突解决在 storage core 已收紧为写回 MDBX 历史，不再只改 `conflicts.resolution`。
 - 新建、删除、移动、复制、分类、passkey、Bitwarden/KeePass 兼容路径都要映射到 MDBX project/entry/attachment/history。
 - Android 管理页需要显示同步状态、device heads、unresolved conflicts、Tiga 状态、snapshot/health check。
 

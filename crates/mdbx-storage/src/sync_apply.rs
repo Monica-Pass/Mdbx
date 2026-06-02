@@ -12,7 +12,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, ProjectRow,
-    SyncStatePayload,
+    ProjectTagSetRow, SyncStatePayload,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -224,6 +224,9 @@ impl SyncApplyRepo {
             &state.attachment_chunks,
             &replace_attachment_chunks.ids,
         )?;
+        if let Some(project_tags) = &state.project_tags {
+            Self::apply_project_tags(conn, project_tags)?;
+        }
         Self::apply_branches(conn, &state.branches)?;
         Ok(conflicts)
     }
@@ -512,6 +515,29 @@ impl SyncApplyRepo {
                     row.created_at,
                 ],
             )?;
+        }
+        Ok(())
+    }
+
+    fn apply_project_tags(
+        conn: &VaultConnection,
+        tag_sets: &[ProjectTagSetRow],
+    ) -> StorageResult<()> {
+        for row in tag_sets {
+            conn.inner().execute(
+                "DELETE FROM project_tags WHERE project_id = ?1",
+                params![row.project_id],
+            )?;
+            for tag in &row.tags {
+                let trimmed = tag.trim().to_lowercase();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                conn.inner().execute(
+                    "INSERT OR IGNORE INTO project_tags (project_id, tag) VALUES (?1, ?2)",
+                    params![row.project_id, trimmed],
+                )?;
+            }
         }
         Ok(())
     }

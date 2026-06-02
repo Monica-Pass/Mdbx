@@ -76,6 +76,39 @@ impl VaultConnection {
         &self.conn
     }
 
+    /// Run a storage mutation atomically.
+    ///
+    /// This uses a manual transaction because repositories share an immutable
+    /// connection handle. If the caller is already inside a transaction, the
+    /// closure is executed in that existing transaction.
+    pub(crate) fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        if !self.conn.is_autocommit() {
+            return f();
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .map_err(StorageError::Database)?;
+
+        match f() {
+            Ok(value) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT;") {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    Err(StorageError::Database(e))
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        }
+    }
+
     /// 附加密钥环，启用字段级加密。
     ///
     /// 在解锁成功后调用。此后所有 `_ct` 字段在写入时加密、读取时解密。

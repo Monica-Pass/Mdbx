@@ -3,9 +3,11 @@ use mdbx_core::model::EntryType;
 #[cfg(test)]
 use mdbx_core::model::Project;
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::repo::commit_ctx::CommitContext;
 
 /// 搜索结果条目。
 #[derive(Debug, Clone)]
@@ -159,18 +161,30 @@ impl SearchService {
         Ok(())
     }
 
+    /// 为项目添加标签，并记录 project 级 commit 供同步使用。
+    ///
+    /// 旧 `add_tag` 保持可用；Android 和新客户端应优先使用该 tracked API。
+    pub fn add_tag_tracked(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        tag: &str,
+    ) -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
+            ensure_active_project(conn, project_id)?;
+            Self::add_tag(conn, project_id, tag)?;
+            create_project_tag_commit(conn, ctx, project_id)?;
+            Ok(())
+        })
+    }
+
     /// 为项目批量设置标签（替换现有标签）。
     pub fn set_tags(
         conn: &VaultConnection,
         project_id: &str,
         tags: &[String],
     ) -> StorageResult<()> {
-        // 在事务中替换
-        conn.inner()
-            .execute("BEGIN IMMEDIATE", [])
-            .map_err(StorageError::Database)?;
-
-        let result = (|| -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
             conn.inner()
                 .execute(
                     "DELETE FROM project_tags WHERE project_id = ?1",
@@ -182,20 +196,22 @@ impl SearchService {
                 Self::add_tag(conn, project_id, tag)?;
             }
             Ok(())
-        })();
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                conn.inner()
-                    .execute("COMMIT", [])
-                    .map_err(StorageError::Database)?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.inner().execute("ROLLBACK", []);
-                Err(e)
-            }
-        }
+    /// 为项目批量设置标签，并记录 project 级 commit 供同步使用。
+    pub fn set_tags_tracked(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        tags: &[String],
+    ) -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
+            ensure_active_project(conn, project_id)?;
+            Self::set_tags(conn, project_id, tags)?;
+            create_project_tag_commit(conn, ctx, project_id)?;
+            Ok(())
+        })
     }
 
     /// 移除项目的指定标签。
@@ -215,6 +231,21 @@ impl SearchService {
             )));
         }
         Ok(())
+    }
+
+    /// 移除项目标签，并记录 project 级 commit 供同步使用。
+    pub fn remove_tag_tracked(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        tag: &str,
+    ) -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
+            ensure_active_project(conn, project_id)?;
+            Self::remove_tag(conn, project_id, tag)?;
+            create_project_tag_commit(conn, ctx, project_id)?;
+            Ok(())
+        })
     }
 
     /// 列出项目的所有标签。
@@ -682,6 +713,39 @@ impl SearchService {
     }
 }
 
+fn ensure_active_project(conn: &VaultConnection, project_id: &str) -> StorageResult<()> {
+    let deleted: Option<bool> = conn
+        .inner()
+        .query_row(
+            "SELECT deleted FROM projects WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok(row.get::<_, i32>(0)? != 0),
+        )
+        .optional()
+        .map_err(StorageError::Database)?;
+
+    match deleted {
+        Some(false) => Ok(()),
+        Some(true) => Err(StorageError::ConstraintViolation(format!(
+            "project {} is deleted",
+            project_id
+        ))),
+        None => Err(StorageError::NotFound(format!(
+            "project {} not found",
+            project_id
+        ))),
+    }
+}
+
+fn create_project_tag_commit(
+    conn: &VaultConnection,
+    ctx: &CommitContext,
+    project_id: &str,
+) -> StorageResult<()> {
+    ctx.create_commit(conn, "change", "project", &[project_id.to_string()], &[])?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -914,6 +978,35 @@ mod tests {
         assert_eq!(all_tags[0].1, 2);
         assert_eq!(all_tags[1].0, "unique");
         assert_eq!(all_tags[1].1, 1);
+    }
+
+    #[test]
+    fn test_tracked_tag_mutations_create_commits_without_extra_steps() {
+        let (conn, ctx) = setup();
+        let p = create_project_with_entry(&conn, &ctx, "Tracked", EntryType::Login, "a", "1");
+        let before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        SearchService::add_tag_tracked(&conn, &ctx, &p.project_id, "work").unwrap();
+        SearchService::set_tags_tracked(
+            &conn,
+            &ctx,
+            &p.project_id,
+            &["work".to_string(), "mobile".to_string()],
+        )
+        .unwrap();
+        SearchService::remove_tag_tracked(&conn, &ctx, &p.project_id, "work").unwrap();
+
+        let after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let tags = SearchService::list_tags(&conn, &p.project_id).unwrap();
+
+        assert_eq!(after, before + 3);
+        assert_eq!(tags, vec!["mobile".to_string()]);
     }
 
     // -----------------------------------------------------------------------

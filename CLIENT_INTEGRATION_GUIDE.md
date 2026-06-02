@@ -134,8 +134,13 @@ Unless you are implementing the low-level storage library itself, client code sh
 - `conflicts`
 - `device_heads`
 - `branches`
+- `project_tags`
 
 Direct writes to these tables often produce vaults that appear to save correctly but disagree across clients, lose delete history, explode history size, or fail snapshot recovery.
+
+For Android integration, avoid treating MDBX as a set of ordinary Room tables. Entry/project/attachment create, edit, delete, move, and copy flows should use repository/storage APIs. User-visible tag changes should use tracked tag APIs. Conflict resolution should use the entry/project/attachment resolution APIs. Updating only `conflicts.resolution`, or editing `project_tags` directly, is not a complete write because it skips commits, object versions, device heads, branch heads, or sync state.
+
+The current storage-core boundary does not require mandatory hardware keys by default and does not add extra unlock prompts. Sky is a flexible and portable Tiga mode that remains secure, suitable for cloud-drive sync and recovery-first multi-device use. Hardware keys can strengthen Multi/Power policies without making Sky portability unsafe.
 
 ## 4. Write Rules
 

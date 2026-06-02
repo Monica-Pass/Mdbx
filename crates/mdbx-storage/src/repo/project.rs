@@ -29,36 +29,39 @@ impl ProjectRepo {
         group_id: Option<&str>,
         icon_ref: Option<&str>,
     ) -> StorageResult<Project> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let project_id = Uuid::new_v4().to_string();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let project_id = Uuid::new_v4().to_string();
 
-        let commit_id = ctx.create_commit(conn, "change", "project", &[project_id.clone()], &[])?;
+            let commit_id =
+                ctx.create_commit(conn, "change", "project", &[project_id.clone()], &[])?;
 
-        let object_clock = format!(r#"{{"counter":1}}"#);
+            let object_clock = format!(r#"{{"counter":1}}"#);
 
-        let title_ct = Self::encrypt_metadata(conn, &project_id, "title", title.as_bytes())?;
+            let title_ct = Self::encrypt_metadata(conn, &project_id, "title", title.as_bytes())?;
 
-        conn.inner().execute(
-            "INSERT INTO projects (project_id, title_ct, summary_ct, group_id, icon_ref,
+            conn.inner().execute(
+                "INSERT INTO projects (project_id, title_ct, summary_ct, group_id, icon_ref,
              favorite, archived, deleted, tiga_mode_override, object_clock,
              head_commit_id, attachment_count, created_at, updated_at,
              created_by_device_id, updated_by_device_id)
              VALUES (?1, ?2, NULL, ?3, ?4, 0, 0, 0, NULL, ?5, ?6, 0, ?7, ?7, ?8, ?8)",
-            params![
-                project_id,
-                title_ct,
-                group_id,
-                icon_ref,
-                object_clock,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_project_current(conn, &commit_id, &project_id)?;
+                params![
+                    project_id,
+                    title_ct,
+                    group_id,
+                    icon_ref,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, &project_id)?;
 
-        ProjectRepo::get_by_id(conn, &project_id)?
-            .ok_or_else(|| StorageError::NotFound(project_id.clone()))
+            ProjectRepo::get_by_id(conn, &project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.clone()))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -201,50 +204,57 @@ impl ProjectRepo {
         ctx: &CommitContext,
         project: &Project,
     ) -> StorageResult<Project> {
-        let now = chrono::Utc::now().to_rfc3339();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
 
-        let commit_id =
-            ctx.commit_object_change(conn, "projects", &project.project_id, "change", "project")?;
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "projects",
+                &project.project_id,
+                "change",
+                "project",
+            )?;
 
-        let object_clock = bump_clock(&project.object_clock);
+            let object_clock = bump_clock(&project.object_clock);
 
-        let title_ct =
-            Self::encrypt_metadata(conn, &project.project_id, "title", &project.title_ct)?;
-        let summary_ct = project
-            .summary_ct
-            .as_ref()
-            .map(|s| Self::encrypt_metadata(conn, &project.project_id, "summary", s))
-            .transpose()?;
+            let title_ct =
+                Self::encrypt_metadata(conn, &project.project_id, "title", &project.title_ct)?;
+            let summary_ct = project
+                .summary_ct
+                .as_ref()
+                .map(|s| Self::encrypt_metadata(conn, &project.project_id, "summary", s))
+                .transpose()?;
 
-        conn.inner().execute(
-            "UPDATE projects SET
+            conn.inner().execute(
+                "UPDATE projects SET
                 title_ct = ?2, summary_ct = ?3, group_id = ?4, icon_ref = ?5,
                 favorite = ?6, archived = ?7, deleted = ?8,
                 tiga_mode_override = ?9, object_clock = ?10,
                 head_commit_id = ?11, attachment_count = ?12,
                 updated_at = ?13, updated_by_device_id = ?14
              WHERE project_id = ?1",
-            params![
-                project.project_id,
-                title_ct,
-                summary_ct,
-                project.group_id,
-                project.icon_ref,
-                project.favorite as i32,
-                project.archived as i32,
-                project.deleted as i32,
-                project.tiga_mode_override.as_ref().map(|m| m.to_string()),
-                object_clock,
-                commit_id,
-                project.attachment_count as i32,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_project_current(conn, &commit_id, &project.project_id)?;
+                params![
+                    project.project_id,
+                    title_ct,
+                    summary_ct,
+                    project.group_id,
+                    project.icon_ref,
+                    project.favorite as i32,
+                    project.archived as i32,
+                    project.deleted as i32,
+                    project.tiga_mode_override.as_ref().map(|m| m.to_string()),
+                    object_clock,
+                    commit_id,
+                    project.attachment_count as i32,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, &project.project_id)?;
 
-        ProjectRepo::get_by_id(conn, &project.project_id)?
-            .ok_or_else(|| StorageError::NotFound(project.project_id.clone()))
+            ProjectRepo::get_by_id(conn, &project.project_id)?
+                .ok_or_else(|| StorageError::NotFound(project.project_id.clone()))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -259,36 +269,38 @@ impl ProjectRepo {
         ctx: &CommitContext,
         project_id: &str,
     ) -> StorageResult<()> {
-        // 验证存在
-        let project = ProjectRepo::get_by_id(conn, project_id)?
-            .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            // 验证存在
+            let project = ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
 
-        if project.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "project is already deleted".to_string(),
-            ));
-        }
+            if project.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "project is already deleted".to_string(),
+                ));
+            }
 
-        let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Utc::now().to_rfc3339();
 
-        // tombstone
-        ctx.create_tombstone(conn, "project", project_id)?;
+            // tombstone
+            ctx.create_tombstone(conn, "project", project_id)?;
 
-        // commit
-        let commit_id =
-            ctx.commit_object_change(conn, "projects", project_id, "change", "project")?;
+            // commit
+            let commit_id =
+                ctx.commit_object_change(conn, "projects", project_id, "change", "project")?;
 
-        let object_clock = bump_clock(&project.object_clock);
+            let object_clock = bump_clock(&project.object_clock);
 
-        conn.inner().execute(
-            "UPDATE projects SET deleted = 1, object_clock = ?2,
+            conn.inner().execute(
+                "UPDATE projects SET deleted = 1, object_clock = ?2,
              head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
              WHERE project_id = ?1",
-            params![project_id, object_clock, commit_id, now, ctx.device_id],
-        )?;
-        ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
+                params![project_id, object_clock, commit_id, now, ctx.device_id],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------

@@ -217,6 +217,8 @@ MDBX 的目标是通过 Syncthing、Git、Nextcloud、WebDAV 包装层、Dropbox
 
 全文搜索可以在已解锁会话中使用临时索引。持久 FTS 表不得保存解密后的 project 标题或其他带秘密语义的文本。
 
+临时搜索索引不是用户可见历史，不应产生 commit。用户可见的 project tag 属于元数据，不是临时搜索状态：tracked tag mutation 应产生 project 级 commit，sync state 应携带每个 project 的完整 tag 集合，这样删除 tag、包括删除最后一个 tag，才能被安全重放。收到旧版不含 tag 字段的 sync payload 时，读取端必须保留本地 tag，不能把缺失字段解释为“清空所有 tag”。
+
 ## 17. 整理与压缩规则
 
 compaction 可以重写较大部分内容，但必须满足：

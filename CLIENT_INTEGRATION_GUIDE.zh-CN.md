@@ -134,8 +134,13 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
 - `conflicts`
 - `device_heads`
 - `branches`
+- `project_tags`
 
 直接写这些表很容易制造“看起来保存成功，但其他客户端数量不一致、删除链路错误、历史爆炸、快照不可回滚”的问题。
+
+Android 接入时尤其要避免把 MDBX 当成普通 Room 表集合。entry/project/attachment 的创建、编辑、删除、移动、复制应走 repo/storage API；用户可见 tag 修改应走 tracked tag API；conflict 解决应走 entry/project/attachment 专用 resolution API。只更新 `conflicts.resolution` 或直接改 `project_tags` 都不算完成写入，因为它会跳过 commit、object version、device head、branch head 或 sync state。
+
+当前 storage core 的安全边界不要求默认强制硬件密钥，也不增加额外解锁步骤。Sky 是灵活便携但仍然安全的 Tiga 模式，适合网盘同步和多设备恢复优先场景；硬件密钥可以作为 Multi/Power 的增强能力，而不是 Sky 便携性的反面。
 
 ## 4. 写入规则
 

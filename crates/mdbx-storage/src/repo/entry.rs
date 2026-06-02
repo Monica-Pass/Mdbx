@@ -30,66 +30,68 @@ impl EntryRepo {
         title: Option<&str>,
         payload: &serde_json::Value,
     ) -> StorageResult<Entry> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let entry_id = Uuid::new_v4().to_string();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let entry_id = Uuid::new_v4().to_string();
 
-        // 验证 project 存在且未删除
-        let (exists, deleted): (bool, bool) = conn
-            .inner()
-            .query_row(
-                "SELECT 1, deleted FROM projects WHERE project_id = ?1",
-                params![project_id],
-                |row| Ok((true, row.get::<_, i32>(1)? != 0)),
-            )
-            .optional()
-            .map_err(StorageError::Database)?
-            .unwrap_or((false, false));
+            // 验证 project 存在且未删除
+            let (exists, deleted): (bool, bool) = conn
+                .inner()
+                .query_row(
+                    "SELECT 1, deleted FROM projects WHERE project_id = ?1",
+                    params![project_id],
+                    |row| Ok((true, row.get::<_, i32>(1)? != 0)),
+                )
+                .optional()
+                .map_err(StorageError::Database)?
+                .unwrap_or((false, false));
 
-        if !exists {
-            return Err(StorageError::NotFound(format!(
-                "project {} not found",
-                project_id
-            )));
-        }
-        if deleted {
-            return Err(StorageError::ConstraintViolation(format!(
-                "project {} is deleted",
-                project_id
-            )));
-        }
+            if !exists {
+                return Err(StorageError::NotFound(format!(
+                    "project {} not found",
+                    project_id
+                )));
+            }
+            if deleted {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "project {} is deleted",
+                    project_id
+                )));
+            }
 
-        let commit_id = ctx.create_commit(conn, "change", "entry", &[entry_id.clone()], &[])?;
+            let commit_id = ctx.create_commit(conn, "change", "entry", &[entry_id.clone()], &[])?;
 
-        let object_clock = format!(r#"{{"counter":1}}"#);
-        let payload_blob =
-            serde_json::to_vec(payload).map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
-        let payload_ct = Self::encrypt_record(conn, &entry_id, "payload", &payload_blob)?;
-        let title_ct = title
-            .map(|t| Self::encrypt_metadata(conn, &entry_id, "title", t.as_bytes()))
-            .transpose()?;
+            let object_clock = format!(r#"{{"counter":1}}"#);
+            let payload_blob = serde_json::to_vec(payload)
+                .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
+            let payload_ct = Self::encrypt_record(conn, &entry_id, "payload", &payload_blob)?;
+            let title_ct = title
+                .map(|t| Self::encrypt_metadata(conn, &entry_id, "title", t.as_bytes()))
+                .transpose()?;
 
-        conn.inner().execute(
-            "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
+            conn.inner().execute(
+                "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
              payload_ct, payload_schema_version, tiga_mode_override, object_clock,
              head_commit_id, deleted, created_at, updated_at,
              created_by_device_id, updated_by_device_id)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, ?6, ?7, 0, ?8, ?8, ?9, ?9)",
-            params![
-                entry_id,
-                project_id,
-                entry_type.to_string(),
-                title_ct,
-                payload_ct,
-                object_clock,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
+                params![
+                    entry_id,
+                    project_id,
+                    entry_type.to_string(),
+                    title_ct,
+                    payload_ct,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
 
-        ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry_id)?;
 
-        EntryRepo::get_by_id(conn, &entry_id)?.ok_or_else(|| StorageError::NotFound(entry_id))
+            EntryRepo::get_by_id(conn, &entry_id)?.ok_or_else(|| StorageError::NotFound(entry_id))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -243,46 +245,49 @@ impl EntryRepo {
         ctx: &CommitContext,
         entry: &Entry,
     ) -> StorageResult<Entry> {
-        let now = chrono::Utc::now().to_rfc3339();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
 
-        let commit_id =
-            ctx.commit_object_change(conn, "entries", &entry.entry_id, "change", "entry")?;
+            let commit_id =
+                ctx.commit_object_change(conn, "entries", &entry.entry_id, "change", "entry")?;
 
-        let object_clock = bump_clock(&entry.object_clock);
+            let object_clock = bump_clock(&entry.object_clock);
 
-        let title_ct = entry
-            .title_ct
-            .as_ref()
-            .map(|t| Self::encrypt_metadata(conn, &entry.entry_id, "title", t))
-            .transpose()?;
-        let payload_ct = Self::encrypt_record(conn, &entry.entry_id, "payload", &entry.payload_ct)?;
+            let title_ct = entry
+                .title_ct
+                .as_ref()
+                .map(|t| Self::encrypt_metadata(conn, &entry.entry_id, "title", t))
+                .transpose()?;
+            let payload_ct =
+                Self::encrypt_record(conn, &entry.entry_id, "payload", &entry.payload_ct)?;
 
-        conn.inner().execute(
-            "UPDATE entries SET
+            conn.inner().execute(
+                "UPDATE entries SET
                 title_ct = ?2, payload_ct = ?3, payload_schema_version = ?4,
                 entry_type = ?5, tiga_mode_override = ?6, object_clock = ?7,
                 head_commit_id = ?8, deleted = ?9,
                 updated_at = ?10, updated_by_device_id = ?11
              WHERE entry_id = ?1",
-            params![
-                entry.entry_id,
-                title_ct,
-                payload_ct,
-                entry.payload_schema_version as i32,
-                entry.entry_type.to_string(),
-                entry.tiga_mode_override.as_ref().map(|m| m.to_string()),
-                object_clock,
-                commit_id,
-                entry.deleted as i32,
-                now,
-                ctx.device_id,
-            ],
-        )?;
+                params![
+                    entry.entry_id,
+                    title_ct,
+                    payload_ct,
+                    entry.payload_schema_version as i32,
+                    entry.entry_type.to_string(),
+                    entry.tiga_mode_override.as_ref().map(|m| m.to_string()),
+                    object_clock,
+                    commit_id,
+                    entry.deleted as i32,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
 
-        ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry.entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry.entry_id)?;
 
-        EntryRepo::get_by_id(conn, &entry.entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry.entry_id.clone()))
+            EntryRepo::get_by_id(conn, &entry.entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry.entry_id.clone()))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -295,38 +300,40 @@ impl EntryRepo {
         entry_id: &str,
         target_project_id: &str,
     ) -> StorageResult<Entry> {
-        let entry = EntryRepo::get_by_id(conn, entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let entry = EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
 
-        if entry.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "entry is deleted".to_string(),
-            ));
-        }
-        ensure_active_project(conn, target_project_id)?;
+            if entry.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "entry is deleted".to_string(),
+                ));
+            }
+            ensure_active_project(conn, target_project_id)?;
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let commit_id = ctx.commit_object_change(conn, "entries", entry_id, "move", "entry")?;
-        let object_clock = bump_clock(&entry.object_clock);
+            let now = chrono::Utc::now().to_rfc3339();
+            let commit_id = ctx.commit_object_change(conn, "entries", entry_id, "move", "entry")?;
+            let object_clock = bump_clock(&entry.object_clock);
 
-        conn.inner().execute(
-            "UPDATE entries SET project_id = ?2, object_clock = ?3,
+            conn.inner().execute(
+                "UPDATE entries SET project_id = ?2, object_clock = ?3,
              head_commit_id = ?4, updated_at = ?5, updated_by_device_id = ?6
              WHERE entry_id = ?1",
-            params![
-                entry_id,
-                target_project_id,
-                object_clock,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
+                params![
+                    entry_id,
+                    target_project_id,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
 
-        ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
 
-        EntryRepo::get_by_id(conn, entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))
+            EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))
+        })
     }
 
     pub fn copy_to_project(
@@ -335,57 +342,60 @@ impl EntryRepo {
         entry_id: &str,
         target_project_id: &str,
     ) -> StorageResult<Entry> {
-        let source = EntryRepo::get_by_id(conn, entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let source = EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
 
-        if source.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "entry is deleted".to_string(),
-            ));
-        }
-        ensure_active_project(conn, target_project_id)?;
+            if source.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "entry is deleted".to_string(),
+                ));
+            }
+            ensure_active_project(conn, target_project_id)?;
 
-        let now = chrono::Utc::now().to_rfc3339();
-        let new_entry_id = Uuid::new_v4().to_string();
-        let commit_id = ctx.create_commit(
-            conn,
-            "copy",
-            "entry",
-            &[new_entry_id.clone()],
-            std::slice::from_ref(&source.head_commit_id),
-        )?;
-        let title_ct = source
-            .title_ct
-            .as_ref()
-            .map(|t| Self::encrypt_metadata(conn, &new_entry_id, "title", t))
-            .transpose()?;
-        let payload_ct = Self::encrypt_record(conn, &new_entry_id, "payload", &source.payload_ct)?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let new_entry_id = Uuid::new_v4().to_string();
+            let commit_id = ctx.create_commit(
+                conn,
+                "copy",
+                "entry",
+                &[new_entry_id.clone()],
+                std::slice::from_ref(&source.head_commit_id),
+            )?;
+            let title_ct = source
+                .title_ct
+                .as_ref()
+                .map(|t| Self::encrypt_metadata(conn, &new_entry_id, "title", t))
+                .transpose()?;
+            let payload_ct =
+                Self::encrypt_record(conn, &new_entry_id, "payload", &source.payload_ct)?;
 
-        conn.inner().execute(
-            "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
+            conn.inner().execute(
+                "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
              payload_ct, payload_schema_version, tiga_mode_override, object_clock,
              head_commit_id, deleted, created_at, updated_at,
              created_by_device_id, updated_by_device_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10, ?11, ?11)",
-            params![
-                new_entry_id,
-                target_project_id,
-                source.entry_type.to_string(),
-                title_ct,
-                payload_ct,
-                source.payload_schema_version as i32,
-                source.tiga_mode_override.as_ref().map(|m| m.to_string()),
-                r#"{"counter":1}"#,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
+                params![
+                    new_entry_id,
+                    target_project_id,
+                    source.entry_type.to_string(),
+                    title_ct,
+                    payload_ct,
+                    source.payload_schema_version as i32,
+                    source.tiga_mode_override.as_ref().map(|m| m.to_string()),
+                    r#"{"counter":1}"#,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
 
-        ObjectVersionRepo::record_entry_current(conn, &commit_id, &new_entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, &new_entry_id)?;
 
-        EntryRepo::get_by_id(conn, &new_entry_id)?
-            .ok_or_else(|| StorageError::NotFound(new_entry_id))
+            EntryRepo::get_by_id(conn, &new_entry_id)?
+                .ok_or_else(|| StorageError::NotFound(new_entry_id))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -397,33 +407,36 @@ impl EntryRepo {
         ctx: &CommitContext,
         entry_id: &str,
     ) -> StorageResult<()> {
-        let entry = EntryRepo::get_by_id(conn, entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let entry = EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
 
-        if entry.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "entry is already deleted".to_string(),
-            ));
-        }
+            if entry.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "entry is already deleted".to_string(),
+                ));
+            }
 
-        let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Utc::now().to_rfc3339();
 
-        ctx.create_tombstone(conn, "entry", entry_id)?;
+            ctx.create_tombstone(conn, "entry", entry_id)?;
 
-        let commit_id = ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
+            let commit_id =
+                ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
 
-        let object_clock = bump_clock(&entry.object_clock);
+            let object_clock = bump_clock(&entry.object_clock);
 
-        conn.inner().execute(
-            "UPDATE entries SET deleted = 1, object_clock = ?2,
+            conn.inner().execute(
+                "UPDATE entries SET deleted = 1, object_clock = ?2,
              head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
              WHERE entry_id = ?1",
-            params![entry_id, object_clock, commit_id, now, ctx.device_id],
-        )?;
+                params![entry_id, object_clock, commit_id, now, ctx.device_id],
+            )?;
 
-        ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
 
-        Ok(())
+            Ok(())
+        })
     }
     // -----------------------------------------------------------------------
     // ENCRYPTION HELPERS

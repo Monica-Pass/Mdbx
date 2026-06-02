@@ -115,6 +115,9 @@ Key capabilities currently verified in the Rust storage core:
 - Entry, project, and attachment rows are recorded in `object_versions` for divergent three-way merge.
 - Different-field concurrent entry/project changes write a two-parent merge commit; same-field changes create unresolved conflicts.
 - Attachment metadata can merge at field level; concurrent content replacement keeps the local content and records a `content_hash` conflict.
+- Entry, project, and attachment conflict resolution now has repository write-back APIs. Resolving a conflict writes a merge commit, updates the object head, records an object version, and then marks the conflict resolved. Attachment incoming-wins never fabricates remote content when the bytes are not locally available.
+- High-risk user-visible project, entry, and attachment mutations are wrapped in atomic transactions so commits, object rows, heads, and object versions succeed or roll back together.
+- `project_tags` are included in sync state. New payloads carry the complete tag set for each project, while old payloads that lack the tag field do not clear local tags. User-visible tag changes should use tracked tag APIs; temporary session search indexes do not enter history.
 - Initial key epochs use a random `mdbx-init-marker-v1` marker; configuring or changing an unlock method binds `mdbx-active-key-epoch-v1` active epoch wrapping. Full key rotation / retirement remains future work.
 
 ## Implementation Rules
@@ -134,8 +137,11 @@ Client code should not directly write:
 - `conflicts`
 - `device_heads`
 - `branches`
+- `project_tags`
 
 Batch user operations should normally produce one user-level commit, not one commit per object.
+
+Android and other clients should use repository/storage APIs for entry/project/attachment CRUD, tracked tag changes, and conflict resolution. Do not only update `conflicts.resolution`, and do not edit `project_tags` directly while skipping commits and sync state.
 
 ## Compatibility Checklist
 

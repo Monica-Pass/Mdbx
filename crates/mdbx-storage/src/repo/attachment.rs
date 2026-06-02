@@ -34,105 +34,107 @@ impl AttachmentRepo {
         content_hash: &str,
         original_size: u64,
     ) -> StorageResult<Attachment> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let attachment_id = Uuid::new_v4().to_string();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let attachment_id = Uuid::new_v4().to_string();
 
-        // 验证 project 存在且未删除
-        let (p_exists, p_deleted): (bool, bool) = conn
-            .inner()
-            .query_row(
-                "SELECT 1, deleted FROM projects WHERE project_id = ?1",
-                params![project_id],
-                |row| Ok((true, row.get::<_, i32>(1)? != 0)),
-            )
-            .optional()
-            .map_err(StorageError::Database)?
-            .unwrap_or((false, false));
-
-        if !p_exists {
-            return Err(StorageError::NotFound(format!(
-                "project {} not found",
-                project_id
-            )));
-        }
-        if p_deleted {
-            return Err(StorageError::ConstraintViolation(format!(
-                "project {} is deleted",
-                project_id
-            )));
-        }
-
-        // 验证 entry（如果指定）存在且未删除
-        if let Some(eid) = entry_id {
-            let (e_exists, e_deleted, e_project): (bool, bool, String) = conn
+            // 验证 project 存在且未删除
+            let (p_exists, p_deleted): (bool, bool) = conn
                 .inner()
                 .query_row(
-                    "SELECT 1, deleted, project_id FROM entries WHERE entry_id = ?1",
-                    params![eid],
-                    |row| Ok((true, row.get::<_, i32>(1)? != 0, row.get(2)?)),
+                    "SELECT 1, deleted FROM projects WHERE project_id = ?1",
+                    params![project_id],
+                    |row| Ok((true, row.get::<_, i32>(1)? != 0)),
                 )
                 .optional()
                 .map_err(StorageError::Database)?
-                .unwrap_or((false, false, String::new()));
+                .unwrap_or((false, false));
 
-            if !e_exists {
-                return Err(StorageError::NotFound(format!("entry {} not found", eid)));
-            }
-            if e_deleted {
-                return Err(StorageError::ConstraintViolation(format!(
-                    "entry {} is deleted",
-                    eid
+            if !p_exists {
+                return Err(StorageError::NotFound(format!(
+                    "project {} not found",
+                    project_id
                 )));
             }
-            if e_project != project_id {
+            if p_deleted {
                 return Err(StorageError::ConstraintViolation(format!(
-                    "entry {} does not belong to project {}",
-                    eid, project_id
+                    "project {} is deleted",
+                    project_id
                 )));
             }
-        }
 
-        let commit_id =
-            ctx.create_commit(conn, "change", "attachment", &[attachment_id.clone()], &[])?;
+            // 验证 entry（如果指定）存在且未删除
+            if let Some(eid) = entry_id {
+                let (e_exists, e_deleted, e_project): (bool, bool, String) = conn
+                    .inner()
+                    .query_row(
+                        "SELECT 1, deleted, project_id FROM entries WHERE entry_id = ?1",
+                        params![eid],
+                        |row| Ok((true, row.get::<_, i32>(1)? != 0, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(StorageError::Database)?
+                    .unwrap_or((false, false, String::new()));
 
-        let storage_mode = "embedded-inline";
+                if !e_exists {
+                    return Err(StorageError::NotFound(format!("entry {} not found", eid)));
+                }
+                if e_deleted {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "entry {} is deleted",
+                        eid
+                    )));
+                }
+                if e_project != project_id {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "entry {} does not belong to project {}",
+                        eid, project_id
+                    )));
+                }
+            }
 
-        let file_name_ct = Self::encrypt_attachment_field(
-            conn,
-            &attachment_id,
-            "file_name",
-            file_name.as_bytes(),
-        )?;
-        let media_type_ct = media_type
-            .map(|m| {
-                Self::encrypt_attachment_field(conn, &attachment_id, "media_type", m.as_bytes())
-            })
-            .transpose()?;
+            let commit_id =
+                ctx.create_commit(conn, "change", "attachment", &[attachment_id.clone()], &[])?;
 
-        conn.inner().execute(
-            "INSERT INTO attachments (attachment_id, project_id, entry_id,
+            let storage_mode = "embedded-inline";
+
+            let file_name_ct = Self::encrypt_attachment_field(
+                conn,
+                &attachment_id,
+                "file_name",
+                file_name.as_bytes(),
+            )?;
+            let media_type_ct = media_type
+                .map(|m| {
+                    Self::encrypt_attachment_field(conn, &attachment_id, "media_type", m.as_bytes())
+                })
+                .transpose()?;
+
+            conn.inner().execute(
+                "INSERT INTO attachments (attachment_id, project_id, entry_id,
              file_name_ct, media_type_ct, storage_mode, content_hash,
              original_size, stored_size, chunk_count, head_commit_id,
              deleted, created_at, updated_at, created_by_device_id, updated_by_device_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, ?9, 0, ?10, ?10, ?11, ?11)",
-            params![
-                attachment_id,
-                project_id,
-                entry_id,
-                file_name_ct,
-                media_type_ct,
-                storage_mode,
-                content_hash,
-                original_size,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &attachment_id)?;
+                params![
+                    attachment_id,
+                    project_id,
+                    entry_id,
+                    file_name_ct,
+                    media_type_ct,
+                    storage_mode,
+                    content_hash,
+                    original_size,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, &attachment_id)?;
 
-        AttachmentRepo::get_by_id(conn, &attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id))
+            AttachmentRepo::get_by_id(conn, &attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -292,52 +294,59 @@ impl AttachmentRepo {
         new_file_name: &str,
         new_media_type: Option<&str>,
     ) -> StorageResult<Attachment> {
-        let att = AttachmentRepo::get_by_id(conn, attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let att = AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
 
-        if att.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "attachment is deleted".to_string(),
-            ));
-        }
+            if att.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "attachment is deleted".to_string(),
+                ));
+            }
 
-        let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Utc::now().to_rfc3339();
 
-        let commit_id =
-            ctx.commit_object_change(conn, "attachments", attachment_id, "change", "attachment")?;
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "attachments",
+                attachment_id,
+                "change",
+                "attachment",
+            )?;
 
-        // content_hash 不变！
-        let file_name_ct = Self::encrypt_attachment_field(
-            conn,
-            attachment_id,
-            "file_name",
-            new_file_name.as_bytes(),
-        )?;
-        let media_type_ct = new_media_type
-            .map(|m| {
-                Self::encrypt_attachment_field(conn, attachment_id, "media_type", m.as_bytes())
-            })
-            .transpose()?;
+            // content_hash 不变！
+            let file_name_ct = Self::encrypt_attachment_field(
+                conn,
+                attachment_id,
+                "file_name",
+                new_file_name.as_bytes(),
+            )?;
+            let media_type_ct = new_media_type
+                .map(|m| {
+                    Self::encrypt_attachment_field(conn, attachment_id, "media_type", m.as_bytes())
+                })
+                .transpose()?;
 
-        conn.inner().execute(
-            "UPDATE attachments SET
+            conn.inner().execute(
+                "UPDATE attachments SET
                 file_name_ct = ?2, media_type_ct = ?3,
                 head_commit_id = ?4,
                 updated_at = ?5, updated_by_device_id = ?6
              WHERE attachment_id = ?1",
-            params![
-                attachment_id,
-                file_name_ct,
-                media_type_ct,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
+                params![
+                    attachment_id,
+                    file_name_ct,
+                    media_type_ct,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
-        AttachmentRepo::get_by_id(conn, attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))
+            AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -349,31 +358,38 @@ impl AttachmentRepo {
         ctx: &CommitContext,
         attachment_id: &str,
     ) -> StorageResult<()> {
-        let att = AttachmentRepo::get_by_id(conn, attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let att = AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
 
-        if att.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "attachment is already deleted".to_string(),
-            ));
-        }
+            if att.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "attachment is already deleted".to_string(),
+                ));
+            }
 
-        let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Utc::now().to_rfc3339();
 
-        ctx.create_tombstone(conn, "attachment", attachment_id)?;
+            ctx.create_tombstone(conn, "attachment", attachment_id)?;
 
-        let commit_id =
-            ctx.commit_object_change(conn, "attachments", attachment_id, "change", "attachment")?;
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "attachments",
+                attachment_id,
+                "change",
+                "attachment",
+            )?;
 
-        conn.inner().execute(
-            "UPDATE attachments SET deleted = 1,
+            conn.inner().execute(
+                "UPDATE attachments SET deleted = 1,
              head_commit_id = ?2, updated_at = ?3, updated_by_device_id = ?4
              WHERE attachment_id = ?1",
-            params![attachment_id, commit_id, now, ctx.device_id],
-        )?;
-        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
+                params![attachment_id, commit_id, now, ctx.device_id],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -406,60 +422,67 @@ impl AttachmentRepo {
         attachment_id: &str,
         data: &[u8],
     ) -> StorageResult<String> {
-        let att = AttachmentRepo::get_by_id(conn, attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let att = AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
 
-        if att.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "attachment is deleted".to_string(),
-            ));
-        }
+            if att.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "attachment is deleted".to_string(),
+                ));
+            }
 
-        let content_hash = compute_sha256_hex(data);
-        let now = chrono::Utc::now().to_rfc3339();
+            let content_hash = compute_sha256_hex(data);
+            let now = chrono::Utc::now().to_rfc3339();
 
-        let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", data)?;
+            let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", data)?;
 
-        let commit_id =
-            ctx.commit_object_change(conn, "attachments", attachment_id, "change", "attachment")?;
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "attachments",
+                attachment_id,
+                "change",
+                "attachment",
+            )?;
 
-        // upsert chunk
-        conn.inner().execute(
-            "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
+            // upsert chunk
+            conn.inner().execute(
+                "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
              chunk_ct, stored_size, created_at)
              VALUES (?1, 0, ?2, ?3, ?4, ?5)
              ON CONFLICT(attachment_id, chunk_index) DO UPDATE SET
                 chunk_hash = excluded.chunk_hash,
                 chunk_ct = excluded.chunk_ct,
                 stored_size = excluded.stored_size",
-            params![
-                attachment_id,
-                content_hash,
-                chunk_ct,
-                data.len() as i64,
-                now,
-            ],
-        )?;
+                params![
+                    attachment_id,
+                    content_hash,
+                    chunk_ct,
+                    data.len() as i64,
+                    now,
+                ],
+            )?;
 
-        // 更新 attachments 元数据
-        conn.inner().execute(
-            "UPDATE attachments SET
+            // 更新 attachments 元数据
+            conn.inner().execute(
+                "UPDATE attachments SET
                 content_hash = ?2, stored_size = ?3, chunk_count = 1,
                 storage_mode = 'embedded-inline',
                 head_commit_id = ?4, updated_at = ?5, updated_by_device_id = ?6
              WHERE attachment_id = ?1",
-            params![
-                attachment_id,
-                content_hash,
-                data.len() as i64,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
+                params![
+                    attachment_id,
+                    content_hash,
+                    data.len() as i64,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
-        Ok(content_hash)
+            Ok(content_hash)
+        })
     }
 
     /// 读取附件内容并验证完整性。
@@ -527,70 +550,77 @@ impl AttachmentRepo {
         data: &[u8],
         chunk_size: usize,
     ) -> StorageResult<String> {
-        let att = AttachmentRepo::get_by_id(conn, attachment_id)?
-            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let att = AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
 
-        if att.deleted {
-            return Err(StorageError::ConstraintViolation(
-                "attachment is deleted".to_string(),
-            ));
-        }
+            if att.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "attachment is deleted".to_string(),
+                ));
+            }
 
-        assert!(chunk_size > 0, "chunk_size must be > 0");
+            assert!(chunk_size > 0, "chunk_size must be > 0");
 
-        let content_hash = compute_sha256_hex(data);
-        let now = chrono::Utc::now().to_rfc3339();
-        let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
-        let chunk_count = chunks.len() as u32;
+            let content_hash = compute_sha256_hex(data);
+            let now = chrono::Utc::now().to_rfc3339();
+            let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+            let chunk_count = chunks.len() as u32;
 
-        let commit_id =
-            ctx.commit_object_change(conn, "attachments", attachment_id, "change", "attachment")?;
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "attachments",
+                attachment_id,
+                "change",
+                "attachment",
+            )?;
 
-        // 清除旧 chunk 数据
-        conn.inner().execute(
-            "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
-            params![attachment_id],
-        )?;
-
-        // 逐 chunk 写入
-        for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_hash = compute_sha256_hex(chunk);
-            let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", chunk)?;
+            // 清除旧 chunk 数据
             conn.inner().execute(
-                "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
+                "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+                params![attachment_id],
+            )?;
+
+            // 逐 chunk 写入
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_hash = compute_sha256_hex(chunk);
+                let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", chunk)?;
+                conn.inner().execute(
+                    "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
                  chunk_ct, stored_size, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    attachment_id,
-                    i as i64,
-                    chunk_hash,
-                    chunk_ct,
-                    chunk.len() as i64,
-                    now,
-                ],
-            )?;
-        }
+                    params![
+                        attachment_id,
+                        i as i64,
+                        chunk_hash,
+                        chunk_ct,
+                        chunk.len() as i64,
+                        now,
+                    ],
+                )?;
+            }
 
-        // 更新 attachments 元数据
-        conn.inner().execute(
-            "UPDATE attachments SET
+            // 更新 attachments 元数据
+            conn.inner().execute(
+                "UPDATE attachments SET
                 content_hash = ?2, stored_size = ?3, chunk_count = ?4,
                 storage_mode = 'embedded-chunked',
                 head_commit_id = ?5, updated_at = ?6, updated_by_device_id = ?7
              WHERE attachment_id = ?1",
-            params![
-                attachment_id,
-                content_hash,
-                data.len() as i64,
-                chunk_count,
-                commit_id,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
+                params![
+                    attachment_id,
+                    content_hash,
+                    data.len() as i64,
+                    chunk_count,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
-        Ok(content_hash)
+            Ok(content_hash)
+        })
     }
 
     /// 校验每个 chunk 的独立 hash。

@@ -1,5 +1,6 @@
 use mdbx_sync::ObjectPayload;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
@@ -17,6 +18,8 @@ pub struct SyncStatePayload {
     pub entries: Vec<EntryRow>,
     pub attachments: Vec<AttachmentRow>,
     pub attachment_chunks: Vec<AttachmentChunkRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_tags: Option<Vec<ProjectTagSetRow>>,
     pub branches: Vec<BranchRow>,
 }
 
@@ -90,6 +93,12 @@ pub struct AttachmentChunkRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectTagSetRow {
+    pub project_id: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchRow {
     pub branch_id: String,
     pub branch_name: String,
@@ -105,6 +114,7 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         entries: load_entry_rows(conn)?,
         attachments: load_attachment_rows(conn)?,
         attachment_chunks: load_attachment_chunk_rows(conn)?,
+        project_tags: Some(load_project_tag_set_rows(conn)?),
         branches: load_branch_rows(conn)?,
     })
 }
@@ -280,6 +290,34 @@ fn load_attachment_chunk_rows(conn: &VaultConnection) -> StorageResult<Vec<Attac
     Ok(out)
 }
 
+fn load_project_tag_set_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectTagSetRow>> {
+    let mut out = BTreeMap::<String, Vec<String>>::new();
+    let mut project_stmt = conn
+        .inner()
+        .prepare("SELECT project_id FROM projects ORDER BY project_id ASC")?;
+    let project_ids = project_stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for project_id in project_ids {
+        out.insert(project_id?, Vec::new());
+    }
+
+    let mut stmt = conn.inner().prepare(
+        "SELECT project_id, tag
+         FROM project_tags
+         ORDER BY project_id ASC, tag ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (project_id, tag) = row?;
+        out.entry(project_id).or_default().push(tag);
+    }
+    Ok(out
+        .into_iter()
+        .map(|(project_id, tags)| ProjectTagSetRow { project_id, tags })
+        .collect())
+}
+
 fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT branch_id, branch_name, head_commit_id, created_at, updated_at
@@ -301,4 +339,41 @@ fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init::{initialize_vault, VaultInitParams};
+    use crate::repo::{CommitContext, ProjectRepo};
+    use crate::search::SearchService;
+
+    fn setup() -> (VaultConnection, CommitContext) {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("test-device".to_string());
+        (conn, ctx)
+    }
+
+    #[test]
+    fn collect_sync_state_includes_empty_project_tag_sets() {
+        let (conn, ctx) = setup();
+        let tagged = ProjectRepo::create(&conn, &ctx, "Tagged", None, None).unwrap();
+        let empty = ProjectRepo::create(&conn, &ctx, "Empty", None, None).unwrap();
+        SearchService::add_tag(&conn, &tagged.project_id, "work").unwrap();
+
+        let state = collect_sync_state(&conn).unwrap();
+        let tag_sets = state.project_tags.unwrap();
+        let tagged_tags = tag_sets
+            .iter()
+            .find(|row| row.project_id == tagged.project_id)
+            .unwrap();
+        let empty_tags = tag_sets
+            .iter()
+            .find(|row| row.project_id == empty.project_id)
+            .unwrap();
+
+        assert_eq!(tagged_tags.tags, vec!["work".to_string()]);
+        assert!(empty_tags.tags.is_empty());
+    }
 }

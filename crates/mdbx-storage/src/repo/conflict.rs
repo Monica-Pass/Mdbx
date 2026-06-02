@@ -9,7 +9,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::sync_state::EntryRow;
+use crate::sync_state::{AttachmentRow, EntryRow, ProjectRow};
 
 /// 冲突记录的持久化仓库。
 ///
@@ -153,43 +153,38 @@ impl ConflictRepo {
         conflict_id: &str,
         resolution: ConflictResolution,
     ) -> StorageResult<Conflict> {
-        let conflict = Self::get_by_id(conn, conflict_id)?
-            .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Entry,
+                "resolve_entry",
+            )?;
 
-        if conflict.object_type != ConflictObjectType::Entry {
-            return Err(StorageError::ConstraintViolation(
-                "only entry conflicts can be resolved through resolve_entry".to_string(),
-            ));
-        }
-        if conflict.resolution != ConflictResolution::Unresolved {
-            return Err(StorageError::ConstraintViolation(format!(
-                "conflict {} is already resolved",
-                conflict_id
-            )));
-        }
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_entry_local_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_entry_incoming_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom conflict resolution requires an explicit merged payload"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
 
-        match resolution {
-            ConflictResolution::LocalWins => {
-                Self::write_local_wins_resolution(conn, ctx, &conflict)?;
-            }
-            ConflictResolution::IncomingWins => {
-                Self::write_incoming_wins_resolution(conn, ctx, &conflict)?;
-            }
-            ConflictResolution::Custom => {
-                return Err(StorageError::ConstraintViolation(
-                    "custom conflict resolution requires an explicit merged payload".to_string(),
-                ));
-            }
-            ConflictResolution::Unresolved => {
-                return Err(StorageError::ConstraintViolation(
-                    "cannot resolve a conflict as unresolved".to_string(),
-                ));
-            }
-        }
-
-        Self::resolve(conn, conflict_id, resolution)?;
-        Self::get_by_id(conn, conflict_id)?
-            .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+            Self::resolve(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
     }
 
     /// Resolve an entry conflict with a caller-provided merged JSON payload.
@@ -203,26 +198,160 @@ impl ConflictRepo {
         conflict_id: &str,
         merged_payload: &serde_json::Value,
     ) -> StorageResult<Conflict> {
-        let conflict = Self::get_by_id(conn, conflict_id)?
-            .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))?;
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Entry,
+                "resolve_entry_custom_payload",
+            )?;
 
-        if conflict.object_type != ConflictObjectType::Entry {
-            return Err(StorageError::ConstraintViolation(
-                "only entry conflicts can be resolved through resolve_entry_custom_payload"
-                    .to_string(),
-            ));
-        }
-        if conflict.resolution != ConflictResolution::Unresolved {
-            return Err(StorageError::ConstraintViolation(format!(
-                "conflict {} is already resolved",
-                conflict_id
-            )));
-        }
+            Self::write_entry_custom_payload_resolution(conn, ctx, &conflict, merged_payload)?;
+            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
 
-        Self::write_custom_payload_resolution(conn, ctx, &conflict, merged_payload)?;
-        Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
-        Self::get_by_id(conn, conflict_id)?
-            .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+    /// Resolve a project conflict and write the chosen project snapshot back.
+    pub fn resolve_project(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Project,
+                "resolve_project",
+            )?;
+
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_project_local_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_project_incoming_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom project conflict resolution requires an explicit merged row"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
+
+            Self::resolve(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a project conflict with a caller-provided merged row.
+    pub fn resolve_project_custom_row(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &ProjectRow,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Project,
+                "resolve_project_custom_row",
+            )?;
+            if merged.project_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom project resolution row does not match conflict object".to_string(),
+                ));
+            }
+
+            Self::write_project_custom_row_resolution(conn, ctx, &conflict, merged)?;
+            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve an attachment conflict and write the chosen metadata back.
+    ///
+    /// Incoming-wins refuses to point metadata at attachment content that is
+    /// not already present locally. This keeps conflict resolution from
+    /// manufacturing a content hash without bytes behind it.
+    pub fn resolve_attachment(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Attachment,
+                "resolve_attachment",
+            )?;
+
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_attachment_local_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_attachment_incoming_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom attachment conflict resolution requires an explicit merged row"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
+
+            Self::resolve(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve an attachment conflict with a caller-provided metadata row.
+    pub fn resolve_attachment_custom_row(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &AttachmentRow,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Attachment,
+                "resolve_attachment_custom_row",
+            )?;
+            if merged.attachment_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom attachment resolution row does not match conflict object".to_string(),
+                ));
+            }
+
+            Self::ensure_attachment_content_material_is_local(conn, &conflict, merged)?;
+            Self::write_attachment_custom_row_resolution(conn, ctx, &conflict, merged)?;
+            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
     }
 
     /// 检查指定对象是否存在未解决的冲突。
@@ -288,7 +417,31 @@ impl ConflictRepo {
         Ok(conflicts)
     }
 
-    fn write_local_wins_resolution(
+    fn load_unresolved_typed_conflict(
+        conn: &VaultConnection,
+        conflict_id: &str,
+        expected_type: ConflictObjectType,
+        api_name: &str,
+    ) -> StorageResult<Conflict> {
+        let conflict = Self::get_by_id(conn, conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))?;
+
+        if conflict.object_type != expected_type {
+            return Err(StorageError::ConstraintViolation(format!(
+                "only {} conflicts can be resolved through {}",
+                expected_type, api_name
+            )));
+        }
+        if conflict.resolution != ConflictResolution::Unresolved {
+            return Err(StorageError::ConstraintViolation(format!(
+                "conflict {} is already resolved",
+                conflict_id
+            )));
+        }
+        Ok(conflict)
+    }
+
+    fn write_entry_local_wins_resolution(
         conn: &VaultConnection,
         ctx: &CommitContext,
         conflict: &Conflict,
@@ -313,7 +466,7 @@ impl ConflictRepo {
         Ok(())
     }
 
-    fn write_incoming_wins_resolution(
+    fn write_entry_incoming_wins_resolution(
         conn: &VaultConnection,
         ctx: &CommitContext,
         conflict: &Conflict,
@@ -340,7 +493,7 @@ impl ConflictRepo {
         Ok(())
     }
 
-    fn write_custom_payload_resolution(
+    fn write_entry_custom_payload_resolution(
         conn: &VaultConnection,
         ctx: &CommitContext,
         conflict: &Conflict,
@@ -377,6 +530,170 @@ impl ConflictRepo {
         Ok(())
     }
 
+    fn write_project_local_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_project_row(conn, &conflict.object_id)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.inner().execute(
+            "UPDATE projects SET object_clock = ?2, head_commit_id = ?3,
+             updated_at = ?4, updated_by_device_id = ?5
+             WHERE project_id = ?1",
+            params![
+                conflict.object_id,
+                bump_object_clock(&current.object_clock),
+                commit_id,
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn write_project_incoming_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_project_row(conn, &conflict.object_id)?;
+        let incoming = ObjectVersionRepo::get_project(
+            conn,
+            &conflict.object_id,
+            &conflict.incoming_commit_id,
+        )?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "incoming project snapshot {}@{}",
+                conflict.object_id, conflict.incoming_commit_id
+            ))
+        })?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        Self::apply_project_row_for_resolution(
+            conn,
+            ctx,
+            &incoming,
+            &commit_id,
+            &bump_object_clock(&current.object_clock),
+        )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn write_project_custom_row_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+        merged: &ProjectRow,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_project_row(conn, &conflict.object_id)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        Self::apply_project_row_for_resolution(
+            conn,
+            ctx,
+            merged,
+            &commit_id,
+            &bump_object_clock(&current.object_clock),
+        )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn write_attachment_local_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.inner().execute(
+            "UPDATE attachments SET head_commit_id = ?2,
+             updated_at = ?3, updated_by_device_id = ?4
+             WHERE attachment_id = ?1",
+            params![conflict.object_id, commit_id, now, ctx.device_id],
+        )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn write_attachment_incoming_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+        let incoming = ObjectVersionRepo::get_attachment(
+            conn,
+            &conflict.object_id,
+            &conflict.incoming_commit_id,
+        )?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "incoming attachment snapshot {}@{}",
+                conflict.object_id, conflict.incoming_commit_id
+            ))
+        })?;
+        Self::ensure_attachment_content_material_is_local(conn, conflict, &incoming)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        Self::apply_attachment_row_for_resolution(conn, ctx, &incoming, &commit_id)?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn write_attachment_custom_row_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+        merged: &AttachmentRow,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        Self::apply_attachment_row_for_resolution(conn, ctx, merged, &commit_id)?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &conflict.object_id)?;
+        Ok(())
+    }
+
+    fn ensure_attachment_content_material_is_local(
+        conn: &VaultConnection,
+        conflict: &Conflict,
+        row: &AttachmentRow,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+        let content_changed = current.storage_mode != row.storage_mode
+            || current.content_hash != row.content_hash
+            || current.original_size != row.original_size
+            || current.stored_size != row.stored_size
+            || current.chunk_count != row.chunk_count;
+
+        if !content_changed {
+            return Ok(());
+        }
+
+        if conflict
+            .conflicting_fields
+            .iter()
+            .any(|field| attachment_content_field(field))
+        {
+            return Err(StorageError::ConstraintViolation(
+                "incoming attachment content is not available locally; choose local-wins or provide local content before resolving".to_string(),
+            ));
+        }
+
+        Err(StorageError::ConstraintViolation(
+            "attachment resolution cannot point to content that is not present locally".to_string(),
+        ))
+    }
+
     fn create_resolution_commit(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -390,7 +707,7 @@ impl ConflictRepo {
         ctx.create_commit(
             conn,
             "merge",
-            "entry",
+            &conflict.object_type.to_string(),
             std::slice::from_ref(&conflict.object_id),
             &parents,
         )
@@ -427,6 +744,74 @@ impl ConflictRepo {
         )?;
         Ok(())
     }
+
+    fn apply_project_row_for_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        row: &ProjectRow,
+        commit_id: &str,
+        object_clock: &str,
+    ) -> StorageResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.inner().execute(
+            "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
+             icon_ref = ?5, favorite = ?6, archived = ?7, deleted = ?8,
+             tiga_mode_override = ?9, object_clock = ?10, head_commit_id = ?11,
+             attachment_count = ?12, updated_at = ?13, updated_by_device_id = ?14
+             WHERE project_id = ?1",
+            params![
+                row.project_id,
+                row.title_ct,
+                row.summary_ct,
+                row.group_id,
+                row.icon_ref,
+                row.favorite as i32,
+                row.archived as i32,
+                row.deleted as i32,
+                row.tiga_mode_override,
+                object_clock,
+                commit_id,
+                row.attachment_count as i64,
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn apply_attachment_row_for_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        row: &AttachmentRow,
+        commit_id: &str,
+    ) -> StorageResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.inner().execute(
+            "UPDATE attachments SET project_id = ?2, entry_id = ?3,
+             file_name_ct = ?4, media_type_ct = ?5, storage_mode = ?6,
+             content_hash = ?7, original_size = ?8, stored_size = ?9,
+             chunk_count = ?10, head_commit_id = ?11, deleted = ?12,
+             updated_at = ?13, updated_by_device_id = ?14
+             WHERE attachment_id = ?1",
+            params![
+                row.attachment_id,
+                row.project_id,
+                row.entry_id,
+                row.file_name_ct,
+                row.media_type_ct,
+                row.storage_mode,
+                row.content_hash,
+                row.original_size as i64,
+                row.stored_size as i64,
+                row.chunk_count as i64,
+                commit_id,
+                row.deleted as i32,
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn bump_object_clock(clock: &str) -> String {
@@ -437,6 +822,13 @@ fn bump_object_clock(clock: &str) -> String {
     format!(r#"{{"counter":{}}}"#, counter + 1)
 }
 
+fn attachment_content_field(field: &str) -> bool {
+    matches!(
+        field,
+        "storage_mode" | "content_hash" | "original_size" | "stored_size" | "chunk_count"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -445,6 +837,7 @@ fn bump_object_clock(clock: &str) -> String {
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
+    use crate::repo::attachment::AttachmentRepo;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
 
@@ -736,5 +1129,181 @@ mod tests {
             "entry".parse::<ConflictObjectType>().unwrap(),
             ConflictObjectType::Entry
         );
+    }
+
+    #[test]
+    fn test_resolve_project_incoming_wins_writes_back_row() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Local", None, None).unwrap();
+        let local = ObjectVersionRepo::current_project_row(&conn, &project.project_id).unwrap();
+        let incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "project",
+                std::slice::from_ref(&project.project_id),
+                std::slice::from_ref(&project.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming = local.clone();
+        incoming.title_ct = b"Incoming".to_vec();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_project_row(&conn, &incoming_commit, &incoming).unwrap();
+
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &project.head_commit_id,
+            &project.head_commit_id,
+            &incoming_commit,
+            &["title_ct".to_string()],
+        )
+        .unwrap();
+
+        let resolved = ConflictRepo::resolve_project(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        let updated = ProjectRepo::get_by_id(&conn, &project.project_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::IncomingWins);
+        assert_eq!(updated.title_ct, b"Incoming");
+        assert!(ObjectVersionRepo::get_project(
+            &conn,
+            &project.project_id,
+            &updated.head_commit_id
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn test_resolve_attachment_incoming_metadata_writes_back_row() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "local.txt",
+            Some("text/plain"),
+            "",
+            0,
+        )
+        .unwrap();
+        let local =
+            ObjectVersionRepo::current_attachment_row(&conn, &attachment.attachment_id).unwrap();
+        let incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "attachment",
+                std::slice::from_ref(&attachment.attachment_id),
+                std::slice::from_ref(&attachment.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming = local.clone();
+        incoming.file_name_ct = b"incoming.txt".to_vec();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_attachment_row(&conn, &incoming_commit, &incoming).unwrap();
+
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &attachment.head_commit_id,
+            &attachment.head_commit_id,
+            &incoming_commit,
+            &["file_name_ct".to_string()],
+        )
+        .unwrap();
+
+        let resolved = ConflictRepo::resolve_attachment(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        let updated = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::IncomingWins);
+        assert_eq!(updated.file_name_ct, b"incoming.txt");
+        assert_eq!(updated.content_hash, attachment.content_hash);
+    }
+
+    #[test]
+    fn test_resolve_attachment_incoming_content_without_material_is_rejected() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "local.txt",
+            Some("text/plain"),
+            "local-hash",
+            10,
+        )
+        .unwrap();
+        let local =
+            ObjectVersionRepo::current_attachment_row(&conn, &attachment.attachment_id).unwrap();
+        let incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "attachment",
+                std::slice::from_ref(&attachment.attachment_id),
+                std::slice::from_ref(&attachment.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming = local.clone();
+        incoming.content_hash = "remote-hash".to_string();
+        incoming.original_size = 20;
+        incoming.stored_size = 20;
+        incoming.chunk_count = 1;
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_attachment_row(&conn, &incoming_commit, &incoming).unwrap();
+
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &attachment.head_commit_id,
+            &attachment.head_commit_id,
+            &incoming_commit,
+            &["content_hash".to_string()],
+        )
+        .unwrap();
+
+        let result = ConflictRepo::resolve_attachment(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        );
+        let still_unresolved = ConflictRepo::get_by_id(&conn, &conflict.conflict_id)
+            .unwrap()
+            .unwrap();
+        let updated = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(still_unresolved.resolution, ConflictResolution::Unresolved);
+        assert_eq!(updated.content_hash, attachment.content_hash);
     }
 }

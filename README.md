@@ -115,6 +115,9 @@ cargo run -p mdbx-cli -- --help
 - entry、project、attachment 已记录 `object_versions` 行快照，用于非快进三方合并。
 - entry/project 不同字段并发修改会写入双 parent merge commit；同字段修改会产生 unresolved conflict。
 - attachment 元数据可字段级合并；双方同时替换内容时会保留本地内容并生成 `content_hash` conflict。
+- entry/project/attachment conflict resolution 已有 repo 写回 API；解决冲突会写 merge commit、更新对象 head、记录 object version，再标记 conflict resolved。attachment incoming-wins 不会在缺少本地内容材料时伪造远端内容。
+- project、entry、attachment 的高风险用户可见 mutation 已包裹为原子事务，commit、对象行、head、object version 会一起成功或一起回滚。
+- `project_tags` 已进入 sync state；新 payload 会携带每个 project 的完整 tag 集合，旧 payload 缺少 tag 字段时不会清空本地标签。用户可见 tag 修改应使用 tracked tag API；会话临时搜索索引不进入历史。
 - 初始化 key epoch 使用 `mdbx-init-marker-v1` 随机 marker；配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍是后续边界。
 
 ## 实现规则
@@ -134,8 +137,11 @@ cargo run -p mdbx-cli -- --help
 - `conflicts`
 - `device_heads`
 - `branches`
+- `project_tags`
 
 批量用户操作通常应该生成一个用户级 commit，而不是每个对象一个 commit。
+
+Android 或其他客户端接入时，应通过 repo/storage API 处理 entry/project/attachment CRUD、tracked tag 修改和 conflict resolution。不要只更新 `conflicts.resolution`，也不要直接改 `project_tags` 后跳过 commit/sync state。
 
 ## 兼容性检查
 

@@ -217,6 +217,8 @@ The storage engine SHOULD maintain indexes for at least:
 
 Full-text search MAY use temporary indexes for decrypted titles during an unlocked session. Persistent FTS tables MUST NOT store decrypted project titles or other secret-bearing text.
 
+Temporary search indexes are not user-visible history and MUST NOT create commits. User-visible project tags are metadata, not temporary search state: tracked tag mutations SHOULD create a project-scoped commit, and sync state SHOULD carry the complete tag set for each project so tag deletion, including deleting the final tag, can be replayed safely. Readers that receive an older sync payload without a tag field MUST preserve local tags instead of treating the missing field as an empty set.
+
 ## 17. Compaction Rules
 
 Compaction MAY rewrite larger portions of the vault, but it MUST be:
