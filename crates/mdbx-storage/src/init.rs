@@ -4,6 +4,8 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 
+pub const INIT_KEY_EPOCH_PROFILE_ID: &str = "mdbx-init-marker-v1";
+
 /// 创建 vault 时的参数。
 pub struct VaultInitParams {
     /// Vault ID（如果不提供则自动生成 UUID v4）
@@ -125,8 +127,13 @@ pub fn initialize_vault(
         db.execute(
             "INSERT INTO key_epochs (key_epoch_id, status, wrapped_epoch_key_ct,
              kdf_profile_id, created_at, activated_at)
-             VALUES (?1, 'active', ?2, 'mdbx-default-v1', ?3, ?3)",
-            rusqlite::params![key_epoch_id, initial_key_epoch_marker, now],
+             VALUES (?1, 'active', ?2, ?3, ?4, ?4)",
+            rusqlite::params![
+                key_epoch_id,
+                initial_key_epoch_marker,
+                INIT_KEY_EPOCH_PROFILE_ID,
+                now
+            ],
         )?;
 
         Ok(VaultInitResult {
@@ -289,7 +296,7 @@ mod tests {
         assert_eq!(status, "active");
         assert_eq!(wrapped_epoch_key_ct.len(), 32);
         assert_ne!(wrapped_epoch_key_ct, vec![0]);
-        assert_eq!(kdf_profile, "mdbx-default-v1");
+        assert_eq!(kdf_profile, INIT_KEY_EPOCH_PROFILE_ID);
     }
 
     #[test]

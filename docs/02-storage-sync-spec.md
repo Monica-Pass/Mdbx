@@ -153,7 +153,7 @@ Minimum requirements:
 
 - historical commits remain replayable
 - snapshots can be produced periodically
-- snapshots can rebuild projects, entries, and attachments metadata
+- snapshots can rebuild projects, entries, attachment metadata, and embedded attachment chunks when present
 - partially damaged vaults SHOULD still allow partial recovery
 
 ## 12. Attachment Storage Modes

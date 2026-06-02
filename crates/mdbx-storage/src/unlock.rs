@@ -9,9 +9,12 @@ use mdbx_core::tiga::TigaMode;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
 
 /// AEAD 包装 vault 密钥时使用的 AAD。
 const VAULT_KEY_WRAP_AAD: &[u8] = b"mdbx-vault-key-wrap";
+const ACTIVE_KEY_EPOCH_AAD: &[u8] = b"mdbx-active-key-epoch-wrap";
+const ACTIVE_KEY_EPOCH_PROFILE_ID: &str = "mdbx-active-key-epoch-v1";
 
 /// 保管库解锁服务。
 ///
@@ -64,12 +67,19 @@ impl UnlockService {
 
         let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(conn, UnlockMethodType::Pin, &kdf_params, &wrapped)
+        Self::store_method(
+            conn,
+            UnlockMethodType::Pin,
+            &kdf_params,
+            &wrapped,
+            &active_epoch_wrapped,
+        )
     }
 
     /// 配置密码解锁方式（默认 Multi 模式）。
@@ -103,12 +113,19 @@ impl UnlockService {
 
         let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(conn, UnlockMethodType::Password, &kdf_params, &wrapped)
+        Self::store_method(
+            conn,
+            UnlockMethodType::Password,
+            &kdf_params,
+            &wrapped,
+            &active_epoch_wrapped,
+        )
     }
 
     /// 配置安全密钥解锁方式。
@@ -130,12 +147,19 @@ impl UnlockService {
 
         let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(conn, UnlockMethodType::SecurityKey, &kdf_params, &wrapped)
+        Self::store_method(
+            conn,
+            UnlockMethodType::SecurityKey,
+            &kdf_params,
+            &wrapped,
+            &active_epoch_wrapped,
+        )
     }
 
     /// 配置密码 + 安全密钥组合解锁方式。
@@ -165,6 +189,7 @@ impl UnlockService {
 
         let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
@@ -175,6 +200,7 @@ impl UnlockService {
             UnlockMethodType::PasswordSecurityKey,
             &kdf_params,
             &wrapped,
+            &active_epoch_wrapped,
         )
     }
 
@@ -333,13 +359,20 @@ impl UnlockService {
             &new_kdf_params,
         )?);
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         // 更新密钥环（vault_key 不变，但派生密钥变了）
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::update_method_key(conn, UnlockMethodType::Pin, &new_kdf_params, &new_wrapped)
+        Self::update_method_key(
+            conn,
+            UnlockMethodType::Pin,
+            &new_kdf_params,
+            &new_wrapped,
+            &active_epoch_wrapped,
+        )
     }
 
     /// 修改密码（保持原有 Tiga 安全等级）。
@@ -377,6 +410,7 @@ impl UnlockService {
             &new_kdf_params,
         )?);
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
@@ -387,6 +421,7 @@ impl UnlockService {
             UnlockMethodType::Password,
             &new_kdf_params,
             &new_wrapped,
+            &active_epoch_wrapped,
         )
     }
 
@@ -534,6 +569,88 @@ impl UnlockService {
         Ok(())
     }
 
+    /// Validate that vault_meta.active_key_epoch_id points at exactly one active
+    /// key epoch and that its material is either the initialization marker or a
+    /// real active epoch wrapping written by unlock setup/change.
+    pub fn validate_active_key_epoch(conn: &VaultConnection) -> StorageResult<()> {
+        let active_key_epoch_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT active_key_epoch_id FROM vault_meta LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Database)?;
+
+        let active_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM key_epochs WHERE status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Database)?;
+        if active_count != 1 {
+            return Err(StorageError::Validation(format!(
+                "expected exactly one active key epoch, found {}",
+                active_count
+            )));
+        }
+
+        let (status, wrapped_epoch_key_ct, kdf_profile_id, activated_at): (
+            String,
+            Vec<u8>,
+            String,
+            Option<String>,
+        ) = conn
+            .inner()
+            .query_row(
+                "SELECT status, wrapped_epoch_key_ct, kdf_profile_id, activated_at
+                 FROM key_epochs WHERE key_epoch_id = ?1",
+                rusqlite::params![active_key_epoch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(StorageError::Database)?;
+
+        if status != "active" {
+            return Err(StorageError::Validation(format!(
+                "active_key_epoch_id points at {} epoch",
+                status
+            )));
+        }
+        if activated_at.is_none() {
+            return Err(StorageError::Validation(
+                "active key epoch is missing activated_at".to_string(),
+            ));
+        }
+
+        match kdf_profile_id.as_str() {
+            INIT_KEY_EPOCH_PROFILE_ID => {
+                if wrapped_epoch_key_ct.len() != 32 || wrapped_epoch_key_ct == vec![0; 32] {
+                    return Err(StorageError::Validation(
+                        "initial key epoch marker must be a nonzero 32-byte random marker"
+                            .to_string(),
+                    ));
+                }
+            }
+            ACTIVE_KEY_EPOCH_PROFILE_ID => {
+                if wrapped_epoch_key_ct.len() < 72 {
+                    return Err(StorageError::Validation(
+                        "active key epoch wrapping is too short".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(StorageError::Validation(format!(
+                    "unsupported active key epoch profile: {}",
+                    other
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // PRIVATE HELPERS — 密钥操作
     // -----------------------------------------------------------------------
@@ -553,6 +670,10 @@ impl UnlockService {
     /// 用 unlock_key 包裹 vault_key。
     fn wrap_vault_key(unlock_key: &[u8], vault_key: &[u8]) -> StorageResult<Vec<u8>> {
         aead::encrypt(unlock_key, vault_key, VAULT_KEY_WRAP_AAD).map_err(StorageError::Crypto)
+    }
+
+    fn wrap_active_key_epoch(vault_key: &[u8]) -> StorageResult<Vec<u8>> {
+        aead::encrypt(vault_key, vault_key, ACTIVE_KEY_EPOCH_AAD).map_err(StorageError::Crypto)
     }
 
     /// 用 unlock_key 解包得到 vault_key。
@@ -607,12 +728,15 @@ impl UnlockService {
         method_type: UnlockMethodType,
         kdf_params: &KdfParams,
         wrapped_vault_key_ct: &[u8],
+        active_epoch_wrapped_ct: &[u8],
     ) -> StorageResult<UnlockMethod> {
         let method_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
+        let kdf_params_ct = kdf_params.to_json_bytes();
 
-        conn.inner()
-            .execute(
+        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let result = (|| -> StorageResult<()> {
+            conn.inner().execute(
                 "INSERT INTO unlock_methods (method_id, method_type, kdf_profile_id,
                  kdf_params_ct, wrapped_vault_key_ct, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
@@ -620,18 +744,29 @@ impl UnlockService {
                     method_id,
                     method_type.to_string(),
                     "mdbx-default-v1",
-                    kdf_params.to_json_bytes(),
+                    kdf_params_ct,
                     wrapped_vault_key_ct,
                     now,
                 ],
-            )
-            .map_err(StorageError::Database)?;
+            )?;
+            Self::bind_active_key_epoch(conn, active_epoch_wrapped_ct, &now)?;
+            Self::validate_active_key_epoch(conn)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => conn.inner().execute_batch("COMMIT;")?,
+            Err(err) => {
+                let _ = conn.inner().execute_batch("ROLLBACK;");
+                return Err(err);
+            }
+        }
 
         Ok(UnlockMethod {
             method_id,
             method_type,
             kdf_profile_id: "mdbx-default-v1".to_string(),
-            kdf_params_ct: kdf_params.to_json_bytes(),
+            kdf_params_ct,
             wrapped_vault_key_ct: wrapped_vault_key_ct.to_vec(),
             created_at: now.clone(),
             updated_at: now,
@@ -644,11 +779,12 @@ impl UnlockService {
         method_type: UnlockMethodType,
         kdf_params: &KdfParams,
         wrapped_vault_key_ct: &[u8],
+        active_epoch_wrapped_ct: &[u8],
     ) -> StorageResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let affected = conn
-            .inner()
-            .execute(
+        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let result = (|| -> StorageResult<()> {
+            let affected = conn.inner().execute(
                 "UPDATE unlock_methods
                  SET kdf_params_ct = ?1, wrapped_vault_key_ct = ?2, updated_at = ?3
                  WHERE method_type = ?4",
@@ -658,14 +794,51 @@ impl UnlockService {
                     now,
                     method_type.to_string(),
                 ],
-            )
-            .map_err(StorageError::Database)?;
+            )?;
+
+            if affected == 0 {
+                return Err(StorageError::Validation(format!(
+                    "no {:?} unlock method configured",
+                    method_type
+                )));
+            }
+            Self::bind_active_key_epoch(conn, active_epoch_wrapped_ct, &now)?;
+            Self::validate_active_key_epoch(conn)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.inner().execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.inner().execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        }
+    }
+
+    fn bind_active_key_epoch(
+        conn: &VaultConnection,
+        wrapped_epoch_key_ct: &[u8],
+        now: &str,
+    ) -> StorageResult<()> {
+        let affected = conn.inner().execute(
+            "UPDATE key_epochs
+             SET status = 'active',
+                 wrapped_epoch_key_ct = ?1,
+                 kdf_profile_id = ?2,
+                 activated_at = COALESCE(activated_at, ?3),
+                 retired_at = NULL
+             WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+            rusqlite::params![wrapped_epoch_key_ct, ACTIVE_KEY_EPOCH_PROFILE_ID, now],
+        )?;
 
         if affected == 0 {
-            return Err(StorageError::Validation(format!(
-                "no {:?} unlock method configured",
-                method_type
-            )));
+            return Err(StorageError::Validation(
+                "vault_meta.active_key_epoch_id does not reference a key epoch".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1204,6 +1377,64 @@ mod tests {
 
         let result = UnlockService::unlock_with_password(&mut conn, "some-password");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_initial_active_key_epoch_marker_is_validated() {
+        let conn = setup();
+        UnlockService::validate_active_key_epoch(&conn).unwrap();
+
+        let (profile, wrapped_len): (String, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT kdf_profile_id, length(wrapped_epoch_key_ct)
+                 FROM key_epochs
+                 WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(profile, INIT_KEY_EPOCH_PROFILE_ID);
+        assert_eq!(wrapped_len, 32);
+    }
+
+    #[test]
+    fn test_unlock_setup_binds_real_active_key_epoch_wrapping() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+        UnlockService::validate_active_key_epoch(&conn).unwrap();
+
+        let (profile, wrapped_len): (String, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT kdf_profile_id, length(wrapped_epoch_key_ct)
+                 FROM key_epochs
+                 WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(profile, ACTIVE_KEY_EPOCH_PROFILE_ID);
+        assert!(wrapped_len >= 72);
+    }
+
+    #[test]
+    fn test_active_key_epoch_validation_rejects_duplicate_active_epochs() {
+        let conn = setup();
+        conn.inner()
+            .execute(
+                "INSERT INTO key_epochs (key_epoch_id, status, wrapped_epoch_key_ct,
+                 kdf_profile_id, created_at, activated_at)
+                 VALUES ('extra-active', 'active', X'01020304', 'mdbx-active-key-epoch-v1',
+                 '2026-06-02T00:00:00Z', '2026-06-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let err = UnlockService::validate_active_key_epoch(&conn).unwrap_err();
+        assert!(err.to_string().contains("exactly one active key epoch"));
     }
 
     // -----------------------------------------------------------------------

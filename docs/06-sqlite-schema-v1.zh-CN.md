@@ -289,7 +289,7 @@
 
 - `commit_id` 应引用 `commits.commit_id`
 - `snapshot_ct` 存储序列化后的对象行快照；敏感字段仍应保持密文或由加密层保护
-- v1 至少必须覆盖 `entry`
+- v1 当前覆盖 `entry`、`project`、`attachment`，用于非快进三方合并
 
 索引建议：
 
@@ -337,6 +337,9 @@
 用途：
 
 - 管理密钥轮换
+- 初始化时允许使用 `mdbx-init-marker-v1` 随机 marker 作为兼容边界
+- 配置或变更 unlock method 后，active epoch 应绑定 `mdbx-active-key-epoch-v1` wrapping
+- 完整 key rotation、retirement、跨 epoch 读取迁移仍需单独实现；不得把初始化 marker 宣称为完整轮换
 
 推荐字段：
 

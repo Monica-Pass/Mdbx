@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use mdbx_core::model::attachment::StorageMode;
+use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
 use mdbx_core::model::{Attachment, Entry, EntryType, Project, Snapshot};
 
 use crate::connection::VaultConnection;
@@ -23,6 +23,8 @@ struct SnapshotPayload {
     projects: Vec<Project>,
     entries: Vec<Entry>,
     attachments: Vec<Attachment>,
+    #[serde(default)]
+    attachment_chunks: Vec<AttachmentChunk>,
 }
 
 /// Snapshot 持久化仓库。
@@ -48,6 +50,7 @@ impl SnapshotRepo {
         let projects = read_all_active_projects(conn)?;
         let entries = read_all_active_entries(conn)?;
         let attachments = read_all_active_attachments(conn)?;
+        let attachment_chunks = read_all_active_attachment_chunks(conn)?;
 
         let payload = SnapshotPayload {
             vault_id,
@@ -56,6 +59,7 @@ impl SnapshotRepo {
             projects,
             entries,
             attachments,
+            attachment_chunks,
         };
 
         let snapshot_json = serde_json::to_vec(&payload)
@@ -132,6 +136,8 @@ impl SnapshotRepo {
         for a in &payload.attachments {
             upsert_attachment(conn, a)?;
         }
+
+        restore_attachment_chunks(conn, &payload.attachment_chunks)?;
 
         // 创建恢复 commit
         ctx.create_commit(
@@ -374,6 +380,37 @@ fn read_all_active_attachments(conn: &VaultConnection) -> StorageResult<Vec<Atta
     Ok(attachments)
 }
 
+fn read_all_active_attachment_chunks(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<AttachmentChunk>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT c.attachment_id, c.chunk_index, c.chunk_hash, c.chunk_ct,
+                c.external_uri_ct, c.stored_size, c.created_at
+         FROM attachment_chunks c
+         JOIN attachments a ON a.attachment_id = c.attachment_id
+         WHERE a.deleted = 0
+         ORDER BY c.attachment_id ASC, c.chunk_index ASC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(AttachmentChunk {
+            attachment_id: row.get(0)?,
+            chunk_index: row.get::<_, i64>(1)? as u32,
+            chunk_hash: row.get(2)?,
+            chunk_ct: row.get(3)?,
+            external_uri_ct: row.get(4)?,
+            stored_size: row.get::<_, i64>(5)? as u64,
+            created_at: row.get(6)?,
+        })
+    })?;
+
+    let mut chunks = Vec::new();
+    for row in rows {
+        chunks.push(row?);
+    }
+    Ok(chunks)
+}
+
 fn upsert_project(conn: &VaultConnection, p: &Project) -> StorageResult<()> {
     conn.inner().execute(
         "INSERT OR REPLACE INTO projects (project_id, title_ct, summary_ct, group_id,
@@ -459,6 +496,48 @@ fn upsert_attachment(conn: &VaultConnection, a: &Attachment) -> StorageResult<()
     Ok(())
 }
 
+fn restore_attachment_chunks(
+    conn: &VaultConnection,
+    chunks: &[AttachmentChunk],
+) -> StorageResult<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let mut attachment_ids: Vec<&str> = chunks
+        .iter()
+        .map(|chunk| chunk.attachment_id.as_str())
+        .collect();
+    attachment_ids.sort_unstable();
+    attachment_ids.dedup();
+
+    for attachment_id in attachment_ids {
+        conn.inner().execute(
+            "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+            params![attachment_id],
+        )?;
+    }
+
+    for chunk in chunks {
+        conn.inner().execute(
+            "INSERT OR REPLACE INTO attachment_chunks (attachment_id, chunk_index,
+             chunk_hash, chunk_ct, external_uri_ct, stored_size, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk.attachment_id,
+                chunk.chunk_index as i64,
+                chunk.chunk_hash,
+                chunk.chunk_ct,
+                chunk.external_uri_ct,
+                chunk.stored_size as i64,
+                chunk.created_at,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -510,6 +589,7 @@ mod tests {
         assert!(payload.projects.is_empty());
         assert!(payload.entries.is_empty());
         assert!(payload.attachments.is_empty());
+        assert!(payload.attachment_chunks.is_empty());
     }
 
     #[test]
@@ -608,6 +688,41 @@ mod tests {
         let payload: SnapshotPayload = serde_json::from_slice(&snap.snapshot_ct).unwrap();
 
         assert_eq!(payload.attachments.len(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_captures_attachment_chunks() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "chunked.bin",
+            Some("application/octet-stream"),
+            "",
+            13,
+        )
+        .unwrap();
+        AttachmentRepo::write_chunked_content(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            b"hello snapshot",
+            5,
+        )
+        .unwrap();
+
+        let snap = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        let payload: SnapshotPayload = serde_json::from_slice(&snap.snapshot_ct).unwrap();
+
+        assert_eq!(payload.attachments.len(), 1);
+        assert_eq!(payload.attachment_chunks.len(), 3);
+        assert!(payload
+            .attachment_chunks
+            .iter()
+            .all(|chunk| chunk.attachment_id == att.attachment_id));
     }
 
     #[test]
@@ -714,6 +829,40 @@ mod tests {
         assert_eq!(attachments[0].media_type_ct, Some(b"image/png".to_vec()));
         assert_eq!(attachments[0].content_hash, "abc123");
         assert_eq!(attachments[0].original_size, 512);
+    }
+
+    #[test]
+    fn test_restore_rebuilds_attachment_chunks_and_content() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "video.bin",
+            Some("application/octet-stream"),
+            "",
+            17,
+        )
+        .unwrap();
+        let content = b"restorable content";
+        AttachmentRepo::write_chunked_content(&conn, &ctx, &att.attachment_id, content, 4).unwrap();
+
+        let snap = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+
+        conn.inner()
+            .execute("DELETE FROM attachment_chunks", [])
+            .unwrap();
+        conn.inner().execute("DELETE FROM attachments", []).unwrap();
+        conn.inner().execute("DELETE FROM entries", []).unwrap();
+        conn.inner().execute("DELETE FROM projects", []).unwrap();
+
+        SnapshotRepo::restore_snapshot(&conn, &ctx, &snap.snapshot_id).unwrap();
+
+        let restored = AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap();
+        assert_eq!(restored, content);
+        assert!(AttachmentRepo::verify_chunks_integrity(&conn, &att.attachment_id).unwrap());
     }
 
     #[test]

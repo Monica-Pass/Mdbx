@@ -153,7 +153,7 @@ MDBX 必须支持从逻辑损坏或同步中断中恢复。
 
 - 历史 commit 可回放
 - 可以周期性生成 snapshot
-- snapshot 可以重建 project、entry、attachment 元数据
+- snapshot 可以重建 project、entry、attachment 元数据，以及存在于数据库内的附件 chunk
 - 局部损坏时最好仍能恢复剩余大部分数据
 
 ## 12. 附件存储模式

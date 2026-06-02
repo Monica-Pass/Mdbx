@@ -11,6 +11,7 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
+use crate::repo::object_version::ObjectVersionRepo;
 
 /// 附件元数据的持久化仓库。
 ///
@@ -128,6 +129,7 @@ impl AttachmentRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &attachment_id)?;
 
         AttachmentRepo::get_by_id(conn, &attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id))
@@ -332,6 +334,7 @@ impl AttachmentRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
         AttachmentRepo::get_by_id(conn, attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))
@@ -368,6 +371,7 @@ impl AttachmentRepo {
              WHERE attachment_id = ?1",
             params![attachment_id, commit_id, now, ctx.device_id],
         )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
         Ok(())
     }
@@ -453,6 +457,7 @@ impl AttachmentRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
         Ok(content_hash)
     }
@@ -583,6 +588,7 @@ impl AttachmentRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
 
         Ok(content_hash)
     }

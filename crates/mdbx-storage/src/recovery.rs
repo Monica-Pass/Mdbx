@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
 
 /// 数据库健康检查结果。
 #[derive(Debug, Clone)]
@@ -540,6 +541,8 @@ impl WalRecoveryTester {
             let commit_id = uuid::Uuid::new_v4().to_string();
             let branch_id = uuid::Uuid::new_v4().to_string();
             let key_epoch_id = uuid::Uuid::new_v4().to_string();
+            let initial_key_epoch_marker =
+                mdbx_crypto::aead::generate_key().map_err(StorageError::Crypto)?;
 
             conn.inner()
                 .execute(
@@ -582,8 +585,13 @@ impl WalRecoveryTester {
                 .execute(
                     "INSERT INTO key_epochs (key_epoch_id, status, wrapped_epoch_key_ct,
                      kdf_profile_id, created_at, activated_at)
-                     VALUES (?1, 'active', X'00', 'mdbx-default-v1', ?2, ?2)",
-                    rusqlite::params![key_epoch_id, now],
+                     VALUES (?1, 'active', ?2, ?3, ?4, ?4)",
+                    rusqlite::params![
+                        key_epoch_id,
+                        initial_key_epoch_marker,
+                        INIT_KEY_EPOCH_PROFILE_ID,
+                        now
+                    ],
                 )
                 .map_err(StorageError::Database)?;
 

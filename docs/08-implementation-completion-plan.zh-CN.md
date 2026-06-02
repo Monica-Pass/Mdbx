@@ -58,14 +58,16 @@ MDBX 必须坚持：
 - 全文搜索只允许使用解锁会话内的临时索引；持久 FTS 不得保存解密后的 project title 或 secret-bearing text。
 - `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
 - 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
-- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；当前写入随机非秘密兼容标记，完整 epoch wrapping/key rotation 仍需在 key management 切片中闭环。
+- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
+- snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
+- project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
 
 ## 3. 主要差距
 
 ### 3.1 格式与恢复
 
-- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；但完整 epoch wrapping、rotation、retirement 仍未闭环。
-- snapshot 当前主要恢复元数据，尚未完整覆盖附件内容 chunk 恢复策略。
+- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
+- snapshot 已覆盖 project、entry、attachment metadata 和 active `attachment_chunks`；仍需补齐旧 reader/新 reader、未知字段保留、非关键扩展等兼容测试。
 - 缺少格式兼容测试：旧 reader、新 reader、未知字段保留、非关键扩展。
 
 ### 3.2 同步与冲突
@@ -75,7 +77,7 @@ MDBX 必须坚持：
 - entry conflict resolution 已有 storage core 写回路径：`local-wins`/`incoming-wins` 会生成 merge commit、推进 entry head、记录 object version，并标记 conflict resolved。
 - 已补充“同一秘密字段并发修改必须冲突”和“不同字段并发修改自动合并”的 storage 回归测试。
 - 已补充删除/修改并发回归：远端删除/本地修改会保留 tombstone 并产生 `deleted` conflict；本地删除/远端修改不会复活 entry。
-- project/attachment 的字段级三方合并尚未完成，目前仍按对象级 conflict 处理。
+- project/attachment 字段级三方合并已完成：project 不同字段并发修改会自动写 merge commit，同字段并发修改会产生字段级 conflict；attachment 元数据可字段级合并，双方同时改内容且内容不同会产生 `content_hash` conflict，只有 incoming 改内容时才替换 incoming chunks。
 - `custom/manual merge` 在 Rust storage core 已有显式 merged payload API；Android 合并编辑器尚未接入。
 
 ### 3.3 变更历史覆盖
@@ -113,8 +115,8 @@ MDBX 必须坚持：
 
 - recovery 验证 commit integrity tag。（已完成）
 - health check 输出 commit tag mismatch、missing parent、dangling head、chunk mismatch。（已完成）
-- snapshot 明确 payload 加密策略，拒绝已解锁状态下的篡改。
-- 整理“生产初始化不得保留固定占位密文”的测试边界。（固定 `X'00'` 已移除；完整 epoch wrapping 仍后续）
+- snapshot 明确 payload 加密策略，拒绝已解锁状态下的篡改，并覆盖 attachment chunk 恢复。
+- 整理“生产初始化不得保留固定占位密文”的测试边界。（固定 `X'00'` 已移除；初始化 marker 与 active epoch wrapping 已分离；完整 rotation 仍后续）
 
 验收：
 
@@ -145,9 +147,9 @@ MDBX 必须坚持：
 任务：
 
 - 实现 serialized commit 导出/导入。（CLI bundle 与 storage core apply 基础路径已完成）
-- 构建 base commit 查找和 fast-forward 判断。（对象级 fast-forward 已完成；entry payload 字段级 base 已完成）
-- 将 incoming commit apply 到 storage，必要时调用 conflict detector。（project/entry/attachment/chunk 状态落地已完成；非快进 state payload 已开始进入 apply 流程）
-- 同字段并发秘密修改生成 conflict；不同字段安全合并。（entry payload 已完成）
+- 构建 base commit 查找和 fast-forward 判断。（对象级 fast-forward 已完成；entry/project/attachment 字段级 base 已完成）
+- 将 incoming commit apply 到 storage，必要时调用 conflict detector。（project/entry/attachment/chunk 状态落地已完成；非快进 state payload 已进入字段级 apply 流程）
+- 同字段并发秘密修改生成 conflict；不同字段安全合并。（entry payload、project 字段、attachment 元数据/内容组已完成）
 - conflict resolve 写回 commit，并更新 head。（entry `local-wins`/`incoming-wins`/`custom payload` 已完成）
 
 验收：
@@ -156,6 +158,8 @@ MDBX 必须坚持：
 - A/B 设备不同字段并发修改自动合并。（storage 回归已覆盖）
 - entry conflict 选择 local-wins/incoming-wins 后会写入 merge commit 并更新 head。（storage 回归已覆盖）
 - entry conflict custom payload 会写入 merge commit、替换 payload、记录 object version，并标记为 custom。（storage 回归已覆盖）
+- project 不同字段并发修改会写双 parent merge commit，同字段并发修改会保留本地状态并记录具体字段 conflict。（storage 回归已覆盖）
+- attachment metadata 与 incoming-only 内容更新可自动合并，双方同时替换内容会保留本地内容并记录 `content_hash` conflict。（storage 回归已覆盖）
 - 删除与修改并发不会误复活 tombstone。（storage 回归已覆盖）
 
 ### P3：附件与性能完成
@@ -223,19 +227,21 @@ MDBX 必须坚持：
 
 ## 6. 当前起步切片
 
-当前 P2 entry 字段级合并切片已完成：
+当前 P2 字段级合并切片已完成：
 
 - `object_versions` 存储 entry commit 快照。
-- 非快进 sync apply 会消费 state payload，并对 entry payload 做三方合并。
+- `object_versions` 同步记录 project/attachment 本地 mutation 与 incoming state 行快照。
+- 非快进 sync apply 会消费 state payload，并对 entry payload、project 字段、attachment 元数据/内容组做三方合并。
 - 不同字段并发修改自动合并并产生双 parent merge commit。
 - 同字段并发修改生成 unresolved conflict。
 - entry conflict 支持 `local-wins`/`incoming-wins` 写回 merge commit 并推进 head。
 - Rust core 支持 `custom` merged payload 写回，用于后续 Android 手动合并编辑器。
 - 删除/修改并发会生成 `deleted` conflict：远端 tombstone 不丢，本地删除不会被远端修改复活。
-- 已通过 `cargo test -p mdbx-storage entry::tests` 与 `cargo test -p mdbx-storage sync_apply`。
+- snapshot 已恢复 attachment chunks；初始化 key epoch marker 与 active epoch wrapping 边界已收紧。
+- 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：
 
 - Android custom/manual merge editor 接入 Rust core/本地 store 的 explicit merged payload API。
-- project/attachment 字段级 merge 与 conflict resolve。
+- project/attachment conflict resolve 的用户选择写回 API。
 - Android `MdbxRepository` 最小 JNI/FFI 操作边界，禁止 Room 成为 MDBX 真源；同时修复现有 Android 编译断引用后恢复 Gradle 验证。

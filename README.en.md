@@ -109,6 +109,14 @@ Note: `import-kdbx-json` / `export-kdbx-json` use a KDBX interoperability JSON i
 
 The current CLI does not yet implement real FIDO/WebAuthn/security-key interaction, production session tokens, or audit policy. Security-key support in storage core is a key-material abstraction with policy tests, not an end-to-end hardware-key client.
 
+Key capabilities currently verified in the Rust storage core:
+
+- Snapshots include and restore active `attachment_chunks`; older metadata-only snapshots remain compatible.
+- Entry, project, and attachment rows are recorded in `object_versions` for divergent three-way merge.
+- Different-field concurrent entry/project changes write a two-parent merge commit; same-field changes create unresolved conflicts.
+- Attachment metadata can merge at field level; concurrent content replacement keeps the local content and records a `content_hash` conflict.
+- Initial key epochs use a random `mdbx-init-marker-v1` marker; configuring or changing an unlock method binds `mdbx-active-key-epoch-v1` active epoch wrapping. Full key rotation / retirement remains future work.
+
 ## Implementation Rules
 
 Do not bypass repository/storage APIs from client code unless you are changing the storage layer itself.

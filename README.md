@@ -109,6 +109,14 @@ cargo run -p mdbx-cli -- --help
 
 当前 CLI 还没有接入真实 FIDO/WebAuthn/security-key 交互，也没有生产级 session token / audit policy；硬件密钥在 storage core 中是 key material 抽象与策略测试，不应宣称为端到端硬件密钥客户端。
 
+当前 Rust storage core 已验证的关键能力：
+
+- snapshot 会携带并恢复 active `attachment_chunks`，旧 metadata-only snapshot 仍保持兼容。
+- entry、project、attachment 已记录 `object_versions` 行快照，用于非快进三方合并。
+- entry/project 不同字段并发修改会写入双 parent merge commit；同字段修改会产生 unresolved conflict。
+- attachment 元数据可字段级合并；双方同时替换内容时会保留本地内容并生成 `content_hash` conflict。
+- 初始化 key epoch 使用 `mdbx-init-marker-v1` 随机 marker；配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍是后续边界。
+
 ## 实现规则
 
 除非正在修改 storage 层本身，否则客户端代码不要绕过 repo/storage API 直接写底层表。

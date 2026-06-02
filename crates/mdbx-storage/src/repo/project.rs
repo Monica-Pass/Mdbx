@@ -9,6 +9,7 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
+use crate::repo::object_version::ObjectVersionRepo;
 
 /// Project 的持久化仓库。
 ///
@@ -54,6 +55,7 @@ impl ProjectRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &project_id)?;
 
         ProjectRepo::get_by_id(conn, &project_id)?
             .ok_or_else(|| StorageError::NotFound(project_id.clone()))
@@ -239,6 +241,7 @@ impl ProjectRepo {
                 ctx.device_id,
             ],
         )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &project.project_id)?;
 
         ProjectRepo::get_by_id(conn, &project.project_id)?
             .ok_or_else(|| StorageError::NotFound(project.project_id.clone()))
@@ -283,6 +286,7 @@ impl ProjectRepo {
              WHERE project_id = ?1",
             params![project_id, object_clock, commit_id, now, ctx.device_id],
         )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
 
         Ok(())
     }

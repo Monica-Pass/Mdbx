@@ -236,6 +236,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in projects {
+            if Self::commit_exists(conn, &row.head_commit_id)? {
+                ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
+            }
             match Self::object_apply_decision(
                 conn,
                 "projects",
@@ -269,6 +272,7 @@ impl SyncApplyRepo {
                             row.updated_by_device_id,
                         ],
                     )?;
+                    ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
                 }
                 ObjectDecision::FastForward => {
                     conn.inner().execute(
@@ -297,16 +301,11 @@ impl SyncApplyRepo {
                             row.updated_by_device_id,
                         ],
                     )?;
+                    ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
                 }
                 ObjectDecision::Conflict { local_head } => {
-                    conflicts += Self::record_object_conflict(
-                        conn,
-                        ctx,
-                        ConflictObjectType::Project,
-                        &row.project_id,
-                        &local_head,
-                        &row.head_commit_id,
-                    )?;
+                    conflicts +=
+                        Self::merge_or_record_project_conflict(conn, ctx, row, &local_head)?;
                 }
                 ObjectDecision::Skip => {}
             }
@@ -402,6 +401,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<AttachmentApplyResult> {
         let mut result = AttachmentApplyResult::default();
         for row in attachments {
+            if Self::commit_exists(conn, &row.head_commit_id)? {
+                ObjectVersionRepo::record_attachment_row(conn, &row.head_commit_id, row)?;
+            }
             match Self::object_apply_decision(
                 conn,
                 "attachments",
@@ -435,6 +437,7 @@ impl SyncApplyRepo {
                             row.updated_by_device_id,
                         ],
                     )?;
+                    ObjectVersionRepo::record_attachment_row(conn, &row.head_commit_id, row)?;
                     result.ids.insert(row.attachment_id.clone());
                 }
                 ObjectDecision::FastForward => {
@@ -469,17 +472,16 @@ impl SyncApplyRepo {
                         "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
                         params![row.attachment_id],
                     )?;
+                    ObjectVersionRepo::record_attachment_row(conn, &row.head_commit_id, row)?;
                     result.ids.insert(row.attachment_id.clone());
                 }
                 ObjectDecision::Conflict { local_head } => {
-                    result.conflict_count += Self::record_object_conflict(
-                        conn,
-                        ctx,
-                        ConflictObjectType::Attachment,
-                        &row.attachment_id,
-                        &local_head,
-                        &row.head_commit_id,
-                    )?;
+                    let merge =
+                        Self::merge_or_record_attachment_conflict(conn, ctx, row, &local_head)?;
+                    result.conflict_count += merge.conflict_count;
+                    if merge.replace_incoming_chunks {
+                        result.ids.insert(row.attachment_id.clone());
+                    }
                 }
                 ObjectDecision::Skip => {}
             }
@@ -627,33 +629,6 @@ impl SyncApplyRepo {
             parents.push(row?);
         }
         Ok(parents)
-    }
-
-    fn record_object_conflict(
-        conn: &VaultConnection,
-        ctx: &CommitContext,
-        object_type: ConflictObjectType,
-        object_id: &str,
-        local_commit_id: &str,
-        incoming_commit_id: &str,
-    ) -> StorageResult<u32> {
-        if ConflictRepo::has_unresolved_conflict(conn, object_type.clone(), object_id)? {
-            return Ok(0);
-        }
-        let base_commit_id =
-            Self::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
-                .unwrap_or_else(|| "unknown".to_string());
-        ConflictRepo::create(
-            conn,
-            ctx,
-            object_type,
-            object_id,
-            &base_commit_id,
-            local_commit_id,
-            incoming_commit_id,
-            &[String::from("<object>")],
-        )?;
-        Ok(1)
     }
 
     fn merge_or_record_entry_conflict(
@@ -850,6 +825,381 @@ impl SyncApplyRepo {
         Ok(())
     }
 
+    fn merge_or_record_project_conflict(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        incoming: &ProjectRow,
+        local_commit_id: &str,
+    ) -> StorageResult<u32> {
+        let incoming_commit_id = &incoming.head_commit_id;
+        let Some(base_commit_id) =
+            Self::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        else {
+            return Self::record_project_field_conflict(
+                conn,
+                ctx,
+                &incoming.project_id,
+                "unknown",
+                local_commit_id,
+                incoming_commit_id,
+                &[String::from("<base>")],
+            );
+        };
+
+        let Some(base_row) =
+            ObjectVersionRepo::get_project(conn, &incoming.project_id, &base_commit_id)?
+        else {
+            return Self::record_project_field_conflict(
+                conn,
+                ctx,
+                &incoming.project_id,
+                &base_commit_id,
+                local_commit_id,
+                incoming_commit_id,
+                &[String::from("<base>")],
+            );
+        };
+
+        let local_row =
+            match ObjectVersionRepo::get_project(conn, &incoming.project_id, local_commit_id)? {
+                Some(row) => row,
+                None => ObjectVersionRepo::current_project_row(conn, &incoming.project_id)?,
+            };
+
+        let mut structural_conflicts = Vec::new();
+        if local_row.deleted != incoming.deleted {
+            structural_conflicts.push("deleted".to_string());
+        }
+        if merge_value(&base_row.title_ct, &local_row.title_ct, &incoming.title_ct).is_none() {
+            structural_conflicts.push("title_ct".to_string());
+        }
+        if merge_value(
+            &base_row.summary_ct,
+            &local_row.summary_ct,
+            &incoming.summary_ct,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("summary_ct".to_string());
+        }
+        if merge_value(&base_row.group_id, &local_row.group_id, &incoming.group_id).is_none() {
+            structural_conflicts.push("group_id".to_string());
+        }
+        if merge_value(&base_row.icon_ref, &local_row.icon_ref, &incoming.icon_ref).is_none() {
+            structural_conflicts.push("icon_ref".to_string());
+        }
+        if merge_value(&base_row.favorite, &local_row.favorite, &incoming.favorite).is_none() {
+            structural_conflicts.push("favorite".to_string());
+        }
+        if merge_value(&base_row.archived, &local_row.archived, &incoming.archived).is_none() {
+            structural_conflicts.push("archived".to_string());
+        }
+        if merge_value(
+            &base_row.tiga_mode_override,
+            &local_row.tiga_mode_override,
+            &incoming.tiga_mode_override,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("tiga_mode_override".to_string());
+        }
+
+        if !structural_conflicts.is_empty() {
+            return Self::record_project_field_conflict(
+                conn,
+                ctx,
+                &incoming.project_id,
+                &base_commit_id,
+                local_commit_id,
+                incoming_commit_id,
+                &structural_conflicts,
+            );
+        }
+
+        Self::apply_merged_project(
+            conn,
+            ctx,
+            &base_row,
+            &local_row,
+            incoming,
+            local_commit_id,
+            incoming_commit_id,
+        )?;
+        Ok(0)
+    }
+
+    fn apply_merged_project(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        base: &ProjectRow,
+        local: &ProjectRow,
+        incoming: &ProjectRow,
+        local_commit_id: &str,
+        incoming_commit_id: &str,
+    ) -> StorageResult<()> {
+        let mut parents = vec![local_commit_id.to_string()];
+        if incoming_commit_id != local_commit_id {
+            parents.push(incoming_commit_id.to_string());
+        }
+        let commit_id = ctx.create_commit(
+            conn,
+            "merge",
+            "project",
+            &[incoming.project_id.clone()],
+            &parents,
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let attachment_count = merge_value(
+            &base.attachment_count,
+            &local.attachment_count,
+            &incoming.attachment_count,
+        )
+        .unwrap_or_else(|| std::cmp::max(local.attachment_count, incoming.attachment_count));
+
+        conn.inner().execute(
+            "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
+             icon_ref = ?5, favorite = ?6, archived = ?7, deleted = ?8,
+             tiga_mode_override = ?9, object_clock = ?10, head_commit_id = ?11,
+             attachment_count = ?12, updated_at = ?13, updated_by_device_id = ?14
+             WHERE project_id = ?1",
+            params![
+                incoming.project_id,
+                merge_value(&base.title_ct, &local.title_ct, &incoming.title_ct)
+                    .unwrap_or_else(|| local.title_ct.clone()),
+                merge_value(&base.summary_ct, &local.summary_ct, &incoming.summary_ct)
+                    .unwrap_or_else(|| local.summary_ct.clone()),
+                merge_value(&base.group_id, &local.group_id, &incoming.group_id)
+                    .unwrap_or_else(|| local.group_id.clone()),
+                merge_value(&base.icon_ref, &local.icon_ref, &incoming.icon_ref)
+                    .unwrap_or_else(|| local.icon_ref.clone()),
+                merge_value(&base.favorite, &local.favorite, &incoming.favorite)
+                    .unwrap_or(local.favorite) as i32,
+                merge_value(&base.archived, &local.archived, &incoming.archived)
+                    .unwrap_or(local.archived) as i32,
+                local.deleted as i32,
+                merge_value(
+                    &base.tiga_mode_override,
+                    &local.tiga_mode_override,
+                    &incoming.tiga_mode_override,
+                )
+                .unwrap_or_else(|| local.tiga_mode_override.clone()),
+                bump_object_clock(&local.object_clock),
+                commit_id,
+                attachment_count as i64,
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        ObjectVersionRepo::record_project_current(conn, &commit_id, &incoming.project_id)?;
+        Ok(())
+    }
+
+    fn merge_or_record_attachment_conflict(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        incoming: &AttachmentRow,
+        local_commit_id: &str,
+    ) -> StorageResult<AttachmentMergeResult> {
+        let incoming_commit_id = &incoming.head_commit_id;
+        let Some(base_commit_id) =
+            Self::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        else {
+            let conflict_count = Self::record_attachment_field_conflict(
+                conn,
+                ctx,
+                &incoming.attachment_id,
+                "unknown",
+                local_commit_id,
+                incoming_commit_id,
+                &[String::from("<base>")],
+            )?;
+            return Ok(AttachmentMergeResult {
+                conflict_count,
+                replace_incoming_chunks: false,
+            });
+        };
+
+        let Some(base_row) =
+            ObjectVersionRepo::get_attachment(conn, &incoming.attachment_id, &base_commit_id)?
+        else {
+            let conflict_count = Self::record_attachment_field_conflict(
+                conn,
+                ctx,
+                &incoming.attachment_id,
+                &base_commit_id,
+                local_commit_id,
+                incoming_commit_id,
+                &[String::from("<base>")],
+            )?;
+            return Ok(AttachmentMergeResult {
+                conflict_count,
+                replace_incoming_chunks: false,
+            });
+        };
+
+        let local_row = match ObjectVersionRepo::get_attachment(
+            conn,
+            &incoming.attachment_id,
+            local_commit_id,
+        )? {
+            Some(row) => row,
+            None => ObjectVersionRepo::current_attachment_row(conn, &incoming.attachment_id)?,
+        };
+
+        let mut structural_conflicts = Vec::new();
+        if local_row.deleted != incoming.deleted {
+            structural_conflicts.push("deleted".to_string());
+        }
+        if merge_value(
+            &base_row.project_id,
+            &local_row.project_id,
+            &incoming.project_id,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("project_id".to_string());
+        }
+        if merge_value(&base_row.entry_id, &local_row.entry_id, &incoming.entry_id).is_none() {
+            structural_conflicts.push("entry_id".to_string());
+        }
+        if merge_value(
+            &base_row.file_name_ct,
+            &local_row.file_name_ct,
+            &incoming.file_name_ct,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("file_name_ct".to_string());
+        }
+        if merge_value(
+            &base_row.media_type_ct,
+            &local_row.media_type_ct,
+            &incoming.media_type_ct,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("media_type_ct".to_string());
+        }
+
+        let local_content_changed = attachment_content_changed(&base_row, &local_row);
+        let incoming_content_changed = attachment_content_changed(&base_row, incoming);
+        let content_matches = attachment_content_matches(&local_row, incoming);
+        let replace_incoming_chunks = if content_matches {
+            false
+        } else if local_content_changed && incoming_content_changed {
+            structural_conflicts.push("content_hash".to_string());
+            false
+        } else {
+            !local_content_changed && incoming_content_changed
+        };
+
+        if !structural_conflicts.is_empty() {
+            let conflict_count = Self::record_attachment_field_conflict(
+                conn,
+                ctx,
+                &incoming.attachment_id,
+                &base_commit_id,
+                local_commit_id,
+                incoming_commit_id,
+                &structural_conflicts,
+            )?;
+            return Ok(AttachmentMergeResult {
+                conflict_count,
+                replace_incoming_chunks: false,
+            });
+        }
+
+        Self::apply_merged_attachment(
+            conn,
+            ctx,
+            &base_row,
+            &local_row,
+            incoming,
+            local_commit_id,
+            incoming_commit_id,
+            replace_incoming_chunks,
+        )?;
+        Ok(AttachmentMergeResult {
+            conflict_count: 0,
+            replace_incoming_chunks,
+        })
+    }
+
+    fn apply_merged_attachment(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        base: &AttachmentRow,
+        local: &AttachmentRow,
+        incoming: &AttachmentRow,
+        local_commit_id: &str,
+        incoming_commit_id: &str,
+        use_incoming_content: bool,
+    ) -> StorageResult<()> {
+        let mut parents = vec![local_commit_id.to_string()];
+        if incoming_commit_id != local_commit_id {
+            parents.push(incoming_commit_id.to_string());
+        }
+        let commit_id = ctx.create_commit(
+            conn,
+            "merge",
+            "attachment",
+            &[incoming.attachment_id.clone()],
+            &parents,
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let content_source = if use_incoming_content {
+            incoming
+        } else {
+            local
+        };
+
+        if use_incoming_content {
+            conn.inner().execute(
+                "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+                params![incoming.attachment_id],
+            )?;
+        }
+
+        conn.inner().execute(
+            "UPDATE attachments SET project_id = ?2, entry_id = ?3,
+             file_name_ct = ?4, media_type_ct = ?5, storage_mode = ?6,
+             content_hash = ?7, original_size = ?8, stored_size = ?9,
+             chunk_count = ?10, head_commit_id = ?11, deleted = ?12,
+             updated_at = ?13, updated_by_device_id = ?14
+             WHERE attachment_id = ?1",
+            params![
+                incoming.attachment_id,
+                merge_value(&base.project_id, &local.project_id, &incoming.project_id)
+                    .unwrap_or_else(|| local.project_id.clone()),
+                merge_value(&base.entry_id, &local.entry_id, &incoming.entry_id)
+                    .unwrap_or_else(|| local.entry_id.clone()),
+                merge_value(
+                    &base.file_name_ct,
+                    &local.file_name_ct,
+                    &incoming.file_name_ct,
+                )
+                .unwrap_or_else(|| local.file_name_ct.clone()),
+                merge_value(
+                    &base.media_type_ct,
+                    &local.media_type_ct,
+                    &incoming.media_type_ct,
+                )
+                .unwrap_or_else(|| local.media_type_ct.clone()),
+                content_source.storage_mode,
+                content_source.content_hash,
+                content_source.original_size as i64,
+                content_source.stored_size as i64,
+                content_source.chunk_count as i64,
+                commit_id,
+                local.deleted as i32,
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        ObjectVersionRepo::record_attachment_current(conn, &commit_id, &incoming.attachment_id)?;
+        Ok(())
+    }
+
     fn entry_payload_json(
         conn: &VaultConnection,
         entry_id: &str,
@@ -881,6 +1231,60 @@ impl SyncApplyRepo {
             ctx,
             ConflictObjectType::Entry,
             entry_id,
+            base_commit_id,
+            local_commit_id,
+            incoming_commit_id,
+            fields,
+        )?;
+        Ok(1)
+    }
+
+    fn record_project_field_conflict(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        base_commit_id: &str,
+        local_commit_id: &str,
+        incoming_commit_id: &str,
+        fields: &[String],
+    ) -> StorageResult<u32> {
+        if ConflictRepo::has_unresolved_conflict(conn, ConflictObjectType::Project, project_id)? {
+            return Ok(0);
+        }
+        ConflictRepo::create(
+            conn,
+            ctx,
+            ConflictObjectType::Project,
+            project_id,
+            base_commit_id,
+            local_commit_id,
+            incoming_commit_id,
+            fields,
+        )?;
+        Ok(1)
+    }
+
+    fn record_attachment_field_conflict(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        base_commit_id: &str,
+        local_commit_id: &str,
+        incoming_commit_id: &str,
+        fields: &[String],
+    ) -> StorageResult<u32> {
+        if ConflictRepo::has_unresolved_conflict(
+            conn,
+            ConflictObjectType::Attachment,
+            attachment_id,
+        )? {
+            return Ok(0);
+        }
+        ConflictRepo::create(
+            conn,
+            ctx,
+            ConflictObjectType::Attachment,
+            attachment_id,
             base_commit_id,
             local_commit_id,
             incoming_commit_id,
@@ -1041,6 +1445,12 @@ struct AttachmentApplyResult {
     conflict_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AttachmentMergeResult {
+    conflict_count: u32,
+    replace_incoming_chunks: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ObjectDecision {
     Insert,
@@ -1072,6 +1482,22 @@ fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, incoming: &T) -> Optio
     } else {
         None
     }
+}
+
+fn attachment_content_changed(base: &AttachmentRow, candidate: &AttachmentRow) -> bool {
+    base.storage_mode != candidate.storage_mode
+        || base.content_hash != candidate.content_hash
+        || base.original_size != candidate.original_size
+        || base.stored_size != candidate.stored_size
+        || base.chunk_count != candidate.chunk_count
+}
+
+fn attachment_content_matches(left: &AttachmentRow, right: &AttachmentRow) -> bool {
+    left.storage_mode == right.storage_mode
+        && left.content_hash == right.content_hash
+        && left.original_size == right.original_size
+        && left.stored_size == right.stored_size
+        && left.chunk_count == right.chunk_count
 }
 
 fn bump_object_clock(clock: &str) -> String {
@@ -1240,6 +1666,17 @@ mod tests {
         EntryRepo::update(conn, ctx, &entry).unwrap()
     }
 
+    fn update_project_for_test(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        mutate: impl FnOnce(&mut mdbx_core::model::Project),
+    ) -> mdbx_core::model::Project {
+        let mut project = ProjectRepo::get_by_id(conn, project_id).unwrap().unwrap();
+        mutate(&mut project);
+        ProjectRepo::update(conn, ctx, &project).unwrap()
+    }
+
     fn attach_state_payload_to_commit(
         conn: &VaultConnection,
         commits: &mut [SerializedCommit],
@@ -1293,6 +1730,75 @@ mod tests {
     fn entry_payload_json(conn: &VaultConnection, entry_id: &str) -> serde_json::Value {
         let entry = EntryRepo::get_by_id(conn, entry_id).unwrap().unwrap();
         serde_json::from_slice(&entry.payload_ct).unwrap()
+    }
+
+    fn create_project_divergence(label: &str) -> (PathBuf, PathBuf, String) {
+        let source_path = temp_vault_path(&format!("{}-source", label));
+        let target_path = temp_vault_path(&format!("{}-target", label));
+        let project_id;
+
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some(format!("{}-vault", label)),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let source_ctx = CommitContext::new("device-a".to_string());
+            let project =
+                ProjectRepo::create(&source, &source_ctx, "P", Some("base"), None).unwrap();
+            project_id = project.project_id.clone();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        (source_path, target_path, project_id)
+    }
+
+    fn create_attachment_divergence(label: &str) -> (PathBuf, PathBuf, String) {
+        let source_path = temp_vault_path(&format!("{}-source", label));
+        let target_path = temp_vault_path(&format!("{}-target", label));
+        let attachment_id;
+
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some(format!("{}-vault", label)),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let source_ctx = CommitContext::new("device-a".to_string());
+            let project = ProjectRepo::create(&source, &source_ctx, "P", None, None).unwrap();
+            let attachment = AttachmentRepo::add(
+                &source,
+                &source_ctx,
+                &project.project_id,
+                None,
+                "base.txt",
+                Some("text/plain"),
+                "",
+                0,
+            )
+            .unwrap();
+            AttachmentRepo::write_inline_content(
+                &source,
+                &source_ctx,
+                &attachment.attachment_id,
+                b"base content",
+            )
+            .unwrap();
+            attachment_id = attachment.attachment_id.clone();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        (source_path, target_path, attachment_id)
     }
 
     fn create_divergent_password_conflict(label: &str) -> (PathBuf, PathBuf, String) {
@@ -1794,6 +2300,196 @@ mod tests {
 
         let local_after = entry_payload_json(&target, &entry_id);
         assert_eq!(local_after["password"], "local-secret");
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn divergent_project_different_fields_auto_merge() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("project-field-merge");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        let incoming = update_project_for_test(&source, &source_ctx, &project_id, |project| {
+            project.icon_ref = Some("remote-icon".to_string());
+        });
+        let _local = update_project_for_test(&target, &target_ctx, &project_id, |project| {
+            project.favorite = true;
+        });
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &incoming.head_commit_id);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+
+        assert_eq!(result.conflict_count, 0);
+        assert!(ConflictRepo::list_unresolved(&target).unwrap().is_empty());
+        let merged = ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.icon_ref.as_deref(), Some("remote-icon"));
+        assert!(merged.favorite);
+
+        let parent_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_parents WHERE commit_id = ?1",
+                params![merged.head_commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_count, 2);
+        assert!(
+            ObjectVersionRepo::get_project(&target, &project_id, &merged.head_commit_id)
+                .unwrap()
+                .is_some()
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn divergent_project_same_field_creates_field_conflict() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("project-field-conflict");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        let incoming = update_project_for_test(&source, &source_ctx, &project_id, |project| {
+            project.group_id = Some("remote".to_string());
+        });
+        let _local = update_project_for_test(&target, &target_ctx, &project_id, |project| {
+            project.group_id = Some("local".to_string());
+        });
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &incoming.head_commit_id);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+
+        assert_eq!(result.conflict_count, 1);
+        let conflicts = ConflictRepo::list_unresolved(&target).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].object_id, project_id);
+        assert_eq!(conflicts[0].conflicting_fields, vec!["group_id"]);
+
+        let local_after = ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_after.group_id.as_deref(), Some("local"));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn divergent_attachment_metadata_and_remote_content_auto_merge() {
+        let (source_path, target_path, attachment_id) =
+            create_attachment_divergence("attachment-field-merge");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        AttachmentRepo::write_inline_content(
+            &source,
+            &source_ctx,
+            &attachment_id,
+            b"remote content",
+        )
+        .unwrap();
+        let incoming = AttachmentRepo::get_by_id(&source, &attachment_id)
+            .unwrap()
+            .unwrap();
+        let _local =
+            AttachmentRepo::rename(&target, &target_ctx, &attachment_id, "local.txt", None)
+                .unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &incoming.head_commit_id);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+
+        assert_eq!(result.conflict_count, 0);
+        assert!(ConflictRepo::list_unresolved(&target).unwrap().is_empty());
+        let merged = AttachmentRepo::get_by_id(&target, &attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.file_name_ct, b"local.txt");
+        assert_eq!(
+            AttachmentRepo::read_content(&target, &attachment_id).unwrap(),
+            b"remote content"
+        );
+        assert!(
+            ObjectVersionRepo::get_attachment(&target, &attachment_id, &merged.head_commit_id)
+                .unwrap()
+                .is_some()
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn divergent_attachment_both_change_content_creates_conflict() {
+        let (source_path, target_path, attachment_id) =
+            create_attachment_divergence("attachment-content-conflict");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        AttachmentRepo::write_inline_content(
+            &source,
+            &source_ctx,
+            &attachment_id,
+            b"remote content",
+        )
+        .unwrap();
+        let incoming = AttachmentRepo::get_by_id(&source, &attachment_id)
+            .unwrap()
+            .unwrap();
+        AttachmentRepo::write_inline_content(
+            &target,
+            &target_ctx,
+            &attachment_id,
+            b"local content",
+        )
+        .unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &incoming.head_commit_id);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+
+        assert_eq!(result.conflict_count, 1);
+        let conflicts = ConflictRepo::list_unresolved(&target).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].object_id, attachment_id);
+        assert_eq!(conflicts[0].conflicting_fields, vec!["content_hash"]);
+        assert_eq!(
+            AttachmentRepo::read_content(&target, &attachment_id).unwrap(),
+            b"local content"
+        );
 
         drop(source);
         drop(target);
