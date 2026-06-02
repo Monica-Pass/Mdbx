@@ -1,101 +1,103 @@
 # MDBX
 
-This directory contains the Rust workspace and implementation notes for Monica MDBX.
+语言：[简体中文](README.md) | [English](README.en.md)
 
-MDBX is Monica's local-first encrypted vault format. It is designed around stable long-term storage, Git-like logical history, sync conflict handling, native attachments, snapshots, and Tiga security modes.
+这个目录包含 Monica MDBX 的 Rust workspace 和实现接入说明。
 
-For the normative format documents, see `../mdbx-doc/`.
+MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替代某张密码表，而是提供长期可维护的本地数据库、类 Git 的逻辑历史、同步冲突处理、原生附件、快照恢复和 Tiga 安全模式。
 
-## Workspace Layout
+规范性文档在 `../mdbx-doc/`。
+
+## Workspace 结构
 
 - `crates/mdbx-core`
-  - Core domain types.
+  - 核心领域类型。
 - `crates/mdbx-crypto`
-  - Encryption, KDF, and key material handling.
+  - 加密、KDF、密钥材料处理。
 - `crates/mdbx-sync`
-  - Sync payload and object payload model.
+  - 同步 payload 和 object payload 模型。
 - `crates/mdbx-storage`
-  - SQLite schema, vault initialization, repositories, search, snapshots, conflicts, recovery, and sync state.
+  - SQLite schema、vault 初始化、repo、搜索、快照、冲突、恢复、sync state。
 - `crates/mdbx-cli`
-  - CLI entry point for local testing and development.
+  - 本地测试和开发用 CLI。
 - `tests/`
-  - Compatibility, concurrency, and recovery scenarios.
+  - 兼容性、并发、恢复场景。
 
-## Documents In This Directory
+## 本目录文档
 
 - `CLIENT_INTEGRATION_GUIDE.md`
-  - English guide for implementing MDBX support in another client.
+  - 英文版客户端接入指南。
 - `CLIENT_INTEGRATION_GUIDE.zh-CN.md`
-  - Chinese guide for implementing MDBX support in another client.
+  - 中文版客户端接入指南。
 
-## Specification Documents
+## 规范文档
 
-Read the spec set in `../mdbx-doc/` before changing storage behavior:
+修改存储行为前必须先读 `../mdbx-doc/`：
 
 - `README.md` / `README.zh-CN.md`
-- `01-product-spec.md`
-- `02-storage-sync-spec.md`
-- `03-security-spec.md`
+- `01-product-spec.zh-CN.md`
+- `02-storage-sync-spec.zh-CN.md`
+- `03-security-spec.zh-CN.md`
 - `06-sqlite-schema-v1.zh-CN.md`
 
-The `mdbx-doc` directory defines the format and product constraints. This directory implements and documents practical integration.
+`mdbx-doc` 定义格式和产品约束；本目录负责实现和实际客户端接入说明。
 
-## Client Support Levels
+## 客户端支持等级
 
-MDBX support should be labeled honestly:
+MDBX 支持需要明确标注：
 
-- **Read-only support**
-  - Open and unlock a vault.
-  - Display folders, entries, and attachment metadata.
-  - Do not write tables, commits, tombstones, snapshots, or conflicts.
-- **Basic read/write support**
-  - Create and edit entries and folders.
-  - Preserve commits, object versions, tombstones, snapshots, branch heads, and device heads.
-- **Sync support**
-  - Merge commit DAGs, preserve tombstones, detect conflicts, and apply sync state safely.
-- **Full Monica-compatible support**
-  - Provide the required management screens, diagnostics, snapshot structure preview, field-level history, and folder-aware move/copy/create flows.
+- **只读支持**
+  - 打开、解锁 vault。
+  - 显示文件夹、条目、附件元数据。
+  - 不写表、不写 commit、不写 tombstone、不写 snapshot、不处理 conflict。
+- **基础读写支持**
+  - 创建和编辑条目、文件夹。
+  - 正确维护 commit、object version、tombstone、snapshot、branch head、device head。
+- **同步支持**
+  - 合并 commit DAG，保留 tombstone，检测 conflict，安全应用 sync state。
+- **完整 Monica 兼容支持**
+  - 提供必备管理面板、诊断、快照结构预览、字段级历史、支持 MDBX 文件夹的新建/移动/复制流程。
 
-See `CLIENT_INTEGRATION_GUIDE.md` for the complete checklist.
+完整清单见 `CLIENT_INTEGRATION_GUIDE.zh-CN.md`。
 
-## Required User-Facing Management Screens
+## 必备用户管理面板
 
-A full user-facing client should include:
+完整客户端应该提供：
 
-- MDBX format-management home
-- database detail page
-- folder / structure management
-- move / copy target picker
-- conflict management
-- commit history
-- snapshots
-- snapshot structure preview
-- diagnostics / maintenance
-- unlock and security
+- MDBX 格式管理首页
+- 数据库详情页
+- 文件夹 / 结构管理
+- 移动 / 复制目标选择
+- 冲突管理
+- 提交历史
+- 快照
+- 快照结构预览
+- 诊断 / 维护
+- 解锁与安全
 
-The format-management entry should always land on the MDBX management home. It should not automatically enter the last opened vault detail page.
+点击“MDBX 格式管理”应该进入 MDBX 管理首页，不应该自动进入上次打开的某个数据库详情页。
 
-Normal users should not see raw developer tools such as sync bundle import/export, benchmarks, or low-level chunk debugging. Keep those behind developer mode.
+普通用户界面不应该暴露 raw sync bundle、benchmark、底层 chunk 调试等开发者工具。这些工具可以放在开发者模式。
 
-## Development Commands
+## 开发命令
 
-From this directory:
+在本目录执行：
 
 ```powershell
 cargo test
 ```
 
-Run the CLI during local development:
+本地开发 CLI：
 
 ```powershell
 cargo run -p mdbx-cli -- --help
 ```
 
-## Implementation Rules
+## 实现规则
 
-Do not bypass repository/storage APIs from client code unless you are changing the storage layer itself.
+除非正在修改 storage 层本身，否则客户端代码不要绕过 repo/storage API 直接写底层表。
 
-Client code should not directly write:
+客户端代码不应该直接写：
 
 - `commits`
 - `commit_parents`
@@ -107,17 +109,17 @@ Client code should not directly write:
 - `device_heads`
 - `branches`
 
-Batch user operations should normally produce one user-level commit, not one commit per object.
+批量用户操作通常应该生成一个用户级 commit，而不是每个对象一个 commit。
 
-## Compatibility Checklist
+## 兼容性检查
 
-Before claiming full support, a client should verify:
+宣称完整支持前，客户端至少应该确认：
 
-- Monica-created MDBX vaults open correctly.
-- Nested folders can be created and selected as targets.
-- Batch move/copy/delete creates coalesced commits.
-- Tombstones prevent deleted objects from reappearing.
-- Two clients show the same item count for the same vault.
-- Conflicts are detected and displayed.
-- Snapshots can be created and reverted with confirmation.
-- Diagnostics expose sync, health, history, tombstone, attachment, and dangling-head status.
+- 能打开 Monica 创建的 MDBX vault。
+- 能创建嵌套文件夹，并把嵌套文件夹作为目标。
+- 批量移动、复制、删除会合并成用户级 commit。
+- tombstone 能防止删除对象被复活。
+- 两个客户端读取同一 vault 数量一致。
+- 能检测并展示冲突。
+- 能创建快照，回滚快照需要二次确认。
+- 诊断页能显示同步、健康、历史、tombstone、附件、dangling head 状态。
