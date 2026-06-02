@@ -120,8 +120,12 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
   - 同步 payload / object payload 模型。
 - `crates/mdbx-storage`
   - SQLite schema、vault 初始化、repo、搜索、快照、冲突、恢复。
+- `crates/mdbx-ffi`
+  - 面向非 Rust 客户端的通用 UniFFI facade；需要跨语言能力时应优先扩展这一边界，而不是回退到客户端侧 SQL。
 
 客户端 SHOULD 优先通过 storage / repo API 写入，而不是直接拼 SQL。
+
+使用 `mdbx-ffi` 时，应把它视为 generic vault/project/entry 操作的客户端边界。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该新增明确的 facade 方法和测试，而不是让客户端直接写对应 SQLite 表。
 
 除非正在实现底层库，否则客户端代码 SHOULD NOT 直接写这些表：
 

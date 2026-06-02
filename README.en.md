@@ -20,6 +20,8 @@ The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibi
   - Sync payload and object payload model.
 - `crates/mdbx-storage`
   - SQLite schema, vault initialization, repositories, search, snapshots, conflicts, recovery, and sync state.
+- `crates/mdbx-ffi`
+  - Generic UniFFI boundary exposing vault, project, and generic entry operations; client-specific payload semantics remain owned by each client.
 - `crates/mdbx-cli`
   - CLI entry point for local testing and development.
 - crate-local `tests/`
@@ -108,6 +110,8 @@ The current `mdbx-cli` is a development and validation entry point for this Rust
 Note: `import-kdbx-json` / `export-kdbx-json` use a KDBX interoperability JSON intermediate representation. They are not full binary `.kdbx` parsing or writing. Once a vault has unlock methods configured, normal CLI operations must pass `--unlock-password` or `--unlock-pin`; otherwise the command is rejected so production writes do not silently fall back to the legacy plaintext compatibility path.
 
 The current CLI does not yet implement real FIDO/WebAuthn/security-key interaction, production session tokens, or audit policy. Security-key support in storage core is a key-material abstraction with policy tests, not an end-to-end hardware-key client.
+
+`mdbx-ffi` provides a generic UniFFI boundary for non-Rust clients that need MDBX core read/write operations. It is not a low-level SQL escape hatch around the storage/repository rules; new cross-client capabilities should extend the FFI facade instead of writing tables directly.
 
 Key capabilities currently verified in the Rust storage core:
 

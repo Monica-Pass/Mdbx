@@ -21,7 +21,7 @@ MDBX 必须坚持：
 
 `mdbx/` 已经具备这些基础：
 
-- Rust workspace：`mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync`、`mdbx-cli`。
+- Rust workspace：`mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync`、`mdbx-ffi`、`mdbx-cli`。
 - SQLite + WAL + foreign key + secure_delete 基线。
 - v1 schema 覆盖 `projects`、`entries`、`attachments`、`attachment_chunks`、`commits`、`commit_parents`、`device_heads`、`branches`、`object_versions`、`tombstones`、`snapshots`、`key_epochs`、`conflicts`、`unlock_methods`、`project_tags`。
 - project、entry、attachment repo 支持创建、更新、软删除和 tombstone。
@@ -58,6 +58,7 @@ MDBX 必须坚持：
 - 全文搜索只允许使用解锁会话内的临时索引；持久 FTS 不得保存解密后的 project title 或 secret-bearing text。
 - `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
 - 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
+- `mdbx-ffi` 已进入 workspace，作为非 Rust 客户端的通用 UniFFI 边界；当前覆盖 vault/project/generic entry、显式 Tiga 创建、安全密钥材料解锁和已解锁状态下重设主密码，后续 tag、attachment、sync、conflict、snapshot、diagnostics 等跨语言能力应继续扩展 facade，而不是让客户端直接写表。
 - 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。

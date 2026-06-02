@@ -120,8 +120,12 @@ The Rust workspace is split by responsibility:
   - sync payload / object payload model
 - `crates/mdbx-storage`
   - SQLite schema, vault initialization, repositories, search, snapshots, conflicts, recovery
+- `crates/mdbx-ffi`
+  - generic UniFFI facade for non-Rust clients; expose or extend this boundary before falling back to client-side SQL
 
 Clients should prefer storage / repository APIs over hand-written SQL.
+
+When using `mdbx-ffi`, treat it as the client boundary for generic vault/project/entry operations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
 
 Unless you are implementing the low-level storage library itself, client code should not directly write these tables:
 

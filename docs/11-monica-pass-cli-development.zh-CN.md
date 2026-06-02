@@ -32,6 +32,7 @@ mdbx/
     mdbx-crypto
     mdbx-storage
     mdbx-sync
+    mdbx-ffi
     mdbx-cli
 ```
 
@@ -77,14 +78,14 @@ Android 侧当前 MDBX 是 SQLite 文件，schema 与 Rust 规范相近但不完
 - Android 当前加密实现是 PBKDF2-SHA256 + AES-256-GCM 包装 epoch key，字段前缀为 `mdbx:v1:`。
 - Rust 规范实现是 Argon2id + XChaCha20-Poly1305 + `unlock_methods` 表 + vault key/keyring。
 
-结论：Monica Pass CLI 必须单独建项目，不直接改造现有 `mdbx-cli`。第一版应优先把 Rust `mdbx` workspace 中的 `mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync` 作为库依赖或内部适配层复用；`mdbx-cli` 只作为行为参考和测试参考。CLI 还需要兼容 Android 当前测试 MDBX 文件，否则会出现 CLI 创建的库和 Android 创建的库互相打不开的问题。
+结论：Monica Pass CLI 必须单独建项目，不直接改造现有 `mdbx-cli`。第一版应优先把 Rust `mdbx` workspace 中的 `mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync` 作为库依赖或内部适配层复用；`mdbx-ffi` 是面向非 Rust 客户端的通用 UniFFI 边界，可作为跨语言客户端参考，但不应让 CLI 先绕远路依赖 FFI；`mdbx-cli` 只作为行为参考和测试参考。CLI 还需要兼容 Android 当前测试 MDBX 文件，否则会出现 CLI 创建的库和 Android 创建的库互相打不开的问题。
 
 项目边界：
 
 - 新项目目录：`monica-pass-cli/`。
 - 新二进制：`monica-pass`。
 - 不在第一阶段重构或替换 `mdbx/crates/mdbx-cli`。
-- 可以复用 `mdbx` workspace 的库 crate、schema、crypto、repo、sync 逻辑。
+- 可以复用 `mdbx` workspace 的库 crate、schema、crypto、repo、sync 逻辑；非 Rust 客户端需要通用读写边界时优先走或扩展 `mdbx-ffi`。
 - 如果现有能力只存在于 `mdbx-cli` 的命令层，应先抽到可复用库或在新项目中重新实现薄适配，避免让 Monica Pass CLI 依赖旧 CLI 的内部命令结构。
 
 ## 3. 产品边界
