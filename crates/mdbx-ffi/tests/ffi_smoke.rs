@@ -49,6 +49,11 @@ fn creates_reopens_and_preserves_generic_entries() {
 
     let vault = create_vault(path.clone(), password.to_string(), device_id.to_string()).unwrap();
     let project = vault.create_project("Personal".to_string()).unwrap();
+    assert!(!project.deleted);
+
+    let projects = vault.list_projects(false).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].project_id, project.project_id);
 
     let payloads = [
         (
@@ -116,6 +121,74 @@ fn creates_reopens_and_preserves_generic_entries() {
         "{not json".to_string(),
     );
     assert!(invalid_payload.is_err());
+}
+
+#[test]
+fn creates_reads_renames_and_deletes_attachment_content() {
+    let vault_path = temp_vault_path("attachment");
+    let path = vault_path.as_path_string();
+    let password = "涓枃 password 12345!";
+    let device_id = "ffi-test-device";
+
+    let vault = create_vault(path.clone(), password.to_string(), device_id.to_string()).unwrap();
+    let project = vault.create_project("Personal".to_string()).unwrap();
+    let entry = vault
+        .create_entry(
+            project.project_id.clone(),
+            "login".to_string(),
+            "GitHub".to_string(),
+            r#"{"kind":"password","username":"alice"}"#.to_string(),
+        )
+        .unwrap();
+
+    let attachment = vault
+        .create_attachment_metadata(
+            project.project_id.clone(),
+            Some(entry.entry_id.clone()),
+            "recovery.txt".to_string(),
+            Some("text/plain".to_string()),
+            "".to_string(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(attachment.file_name, "recovery.txt");
+    assert_eq!(attachment.media_type.as_deref(), Some("text/plain"));
+    assert_eq!(attachment.entry_id.as_deref(), Some(entry.entry_id.as_str()));
+
+    let content = b"one\ntwo\nthree".to_vec();
+    let written = vault
+        .write_attachment_inline_content(attachment.attachment_id.clone(), content.clone())
+        .unwrap();
+    assert_eq!(written.storage_mode, "embedded-inline");
+    assert_eq!(written.stored_size, content.len() as u64);
+    assert_eq!(written.chunk_count, 1);
+
+    let read = vault
+        .read_attachment_content(attachment.attachment_id.clone())
+        .unwrap();
+    assert_eq!(read, content);
+
+    let by_entry = vault
+        .list_attachments_by_entry(entry.entry_id.clone())
+        .unwrap();
+    assert_eq!(by_entry.len(), 1);
+    assert_eq!(by_entry[0].attachment_id, attachment.attachment_id);
+
+    let renamed = vault
+        .rename_attachment(
+            attachment.attachment_id.clone(),
+            "codes.txt".to_string(),
+            Some("text/markdown".to_string()),
+        )
+        .unwrap();
+    assert_eq!(renamed.file_name, "codes.txt");
+    assert_eq!(renamed.media_type.as_deref(), Some("text/markdown"));
+
+    vault.delete_attachment(attachment.attachment_id).unwrap();
+    assert!(vault
+        .list_attachments_by_project(project.project_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

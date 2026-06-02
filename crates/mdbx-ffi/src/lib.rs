@@ -11,7 +11,7 @@ use mdbx_core::tiga::TigaMode;
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
-use mdbx_storage::repo::{CommitContext, EntryRepo, ProjectRepo};
+use mdbx_storage::repo::{AttachmentRepo, CommitContext, EntryRepo, ProjectRepo};
 use mdbx_storage::unlock::UnlockService;
 use zeroize::Zeroizing;
 
@@ -55,6 +55,7 @@ pub struct VaultInfo {
 pub struct ProjectRecord {
     pub project_id: String,
     pub title: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -64,6 +65,21 @@ pub struct EntryRecord {
     pub entry_type: String,
     pub title: String,
     pub payload_json: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AttachmentRecord {
+    pub attachment_id: String,
+    pub project_id: String,
+    pub entry_id: Option<String>,
+    pub file_name: String,
+    pub media_type: Option<String>,
+    pub storage_mode: String,
+    pub content_hash: String,
+    pub original_size: u64,
+    pub stored_size: u64,
+    pub chunk_count: u32,
     pub deleted: bool,
 }
 
@@ -104,10 +120,19 @@ impl MdbxVault {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         let ctx = CommitContext::new(self.device_id.clone());
         let project = ProjectRepo::create(&conn, &ctx, &title, None, None)?;
-        Ok(ProjectRecord {
-            project_id: project.project_id,
-            title: String::from_utf8_lossy(&project.title_ct).to_string(),
-        })
+        project_record_from_project(&project)
+    }
+
+    pub fn list_projects(&self, include_deleted: bool) -> Result<Vec<ProjectRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let projects = if include_deleted {
+            let mut active = ProjectRepo::list_all(&conn)?;
+            active.extend(ProjectRepo::list_deleted(&conn)?);
+            active
+        } else {
+            ProjectRepo::list_all(&conn)?
+        };
+        projects.iter().map(project_record_from_project).collect()
     }
 
     pub fn create_entry(
@@ -252,6 +277,120 @@ impl MdbxVault {
         let ctx = CommitContext::new(self.device_id.clone());
         let moved = EntryRepo::move_to_project(&conn, &ctx, &entry_id, &target_project_id)?;
         entry_record_from_entry(&moved)
+    }
+
+    pub fn create_attachment_metadata(
+        &self,
+        project_id: String,
+        entry_id: Option<String>,
+        file_name: String,
+        media_type: Option<String>,
+        content_hash: String,
+        original_size: u64,
+    ) -> Result<AttachmentRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            entry_id.as_deref(),
+            &file_name,
+            media_type.as_deref(),
+            &content_hash,
+            original_size,
+        )?;
+        attachment_record_from_attachment(&attachment)
+    }
+
+    pub fn list_attachments_by_project(
+        &self,
+        project_id: String,
+    ) -> Result<Vec<AttachmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let attachments = AttachmentRepo::list_by_project(&conn, &project_id)?;
+        attachments
+            .iter()
+            .map(attachment_record_from_attachment)
+            .collect()
+    }
+
+    pub fn list_attachments_by_entry(
+        &self,
+        entry_id: String,
+    ) -> Result<Vec<AttachmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let attachments = AttachmentRepo::list_by_entry(&conn, &entry_id)?;
+        attachments
+            .iter()
+            .map(attachment_record_from_attachment)
+            .collect()
+    }
+
+    pub fn write_attachment_inline_content(
+        &self,
+        attachment_id: String,
+        content: Vec<u8>,
+    ) -> Result<AttachmentRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        AttachmentRepo::write_inline_content(&conn, &ctx, &attachment_id, &content)?;
+        let attachment = AttachmentRepo::get_by_id(&conn, &attachment_id)?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))?;
+        attachment_record_from_attachment(&attachment)
+    }
+
+    pub fn write_attachment_chunked_content(
+        &self,
+        attachment_id: String,
+        content: Vec<u8>,
+        chunk_size: u32,
+    ) -> Result<AttachmentRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        AttachmentRepo::write_chunked_content(
+            &conn,
+            &ctx,
+            &attachment_id,
+            &content,
+            chunk_size.max(1) as usize,
+        )?;
+        let attachment = AttachmentRepo::get_by_id(&conn, &attachment_id)?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))?;
+        attachment_record_from_attachment(&attachment)
+    }
+
+    pub fn read_attachment_content(
+        &self,
+        attachment_id: String,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        AttachmentRepo::read_content(&conn, &attachment_id).map_err(MdbxFfiError::from)
+    }
+
+    pub fn rename_attachment(
+        &self,
+        attachment_id: String,
+        file_name: String,
+        media_type: Option<String>,
+    ) -> Result<AttachmentRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let attachment = AttachmentRepo::rename(
+            &conn,
+            &ctx,
+            &attachment_id,
+            &file_name,
+            media_type.as_deref(),
+        )?;
+        attachment_record_from_attachment(&attachment)
+    }
+
+    pub fn delete_attachment(&self, attachment_id: String) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        AttachmentRepo::soft_delete(&conn, &ctx, &attachment_id)?;
+        Ok(())
     }
 
     pub fn setup_local_security_key_unlock(
@@ -406,5 +545,37 @@ fn entry_record_from_entry(entry: &mdbx_core::model::Entry) -> Result<EntryRecor
             .unwrap_or_default(),
         payload_json: serde_json::to_string(&payload)?,
         deleted: entry.deleted,
+    })
+}
+
+fn project_record_from_project(
+    project: &mdbx_core::model::Project,
+) -> Result<ProjectRecord, MdbxFfiError> {
+    Ok(ProjectRecord {
+        project_id: project.project_id.clone(),
+        title: String::from_utf8_lossy(&project.title_ct).to_string(),
+        deleted: project.deleted,
+    })
+}
+
+fn attachment_record_from_attachment(
+    attachment: &mdbx_core::model::Attachment,
+) -> Result<AttachmentRecord, MdbxFfiError> {
+    Ok(AttachmentRecord {
+        attachment_id: attachment.attachment_id.clone(),
+        project_id: attachment.project_id.clone(),
+        entry_id: attachment.entry_id.clone(),
+        file_name: String::from_utf8_lossy(&attachment.file_name_ct).to_string(),
+        media_type: attachment
+            .media_type_ct
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|s| s.to_string()),
+        storage_mode: attachment.storage_mode.to_string(),
+        content_hash: attachment.content_hash.clone(),
+        original_size: attachment.original_size,
+        stored_size: attachment.stored_size,
+        chunk_count: attachment.chunk_count,
+        deleted: attachment.deleted,
     })
 }
