@@ -518,6 +518,9 @@ fn cmd_unlock(path: &std::path::Path, unlock: UnlockArgs<'_>) -> Result<(), Stri
         mdbx_core::model::UnlockMethodType::SecurityKey => {
             return Err("security key unlock not yet supported in CLI".to_string());
         }
+        mdbx_core::model::UnlockMethodType::PasswordSecurityKey => {
+            return Err("password + security key unlock not yet supported in CLI".to_string());
+        }
     }
 
     println!("Vault unlocked successfully.");

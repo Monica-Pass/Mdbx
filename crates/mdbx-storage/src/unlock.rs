@@ -2,6 +2,7 @@ use mdbx_crypto::aead;
 use mdbx_crypto::kdf::{self, Argon2Params};
 use mdbx_crypto::keyring::Keyring;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use mdbx_core::model::{KdfParams, UnlockMethod, UnlockMethodType, VaultSession};
 use mdbx_core::tiga::TigaMode;
@@ -30,6 +31,19 @@ const VAULT_KEY_WRAP_AAD: &[u8] = b"mdbx-vault-key-wrap";
 /// - **change**: 验证旧凭据 → 解包 vault_key → 用新凭据重新包裹
 pub struct UnlockService;
 
+/// 当前 vault 解锁方式相对某个 Tiga 模式的策略评估。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TigaUnlockAssessment {
+    pub mode: TigaMode,
+    pub configured_methods: Vec<UnlockMethodType>,
+    pub has_portable_unlock: bool,
+    pub has_security_key_unlock: bool,
+    pub has_combined_password_security_key: bool,
+    pub has_required_combined_strength: bool,
+    pub satisfies_policy: bool,
+    pub warnings: Vec<String>,
+}
+
 impl UnlockService {
     // -----------------------------------------------------------------------
     // SETUP — 配置解锁方式
@@ -46,13 +60,13 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
 
-        let vault_key = Self::get_or_generate_vault_key(conn);
-        let wrapped = Self::wrap_vault_key(&unlock_key, &vault_key)?;
+        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::store_method(conn, UnlockMethodType::Pin, &kdf_params, &wrapped)
@@ -85,13 +99,13 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
 
-        let vault_key = Self::get_or_generate_vault_key(conn);
-        let wrapped = Self::wrap_vault_key(&unlock_key, &vault_key)?;
+        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::store_method(conn, UnlockMethodType::Password, &kdf_params, &wrapped)
@@ -112,16 +126,56 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Self::derive_key(key_data, &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(key_data, &kdf_params)?);
 
-        let vault_key = Self::get_or_generate_vault_key(conn);
-        let wrapped = Self::wrap_vault_key(&unlock_key, &vault_key)?;
+        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::store_method(conn, UnlockMethodType::SecurityKey, &kdf_params, &wrapped)
+    }
+
+    /// 配置密码 + 安全密钥组合解锁方式。
+    ///
+    /// 该方式要求两个材料同时存在才能解包 vault key，适合作为 Power 模式
+    /// 的推荐入口。它不会移除已有便携方式，客户端可通过策略评估引导用户
+    /// 是否保留恢复路径。
+    pub fn setup_password_security_key(
+        conn: &mut VaultConnection,
+        password: &str,
+        key_data: &[u8],
+        mode: TigaMode,
+    ) -> StorageResult<UnlockMethod> {
+        Self::validate_password(password)?;
+        Self::validate_security_key_data(key_data)?;
+
+        let normalized = Self::normalize_unicode(password);
+        let combined = Zeroizing::new(Self::combine_password_and_security_key(
+            normalized.as_bytes(),
+            key_data,
+        ));
+        let mut kdf_params = KdfParams::for_password_with_mode(mode);
+        kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
+            StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
+        })?;
+        let unlock_key = Zeroizing::new(Self::derive_key(combined.as_slice(), &kdf_params)?);
+
+        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
+
+        let vault_ctx = Self::read_vault_context(conn)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
+        conn.attach_keyring(keyring);
+
+        Self::store_method(
+            conn,
+            UnlockMethodType::PasswordSecurityKey,
+            &kdf_params,
+            &wrapped,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -137,12 +191,15 @@ impl UnlockService {
         let normalized = pin.trim();
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
 
-        let vault_key = Self::unwrap_vault_key(&unlock_key, &method.wrapped_vault_key_ct)?;
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::create_session(UnlockMethodType::Pin)
@@ -161,12 +218,15 @@ impl UnlockService {
         let normalized = Self::normalize_unicode(password);
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
 
-        let vault_key = Self::unwrap_vault_key(&unlock_key, &method.wrapped_vault_key_ct)?;
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::create_session(UnlockMethodType::Password)
@@ -184,15 +244,53 @@ impl UnlockService {
 
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Self::derive_key(key_data, &kdf_params)?;
+        let unlock_key = Zeroizing::new(Self::derive_key(key_data, &kdf_params)?);
 
-        let vault_key = Self::unwrap_vault_key(&unlock_key, &method.wrapped_vault_key_ct)?;
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::create_session(UnlockMethodType::SecurityKey)
+    }
+
+    /// 使用密码 + 安全密钥组合方式解锁 vault。
+    pub fn unlock_with_password_security_key(
+        conn: &mut VaultConnection,
+        password: &str,
+        key_data: &[u8],
+    ) -> StorageResult<VaultSession> {
+        let method = Self::find_method_by_type(conn, UnlockMethodType::PasswordSecurityKey)?
+            .ok_or_else(|| {
+                StorageError::Validation(
+                    "no password + security key unlock method configured".to_string(),
+                )
+            })?;
+
+        Self::validate_security_key_data(key_data)?;
+        let normalized = Self::normalize_unicode(password);
+        let combined = Zeroizing::new(Self::combine_password_and_security_key(
+            normalized.as_bytes(),
+            key_data,
+        ));
+        let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
+            .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
+        let unlock_key = Zeroizing::new(Self::derive_key(combined.as_slice(), &kdf_params)?);
+
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
+
+        let vault_ctx = Self::read_vault_context(conn)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
+        conn.attach_keyring(keyring);
+
+        Self::create_session(UnlockMethodType::PasswordSecurityKey)
     }
 
     // -----------------------------------------------------------------------
@@ -214,8 +312,14 @@ impl UnlockService {
         let old_normalized = old_pin.trim();
         let old_kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let old_unlock_key = Self::derive_key(old_normalized.as_bytes(), &old_kdf_params)?;
-        let vault_key = Self::unwrap_vault_key(&old_unlock_key, &method.wrapped_vault_key_ct)?;
+        let old_unlock_key = Zeroizing::new(Self::derive_key(
+            old_normalized.as_bytes(),
+            &old_kdf_params,
+        )?);
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            old_unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
 
         // 用新凭据重新包裹
         Self::validate_pin(new_pin)?;
@@ -224,12 +328,15 @@ impl UnlockService {
         new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let new_unlock_key = Self::derive_key(new_normalized.as_bytes(), &new_kdf_params)?;
-        let new_wrapped = Self::wrap_vault_key(&new_unlock_key, &vault_key)?;
+        let new_unlock_key = Zeroizing::new(Self::derive_key(
+            new_normalized.as_bytes(),
+            &new_kdf_params,
+        )?);
+        let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
 
         // 更新密钥环（vault_key 不变，但派生密钥变了）
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::update_method_key(conn, UnlockMethodType::Pin, &new_kdf_params, &new_wrapped)
@@ -249,8 +356,14 @@ impl UnlockService {
         let old_normalized = Self::normalize_unicode(old_password);
         let old_kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let old_unlock_key = Self::derive_key(old_normalized.as_bytes(), &old_kdf_params)?;
-        let vault_key = Self::unwrap_vault_key(&old_unlock_key, &method.wrapped_vault_key_ct)?;
+        let old_unlock_key = Zeroizing::new(Self::derive_key(
+            old_normalized.as_bytes(),
+            &old_kdf_params,
+        )?);
+        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
+            old_unlock_key.as_slice(),
+            &method.wrapped_vault_key_ct,
+        )?);
 
         let mode = old_kdf_params.infer_tiga_mode();
         Self::validate_password(new_password)?;
@@ -259,11 +372,14 @@ impl UnlockService {
         new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let new_unlock_key = Self::derive_key(new_normalized.as_bytes(), &new_kdf_params)?;
-        let new_wrapped = Self::wrap_vault_key(&new_unlock_key, &vault_key)?;
+        let new_unlock_key = Zeroizing::new(Self::derive_key(
+            new_normalized.as_bytes(),
+            &new_kdf_params,
+        )?);
+        let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
 
         let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
         Self::update_method_key(
@@ -320,6 +436,79 @@ impl UnlockService {
         Self::find_method_by_type(conn, method_type).map(|m| m.is_some())
     }
 
+    /// 评估当前已配置解锁方式是否符合指定 Tiga 模式的 vault 解锁策略。
+    pub fn assess_tiga_unlock_policy(
+        conn: &VaultConnection,
+        mode: TigaMode,
+    ) -> StorageResult<TigaUnlockAssessment> {
+        let methods = Self::list_methods(conn)?;
+        let configured_methods: Vec<UnlockMethodType> =
+            methods.iter().map(|m| m.method_type).collect();
+        let has_portable_unlock = configured_methods.iter().any(|m| m.is_portable());
+        let has_security_key_unlock = configured_methods.iter().any(|m| m.uses_security_key());
+        let has_combined_password_security_key = configured_methods
+            .iter()
+            .any(|m| m.is_combined_password_security_key());
+        let has_required_combined_strength = methods.iter().any(|m| {
+            m.method_type.is_combined_password_security_key()
+                && KdfParams::from_json_bytes(&m.kdf_params_ct)
+                    .map(|params| params.infer_tiga_mode() >= mode)
+                    .unwrap_or(false)
+        });
+        let policy = mode.unlock_policy();
+
+        let mut warnings = Vec::new();
+        if !methods.is_empty() && !has_portable_unlock && mode != TigaMode::Power {
+            warnings.push(
+                "cloud-synced vault has no portable unlock method; another device will need security-key material".to_string(),
+            );
+        }
+        if policy.recommends_security_key && !has_security_key_unlock {
+            warnings.push(format!(
+                "{mode} mode recommends adding a security key unlock path"
+            ));
+        }
+        if policy.requires_combined_password_security_key && !has_combined_password_security_key {
+            warnings.push(
+                "power mode requires a password + security key combined unlock method".to_string(),
+            );
+        }
+        if policy.requires_combined_password_security_key
+            && has_combined_password_security_key
+            && !has_required_combined_strength
+        {
+            warnings.push(
+                "password + security key unlock method uses a weaker KDF profile than power mode"
+                    .to_string(),
+            );
+        }
+        if !policy.allows_portable_unlock && has_portable_unlock {
+            warnings.push(
+                "power mode is strongest after removing standalone portable unlock methods"
+                    .to_string(),
+            );
+        }
+
+        let satisfies_policy = if methods.is_empty() {
+            false
+        } else if policy.requires_combined_password_security_key {
+            has_required_combined_strength && !has_portable_unlock
+        } else {
+            has_portable_unlock
+        };
+
+        Ok(TigaUnlockAssessment {
+            mode,
+            configured_methods,
+            has_portable_unlock,
+            has_security_key_unlock,
+            has_combined_password_security_key,
+            has_required_combined_strength,
+            satisfies_policy,
+            warnings,
+        })
+    }
+
     /// 删除指定类型的解锁方式。
     ///
     /// 至少需要保留一种解锁方式。
@@ -354,10 +543,10 @@ impl UnlockService {
     /// 首次设置解锁方式时生成新的随机 vault_key。
     /// 后续设置的解锁方式复用同一个 vault_key，
     /// 确保无论用哪种方式解锁都能解密同一批数据。
-    fn get_or_generate_vault_key(conn: &VaultConnection) -> Vec<u8> {
+    fn get_or_generate_vault_key(conn: &VaultConnection) -> StorageResult<Vec<u8>> {
         match conn.keyring() {
-            Some(kr) => kr.vault_key.clone(),
-            None => aead::generate_key().unwrap_or_else(|_| vec![0u8; 32]),
+            Some(kr) => Ok(kr.vault_key.clone()),
+            None => aead::generate_key().map_err(StorageError::Crypto),
         }
     }
 
@@ -397,6 +586,15 @@ impl UnlockService {
         };
         kdf::derive_key(credential, &kdf_params.salt, &argon2_params)
             .map_err(|e| StorageError::Crypto(e))
+    }
+
+    fn combine_password_and_security_key(password: &[u8], key_data: &[u8]) -> Vec<u8> {
+        let mut combined = Vec::with_capacity(16 + password.len() + key_data.len());
+        combined.extend_from_slice(&(password.len() as u64).to_le_bytes());
+        combined.extend_from_slice(password);
+        combined.extend_from_slice(&(key_data.len() as u64).to_le_bytes());
+        combined.extend_from_slice(key_data);
+        combined
     }
 
     // -----------------------------------------------------------------------
@@ -549,6 +747,15 @@ impl UnlockService {
         if trimmed.is_empty() {
             return Err(StorageError::Validation(
                 "password must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_security_key_data(key_data: &[u8]) -> StorageResult<()> {
+        if key_data.is_empty() {
+            return Err(StorageError::Validation(
+                "security key data must not be empty".to_string(),
             ));
         }
         Ok(())
@@ -765,6 +972,159 @@ mod tests {
         let mut conn = setup();
         let result = UnlockService::unlock_with_security_key(&mut conn, b"some-key-data");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_and_unlock_password_security_key() {
+        let mut conn = setup();
+        let key_data = b"hardware-key-material-32bytes!!!";
+        UnlockService::setup_password_security_key(
+            &mut conn,
+            "my-secret-password",
+            key_data,
+            TigaMode::Sky,
+        )
+        .unwrap();
+
+        let session = UnlockService::unlock_with_password_security_key(
+            &mut conn,
+            "my-secret-password",
+            key_data,
+        )
+        .unwrap();
+        assert_eq!(session.unlock_method, UnlockMethodType::PasswordSecurityKey);
+    }
+
+    #[test]
+    fn test_password_security_key_requires_both_factors() {
+        let mut conn = setup();
+        let key_data = b"hardware-key-material-32bytes!!!";
+        UnlockService::setup_password_security_key(
+            &mut conn,
+            "my-secret-password",
+            key_data,
+            TigaMode::Sky,
+        )
+        .unwrap();
+
+        assert!(UnlockService::unlock_with_password_security_key(
+            &mut conn,
+            "wrong-password",
+            key_data
+        )
+        .is_err());
+        assert!(UnlockService::unlock_with_password_security_key(
+            &mut conn,
+            "my-secret-password",
+            b"wrong-key-data"
+        )
+        .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // TIGA UNLOCK POLICY
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tiga_sky_policy_accepts_portable_unlock() {
+        let mut conn = setup();
+        UnlockService::setup_password_with_mode(&mut conn, "password", TigaMode::Sky).unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Sky).unwrap();
+        assert!(assessment.satisfies_policy);
+        assert!(assessment.has_portable_unlock);
+        assert!(!assessment.has_security_key_unlock);
+    }
+
+    #[test]
+    fn test_tiga_multi_policy_warns_without_security_key_but_remains_usable() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Multi).unwrap();
+        assert!(assessment.satisfies_policy);
+        assert!(assessment.has_portable_unlock);
+        assert!(!assessment.has_security_key_unlock);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("recommends adding a security key")));
+    }
+
+    #[test]
+    fn test_tiga_multi_policy_requires_portable_recovery_path() {
+        let mut conn = setup();
+        UnlockService::setup_security_key(&mut conn, b"hardware-key-material-32bytes!!!").unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Multi).unwrap();
+        assert!(!assessment.satisfies_policy);
+        assert!(!assessment.has_portable_unlock);
+        assert!(assessment.has_security_key_unlock);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no portable unlock method")));
+    }
+
+    #[test]
+    fn test_tiga_power_policy_requires_combined_factor_without_portable_fallback() {
+        let mut conn = setup();
+        UnlockService::setup_password_security_key(
+            &mut conn,
+            "password",
+            b"hardware-key-material-32bytes!!!",
+            TigaMode::Power,
+        )
+        .unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Power).unwrap();
+        assert!(assessment.satisfies_policy);
+        assert!(assessment.has_combined_password_security_key);
+        assert!(assessment.has_required_combined_strength);
+        assert!(!assessment.has_portable_unlock);
+    }
+
+    #[test]
+    fn test_tiga_power_policy_rejects_standalone_password_fallback() {
+        let mut conn = setup();
+        UnlockService::setup_password_security_key(
+            &mut conn,
+            "password",
+            b"hardware-key-material-32bytes!!!",
+            TigaMode::Power,
+        )
+        .unwrap();
+        UnlockService::setup_password(&mut conn, "fallback-password").unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Power).unwrap();
+        assert!(!assessment.satisfies_policy);
+        assert!(assessment.has_combined_password_security_key);
+        assert!(assessment.has_portable_unlock);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("standalone portable")));
+    }
+
+    #[test]
+    fn test_tiga_power_policy_rejects_weak_combined_kdf() {
+        let mut conn = setup();
+        UnlockService::setup_password_security_key(
+            &mut conn,
+            "password",
+            b"hardware-key-material-32bytes!!!",
+            TigaMode::Sky,
+        )
+        .unwrap();
+
+        let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Power).unwrap();
+        assert!(!assessment.satisfies_policy);
+        assert!(assessment.has_combined_password_security_key);
+        assert!(!assessment.has_required_combined_strength);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("weaker KDF")));
     }
 
     // -----------------------------------------------------------------------

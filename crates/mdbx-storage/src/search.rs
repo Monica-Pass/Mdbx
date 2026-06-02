@@ -31,6 +31,25 @@ pub struct SearchResult {
 pub struct SearchService;
 
 impl SearchService {
+    /// Ensure the per-connection FTS index is temporary.
+    ///
+    /// Older schema versions created `project_titles_fts` in the main database,
+    /// which could persist plaintext title tokens. The temp table shadows any
+    /// main table with the same name for this connection, and the main table is
+    /// dropped to remove legacy persisted tokens.
+    fn ensure_temp_fts(conn: &VaultConnection) -> StorageResult<()> {
+        conn.inner()
+            .execute_batch(
+                "DROP TABLE IF EXISTS main.project_titles_fts;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS temp.project_titles_fts USING fts5(
+                     project_id UNINDEXED,
+                     title,
+                     tokenize='unicode61 remove_diacritics 2'
+                 );",
+            )
+            .map_err(StorageError::Database)
+    }
+
     // -----------------------------------------------------------------------
     // INDEX — 索引维护
     // -----------------------------------------------------------------------
@@ -43,6 +62,8 @@ impl SearchService {
         project_id: &str,
         title: &str,
     ) -> StorageResult<()> {
+        Self::ensure_temp_fts(conn)?;
+
         // 先删除旧索引（如果存在）
         conn.inner()
             .execute(
@@ -64,6 +85,8 @@ impl SearchService {
 
     /// 移除项目的 FTS 索引（项目删除时调用）。
     pub fn remove_project_index(conn: &VaultConnection, project_id: &str) -> StorageResult<()> {
+        Self::ensure_temp_fts(conn)?;
+
         conn.inner()
             .execute(
                 "DELETE FROM project_titles_fts WHERE project_id = ?1",
@@ -84,6 +107,8 @@ impl SearchService {
 
     /// 批量重建所有项目的 FTS 索引。
     pub fn rebuild_fts_index(conn: &VaultConnection) -> StorageResult<u32> {
+        Self::ensure_temp_fts(conn)?;
+
         // 清空 FTS 索引
         conn.inner()
             .execute("DELETE FROM project_titles_fts", [])
@@ -252,6 +277,8 @@ impl SearchService {
 
     /// FTS5 标题搜索。
     fn search_title_fts(conn: &VaultConnection, query: &str) -> StorageResult<Vec<SearchResult>> {
+        Self::ensure_temp_fts(conn)?;
+
         // 将用户查询转换为 FTS5 查询语法
         let fts_query = Self::build_fts_query(query);
 
@@ -491,6 +518,7 @@ impl SearchService {
         // FTS 标题搜索
         let use_fts = title_query.map(|q| !q.trim().is_empty()).unwrap_or(false);
         if use_fts {
+            Self::ensure_temp_fts(conn)?;
             let fts_query = Self::build_fts_query(title_query.unwrap());
             conditions.push(format!(
                 "p.project_id IN (SELECT project_id FROM project_titles_fts WHERE project_titles_fts MATCH ?{})",

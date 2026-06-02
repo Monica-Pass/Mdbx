@@ -6,7 +6,9 @@
 
 MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替代某张密码表，而是提供长期可维护的本地数据库、类 Git 的逻辑历史、同步冲突处理、原生附件、快照恢复和 Tiga 安全模式。
 
-规范性文档在 `../mdbx-doc/`。
+规范性文档在 `docs/`。
+
+MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能力必须尽量保留兼容路径，数据安全永远优先于一时方便。
 
 ## Workspace 结构
 
@@ -20,8 +22,8 @@ MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替
   - SQLite schema、vault 初始化、repo、搜索、快照、冲突、恢复、sync state。
 - `crates/mdbx-cli`
   - 本地测试和开发用 CLI。
-- `tests/`
-  - 兼容性、并发、恢复场景。
+- crate-local `tests/`
+  - 兼容性、crypto vector、并发、恢复场景跟随各 crate 放置。
 
 ## 本目录文档
 
@@ -32,15 +34,15 @@ MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替
 
 ## 规范文档
 
-修改存储行为前必须先读 `../mdbx-doc/`：
+修改存储行为前必须先读 `docs/`：
 
-- `README.md` / `README.zh-CN.md`
-- `01-product-spec.zh-CN.md`
-- `02-storage-sync-spec.zh-CN.md`
-- `03-security-spec.zh-CN.md`
-- `06-sqlite-schema-v1.zh-CN.md`
+- `docs/README.md` / `docs/README.zh-CN.md`
+- `docs/01-product-spec.zh-CN.md`
+- `docs/02-storage-sync-spec.zh-CN.md`
+- `docs/03-security-spec.zh-CN.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
-`mdbx-doc` 定义格式和产品约束；本目录负责实现和实际客户端接入说明。
+`docs/` 定义格式和产品约束；Rust workspace 负责实现这些约束，并提供实际客户端接入说明。
 
 ## 客户端支持等级
 
@@ -96,6 +98,8 @@ cargo run -p mdbx-cli -- --help
 ## 实现规则
 
 除非正在修改 storage 层本身，否则客户端代码不要绕过 repo/storage API 直接写底层表。
+
+兼容性和恢复能力属于实现要求，不是后续润色项。新增加密 envelope、表、索引、解锁方式和 Tiga 策略时，除非存在必须处理的关键安全问题，否则必须保持旧 vault 可读。
 
 客户端代码不应该直接写：
 

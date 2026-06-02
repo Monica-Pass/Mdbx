@@ -12,6 +12,7 @@ Its design goals are:
 - security modes through the Tiga model
 - project-oriented password organization
 - native attachment support
+- 4ever And 4ever compatibility: old vaults stay readable and data safety wins over convenience
 
 ## Chinese Documents
 
@@ -23,6 +24,11 @@ Chinese versions are provided for direct review and planning:
 - `02-storage-sync-spec.zh-CN.md`
 - `03-security-spec.zh-CN.md`
 - `04-roadmap-acceptance.zh-CN.md`
+- `05-rfc-structure.zh-CN.md`
+- `06-sqlite-schema-v1.zh-CN.md`
+- `07-low-end-model-task-breakdown.zh-CN.md`
+- `08-implementation-completion-plan.zh-CN.md`
+- `11-monica-pass-cli-development.zh-CN.md`
 
 ## Reading Order
 
@@ -41,6 +47,11 @@ If you are a Chinese-speaking reviewer, read these files in order:
 3. `02-storage-sync-spec.zh-CN.md`
 4. `03-security-spec.zh-CN.md`
 5. `04-roadmap-acceptance.zh-CN.md`
+6. `05-rfc-structure.zh-CN.md`
+7. `06-sqlite-schema-v1.zh-CN.md`
+8. `07-low-end-model-task-breakdown.zh-CN.md`
+9. `08-implementation-completion-plan.zh-CN.md`
+10. `11-monica-pass-cli-development.zh-CN.md`
 
 ## Document Roles
 
@@ -60,6 +71,21 @@ If you are a Chinese-speaking reviewer, read these files in order:
 - `04-roadmap-acceptance.md`
   - MVP scope, later phases, acceptance criteria, test matrix, and benchmark requirements.
 
+- `05-rfc-structure.zh-CN.md`
+  - Document governance, compatibility rules, and RFC-style layering.
+
+- `06-sqlite-schema-v1.zh-CN.md`
+  - SQLite v1 schema guidance for projects, entries, attachments, history, unlock methods, and search.
+
+- `07-low-end-model-task-breakdown.zh-CN.md`
+  - Implementation task breakdown for weaker models.
+
+- `08-implementation-completion-plan.zh-CN.md`
+  - Current implementation completion plan and status-oriented work list.
+
+- `11-monica-pass-cli-development.zh-CN.md`
+  - Monica Pass CLI development and integration notes.
+
 ## Non-Negotiable Principles
 
 Every implementation and every design choice MUST preserve all of the following:
@@ -67,6 +93,8 @@ Every implementation and every design choice MUST preserve all of the following:
 - Local-first
 - Long-term readability and migration friendliness
 - Forward and backward compatibility
+- 4ever And 4ever: new versions must read older vaults; old implementations should preserve unknown non-critical data where possible
+- Data safety before convenience
 - No mandatory central server
 - Project-oriented password storage
 - Native attachment capability
@@ -88,8 +116,9 @@ Every implementation and every design choice MUST preserve all of the following:
   - A file or binary payload referenced by a project or entry.
 
 - `tiga mode`
-  - One of `Power Type`, `Multi Type`, or `Sky Type`.
-  - Semantic mapping: `Power Type` = strongest protection, `Multi Type` = balanced default, `Sky Type` = faster and lighter-weight use.
+  - One of `power`, `multi`, or `sky` in stored values and APIs.
+  - Compatibility display names may use `Power Type`, `Multi Type`, or `Sky Type`.
+  - `power` = strongest protection, `multi` = balanced default, `sky` = flexible and portable while still secure.
 
 - `oplog`
   - Append-only change history used for sync and recovery.

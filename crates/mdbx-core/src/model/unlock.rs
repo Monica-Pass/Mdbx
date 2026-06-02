@@ -13,6 +13,8 @@ pub enum UnlockMethodType {
     Password,
     #[serde(rename = "security_key")]
     SecurityKey,
+    #[serde(rename = "password_security_key")]
+    PasswordSecurityKey,
 }
 
 impl UnlockMethodType {
@@ -21,6 +23,7 @@ impl UnlockMethodType {
             Self::Pin => "pin".to_string(),
             Self::Password => "password".to_string(),
             Self::SecurityKey => "security_key".to_string(),
+            Self::PasswordSecurityKey => "password_security_key".to_string(),
         }
     }
 
@@ -29,8 +32,26 @@ impl UnlockMethodType {
             "pin" => Ok(Self::Pin),
             "password" => Ok(Self::Password),
             "security_key" => Ok(Self::SecurityKey),
+            "password_security_key" => Ok(Self::PasswordSecurityKey),
             other => Err(format!("unknown unlock method type: {}", other)),
         }
+    }
+
+    /// Whether this method can unlock a cloud-synced vault without local
+    /// hardware key material.
+    pub fn is_portable(&self) -> bool {
+        matches!(self, Self::Pin | Self::Password)
+    }
+
+    /// Whether this method uses hardware/security-key material.
+    pub fn uses_security_key(&self) -> bool {
+        matches!(self, Self::SecurityKey | Self::PasswordSecurityKey)
+    }
+
+    /// Whether this method requires both a human secret and security-key
+    /// material in the same unwrap path.
+    pub fn is_combined_password_security_key(&self) -> bool {
+        matches!(self, Self::PasswordSecurityKey)
     }
 }
 
@@ -136,5 +157,31 @@ impl KdfParams {
 
     pub fn from_json_bytes(data: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(data).map_err(|e| format!("failed to parse KdfParams: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlock_method_type_roundtrips_combined_security_key() {
+        let parsed = UnlockMethodType::parse("password_security_key").unwrap();
+        assert_eq!(parsed, UnlockMethodType::PasswordSecurityKey);
+        assert_eq!(parsed.to_string(), "password_security_key");
+    }
+
+    #[test]
+    fn unlock_method_type_reports_portability_and_security_key_use() {
+        assert!(UnlockMethodType::Password.is_portable());
+        assert!(!UnlockMethodType::Password.uses_security_key());
+
+        assert!(!UnlockMethodType::SecurityKey.is_portable());
+        assert!(UnlockMethodType::SecurityKey.uses_security_key());
+        assert!(!UnlockMethodType::SecurityKey.is_combined_password_security_key());
+
+        assert!(!UnlockMethodType::PasswordSecurityKey.is_portable());
+        assert!(UnlockMethodType::PasswordSecurityKey.uses_security_key());
+        assert!(UnlockMethodType::PasswordSecurityKey.is_combined_password_security_key());
     }
 }

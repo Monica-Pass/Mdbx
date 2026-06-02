@@ -200,7 +200,9 @@
 
 必读：
 
-- `08-kdbx-to-mdbx-mapping.zh-CN.md`
+- `01-product-spec.zh-CN.md`
+- `06-sqlite-schema-v1.zh-CN.md`
+- `08-implementation-completion-plan.zh-CN.md`
 
 验收：
 
@@ -228,7 +230,7 @@
 必读：
 
 - `03-security-spec.zh-CN.md`
-- `09-tiga-parameters.zh-CN.md`
+- `06-sqlite-schema-v1.zh-CN.md`
 
 验收：
 

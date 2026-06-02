@@ -45,17 +45,19 @@ An MDBX implementation MUST allow create, read, update, delete, search, export, 
 The format MUST prioritize long-term stability.
 New versions MUST read older vaults.
 When possible, older implementations SHOULD safely ignore unknown non-critical additions.
+Implementations MUST NOT intentionally strand user data during migrations; data safety takes priority over convenience, cleanup, or format simplification.
 
 ### 4.3 Tiga Security Modes
 
 MDBX MUST support three security modes:
 
-- `Power Type`
-- `Multi Type`
-- `Sky Type`
+- `power`
+- `multi`
+- `sky`
 
 These modes MUST affect cryptographic parameters, caching behavior, and convenience features.
-Semantic mapping: `Power Type` = strongest protection, `Multi Type` = balanced default, `Sky Type` = faster and lighter-weight use.
+Compatibility display names MAY use `Power Type`, `Multi Type`, and `Sky Type`.
+Semantic mapping: `power` = strongest protection, `multi` = balanced default, `sky` = flexible and portable while still secure.
 Details are defined in `03-security-spec.md`.
 
 ### 4.4 Git-Like Conflict Prevention
@@ -253,6 +255,8 @@ Future MDBX versions MUST preserve these invariants:
 - attachment metadata remains first-class
 - lower versions can detect unsupported critical extensions
 - unknown non-critical fields can be preserved
+- old vaults remain readable before, during, and after migrations
+- portable unlock paths remain available unless the user deliberately chooses a stricter Tiga policy
 
 ## 14. Rejection Rules
 

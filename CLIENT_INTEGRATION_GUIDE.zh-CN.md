@@ -10,10 +10,10 @@
 
 更底层的格式规范请同时阅读：
 
-- `../mdbx-doc/01-product-spec.zh-CN.md`
-- `../mdbx-doc/02-storage-sync-spec.zh-CN.md`
-- `../mdbx-doc/03-security-spec.zh-CN.md`
-- `../mdbx-doc/06-sqlite-schema-v1.zh-CN.md`
+- `docs/01-product-spec.zh-CN.md`
+- `docs/02-storage-sync-spec.zh-CN.md`
+- `docs/03-security-spec.zh-CN.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
 ## 1. 接入边界
 
@@ -442,6 +442,14 @@ MAY 拆成多个 commit 的操作：
 
 - 用户看到的解锁方式
 - 底层实际参与加密的 key material
+
+Tiga 模式的解锁策略 SHOULD 按以下语义呈现：
+
+- `Sky`：灵活便携，不代表不安全。客户端 MAY 使用密码、PIN、平台凭据包装或安全密钥作为解锁入口，但仍必须走 MDBX 的 KDF、AEAD 和 keyring 机制。适合需要频繁跨设备、网盘同步或恢复优先的 vault。
+- `Multi`：默认平衡。客户端 SHOULD 建议用户添加安全密钥，但 MUST 保留清晰的可恢复路径，例如强密码。网盘中的 `.mdbx` 文件可以同步到新设备，新设备可通过已配置的便携解锁方式打开；如果安全密钥或等价平台凭据可用，也可以通过安全密钥方式打开。
+- `Power`：最高防护。客户端 SHOULD 引导用户配置密码 + 安全密钥组合解锁方式。若仍保留独立密码或 PIN 解锁，客户端 SHOULD 明确提示这会降低 Power 模式对离线爆破的防护强度。
+
+安全密钥参与解锁时，客户端 MUST NOT 把硬件密钥本体、challenge 响应、派生 key material 或可重放的等价材料写入 `.mdbx` 之外的日志、缓存或同步元数据。支持硬件密钥本身并不会让网盘存储变得不安全或不可用；是否便携取决于 vault 配置了哪些解锁路径。仅配置安全密钥且没有便携解锁方式的 vault 在新设备上需要同一把硬件密钥或等价平台凭据；客户端 SHOULD 在用户启用这种配置前说明恢复影响。
 
 客户端 MUST NOT 把主密码、派生密钥、epoch key 写入日志。
 

@@ -5,7 +5,7 @@ use crate::error::{StorageError, StorageResult};
 /// 创建全部 v1 表与索引。
 pub fn create_all_tables(conn: &Connection) -> StorageResult<()> {
     conn.execute_batch(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         VAULT_META_DDL,
         PROJECTS_DDL,
         ENTRIES_DDL,
@@ -22,7 +22,6 @@ pub fn create_all_tables(conn: &Connection) -> StorageResult<()> {
         CONFLICTS_DDL,
         UNLOCK_METHODS_DDL,
         PROJECT_TAGS_DDL,
-        PROJECT_TITLES_FTS_DDL,
         INDEX_DDL,
     ))
     .map_err(|e| StorageError::SchemaCreation(e.to_string()))
@@ -222,7 +221,7 @@ CREATE TABLE IF NOT EXISTS conflicts (
 pub const UNLOCK_METHODS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS unlock_methods (
     method_id            TEXT PRIMARY KEY NOT NULL,
-    method_type          TEXT NOT NULL CHECK(method_type IN ('pin','password','security_key')),
+    method_type          TEXT NOT NULL CHECK(method_type IN ('pin','password','security_key','password_security_key')),
     kdf_profile_id       TEXT NOT NULL,
     kdf_params_ct        BLOB NOT NULL,
     wrapped_vault_key_ct BLOB NOT NULL,
@@ -236,13 +235,6 @@ CREATE TABLE IF NOT EXISTS project_tags (
     tag        TEXT NOT NULL COLLATE NOCASE,
     PRIMARY KEY (project_id, tag),
     FOREIGN KEY (project_id) REFERENCES projects(project_id)
-);";
-
-pub const PROJECT_TITLES_FTS_DDL: &str = "\
-CREATE VIRTUAL TABLE IF NOT EXISTS project_titles_fts USING fts5(
-    project_id UNINDEXED,
-    title,
-    tokenize='unicode61 remove_diacritics 2'
 );";
 
 // ---------------------------------------------------------------------------
@@ -331,7 +323,6 @@ mod tests {
             "conflicts",
             "unlock_methods",
             "project_tags",
-            "project_titles_fts",
         ];
         for table in required {
             assert!(
@@ -340,6 +331,22 @@ mod tests {
                 table
             );
         }
+    }
+
+    #[test]
+    fn test_project_titles_fts_is_not_persistent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        create_all_tables(&conn).unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'project_titles_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

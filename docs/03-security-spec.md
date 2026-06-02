@@ -30,22 +30,33 @@ The preferred default stack is:
 
 - `Argon2id + HKDF-SHA-256 + XChaCha20-Poly1305`
 
+Current committed AEAD envelope:
+
+- new ciphertext values MUST use `MDBXAE1\0 || commitment || nonce || ciphertext`
+- `commitment` is an HMAC-SHA-256 commitment over the envelope context, associated data, nonce, and encrypted payload
+- decryptors MUST continue to accept legacy `nonce || ciphertext` values written before the committed envelope existed
+- encryptors MUST NOT write new legacy envelopes
+
+Random key or nonce generation failure MUST fail the operation. Implementations MUST NOT fall back to an all-zero key, deterministic nonce, or other placeholder secret.
+
 ## 3. Tiga Modes
 
 MDBX MUST expose three user-selectable security modes.
 
-Naming convention:
+Stored values and API names:
 
-- `Power Type`
+- `power`
   - strongest-protection mode
 
-- `Multi Type`
+- `multi`
   - balanced default mode
 
-- `Sky Type`
-  - faster and lighter-weight mode
+- `sky`
+  - flexible and portable mode that remains secure
 
-### 3.1 Power Type
+Compatibility display names MAY use `Power Type`, `Multi Type`, and `Sky Type`, but storage and API values SHOULD use `power`, `multi`, and `sky`.
+
+### 3.1 Power
 
 Purpose:
 
@@ -58,30 +69,38 @@ Typical effects:
 - less plaintext caching
 - stronger warnings before export or copy
 - stricter attachment handling defaults
+- password + security-key combined unlock SHOULD be configured for full Power policy satisfaction
+- standalone portable unlock SHOULD NOT satisfy the full Power policy unless explicitly accepted as a downgrade by the user
 
-### 3.2 Multi Type
+### 3.2 Multi
 
 Purpose:
 
 - recommended default balance
+- cloud-drive portability with strong recovery semantics
 
 Typical effects:
 
 - strong Argon2id cost
 - moderate caching allowed
 - usability features enabled when low risk
+- security key SHOULD be recommended
+- a portable recovery path such as a strong password MUST remain available unless the user explicitly chooses otherwise
 
-### 3.3 Sky Type
+### 3.3 Sky
 
 Purpose:
 
-- convenience and speed in lower-risk environments
+- flexible, portable, and recovery-first use, including cloud-drive workflows
+- Sky is not an unsafe mode
 
 Typical effects:
 
 - lower but still acceptable KDF cost floor
 - more permissive caching
 - faster unlock and routine operations
+- password, PIN wrapper, platform credential wrapper, or security-key unlock MAY be offered
+- all unlock paths MUST still use MDBX KDF, AEAD, keyring, and logging rules
 
 ## 4. Tiga Mode Scope
 
@@ -173,6 +192,7 @@ MDBX SHOULD support combinations of:
 - key file
 - security key or hardware-backed key material
 - biometric unlock wrapper where supported by platform
+- combined password + security-key unlock, represented as `password_security_key`
 
 ### 10.1 PIN Unlock
 
@@ -215,6 +235,14 @@ It may be used to:
 It SHOULD NOT be described as a mandatory cloud-dependent unlock mechanism.
 MDBX MUST remain local-first.
 
+Hardware-key support does not make cloud-drive storage unsafe or unusable. Portability depends on the configured unlock methods:
+
+- `password` and properly designed portable recovery methods can open a cloud-synced vault on a new device.
+- `security_key`-only configurations require the same hardware key or equivalent platform credential on the new device.
+- `password_security_key` provides stronger offline-attack resistance but intentionally reduces standalone portability.
+
+Clients MUST explain these recovery consequences before disabling all portable unlock paths.
+
 Biometric unlock SHOULD wrap a stronger underlying secret and SHOULD NOT replace the actual cryptographic vault secret model.
 
 ## 10.4 Minimum Unlock Capability
@@ -224,13 +252,14 @@ A user-facing MDBX implementation SHOULD support at least two of the following t
 - `PIN`
 - `password`
 - `security key`
+- `password_security_key`
 
 If an implementation claims password support, that password support MUST include Chinese input.
 
 ## 11. Minimum Parameter Philosophy
 
 MDBX MUST define minimum supported security floors.
-Even `Sky Type` MUST remain meaningfully secure and MUST NOT degrade into a toy configuration.
+Even `sky` MUST remain meaningfully secure and MUST NOT degrade into a toy configuration.
 
 The exact parameter table SHOULD be published separately and versioned.
 
@@ -260,6 +289,9 @@ A security design is non-compliant if it:
 
 - lacks authenticated encryption
 - leaves attachment integrity undefined
+- writes new ciphertext without the committed AEAD envelope
+- intentionally removes the ability to read legacy valid ciphertext or vaults without a documented critical-security migration
+- falls back to an all-zero key, deterministic nonce, or placeholder secret after RNG failure
 - allows weaker mode switching without explicit user acknowledgement
 - stores long-lived plaintext secrets by default without strong justification
 - treats biometric unlock as the only real secret

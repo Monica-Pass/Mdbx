@@ -12,6 +12,7 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - 通过 Tiga 模型提供三档安全状态
 - 以 `project` 为中心组织密码
 - 原生支持附件
+- 4ever And 4ever：旧 vault 长期可读，数据安全优先于一时方便
 
 ## RFC 风格分层
 
@@ -23,11 +24,11 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 
 - `06` 到 `09`
   - 实现指导层
-  - 定义 SQLite schema、任务拆分、KDBX 映射、Tiga 参数
+  - 定义 SQLite schema、任务拆分、当前实现完成计划等
 
-- `10`
+- `10` 以后
   - 状态总结层
-  - 定义当前完成度、风险、下一步建议
+  - 定义当前完成度、CLI 接入、风险、下一步建议
 
 ## 阅读顺序
 
@@ -50,9 +51,8 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 6. `05-rfc-structure.zh-CN.md`
 7. `06-sqlite-schema-v1.zh-CN.md`
 8. `07-low-end-model-task-breakdown.zh-CN.md`
-9. `08-kdbx-to-mdbx-mapping.zh-CN.md`
-10. `09-tiga-parameters.zh-CN.md`
-11. `10-status-summary.zh-CN.md`
+9. `08-implementation-completion-plan.zh-CN.md`
+10. `11-monica-pass-cli-development.zh-CN.md`
 
 ## 文档职责
 
@@ -81,14 +81,11 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - `07-low-end-model-task-breakdown.zh-CN.md`
   - 专门给低端模型使用的任务拆分清单，可直接派活。
 
-- `08-kdbx-to-mdbx-mapping.zh-CN.md`
-  - KDBX 到 MDBX 的映射规范，减少导入器实现时的自由发挥。
+- `08-implementation-completion-plan.zh-CN.md`
+  - 当前实现完成计划，记录已经完成的安全、同步、tracked mutation 和客户端接入事项。
 
-- `09-tiga-parameters.zh-CN.md`
-  - Tiga 三模式的参数推荐表和行为差异说明。
-
-- `10-status-summary.zh-CN.md`
-  - 当前 spec 完成度、风险项、MVP 就绪度、下一步建议。
+- `11-monica-pass-cli-development.zh-CN.md`
+  - Monica Pass CLI 开发与接入说明。
 
 ## 不可妥协原则
 
@@ -97,6 +94,8 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - 本地优先
 - 长期可读、可迁移
 - 前向兼容与后向兼容
+- 4ever And 4ever：新版本必须能读旧 vault；旧实现应尽量保留未知但非关键的数据
+- 数据安全优先于便利性
 - 不依赖中心服务器
 - 以 `project` 为中心组织密码
 - 原生附件能力
@@ -118,8 +117,9 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
   - 归属于 `project` 或 `entry` 的文件或二进制内容。
 
 - `tiga mode`
-  - 三档安全模式之一：`Power Type`、`Multi Type`、`Sky Type`。
-  - 语义映射为：`Power Type` = 最高防护，`Multi Type` = 平衡默认，`Sky Type` = 更快更轻便。
+  - 存储值和 API 使用三档之一：`power`、`multi`、`sky`。
+  - 兼容性显示名可以使用：`Power Type`、`Multi Type`、`Sky Type`。
+  - 语义映射为：`power` = 最高防护，`multi` = 平衡默认，`sky` = 灵活便携但仍然安全。
 
 - `oplog`
   - 追加式变更历史，用于同步与恢复。

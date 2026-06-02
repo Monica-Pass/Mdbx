@@ -74,7 +74,7 @@ MVP 必须包含：
 
 ### Inputs
 
-列出本任务必须遵循的 `mdbx-doc/` 规范文件。
+列出本任务必须遵循的 `docs/` 规范文件。
 
 ### Constraints
 

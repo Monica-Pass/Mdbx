@@ -590,6 +590,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -607,6 +608,7 @@ dependencies = [
  "thiserror",
  "unicode-normalization",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -23,11 +23,11 @@ MDBX 必须坚持：
 
 - Rust workspace：`mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync`、`mdbx-cli`。
 - SQLite + WAL + foreign key + secure_delete 基线。
-- v1 schema 覆盖 `projects`、`entries`、`attachments`、`attachment_chunks`、`commits`、`commit_parents`、`device_heads`、`branches`、`object_versions`、`tombstones`、`snapshots`、`key_epochs`、`conflicts`。
+- v1 schema 覆盖 `projects`、`entries`、`attachments`、`attachment_chunks`、`commits`、`commit_parents`、`device_heads`、`branches`、`object_versions`、`tombstones`、`snapshots`、`key_epochs`、`conflicts`、`unlock_methods`、`project_tags`。
 - project、entry、attachment repo 支持创建、更新、软删除和 tombstone。
 - attachment 支持 inline/chunked 内容、chunk hash、整体 hash、改名不改内容。
 - Tiga 解析支持 entry > project > global。
-- Unlock 支持密码/PIN/security key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC。
+- Unlock 支持密码/PIN/security key/password_security_key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC。
 - KDBX import/export 具备基本回环。
 - conflict detector 支持 JSON 三方字段合并。
 - snapshot、recovery、benchmark harness 已有 MVP 骨架。
@@ -46,6 +46,16 @@ MDBX 必须坚持：
 - entry 本地 create/update/move/copy/delete 会写入 `object_versions` 行快照，用于后续因果三方合并。
 - sync apply 已能在非快进分叉场景消费 `mdbx-storage/state-v1`，对 entry payload 做 base/local/incoming 三方字段合并。
 - entry 不同 payload 字段并发修改会自动产生 merge commit；同一 payload 字段并发修改会生成 unresolved conflict，并记录具体字段名。
+
+本轮安全与文档对齐已补强：
+
+- 规范目录已统一为 `docs/`，README、接入指南和规范索引已改为新路径。
+- 新写入密文使用 `MDBXAE1\0 || commitment || nonce || ciphertext` committed AEAD envelope；解密继续兼容 legacy `nonce || ciphertext`。
+- RNG/key/nonce 生成失败必须失败，不允许退回全零 key、确定性 nonce 或占位秘密。
+- Tiga 存储/API 名称对齐为 `sky`、`multi`、`power`；`Power Type`、`Multi Type`、`Sky Type` 只作为兼容显示名。
+- Sky 被定义为灵活便携但仍然安全，适合网盘同步和恢复优先场景；Multi 建议安全密钥但保留便携恢复；Power 要求密码 + 安全密钥组合解锁才能完整满足策略。
+- `unlock_methods.method_type` 明确支持 `password_security_key`。
+- 全文搜索只允许使用解锁会话内的临时索引；持久 FTS 不得保存解密后的 project title 或 secret-bearing text。
 
 ## 3. 主要差距
 

@@ -41,8 +41,11 @@ The minimum logical schema MUST reserve space for at least these record classes:
 - `branches`
 - `tombstones`
 - `snapshots`
-- `settings`
 - `key_epochs`
+- `conflicts`
+- `unlock_methods`
+- `object_versions`
+- `project_tags`
 
 An MVP MAY omit some secondary indexes or optional tables, but MUST NOT omit `projects` or `attachments`.
 
@@ -211,6 +214,8 @@ The storage engine SHOULD maintain indexes for at least:
 - attachment ownership
 - tombstone lookup
 - commit lineage lookup
+
+Full-text search MAY use temporary indexes for decrypted titles during an unlocked session. Persistent FTS tables MUST NOT store decrypted project titles or other secret-bearing text.
 
 ## 17. Compaction Rules
 

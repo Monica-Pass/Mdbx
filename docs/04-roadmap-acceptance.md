@@ -74,7 +74,7 @@ State exactly what must be produced.
 
 ### Inputs
 
-List the governing spec files in `mdbx-doc/`.
+List the governing spec files in `docs/`.
 
 ### Constraints
 

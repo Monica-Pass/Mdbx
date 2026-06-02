@@ -37,15 +37,17 @@
 - `snapshots`
 - `key_epochs`
 - `conflicts`
+- `unlock_methods`
+- `project_tags`
 
 ### 2.2 可后续补强表
 
 以下表可在 MVP 后增强：
 
 - `audit_events`
-- `project_tags`
 - `entry_custom_fields`
-- `search_index_cache`
+
+全文搜索索引可以在解锁会话中使用临时表或内存结构，但不得作为持久 schema 保存解密后的 project 标题或其他秘密文本。
 
 ## 3. 表结构总览
 
@@ -346,6 +348,65 @@
 - `activated_at TEXT NULL`
 - `retired_at TEXT NULL`
 
+## 3.14 conflicts
+
+用途：
+
+- 记录自动合并不安全的并发修改
+- 支持后续用户选择 local、incoming 或 custom 结果
+
+推荐字段：
+
+- `conflict_id TEXT PRIMARY KEY`
+- `object_type TEXT NOT NULL`
+- `object_id TEXT NOT NULL`
+- `base_commit_id TEXT NOT NULL`
+- `local_commit_id TEXT NOT NULL`
+- `incoming_commit_id TEXT NOT NULL`
+- `conflicting_fields TEXT NOT NULL`
+- `resolution TEXT NOT NULL DEFAULT 'unresolved'`
+- `created_at TEXT NOT NULL`
+- `resolved_at TEXT NULL`
+
+## 3.15 unlock_methods
+
+用途：
+
+- 记录用户可见解锁方式如何包装 vault key
+- 支持 Tiga 对便携性、安全密钥和组合解锁的策略约束
+
+推荐字段：
+
+- `method_id TEXT PRIMARY KEY`
+- `method_type TEXT NOT NULL`
+- `kdf_profile_id TEXT NOT NULL`
+- `kdf_params_ct BLOB NOT NULL`
+- `wrapped_vault_key_ct BLOB NOT NULL`
+- `created_at TEXT NOT NULL`
+- `updated_at TEXT NOT NULL`
+
+约束：
+
+- `method_type` 必须至少支持 `pin`、`password`、`security_key`、`password_security_key`
+- `password_security_key` 表示密码 + 安全密钥组合解锁路径，用于满足更严格的 Power 策略
+- 安全密钥材料、challenge response、派生 key material 或可重放等价材料不得写入日志、缓存或未认证同步元数据
+
+## 3.16 project_tags
+
+用途：
+
+- 记录非秘密标签索引或已确认可持久化的标签关系
+
+推荐字段：
+
+- `project_id TEXT NOT NULL`
+- `tag TEXT NOT NULL COLLATE NOCASE`
+- `PRIMARY KEY (project_id, tag)`
+
+约束：
+
+- 如果 tag 可能包含秘密语义，应改为密文载荷或仅在解锁会话中临时索引
+
 ## 4. 建议关系图
 
 逻辑关系如下：
@@ -364,6 +425,9 @@ vault
   -> tombstones
   -> snapshots
   -> key_epochs
+  -> conflicts
+  -> unlock_methods
+  -> project_tags
 ```
 
 ## 5. 最小 SQL 原型约束
@@ -377,6 +441,8 @@ vault
 - `commits` 与 `commit_parents` 支持 DAG
 - `object_versions` 支持 entry 的 commit 快照
 - `tombstones` 支持延迟清理
+- `unlock_methods` 支持 `pin`、`password`、`security_key`、`password_security_key`
+- 全文搜索持久 schema 不保存解密标题
 
 ## 6. 禁止事项
 
@@ -387,6 +453,8 @@ vault
 - 附件只是某个 JSON 大字段中的匿名数组
 - 大附件和普通元数据强耦合，导致小修改也重写大块内容
 - 没有 `commits` 或没有 `tombstones`
+- 持久 FTS 表保存解密后的 project title 或 secret-bearing text
+- `unlock_methods` 不支持组合的 `password_security_key`，却宣称完整 Power 策略
 
 ## 7. MVP 实现顺序建议
 
@@ -406,6 +474,8 @@ vault
 12. `snapshots`
 13. `key_epochs`
 14. `conflicts`
+15. `unlock_methods`
+16. `project_tags`
 
 ## 8. 验收标准
 
@@ -417,4 +487,6 @@ vault
 - 能表达 commit DAG
 - 能表达 entry 的 commit 快照，用于字段级三方合并
 - 能表达 tombstone
+- 能表达多种 unlock method，包括 `password_security_key`
+- 能确认全文搜索不会把解密标题持久化
 - 能支持后续 KDBX 导入映射

@@ -15,6 +15,17 @@ pub enum TigaMode {
     Power,
 }
 
+/// Tiga 对 vault 解锁方式的策略描述。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TigaUnlockPolicy {
+    /// 是否允许不依赖硬件密钥的便携解锁方式。
+    pub allows_portable_unlock: bool,
+    /// 是否建议配置硬件密钥作为额外保护或便利入口。
+    pub recommends_security_key: bool,
+    /// 是否要求存在密码 + 硬件密钥组合解锁方式。
+    pub requires_combined_password_security_key: bool,
+}
+
 impl TigaMode {
     /// 根据三级层次解析有效的 Tiga 模式。
     ///
@@ -27,6 +38,29 @@ impl TigaMode {
         entry_override
             .or(project_override)
             .unwrap_or(global_default)
+    }
+
+    /// 返回当前 Tiga 模式对应的 vault 解锁策略。
+    pub fn unlock_policy(&self) -> TigaUnlockPolicy {
+        match self {
+            // Sky 是灵活便携，不是弱安全：仍使用同一套 KDF/AEAD/keyring，
+            // 只是允许用户保留更容易跨设备恢复的解锁方式。
+            TigaMode::Sky => TigaUnlockPolicy {
+                allows_portable_unlock: true,
+                recommends_security_key: false,
+                requires_combined_password_security_key: false,
+            },
+            TigaMode::Multi => TigaUnlockPolicy {
+                allows_portable_unlock: true,
+                recommends_security_key: true,
+                requires_combined_password_security_key: false,
+            },
+            TigaMode::Power => TigaUnlockPolicy {
+                allows_portable_unlock: false,
+                recommends_security_key: true,
+                requires_combined_password_security_key: true,
+            },
+        }
     }
 }
 
@@ -88,5 +122,28 @@ mod tests {
             let parsed: TigaMode = s.parse().unwrap();
             assert_eq!(mode, parsed);
         }
+    }
+
+    #[test]
+    fn test_unlock_policy_sky_is_portable_not_unsafe() {
+        let policy = TigaMode::Sky.unlock_policy();
+        assert!(policy.allows_portable_unlock);
+        assert!(!policy.requires_combined_password_security_key);
+    }
+
+    #[test]
+    fn test_unlock_policy_multi_recommends_security_key() {
+        let policy = TigaMode::Multi.unlock_policy();
+        assert!(policy.allows_portable_unlock);
+        assert!(policy.recommends_security_key);
+        assert!(!policy.requires_combined_password_security_key);
+    }
+
+    #[test]
+    fn test_unlock_policy_power_requires_combined_factor() {
+        let policy = TigaMode::Power.unlock_policy();
+        assert!(!policy.allows_portable_unlock);
+        assert!(policy.recommends_security_key);
+        assert!(policy.requires_combined_password_security_key);
     }
 }

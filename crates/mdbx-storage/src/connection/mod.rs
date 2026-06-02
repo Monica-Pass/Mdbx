@@ -25,6 +25,7 @@ impl VaultConnection {
     pub fn open(path: &Path) -> StorageResult<Self> {
         let conn = Connection::open(path)?;
         Self::apply_pragmas(&conn)?;
+        Self::cleanup_legacy_persistent_fts(&conn)?;
         Ok(Self {
             conn,
             keyring: None,
@@ -36,6 +37,7 @@ impl VaultConnection {
         let conn = Connection::open(path)?;
         Self::apply_pragmas(&conn)?;
         schema::create_all_tables(&conn)?;
+        Self::cleanup_legacy_persistent_fts(&conn)?;
         Ok(Self {
             conn,
             keyring: None,
@@ -47,6 +49,7 @@ impl VaultConnection {
         let conn = Connection::open_in_memory()?;
         Self::apply_pragmas(&conn)?;
         schema::create_all_tables(&conn)?;
+        Self::cleanup_legacy_persistent_fts(&conn)?;
         Ok(Self {
             conn,
             keyring: None,
@@ -61,6 +64,11 @@ impl VaultConnection {
              PRAGMA busy_timeout=5000;",
         )
         .map_err(|e| StorageError::Database(e))
+    }
+
+    fn cleanup_legacy_persistent_fts(conn: &Connection) -> StorageResult<()> {
+        conn.execute_batch("DROP TABLE IF EXISTS main.project_titles_fts;")
+            .map_err(StorageError::Database)
     }
 
     /// 获取内部 rusqlite 连接的引用。
@@ -83,5 +91,69 @@ impl VaultConnection {
     /// 当前连接是否已启用加密。
     pub fn is_encrypted(&self) -> bool {
         self.keyring.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mdbx-{label}-{}.db", Uuid::new_v4()))
+    }
+
+    fn create_legacy_fts_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE main.project_titles_fts USING fts5(
+                project_id UNINDEXED,
+                title,
+                tokenize='unicode61 remove_diacritics 2'
+             );
+             INSERT INTO main.project_titles_fts (project_id, title)
+             VALUES ('project-1', 'plaintext legacy title');",
+        )
+        .unwrap();
+    }
+
+    fn persistent_fts_exists(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'project_titles_fts'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_removes_legacy_persistent_fts() {
+        let path = temp_db_path("open-legacy-fts");
+        create_legacy_fts_db(&path);
+
+        let conn = VaultConnection::open(&path).unwrap();
+        assert!(!persistent_fts_exists(conn.inner()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_removes_legacy_persistent_fts_from_existing_file() {
+        let path = temp_db_path("create-legacy-fts");
+        create_legacy_fts_db(&path);
+
+        let conn = VaultConnection::create(&path).unwrap();
+        assert!(!persistent_fts_exists(conn.inner()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_in_memory_does_not_create_persistent_fts() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        assert!(!persistent_fts_exists(conn.inner()));
     }
 }

@@ -1,5 +1,6 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::kdf;
@@ -30,6 +31,18 @@ pub struct Keyring {
     pub history_subkey: Vec<u8>,
     /// 完整性认证子密钥
     pub integrity_subkey: Vec<u8>,
+}
+
+impl Drop for Keyring {
+    fn drop(&mut self) {
+        self.unlock_key.zeroize();
+        self.vault_key.zeroize();
+        self.record_subkey.zeroize();
+        self.attachment_subkey.zeroize();
+        self.metadata_subkey.zeroize();
+        self.history_subkey.zeroize();
+        self.integrity_subkey.zeroize();
+    }
 }
 
 impl Keyring {

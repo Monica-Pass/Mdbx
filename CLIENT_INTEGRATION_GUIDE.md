@@ -10,10 +10,10 @@ It does not replace the full format specifications. It answers three practical q
 
 Read these lower-level specs as well:
 
-- `../mdbx-doc/01-product-spec.md`
-- `../mdbx-doc/02-storage-sync-spec.md`
-- `../mdbx-doc/03-security-spec.md`
-- `../mdbx-doc/06-sqlite-schema-v1.zh-CN.md`
+- `docs/01-product-spec.md`
+- `docs/02-storage-sync-spec.md`
+- `docs/03-security-spec.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
 ## 1. Integration Boundary
 
@@ -442,6 +442,14 @@ Clients must clearly distinguish:
 
 - user-visible unlock method
 - cryptographic key material actually used by the storage layer
+
+Clients should present Tiga unlock policy with these semantics:
+
+- `Sky`: flexible and portable, not unsafe. Clients may use password, PIN, platform credential wrapping, or security-key unlock, but must still use MDBX KDF, AEAD, and keyring handling. This mode fits cloud-drive sync, frequent cross-device use, and recovery-first vaults.
+- `Multi`: balanced default. Clients should recommend adding a security key, but must keep a clear recovery path such as a strong password. A cloud-synced `.mdbx` file can be opened on a new device through any configured portable unlock path, or through a security-key path when the required hardware key or equivalent platform credential is available.
+- `Power`: strongest protection. Clients should guide users toward a password + security key combined unlock method. If standalone password or PIN unlock remains configured, clients should clearly warn that it weakens Power-mode resistance to offline brute-force attacks.
+
+When a security key participates in unlock, clients must not log or cache the hardware key itself, challenge responses, derived key material, or replayable equivalent material. Hardware-key support does not make cloud-drive storage unsafe or unusable by itself; portability depends on the configured unlock paths. A vault configured only with security-key unlock and no portable unlock path will require the same hardware key or equivalent platform credential on a new device, so clients should explain this recovery impact before enabling that configuration.
 
 Clients must not log master passwords, derived keys, or epoch keys.
 

@@ -6,7 +6,9 @@ This directory contains the Rust workspace and implementation notes for Monica M
 
 MDBX is Monica's local-first encrypted vault format. It is designed around stable long-term storage, Git-like logical history, sync conflict handling, native attachments, snapshots, and Tiga security modes.
 
-For the normative format documents, see `../mdbx-doc/`.
+For the normative format documents, see `docs/`.
+
+The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibility paths must be preserved whenever possible, and data safety comes before convenience.
 
 ## Workspace Layout
 
@@ -20,8 +22,8 @@ For the normative format documents, see `../mdbx-doc/`.
   - SQLite schema, vault initialization, repositories, search, snapshots, conflicts, recovery, and sync state.
 - `crates/mdbx-cli`
   - CLI entry point for local testing and development.
-- `tests/`
-  - Compatibility, concurrency, and recovery scenarios.
+- crate-local `tests/`
+  - Compatibility, crypto-vector, concurrency, and recovery scenarios live beside the crates they validate.
 
 ## Documents In This Directory
 
@@ -32,15 +34,15 @@ For the normative format documents, see `../mdbx-doc/`.
 
 ## Specification Documents
 
-Read the spec set in `../mdbx-doc/` before changing storage behavior:
+Read the spec set in `docs/` before changing storage behavior:
 
-- `README.md` / `README.zh-CN.md`
-- `01-product-spec.md`
-- `02-storage-sync-spec.md`
-- `03-security-spec.md`
-- `06-sqlite-schema-v1.zh-CN.md`
+- `docs/README.md` / `docs/README.zh-CN.md`
+- `docs/01-product-spec.md`
+- `docs/02-storage-sync-spec.md`
+- `docs/03-security-spec.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
-The `mdbx-doc` directory defines the format and product constraints. This directory implements and documents practical integration.
+The `docs/` directory defines the format and product constraints. The Rust workspace implements those constraints and documents practical integration.
 
 ## Client Support Levels
 
@@ -96,6 +98,8 @@ cargo run -p mdbx-cli -- --help
 ## Implementation Rules
 
 Do not bypass repository/storage APIs from client code unless you are changing the storage layer itself.
+
+Compatibility and recovery are implementation requirements, not polish. New encryption envelopes, tables, indexes, unlock methods, and Tiga policies must keep old vault readability unless a critical security issue requires a deliberate migration.
 
 Client code should not directly write:
 
