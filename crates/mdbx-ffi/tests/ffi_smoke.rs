@@ -153,7 +153,10 @@ fn creates_reads_renames_and_deletes_attachment_content() {
         .unwrap();
     assert_eq!(attachment.file_name, "recovery.txt");
     assert_eq!(attachment.media_type.as_deref(), Some("text/plain"));
-    assert_eq!(attachment.entry_id.as_deref(), Some(entry.entry_id.as_str()));
+    assert_eq!(
+        attachment.entry_id.as_deref(),
+        Some(entry.entry_id.as_str())
+    );
 
     let content = b"one\ntwo\nthree".to_vec();
     let written = vault
@@ -227,15 +230,40 @@ fn updates_deletes_restores_and_moves_generic_entry() {
         true
     );
 
-    vault
-        .delete_entry(source.project_id.clone(), created.entry_id.clone())
+    let type_changed = vault
+        .update_entry(
+            source.project_id.clone(),
+            created.entry_id.clone(),
+            "ssh-key".to_string(),
+            "SSH Key".to_string(),
+            r#"{"kind":"password","username":"alice","sshKeyData":"private-key-material"}"#
+                .to_string(),
+        )
         .unwrap();
+    assert_eq!(type_changed.entry_id, created.entry_id);
+    assert_eq!(type_changed.title, "SSH Key");
+    assert_eq!(type_changed.entry_type, "ssh-key");
     assert!(vault
         .list_entries(source.project_id.clone(), Some("login".to_string()))
         .unwrap()
         .is_empty());
+    assert_eq!(
+        vault
+            .list_entries(source.project_id.clone(), Some("ssh-key".to_string()))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    vault
+        .delete_entry(source.project_id.clone(), created.entry_id.clone())
+        .unwrap();
+    assert!(vault
+        .list_entries(source.project_id.clone(), Some("ssh-key".to_string()))
+        .unwrap()
+        .is_empty());
     let deleted = vault
-        .list_deleted_entries(source.project_id.clone(), Some("login".to_string()))
+        .list_deleted_entries(source.project_id.clone(), Some("ssh-key".to_string()))
         .unwrap();
     assert_eq!(deleted.len(), 1);
     assert!(deleted[0].deleted);
