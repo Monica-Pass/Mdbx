@@ -425,6 +425,52 @@ impl UnlockService {
         )
     }
 
+    /// 重设密码。
+    ///
+    /// 仅允许在已经解锁的连接上调用。该路径不需要旧密码明文，而是复用当前
+    /// keyring 中的 vault_key，用新密码重新包裹同一个 vault key。
+    pub fn reset_password_with_mode(
+        conn: &mut VaultConnection,
+        new_password: &str,
+        mode: TigaMode,
+    ) -> StorageResult<()> {
+        Self::find_method_by_type(conn, UnlockMethodType::Password)?
+            .ok_or_else(|| StorageError::Validation("no password configured".to_string()))?;
+
+        let vault_key = conn
+            .keyring()
+            .map(|keyring| keyring.vault_key.clone())
+            .ok_or_else(|| {
+                StorageError::Validation(
+                    "vault must be unlocked before resetting password".to_string(),
+                )
+            })?;
+
+        Self::validate_password(new_password)?;
+        let normalized = Self::normalize_unicode(new_password);
+        let mut new_kdf_params = KdfParams::for_password_with_mode(mode);
+        new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
+            StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
+        })?;
+        let new_unlock_key =
+            Zeroizing::new(Self::derive_key(normalized.as_bytes(), &new_kdf_params)?);
+        let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), &vault_key)?;
+        let active_epoch_wrapped = Self::wrap_active_key_epoch(&vault_key)?;
+
+        Self::update_method_key(
+            conn,
+            UnlockMethodType::Password,
+            &new_kdf_params,
+            &new_wrapped,
+            &active_epoch_wrapped,
+        )?;
+
+        let vault_ctx = Self::read_vault_context(conn)?;
+        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
+        conn.attach_keyring(keyring);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // LIST — 查询
     // -----------------------------------------------------------------------
@@ -1063,6 +1109,51 @@ mod tests {
 
         assert!(UnlockService::unlock_with_password(&mut conn, "old-password").is_err());
         assert!(UnlockService::unlock_with_password(&mut conn, "new-password").is_ok());
+    }
+
+    #[test]
+    fn test_reset_password_uses_unlocked_vault_key() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "old-password").unwrap();
+        let vault_key = conn.keyring().unwrap().vault_key.clone();
+
+        UnlockService::reset_password_with_mode(&mut conn, "new-password", TigaMode::Multi)
+            .unwrap();
+
+        assert!(UnlockService::unlock_with_password(&mut conn, "old-password").is_err());
+        assert!(UnlockService::unlock_with_password(&mut conn, "new-password").is_ok());
+        assert_eq!(conn.keyring().unwrap().vault_key, vault_key);
+    }
+
+    #[test]
+    fn test_reset_password_requires_unlocked_vault() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "old-password").unwrap();
+        conn.keyring = None;
+
+        let result =
+            UnlockService::reset_password_with_mode(&mut conn, "new-password", TigaMode::Multi);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vault must be unlocked before resetting password"));
+    }
+
+    #[test]
+    fn test_reset_password_requires_configured_password_method() {
+        let mut conn = setup();
+        UnlockService::setup_pin(&mut conn, "123456").unwrap();
+
+        let result =
+            UnlockService::reset_password_with_mode(&mut conn, "new-password", TigaMode::Multi);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no password configured"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ members = [
     "crates/mdbx-storage",
     "crates/mdbx-sync",
     "crates/mdbx-cli",
+    "crates/mdbx-ffi",
 ]
 
 [workspace.package]
