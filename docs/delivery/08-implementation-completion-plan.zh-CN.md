@@ -1,0 +1,251 @@
+# MDBX 实现补完计划
+
+版本：`MDBX-1-DRAFT`
+
+本文是执行文档。它把原始设计清单、现有 `mdbx/` Rust 实现、后续 Monica Android 接入放到同一张路线图里。后续开发应优先更新本文，再按本文推进代码。
+
+## 1. 不可妥协原则
+
+MDBX 必须坚持：
+
+- 本地优先：所有创建、修改、删除、搜索、冲突处理都能离线完成。
+- 4ever：格式公开、自描述、自校验、长期可读，新增能力必须保留兼容路径。
+- project 优先：`project` 是一等主容器，entry 不允许退化成无归属平铺密码。
+- attachment 一等化：附件从 v1 起进入 schema、历史、恢复和完整性模型。
+- 类 Git 历史：每个本地变更必须产生 commit，commit DAG、device head、tombstone、conflict 都是核心格式的一部分。
+- 因果冲突检测：不能只靠时间戳；同一秘密字段并发修改必须显式冲突。
+- 安全默认：加密、认证、完整性验证失败必须失败，不能静默回退。
+- 增量写入：常规小改动只更新相关行和追加历史，不能逻辑上重写全库。
+
+## 2. 当前实现状态
+
+`mdbx/` 已经具备这些基础：
+
+- Rust workspace：`mdbx-core`、`mdbx-crypto`、`mdbx-storage`、`mdbx-sync`、`mdbx-ffi`、`mdbx-cli`。
+- SQLite + WAL + foreign key + secure_delete 基线。
+- v1 schema 覆盖 `projects`、`entries`、`attachments`、`attachment_chunks`、`commits`、`commit_parents`、`device_heads`、`branches`、`object_versions`、`tombstones`、`snapshots`、`key_epochs`、`conflicts`、`unlock_methods`、`project_tags`。
+- project、entry、attachment repo 支持创建、更新、软删除和 tombstone。
+- attachment 支持 inline/chunked 内容、chunk hash、整体 hash、改名不改内容。
+- Tiga 解析支持 entry > project > global。
+- Unlock storage core 支持密码/PIN/security key/password_security_key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC；CLI 当前只支持密码/PIN 解锁，真实 FIDO/WebAuthn/security-key 交互仍是客户端后续边界。
+- KDBX JSON import/export 具备基本回环；这是互操作 JSON 中间表示，不是完整二进制 `.kdbx` 解析/写入。
+- conflict detector 支持 JSON 三方字段合并。
+- snapshot、recovery、benchmark harness 已有 MVP 骨架。
+
+上一轮已补强：
+
+- 新增 history/integrity 子密钥。
+- commit `changed_object_ids_ct` 在有 keyring 时加密。
+- commit `integrity_tag` 不再写 `X'00'`，改为 HMAC-SHA-256 或测试模式 SHA-256。
+- 已解锁状态下 project/entry/attachment 解密失败不再吞掉。
+- 增加密文篡改回归测试。
+- recovery health check 已接入 commit integrity tag 重算校验，能发现 commit 元数据篡改。
+- 已解锁 vault 仍兼容旧的明文 commit history payload。
+- Tiga global/project/entry 写入接口已改为 tracked mutation，必须带 `CommitContext` 并产生 commit。
+- entry 移动到其他 project、复制到其他 project 已成为一等 API，并产生可追溯 commit parent 链。
+- entry 本地 create/update/move/copy/delete 会写入 `object_versions` 行快照，用于后续因果三方合并。
+- sync apply 已能在非快进分叉场景消费 `mdbx-storage/state-v1`，对 entry payload 做 base/local/incoming 三方字段合并。
+- entry 不同 payload 字段并发修改会自动产生 merge commit；同一 payload 字段并发修改会生成 unresolved conflict，并记录具体字段名。
+
+本轮安全与文档对齐已补强：
+
+- 规范目录已统一为 `docs/`，README、接入指南和规范索引已改为新路径。
+- 新写入密文使用 `MDBXAE1\0 || commitment || nonce || ciphertext` committed AEAD envelope；解密继续兼容 legacy `nonce || ciphertext`。
+- RNG/key/nonce 生成失败必须失败，不允许退回全零 key、确定性 nonce 或占位秘密。
+- Tiga 存储/API 名称对齐为 `sky`、`multi`、`power`；`Power Type`、`Multi Type`、`Sky Type` 只作为兼容显示名。
+- Sky 被定义为灵活便携但仍然安全，适合网盘同步和恢复优先场景；Multi 建议安全密钥但保留便携恢复；Power 要求密码 + 安全密钥组合解锁才能完整满足策略。
+- `unlock_methods.method_type` 明确支持 `password_security_key`。
+- 全文搜索只允许使用解锁会话内的临时索引；持久 FTS 不得保存解密后的 project title 或 secret-bearing text。
+- `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
+- 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
+- `mdbx-ffi` 已进入 workspace，作为非 Rust 客户端的通用 UniFFI 边界；当前覆盖 vault/project/generic entry、显式 Tiga 创建、安全密钥材料解锁和已解锁状态下重设主密码，后续 tag、attachment、sync、conflict、snapshot、diagnostics 等跨语言能力应继续扩展 facade，而不是让客户端直接写表。
+- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
+- snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
+- project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
+- project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
+- project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
+- `project_tags` 已分类为用户可见元数据：tracked tag API 会产生 project 级 commit；sync state 携带每个 project 的完整 tag 集合；临时 FTS/search index 保持解锁会话内临时状态，不进入历史。
+
+## 3. 主要差距
+
+### 3.1 格式与恢复
+
+- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
+- snapshot 已覆盖 project、entry、attachment metadata 和 active `attachment_chunks`；仍需补齐旧 reader/新 reader、未知字段保留、非关键扩展等兼容测试。
+- 缺少格式兼容测试：旧 reader、新 reader、未知字段保留、非关键扩展。
+
+### 3.2 同步与冲突
+
+- `mdbx-sync` 协商和 bundle 已有；Rust core 已支持 `mdbx-storage/state-v1` 对象状态 payload，并能在 fast-forward apply 时落地 `projects`、`entries`、`attachments`、`attachment_chunks`。
+- entry payload 已接入字段级 base commit 查找、不同字段自动合并、同字段 unresolved conflict。
+- entry conflict resolution 已有 storage core 写回路径：`local-wins`/`incoming-wins` 会生成 merge commit、推进 entry head、记录 object version，并标记 conflict resolved。
+- 已补充“同一秘密字段并发修改必须冲突”和“不同字段并发修改自动合并”的 storage 回归测试。
+- 已补充删除/修改并发回归：远端删除/本地修改会保留 tombstone 并产生 `deleted` conflict；本地删除/远端修改不会复活 entry。
+- project/attachment 字段级三方合并已完成：project 不同字段并发修改会自动写 merge commit，同字段并发修改会产生字段级 conflict；attachment 元数据可字段级合并，双方同时改内容且内容不同会产生 `content_hash` conflict，只有 incoming 改内容时才替换 incoming chunks。
+- `custom/manual merge` 在 Rust storage core 已有显式 merged payload/row API；Android 合并编辑器尚未接入。
+
+### 3.3 变更历史覆盖
+
+- 搜索类临时索引已明确不写 commit；用户可见 tag 修改已有 tracked API。仍需为未来新增维护操作逐项分类是否属于用户可见历史。
+- project、entry、attachment、conflict resolution、tracked tag 的主要写入链路已收窄崩溃窗口。后续仍需为 snapshot restore、bulk import、batch move/copy 等批量用户级 mutation 设计更高层的合并 commit API。
+
+### 3.4 性能与增量
+
+- benchmark harness 已有，但还没有形成可发布报告。
+- 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
+- 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
+- external-hash-ref 附件模式尚未实现。
+
+### 3.5 安全
+
+- 内存清零、明文驻留最小化、密钥文件、真实硬件密钥协议、生物识别封装仍需扩展。
+- header/content 全局认证模型还不完整。
+- 加密上下文 AAD 已覆盖字段级，但 commit/bundle/snapshot 的认证边界还需统一记录到规范。
+
+### 3.6 Android 接入
+
+- Android 侧当前不应把 MDBX 当作普通 Room 表的附属字段；最终应直接调用 MDBX 操作层。
+- Android MDBX 管理页已有冲突队列和 local/incoming 解决入口；entry/project/attachment 冲突解决在 storage core 已收紧为写回 MDBX 历史，不再只改 `conflicts.resolution`。
+- 新建、删除、移动、复制、分类、passkey、Bitwarden/KeePass 兼容路径都要映射到 MDBX project/entry/attachment/history。
+- Android 管理页需要显示同步状态、device heads、unresolved conflicts、Tiga 状态、snapshot/health check。
+
+## 4. 分阶段路线图
+
+### P0：格式可信与恢复闭环
+
+目标：让 `.mdbx` 文件能自校验、能发现历史篡改、能对损坏给出明确报告。
+
+任务：
+
+- recovery 验证 commit integrity tag。（已完成）
+- health check 输出 commit tag mismatch、missing parent、dangling head、chunk mismatch。（已完成）
+- snapshot 明确 payload 加密策略，拒绝已解锁状态下的篡改，并覆盖 attachment chunk 恢复。
+- 整理“生产初始化不得保留固定占位密文”的测试边界。（固定 `X'00'` 已移除；初始化 marker 与 active epoch wrapping 已分离；完整 rotation 仍后续）
+
+验收：
+
+- `cargo fmt`
+- `$env:CARGO_INCREMENTAL='0'; cargo test`
+- 篡改 commit 字段会被 health check 报错。
+
+### P1：所有 mutation 进入 commit 历史
+
+目标：任何用户可见的新增、删除、移动、复制、Tiga 切换都能被同步和回放。
+
+任务：
+
+- Tiga setter 改为接收 `CommitContext` 或新增 tracked API。（已完成）
+- repo mutation 使用事务包裹对象写入、commit 写入、head 更新。
+- 分类/标签/搜索索引变更定义是否进入历史；用户可见语义必须进入历史。
+- 移动 entry 到 project、复制 entry、恢复 tombstone 等操作形成一等 API。（entry 移动/复制已完成）
+
+验收：
+
+- 所有 repo 用户可见 mutation 都产生 commit。
+- 崩溃注入不会留下“有 commit 无对象”或“有对象无 commit”的健康状态。
+
+### P2：同步 apply 与冲突闭环
+
+目标：多设备离线编辑后，通过文件/网盘同步可以安全合并。
+
+任务：
+
+- 实现 serialized commit 导出/导入。（CLI bundle 与 storage core apply 基础路径已完成）
+- 构建 base commit 查找和 fast-forward 判断。（对象级 fast-forward 已完成；entry/project/attachment 字段级 base 已完成）
+- 将 incoming commit apply 到 storage，必要时调用 conflict detector。（project/entry/attachment/chunk 状态落地已完成；非快进 state payload 已进入字段级 apply 流程）
+- 同字段并发秘密修改生成 conflict；不同字段安全合并。（entry payload、project 字段、attachment 元数据/内容组已完成）
+- conflict resolve 写回 commit，并更新 head。（entry `local-wins`/`incoming-wins`/`custom payload` 已完成）
+
+验收：
+
+- A/B 设备同字段并发修改产生 unresolved conflict。（storage 回归已覆盖）
+- A/B 设备不同字段并发修改自动合并。（storage 回归已覆盖）
+- entry conflict 选择 local-wins/incoming-wins 后会写入 merge commit 并更新 head。（storage 回归已覆盖）
+- entry conflict custom payload 会写入 merge commit、替换 payload、记录 object version，并标记为 custom。（storage 回归已覆盖）
+- project 不同字段并发修改会写双 parent merge commit，同字段并发修改会保留本地状态并记录具体字段 conflict。（storage 回归已覆盖）
+- attachment metadata 与 incoming-only 内容更新可自动合并，双方同时替换内容会保留本地内容并记录 `content_hash` conflict。（storage 回归已覆盖）
+- 删除与修改并发不会误复活 tombstone。（storage 回归已覆盖）
+
+### P3：附件与性能完成
+
+目标：明显优于 KDBX 的小修改同步和大附件行为。
+
+任务：
+
+- external-hash-ref 模式。
+- 附件 blob 内容寻址目录或可插拔 blob provider。
+- metadata-only 更新不触碰 chunk。
+- benchmark 输出 delta size 和时延报告。
+- 可选 zstd 压缩和二进制 payload 序列化。
+
+验收：
+
+- 小 entry 修改保存目标 `<100 ms`。
+- 附件改名不改 chunk。
+- 大附件不导致普通 entry 修改产生大 delta。
+
+### P4：迁移与长期兼容
+
+目标：KDBX 用户可迁移，MDBX 格式可长期维护。
+
+任务：
+
+- KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments，并扩展到真实二进制 `.kdbx` 解析/写入。
+- RFC 结构补齐：header、schema、crypto、commit、sync、snapshot、extensions。
+- 兼容性测试矩阵落地。
+- CLI 已增加 `health`、`benchmark`、`snapshot`、`sync bundle/apply`、`import-kdbx-json`、`export-kdbx-json`；后续如要使用 `import-kdbx`/`export-kdbx` 名称，必须先实现真实二进制 `.kdbx` 支持。
+
+验收：
+
+- import/export roundtrip 报告。
+- 旧 vault 打开测试。
+- 未知非关键扩展保留测试。
+
+### P5：Monica Android 接入
+
+目标：Android 对 MDBX 的所有用户操作直接落到 MDBX 文件和 MDBX 历史。
+
+任务：
+
+- Android 定义 `MdbxRepository` 边界：所有新建、删除、移动、复制、分类、passkey 操作只通过它进入 MDBX。
+- 新建页面、移动/复制页面、新建分类菜单支持选择 MDBX vault/project。
+- 密码、TOTP、passkey、SSH、API token 映射到 MDBX entry type。
+- Bitwarden/KeePass 兼容字段进入 payload 映射表。
+- MDBX 管理页增加 health check、snapshot、device heads、sync status、conflict list、resolve action。
+- 离线操作立即本地生效；同步后依据 commit DAG 合并。
+
+验收：
+
+- A 设备删除 entry，B 设备同步后消失；离线时 B 保留本地状态，联网/同步后按 commit 合并。
+- 同一字段并发修改在 Android 管理页出现冲突处理入口。
+- Android 选择 entry conflict 的“使用本地/使用传入”会写 merge commit、推进 entry head 并刷新列表；“标记解决”不得静默吞掉 entry 冲突。
+- passkey 可存储并导入/导出到 Bitwarden/KeePass 兼容结构。
+
+## 5. 工作规则
+
+- 每个阶段先写测试或 health check，再改实现。
+- 不允许引入“为了 UI 方便绕过 MDBX repo”的写入路径。
+- 不允许把认证失败降级成 warning。
+- 不允许把 Android Room 当 MDBX 的真源；Room 最多是索引/cache。
+- 每个合并切片必须说明验收命令。
+
+## 6. 当前起步切片
+
+当前 P2 字段级合并切片已完成：
+
+- `object_versions` 存储 entry commit 快照。
+- `object_versions` 同步记录 project/attachment 本地 mutation 与 incoming state 行快照。
+- 非快进 sync apply 会消费 state payload，并对 entry payload、project 字段、attachment 元数据/内容组做三方合并。
+- 不同字段并发修改自动合并并产生双 parent merge commit。
+- 同字段并发修改生成 unresolved conflict。
+- entry conflict 支持 `local-wins`/`incoming-wins` 写回 merge commit 并推进 head。
+- Rust core 支持 `custom` merged payload 写回，用于后续 Android 手动合并编辑器。
+- 删除/修改并发会生成 `deleted` conflict：远端 tombstone 不丢，本地删除不会被远端修改复活。
+- snapshot 已恢复 attachment chunks；初始化 key epoch marker 与 active epoch wrapping 边界已收紧。
+- 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
+
+下一刀建议：
+
+- Android custom/manual merge editor 接入 Rust core/本地 store 的 explicit merged payload API。
+- project/attachment conflict resolve 的用户选择写回 API。
+- Android `MdbxRepository` 最小 JNI/FFI 操作边界，禁止 Room 成为 MDBX 真源；同时修复现有 Android 编译断引用后恢复 Gradle 验证。

@@ -41,10 +41,10 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
 修改存储行为前必须先读 `docs/`：
 
 - `docs/README.md` / `docs/README.zh-CN.md`
-- `docs/01-product-spec.zh-CN.md`
-- `docs/02-storage-sync-spec.zh-CN.md`
-- `docs/03-security-spec.zh-CN.md`
-- `docs/06-sqlite-schema-v1.zh-CN.md`
+- `docs/product/01-product-spec.zh-CN.md`
+- `docs/storage/02-storage-sync-spec.zh-CN.md`
+- `docs/security/03-security-spec.zh-CN.md`
+- `docs/storage/06-sqlite-schema-v1.zh-CN.md`
 
 `docs/` 定义格式和产品约束；Rust workspace 负责实现这些约束，并提供实际客户端接入说明。
 

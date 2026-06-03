@@ -41,10 +41,10 @@ The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibi
 Read the spec set in `docs/` before changing storage behavior:
 
 - `docs/README.md` / `docs/README.zh-CN.md`
-- `docs/01-product-spec.md`
-- `docs/02-storage-sync-spec.md`
-- `docs/03-security-spec.md`
-- `docs/06-sqlite-schema-v1.zh-CN.md`
+- `docs/product/01-product-spec.md`
+- `docs/storage/02-storage-sync-spec.md`
+- `docs/security/03-security-spec.md`
+- `docs/storage/06-sqlite-schema-v1.zh-CN.md`
 
 The `docs/` directory defines the format and product constraints. The Rust workspace implements those constraints and documents practical integration.
 
