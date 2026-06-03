@@ -10,10 +10,10 @@
 
 更底层的格式规范请同时阅读：
 
-- `docs/product/01-product-spec.zh-CN.md`
-- `docs/storage/02-storage-sync-spec.zh-CN.md`
-- `docs/security/03-security-spec.zh-CN.md`
-- `docs/storage/06-sqlite-schema-v1.zh-CN.md`
+- `docs/01-product-spec.zh-CN.md`
+- `docs/02-storage-sync-spec.zh-CN.md`
+- `docs/03-security-spec.zh-CN.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
 ## 1. 接入边界
 

@@ -10,10 +10,10 @@ It does not replace the full format specifications. It answers three practical q
 
 Read these lower-level specs as well:
 
-- `docs/product/01-product-spec.md`
-- `docs/storage/02-storage-sync-spec.md`
-- `docs/security/03-security-spec.md`
-- `docs/storage/06-sqlite-schema-v1.zh-CN.md`
+- `docs/01-product-spec.md`
+- `docs/02-storage-sync-spec.md`
+- `docs/03-security-spec.md`
+- `docs/06-sqlite-schema-v1.zh-CN.md`
 
 ## 1. Integration Boundary
 
