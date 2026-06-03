@@ -35,7 +35,7 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
   - 中文版客户端接入指南。
 - `crates/mdbx-ffi/README.md` / `crates/mdbx-ffi/README.zh-CN.md`
   - 面向非 Rust 客户端的 UniFFI 边界参考。
-- `android/README.zh-CN.md` / `android/README.md`
+- `docs/android/README.zh-CN.md` / `docs/android/README.md`
   - Monica for Android 当前 MDBX 1.0 接入结构、working copy、Room 索引和后续 FFI 迁移建议。
 
 ## 规范文档
@@ -153,7 +153,7 @@ cargo run -p mdbx-cli -- --help
 
 Android 或其他客户端接入时，应通过 repo/storage API 处理 entry/project/attachment CRUD、tracked tag 修改和 conflict resolution。不要只更新 `conflicts.resolution`，也不要直接改 `project_tags` 后跳过 commit/sync state。
 
-Monica for Android 的当前接入样板见 `android/README.zh-CN.md`。
+Monica for Android 的当前接入样板见 `docs/android/README.zh-CN.md`。
 
 ## 兼容性检查
 

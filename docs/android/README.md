@@ -5,10 +5,10 @@ Language: [简体中文](README.zh-CN.md) | [English](README.md)
 This document describes how Monica for Android currently integrates MDBX 1.0.
 Use it as a reference implementation note, not as the normative format spec.
 
-Normative format rules live in [`docs/`](../docs/README.md). General client
-rules live in [`CLIENT_INTEGRATION_GUIDE.md`](../CLIENT_INTEGRATION_GUIDE.md).
+Normative format rules live in [`docs/`](../README.md). General client
+rules live in [`CLIENT_INTEGRATION_GUIDE.md`](../../CLIENT_INTEGRATION_GUIDE.md).
 The generic UniFFI boundary lives in
-[`crates/mdbx-ffi/README.md`](../crates/mdbx-ffi/README.md).
+[`crates/mdbx-ffi/README.md`](../../crates/mdbx-ffi/README.md).
 
 ## Principles
 

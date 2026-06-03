@@ -4,7 +4,7 @@
 
 本文记录 Monica for Android 当前接入 MDBX 1.0 的实际结构，供后续 Android 客户端、Monica Android 维护者和 MDBX FFI 迁移工作参考。
 
-这不是 MDBX 格式规范。格式规则仍以 [`docs/`](../docs/README.zh-CN.md) 为准；通用客户端边界见 [`CLIENT_INTEGRATION_GUIDE.zh-CN.md`](../CLIENT_INTEGRATION_GUIDE.zh-CN.md)；跨语言 UniFFI 边界见 [`crates/mdbx-ffi/README.zh-CN.md`](../crates/mdbx-ffi/README.zh-CN.md)。
+这不是 MDBX 格式规范。格式规则仍以 [`docs/`](../README.zh-CN.md) 为准；通用客户端边界见 [`CLIENT_INTEGRATION_GUIDE.zh-CN.md`](../../CLIENT_INTEGRATION_GUIDE.zh-CN.md)；跨语言 UniFFI 边界见 [`crates/mdbx-ffi/README.zh-CN.md`](../../crates/mdbx-ffi/README.zh-CN.md)。
 
 ## 接入原则
 
