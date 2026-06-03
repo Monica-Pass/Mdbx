@@ -35,6 +35,8 @@ The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibi
   - Chinese guide for implementing MDBX support in another client.
 - `crates/mdbx-ffi/README.md` / `crates/mdbx-ffi/README.zh-CN.md`
   - UniFFI boundary reference for non-Rust clients.
+- `android/README.md` / `android/README.zh-CN.md`
+  - Current Monica for Android MDBX 1.0 integration structure, working-copy model, Room indexes, and future FFI migration notes.
 
 ## Specification Documents
 
@@ -150,6 +152,8 @@ Client code should not directly write:
 Batch user operations should normally produce one user-level commit, not one commit per object.
 
 Android and other clients should use repository/storage APIs for entry/project/attachment CRUD, tracked tag changes, and conflict resolution. Do not only update `conflicts.resolution`, and do not edit `project_tags` directly while skipping commits and sync state.
+
+For the current Monica for Android integration reference, see `android/README.md`.
 
 ## Compatibility Checklist
 

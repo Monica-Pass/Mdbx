@@ -129,6 +129,8 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
 
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
+Monica for Android 的当前 MDBX 1.0 接入样板见 `android/README.zh-CN.md`。它记录 Android 端如何在 `MdbxRepository` / `MdbxVaultStore` 边界内处理 Room 索引、working copy、WebDAV、OneDrive、旧测试版 vault 和后续 FFI 迁移。
+
 除非正在实现底层库，否则客户端代码 SHOULD NOT 直接写这些表：
 
 - `commits`
