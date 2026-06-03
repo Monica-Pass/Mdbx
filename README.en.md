@@ -33,6 +33,10 @@ The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibi
   - English guide for implementing MDBX support in another client.
 - `CLIENT_INTEGRATION_GUIDE.zh-CN.md`
   - Chinese guide for implementing MDBX support in another client.
+- `crates/mdbx-ffi/README.md` / `crates/mdbx-ffi/README.zh-CN.md`
+  - UniFFI boundary reference for non-Rust clients.
+- `docs/android/README.md` / `docs/android/README.zh-CN.md`
+  - Current Monica for Android MDBX 1.0 integration structure, working-copy model, Room indexes, and future FFI migration notes.
 
 ## Specification Documents
 
@@ -113,6 +117,8 @@ The current CLI does not yet implement real FIDO/WebAuthn/security-key interacti
 
 `mdbx-ffi` provides a generic UniFFI boundary for non-Rust clients that need MDBX core read/write operations. It is not a low-level SQL escape hatch around the storage/repository rules; new cross-client capabilities should extend the FFI facade instead of writing tables directly.
 
+For exported methods, JSON payload rules, binding generation, iOS packaging notes, and extension rules, see `crates/mdbx-ffi/README.md`.
+
 Key capabilities currently verified in the Rust storage core:
 
 - Snapshots include and restore active `attachment_chunks`; older metadata-only snapshots remain compatible.
@@ -146,6 +152,8 @@ Client code should not directly write:
 Batch user operations should normally produce one user-level commit, not one commit per object.
 
 Android and other clients should use repository/storage APIs for entry/project/attachment CRUD, tracked tag changes, and conflict resolution. Do not only update `conflicts.resolution`, and do not edit `project_tags` directly while skipping commits and sync state.
+
+For the current Monica for Android integration reference, see `docs/android/README.md`.
 
 ## Compatibility Checklist
 

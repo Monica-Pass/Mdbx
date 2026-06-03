@@ -127,6 +127,10 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
 
 使用 `mdbx-ffi` 时，应把它视为 generic vault/project/entry 操作的客户端边界。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该新增明确的 facade 方法和测试，而不是让客户端直接写对应 SQLite 表。
 
+当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
+
+Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN.md`。它记录 Android 端如何在 `MdbxRepository` / `MdbxVaultStore` 边界内处理 Room 索引、working copy、WebDAV、OneDrive、旧测试版 vault 和后续 FFI 迁移。
+
 除非正在实现底层库，否则客户端代码 SHOULD NOT 直接写这些表：
 
 - `commits`

@@ -127,6 +127,10 @@ Clients should prefer storage / repository APIs over hand-written SQL.
 
 When using `mdbx-ffi`, treat it as the client boundary for generic vault/project/entry operations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
 
+See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
+
+For the current Monica for Android MDBX 1.0 integration reference, see `docs/android/README.md`. It documents the Android-side `MdbxRepository` / `MdbxVaultStore` boundary, Room indexes, working-copy model, WebDAV, OneDrive, legacy test-version vaults, and future FFI migration path.
+
 Unless you are implementing the low-level storage library itself, client code should not directly write these tables:
 
 - `commits`
