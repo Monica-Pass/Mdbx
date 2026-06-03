@@ -127,6 +127,8 @@ Clients should prefer storage / repository APIs over hand-written SQL.
 
 When using `mdbx-ffi`, treat it as the client boundary for generic vault/project/entry operations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
 
+See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
+
 Unless you are implementing the low-level storage library itself, client code should not directly write these tables:
 
 - `commits`

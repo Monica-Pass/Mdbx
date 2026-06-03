@@ -33,6 +33,8 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
   - 英文版客户端接入指南。
 - `CLIENT_INTEGRATION_GUIDE.zh-CN.md`
   - 中文版客户端接入指南。
+- `crates/mdbx-ffi/README.md` / `crates/mdbx-ffi/README.zh-CN.md`
+  - 面向非 Rust 客户端的 UniFFI 边界参考。
 
 ## 规范文档
 
@@ -112,6 +114,8 @@ cargo run -p mdbx-cli -- --help
 当前 CLI 还没有接入真实 FIDO/WebAuthn/security-key 交互，也没有生产级 session token / audit policy；硬件密钥在 storage core 中是 key material 抽象与策略测试，不应宣称为端到端硬件密钥客户端。
 
 `mdbx-ffi` 提供通用 UniFFI 边界，适合非 Rust 客户端复用 MDBX 核心读写能力。它不是绕过 storage/repo 规则的低层 SQL 通道；新增跨端能力时应优先扩展 FFI facade，而不是让客户端直接写底层表。
+
+导出方法、JSON payload 规则、binding 生成、iOS 打包注意事项和扩展规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
 当前 Rust storage core 已验证的关键能力：
 
