@@ -206,8 +206,14 @@ impl MdbxVault {
             ))
             .into());
         }
+        if entry.entry_type != expected_type {
+            return Err(StorageError::ConstraintViolation(format!(
+                "entry {} is not a {} entry",
+                entry_id, entry_type
+            ))
+            .into());
+        }
 
-        entry.entry_type = expected_type;
         entry.title_ct = Some(title.into_bytes());
         entry.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
 
@@ -354,7 +360,10 @@ impl MdbxVault {
         attachment_record_from_attachment(&attachment)
     }
 
-    pub fn read_attachment_content(&self, attachment_id: String) -> Result<Vec<u8>, MdbxFfiError> {
+    pub fn read_attachment_content(
+        &self,
+        attachment_id: String,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         AttachmentRepo::read_content(&conn, &attachment_id).map_err(MdbxFfiError::from)
     }
