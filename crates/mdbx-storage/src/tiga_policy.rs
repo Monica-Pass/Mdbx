@@ -521,6 +521,15 @@ impl TigaService {
                 return Err(policy_error(error));
             }
         };
+        let override_tag = if resolved.compliance == PolicyCompliance::Exception {
+            Some(integrity_tag(
+                conn,
+                b"tiga-policy-override",
+                &policy_override,
+            )?)
+        } else {
+            None
+        };
 
         conn.with_immediate_transaction(|| {
             if let Some(exception) = exception {
@@ -534,7 +543,20 @@ impl TigaService {
                 &decision,
                 resolved.exception_id.as_deref(),
             )?;
-            Self::set_global_default(conn, ctx, mode)?;
+            if resolved.compliance == PolicyCompliance::Exception {
+                TigaPolicyStore::put_override(
+                    conn,
+                    &scope,
+                    &policy_override,
+                    resolved.exception_id.as_deref(),
+                    ctx.device_id.as_str(),
+                    override_tag.as_deref(),
+                )?;
+                track_scope_policy_change(conn, ctx, &scope)?;
+            } else {
+                TigaPolicyStore::delete_override(conn, &scope)?;
+                Self::set_global_default(conn, ctx, mode)?;
+            }
             conn.inner().execute(
                 "UPDATE vault_meta SET tiga_policy_version = ?1,
                  tiga_compliance_status = ?2",
@@ -1464,7 +1486,7 @@ mod tests {
             target: TigaScope::Vault,
             approved_override: TigaPolicyOverride::for_vault_profile(TigaMode::Sky),
             reason: "user approved a temporary portability exception".to_string(),
-            expires_at_unix_secs: Some(2_000),
+            expires_at_unix_secs: None,
         };
         TigaService::set_vault_profile_authorized(
             &conn,
@@ -1476,8 +1498,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             TigaService::get_global_default(&conn).unwrap(),
-            TigaMode::Sky
+            TigaMode::Power
         );
+        let resolved = TigaService::resolve_vault_policy(&conn).unwrap();
+        assert_eq!(resolved.policy.profile, TigaMode::Sky);
+        assert_eq!(resolved.exception_id.as_deref(), Some("vault-downgrade"));
         assert_eq!(
             TigaService::get_policy_state(&conn).unwrap().compliance,
             PolicyCompliance::Exception
@@ -1492,5 +1517,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tag_len, 32);
+    }
+
+    #[test]
+    fn expired_vault_profile_exception_fails_closed_against_preserved_baseline() {
+        let (conn, ctx, _, _) = setup();
+        let standard_session = session(UnlockMethodType::Password, 1_000);
+        let standard_device = standard_device();
+        TigaService::set_vault_profile_authorized(
+            &conn,
+            &ctx,
+            TigaMode::Power,
+            None,
+            TigaAuthorizationContext {
+                session: Some(&standard_session),
+                device: &standard_device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+
+        let strong_session = session(UnlockMethodType::PasswordSecurityKey, 1_020);
+        let trusted_device = trusted_device();
+        let exception = PolicyException {
+            exception_id: "expired-vault-downgrade".to_string(),
+            target: TigaScope::Vault,
+            approved_override: TigaPolicyOverride::for_vault_profile(TigaMode::Sky),
+            reason: "temporary downgrade".to_string(),
+            expires_at_unix_secs: Some(2_000),
+        };
+        TigaService::set_vault_profile_authorized(
+            &conn,
+            &ctx,
+            TigaMode::Sky,
+            Some(&exception),
+            TigaAuthorizationContext {
+                session: Some(&strong_session),
+                device: &trusted_device,
+                now_unix_secs: 1_030,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            TigaService::get_global_default(&conn).unwrap(),
+            TigaMode::Power
+        );
+        let error = TigaService::resolve_vault_policy(&conn).unwrap_err();
+        assert!(error.to_string().contains("invalid, expired"));
     }
 }

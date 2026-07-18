@@ -16,6 +16,13 @@ The exported boundary covers:
 - configure local security-key-material unlock on an already unlocked vault
 - open a vault with local security-key material
 - reset the master password on an already unlocked vault
+- inspect the complete effective Tiga2 runtime policy at vault, project, or entry scope
+- authorize sensitive operations with typed outcomes, reasons, and client constraints
+- supply real device assurance and platform-protection capabilities
+- inspect active-session activity, unlock-policy compliance, and security audit events
+- apply an exact audited exception when explicitly weakening a vault profile
+- configure and open password + security-key combined unlock methods
+- list and remove unlock methods through authorized storage APIs
 - create projects
 - create, list, update, soft-delete, restore, and move generic entries
 
@@ -54,6 +61,18 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 - `title`
 - `payload_json`
 - `deleted`
+
+### Tiga2 Runtime Boundary
+
+`MdbxDeviceContext` carries the device evidence used for each authorization decision. Clients must report actual platform capabilities and must not claim `TrustedHardware`, secure clipboard, screen-capture protection, or secure temporary files unless those protections are active for the operation.
+
+Call `resolve_tiga_policy` to obtain the complete effective policy for a vault, project, or entry. Call `authorize_tiga_operation` immediately before a client-owned sensitive action. Only `Allow` and `AllowWithConstraints` permit the action. Every returned constraint must be enforced by the client; a confirmation dialog does not override `RequireFreshAuthentication`, `RequireAdditionalFactor`, or `Deny`.
+
+Successful connection-backed authorization renews the session idle timestamp without changing the original authentication timestamp or absolute lifetime. `active_session_info`, `assess_tiga_unlock_policy`, and `list_security_audit_events` expose the state needed for client security UI without exposing credential or key material.
+
+`set_tiga_profile` requires a non-empty reason when weakening the current baseline. The storage core creates and persists an exact scope-bound policy exception. Strengthening the profile clears an active vault-level weakening override.
+
+Power remediation is available through `setup_password_security_key_unlock`, `list_unlock_methods`, and `remove_unlock_method`. After removing weaker standalone fallbacks, reopen with `open_vault_with_password_security_key` so the active session carries both factors.
 
 ### Entry Types
 
@@ -183,4 +202,4 @@ Run the FFI test suite from the repository root:
 cargo test -p mdbx-ffi
 ```
 
-The smoke tests verify vault create/open, entry round trips, update/delete/restore/move flows, security-key-material unlock, master-password reset, and explicit Tiga mode creation.
+The smoke tests verify vault create/open, entry round trips, update/delete/restore/move flows, security-key-material unlock, master-password reset, full Tiga2 policy and authorization mapping, exact exceptions, and Power combined-factor remediation.
