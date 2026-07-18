@@ -13,6 +13,7 @@ The exported boundary covers:
 - create a vault with password unlock, defaulting to `Multi` Tiga mode
 - create a vault with explicit `Sky`, `Multi`, or `Power` Tiga mode
 - open a vault with password unlock
+- inspect migration requirements without changing the vault and explicitly invoke the storage-core upgrade
 - configure local security-key-material unlock on an already unlocked vault
 - open a vault with local security-key material
 - reset the master password on an already unlocked vault
@@ -73,6 +74,8 @@ Successful connection-backed authorization renews the session idle timestamp wit
 `set_tiga_profile` requires a non-empty reason when weakening the current baseline. The storage core creates and persists an exact scope-bound policy exception. Strengthening the profile clears an active vault-level weakening override.
 
 Power remediation is available through `setup_password_security_key_unlock`, `list_unlock_methods`, and `remove_unlock_method`. After removing weaker standalone fallbacks, reopen with `open_vault_with_password_security_key` so the active session carries both factors.
+
+Use `inspect_vault_migration` before opening when the client needs upgrade consent, backup, or progress UI. After consent, call `upgrade_vault`; the deterministic field conversion remains entirely inside `mdbx-storage`. The ordinary `open_vault` functions retain automatic upgrade for compatibility-oriented callers.
 
 ### Entry Types
 

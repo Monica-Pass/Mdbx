@@ -539,6 +539,8 @@ If the vault contains an unknown critical extension, the client must refuse writ
 
 Clients may own migration prompts, pre-upgrade backup placement, progress, and remediation UI, but the storage core must perform the format conversion. Android, iOS, and desktop clients must not maintain separate MDBX1 field-mapping implementations.
 
+Use `inspect_migration_path` or the UniFFI `inspect_vault_migration` function for a read-only migration plan before showing consent and backup UI. After consent, call `upgrade_path` or UniFFI `upgrade_vault`; both delegate to the same storage-core transactional migrator. `VaultConnection::open` remains an automatic-upgrade compatibility path for simple callers.
+
 ### 7.2 Stable IDs
 
 Clients must preserve:

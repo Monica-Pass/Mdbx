@@ -51,3 +51,9 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 ## Client/Core Boundary
 
 Clients own upgrade prompts, backup placement, progress UI, platform capability evidence, and remediation interactions. The storage core owns format detection, deterministic conversion, transactions, rollback, idempotence, and validation. Clients must not reimplement the MDBX1-to-MDBX2 field mapping.
+
+### Client-Controlled Migration APIs
+
+The compatibility path `VaultConnection::open` continues to upgrade automatically so simple callers remain generation-compatible. A client that needs consent, backup, and progress orchestration should first call the read-only `mdbx_storage::migration::inspect_migration_path` (or the UniFFI `inspect_vault_migration` function). The result reports the current format/schema, minimum reader/writer generations, whether an upgrade is required, and whether critical extensions are unknown.
+
+After the client has obtained consent and completed its backup workflow, it can call `mdbx_storage::migration::upgrade_path` (or UniFFI `upgrade_vault`). The same storage-core transactional migrator performs the conversion. Clients own prompts and progress, never a second MDBX1 field-mapping implementation. Unknown critical extensions may be inspected and shown in read-only UI, but explicit upgrade still refuses to write.

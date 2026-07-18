@@ -15,6 +15,7 @@ use mdbx_core::tiga::{
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
+use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::repo::{CommitContext, EntryRepo, ProjectRepo};
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -56,6 +57,35 @@ impl From<serde_json::Error> for MdbxFfiError {
 pub struct VaultInfo {
     pub vault_id: String,
     pub device_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxMigrationInfo {
+    pub initialized: bool,
+    pub format_version: Option<String>,
+    pub schema_version: Option<u32>,
+    pub min_reader_version: Option<String>,
+    pub min_writer_version: Option<String>,
+    pub requires_upgrade: bool,
+    pub unknown_critical_extensions: bool,
+    pub target_format_version: String,
+    pub target_schema_version: u32,
+}
+
+impl From<MigrationInfo> for MdbxMigrationInfo {
+    fn from(value: MigrationInfo) -> Self {
+        Self {
+            initialized: value.initialized,
+            format_version: value.format_version,
+            schema_version: value.schema_version,
+            min_reader_version: value.min_reader_version,
+            min_writer_version: value.min_writer_version,
+            requires_upgrade: value.requires_upgrade,
+            unknown_critical_extensions: value.unknown_critical_extensions,
+            target_format_version: value.target_format_version,
+            target_schema_version: value.target_schema_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1044,6 +1074,21 @@ pub fn create_vault(
     device_id: String,
 ) -> Result<Arc<MdbxVault>, MdbxFfiError> {
     create_vault_with_tiga_mode(path, password, device_id, MdbxTigaMode::Multi)
+}
+
+/// Read migration metadata without opening the vault for writing.
+#[uniffi::export]
+pub fn inspect_vault_migration(path: String) -> Result<MdbxMigrationInfo, MdbxFfiError> {
+    Ok(inspect_migration_path(Path::new(&path))?.into())
+}
+
+/// Explicitly run the storage-core migration after the client has inspected,
+/// backed up, and obtained user consent. The compatibility `open_vault` path
+/// remains automatic for callers that do not need this orchestration.
+#[uniffi::export]
+pub fn upgrade_vault(path: String) -> Result<MdbxMigrationInfo, MdbxFfiError> {
+    upgrade_path(Path::new(&path))?;
+    Ok(inspect_migration_path(Path::new(&path))?.into())
 }
 
 #[uniffi::export]

@@ -98,3 +98,17 @@ MDBX2 同时收紧以下实现边界：
 - `mdbx-storage` 负责格式识别、确定性映射、事务、回滚、幂等、策略例外和结果校验。
 - 客户端不得自行复制 MDBX1 到 MDBX2 的字段转换逻辑。
 - “兼容上一代”表示新代可以读取并升级上一代；不承诺旧二进制理解 MDBX2 新策略并安全写入。
+
+### 7.1 客户端可控迁移 API
+
+兼容默认路径仍然支持 `VaultConnection::open` 自动升级，保证旧客户端或简单调用方不会因为代际差异无法打开 vault。需要在 UI 中先提示、备份并取得用户同意的客户端，应先调用：
+
+- `mdbx_storage::migration::inspect_migration_path`
+- UniFFI：`inspect_vault_migration`
+
+检查结果是只读的，包含当前 format/schema、最低读写代际、是否需要升级以及未知 critical extension 标志。用户确认后调用：
+
+- `mdbx_storage::migration::upgrade_path`
+- UniFFI：`upgrade_vault`
+
+转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。未知 critical extension 可以被检查并展示，但显式升级必须拒绝写入。

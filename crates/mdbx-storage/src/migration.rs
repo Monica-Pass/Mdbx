@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use mdbx_core::model::{KdfParams, UnlockMethodType};
 use mdbx_core::tiga::{TigaMode, TigaPolicyOverride, TIGA_POLICY_VERSION};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
 use crate::schema::v2;
@@ -20,6 +21,121 @@ pub struct FormatInfo {
     pub schema_version: u32,
     pub min_reader_version: String,
     pub min_writer_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationInfo {
+    pub initialized: bool,
+    pub format_version: Option<String>,
+    pub schema_version: Option<u32>,
+    pub min_reader_version: Option<String>,
+    pub min_writer_version: Option<String>,
+    pub requires_upgrade: bool,
+    pub unknown_critical_extensions: bool,
+    pub target_format_version: String,
+    pub target_schema_version: u32,
+}
+
+/// Inspect a vault without changing it. This is the client-facing planning
+/// step for backup, consent, progress, and remediation UI.
+pub fn inspect_migration(conn: &Connection) -> StorageResult<MigrationInfo> {
+    if !table_exists(conn, "vault_meta")? {
+        return Ok(MigrationInfo {
+            initialized: false,
+            format_version: None,
+            schema_version: None,
+            min_reader_version: None,
+            min_writer_version: None,
+            requires_upgrade: false,
+            unknown_critical_extensions: false,
+            target_format_version: FORMAT_V2.to_string(),
+            target_schema_version: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    let meta: Option<(String, String)> = conn
+        .query_row(
+            "SELECT format_version, critical_extensions FROM vault_meta LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(StorageError::Database)?;
+    let Some((format_version, critical_extensions)) = meta else {
+        return Ok(MigrationInfo {
+            initialized: false,
+            format_version: None,
+            schema_version: None,
+            min_reader_version: None,
+            min_writer_version: None,
+            requires_upgrade: false,
+            unknown_critical_extensions: false,
+            target_format_version: FORMAT_V2.to_string(),
+            target_schema_version: CURRENT_SCHEMA_VERSION,
+        });
+    };
+
+    let schema_version = if v2::column_exists(conn, "vault_meta", "schema_version")? {
+        conn.query_row("SELECT schema_version FROM vault_meta LIMIT 1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+        .map(|value| value as u32)
+    } else {
+        Some(1)
+    };
+    let min_reader_version = optional_meta_text(conn, "min_reader_version")?;
+    let min_writer_version = optional_meta_text(conn, "min_writer_version")?;
+    let requires_upgrade = match format_version.as_str() {
+        FORMAT_V1 | FORMAT_V1_DRAFT => true,
+        FORMAT_V2 => schema_version.unwrap_or(1) < CURRENT_SCHEMA_VERSION,
+        other => {
+            return Err(StorageError::Validation(format!(
+                "unsupported MDBX format version: {other}"
+            )))
+        }
+    };
+
+    Ok(MigrationInfo {
+        initialized: true,
+        format_version: Some(format_version),
+        schema_version,
+        min_reader_version,
+        min_writer_version,
+        requires_upgrade,
+        unknown_critical_extensions: has_unknown_critical_extensions(&critical_extensions),
+        target_format_version: FORMAT_V2.to_string(),
+        target_schema_version: CURRENT_SCHEMA_VERSION,
+    })
+}
+
+/// Inspect a vault file using a read-only SQLite handle.
+pub fn inspect_migration_path(path: &Path) -> StorageResult<MigrationInfo> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(StorageError::Database)?;
+    inspect_migration(&conn)
+}
+
+/// Explicitly upgrade a vault file through the storage-core migration path.
+/// The existing `VaultConnection::open` path remains an automatic-upgrade
+/// compatibility path; clients that need consent and backup orchestration can
+/// call this function after `inspect_migration_path`.
+pub fn upgrade_path(path: &Path) -> StorageResult<Option<FormatInfo>> {
+    let conn = Connection::open(path).map_err(StorageError::Database)?;
+    upgrade_to_latest(&conn)
+}
+
+fn optional_meta_text(conn: &Connection, column: &str) -> StorageResult<Option<String>> {
+    if !v2::column_exists(conn, "vault_meta", column)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        &format!("SELECT {column} FROM vault_meta LIMIT 1"),
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(StorageError::Database)
 }
 
 /// Upgrade an initialized vault to the latest supported generation.
@@ -382,14 +498,19 @@ fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
 }
 
 fn reject_unknown_critical_extensions(value: &str) -> StorageResult<()> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
+    if !has_unknown_critical_extensions(value) {
         return Ok(());
     }
 
     Err(StorageError::Validation(format!(
-        "vault requires unsupported critical extensions: {trimmed}"
+        "vault requires unsupported critical extensions: {}",
+        value.trim()
     )))
+}
+
+fn has_unknown_critical_extensions(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed != "[]"
 }
 
 fn table_exists(conn: &Connection, table: &str) -> StorageResult<bool> {
@@ -512,6 +633,56 @@ mod tests {
             .unwrap();
         assert_eq!(version, FORMAT_V1);
         assert!(!v2::column_exists(&conn, "vault_meta", "schema_version").unwrap());
+    }
+
+    #[test]
+    fn migration_inspection_is_read_only_and_reports_legacy_upgrade() {
+        let conn = v1_database();
+        let info = inspect_migration(&conn).unwrap();
+        assert!(info.initialized);
+        assert_eq!(info.format_version.as_deref(), Some(FORMAT_V1));
+        assert_eq!(info.schema_version, Some(1));
+        assert!(info.requires_upgrade);
+        assert!(!info.unknown_critical_extensions);
+
+        let format: String = conn
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
+    }
+
+    #[test]
+    fn current_migration_inspection_reports_no_upgrade() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        let info = inspect_migration(conn.inner()).unwrap();
+        assert!(info.initialized);
+        assert_eq!(info.format_version.as_deref(), Some(FORMAT_V2));
+        assert_eq!(info.schema_version, Some(CURRENT_SCHEMA_VERSION));
+        assert!(!info.requires_upgrade);
+    }
+
+    #[test]
+    fn migration_inspection_flags_unknown_critical_extensions_without_writing() {
+        let conn = v1_database();
+        conn.execute(
+            "UPDATE vault_meta SET critical_extensions = 'future-extension'",
+            [],
+        )
+        .unwrap();
+        let info = inspect_migration(&conn).unwrap();
+        assert!(info.unknown_critical_extensions);
+        assert!(info.requires_upgrade);
+        let error = upgrade_to_latest(&conn).unwrap_err();
+        assert!(error.to_string().contains("critical extensions"));
+        let format: String = conn
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
     }
 
     #[test]

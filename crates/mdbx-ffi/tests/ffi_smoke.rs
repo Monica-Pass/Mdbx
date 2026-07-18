@@ -2,10 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
-    create_vault, create_vault_with_tiga_mode, open_vault, open_vault_with_password_security_key,
-    open_vault_with_security_key, MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome,
-    MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext, MdbxPolicyCompliance,
-    MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType,
+    create_vault, create_vault_with_tiga_mode, inspect_vault_migration, open_vault,
+    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
+    MdbxDeviceAssurance, MdbxDeviceContext, MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation,
+    MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType,
 };
 use uuid::Uuid;
 
@@ -299,6 +300,43 @@ fn creates_vault_with_explicit_tiga_mode() {
         )
         .unwrap();
     assert_eq!(mode, "sky");
+}
+
+#[test]
+fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
+    let vault_path = temp_vault_path("migration-plan");
+    {
+        let conn = rusqlite::Connection::open(vault_path.path()).unwrap();
+        mdbx_storage::schema::v1::create_all_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('ffi-legacy-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let plan = inspect_vault_migration(vault_path.as_path_string()).unwrap();
+    assert!(plan.initialized);
+    assert_eq!(plan.format_version.as_deref(), Some("MDBX-1"));
+    assert_eq!(plan.schema_version, Some(1));
+    assert!(plan.requires_upgrade);
+    assert!(!plan.unknown_critical_extensions);
+
+    let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
+    assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
+    assert_eq!(upgraded.schema_version, Some(3));
+    assert!(!upgraded.requires_upgrade);
+
+    let stored_format: String = rusqlite::Connection::open(vault_path.path())
+        .unwrap()
+        .query_row("SELECT format_version FROM vault_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored_format, "MDBX-2");
 }
 
 #[test]
