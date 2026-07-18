@@ -3,7 +3,10 @@ use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
 use mdbx_core::model::ConflictObjectType;
-use mdbx_core::tiga::{TigaMode, TigaPolicyOverride};
+use mdbx_core::tiga::{
+    AuthorizationConstraint, AuthorizationReason, PolicyException, TigaMode, TigaPolicyOverride,
+    TigaScope,
+};
 use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit};
 
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
@@ -15,6 +18,9 @@ use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, ProjectRow,
     ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
     TigaPolicyOverrideRow, TigaVaultStateRow,
+};
+use crate::tiga_policy::{
+    optional_integrity_tag, verify_optional_integrity_tag, SecurityAuditEvent,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -249,6 +255,13 @@ impl SyncApplyRepo {
         conn: &VaultConnection,
         incoming: &TigaVaultStateRow,
     ) -> StorageResult<()> {
+        if incoming.policy_version > mdbx_core::tiga::TIGA_POLICY_VERSION {
+            return Err(StorageError::Validation(format!(
+                "unsupported incoming Tiga policy version {}; expected {}",
+                incoming.policy_version,
+                mdbx_core::tiga::TIGA_POLICY_VERSION
+            )));
+        }
         let local: TigaVaultStateRow = conn.inner().query_row(
             "SELECT default_tiga_mode, tiga_policy_version, tiga_compliance_status, updated_at
              FROM vault_meta",
@@ -291,6 +304,13 @@ impl SyncApplyRepo {
         incoming_rows: &[TigaPolicyExceptionRow],
     ) -> StorageResult<()> {
         for incoming in incoming_rows {
+            let incoming_exception = policy_exception_from_row(incoming)?;
+            verify_optional_integrity_tag(
+                conn,
+                b"tiga-policy-exception",
+                &incoming_exception,
+                incoming.integrity_tag.as_deref(),
+            )?;
             let local = conn
                 .inner()
                 .query_row(
@@ -317,6 +337,13 @@ impl SyncApplyRepo {
                 .optional()?;
 
             if let Some(local) = local {
+                let local_exception = policy_exception_from_row(&local)?;
+                verify_optional_integrity_tag(
+                    conn,
+                    b"tiga-policy-exception",
+                    &local_exception,
+                    local.integrity_tag.as_deref(),
+                )?;
                 if !same_exception_identity(&local, incoming) {
                     return Err(StorageError::Validation(format!(
                         "Tiga exception {} was rewritten during sync",
@@ -367,6 +394,12 @@ impl SyncApplyRepo {
                 .map_err(|e| {
                 StorageError::Validation(format!("invalid incoming Tiga policy: {e}"))
             })?;
+            verify_optional_integrity_tag(
+                conn,
+                b"tiga-policy-override",
+                &incoming_policy,
+                incoming.integrity_tag.as_deref(),
+            )?;
             let local = conn
                 .inner()
                 .query_row(
@@ -394,6 +427,12 @@ impl SyncApplyRepo {
                     .map_err(|e| {
                         StorageError::Validation(format!("invalid local Tiga policy: {e}"))
                     })?;
+                verify_optional_integrity_tag(
+                    conn,
+                    b"tiga-policy-override",
+                    &local_policy,
+                    local.integrity_tag.as_deref(),
+                )?;
                 let merged_policy = local_policy.merge_stricter(&incoming_policy);
                 let exception_id =
                     if merged_policy == local_policy && merged_policy != incoming_policy {
@@ -423,7 +462,7 @@ impl SyncApplyRepo {
                     } else if merged_policy == local_policy {
                         local.integrity_tag
                     } else {
-                        None
+                        optional_integrity_tag(conn, b"tiga-policy-override", &merged_policy)?
                     },
                 }
             } else {
@@ -460,6 +499,13 @@ impl SyncApplyRepo {
         incoming_rows: &[SecurityAuditEventRow],
     ) -> StorageResult<()> {
         for incoming in incoming_rows {
+            let incoming_event = security_audit_event_from_row(incoming)?;
+            verify_optional_integrity_tag(
+                conn,
+                b"tiga-security-audit",
+                &incoming_event,
+                incoming.integrity_tag.as_deref(),
+            )?;
             let local = conn
                 .inner()
                 .query_row(
@@ -487,6 +533,13 @@ impl SyncApplyRepo {
                 )
                 .optional()?;
             if let Some(local) = local {
+                let local_event = security_audit_event_from_row(&local)?;
+                verify_optional_integrity_tag(
+                    conn,
+                    b"tiga-security-audit",
+                    &local_event,
+                    local.integrity_tag.as_deref(),
+                )?;
                 if !same_audit_identity(&local, incoming) {
                     return Err(StorageError::Validation(format!(
                         "security audit event {} was rewritten during sync",
@@ -1872,6 +1925,55 @@ fn same_audit_identity(a: &SecurityAuditEventRow, b: &SecurityAuditEventRow) -> 
         && a.exception_id == b.exception_id
 }
 
+fn policy_exception_from_row(row: &TigaPolicyExceptionRow) -> StorageResult<PolicyException> {
+    Ok(PolicyException {
+        exception_id: row.exception_id.clone(),
+        target: tiga_scope_from_parts(&row.target_scope, &row.target_id)?,
+        approved_override: serde_json::from_str(&row.approved_override_json).map_err(|error| {
+            StorageError::Validation(format!("invalid synced Tiga exception: {error}"))
+        })?,
+        reason: row.reason.clone(),
+        expires_at_unix_secs: row.expires_at_unix_secs,
+    })
+}
+
+fn security_audit_event_from_row(row: &SecurityAuditEventRow) -> StorageResult<SecurityAuditEvent> {
+    Ok(SecurityAuditEvent {
+        event_id: row.event_id.clone(),
+        occurred_at: row.occurred_at.clone(),
+        operation: parse_storage_enum(&row.operation)?,
+        outcome: parse_storage_enum(&row.outcome)?,
+        scope: tiga_scope_from_parts(&row.scope_type, &row.scope_id)?,
+        session_id: row.session_id.clone(),
+        device_id: row.device_id.clone(),
+        reasons: serde_json::from_str::<Vec<AuthorizationReason>>(&row.reason_codes_json)
+            .map_err(|error| StorageError::Validation(error.to_string()))?,
+        constraints: serde_json::from_str::<Vec<AuthorizationConstraint>>(&row.constraints_json)
+            .map_err(|error| StorageError::Validation(error.to_string()))?,
+        exception_id: row.exception_id.clone(),
+    })
+}
+
+fn parse_storage_enum<T: serde::de::DeserializeOwned>(value: &str) -> StorageResult<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|error| StorageError::Validation(error.to_string()))
+}
+
+fn tiga_scope_from_parts(scope_type: &str, scope_id: &str) -> StorageResult<TigaScope> {
+    match scope_type {
+        "vault" => Ok(TigaScope::Vault),
+        "project" => Ok(TigaScope::Project {
+            project_id: scope_id.to_string(),
+        }),
+        "entry" => Ok(TigaScope::Entry {
+            entry_id: scope_id.to_string(),
+        }),
+        other => Err(StorageError::Validation(format!(
+            "invalid synced Tiga scope: {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,6 +1984,7 @@ mod tests {
     use crate::sync_state::collect_sync_state_payload;
     use mdbx_core::model::{ChangeScope, Commit, CommitKind, ConflictResolution, EntryType};
     use mdbx_core::tiga::TIGA_POLICY_VERSION;
+    use mdbx_crypto::keyring::Keyring;
     use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit, TombstoneRecord};
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -1891,6 +1994,50 @@ mod tests {
         initialize_vault(&conn, &VaultInitParams::default()).unwrap();
         let ctx = CommitContext::new("device-a".to_string());
         (conn, ctx)
+    }
+
+    #[test]
+    fn synced_tiga_records_reject_invalid_authenticated_tags() {
+        let mut conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        conn.attach_keyring(Keyring::from_vault_key(&[9_u8; 32], b"sync-tiga-test").unwrap());
+
+        let policy = TigaPolicyOverride {
+            clipboard_allowed: Some(false),
+            ..Default::default()
+        };
+        let mut policy_tag = optional_integrity_tag(&conn, b"tiga-policy-override", &policy)
+            .unwrap()
+            .unwrap();
+        policy_tag[0] ^= 1;
+        let error = SyncApplyRepo::apply_tiga_policy_overrides(
+            &conn,
+            &[TigaPolicyOverrideRow {
+                scope_type: "vault".to_string(),
+                scope_id: String::new(),
+                policy_json: serde_json::to_string(&policy).unwrap(),
+                exception_id: None,
+                updated_at: "2026-07-19T00:00:00Z".to_string(),
+                updated_by_device_id: "remote".to_string(),
+                integrity_tag: Some(policy_tag),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("integrity tag mismatch"));
+
+        let state_error = SyncApplyRepo::apply_tiga_vault_state(
+            &conn,
+            &TigaVaultStateRow {
+                default_tiga_mode: "multi".to_string(),
+                policy_version: TIGA_POLICY_VERSION + 1,
+                compliance_status: "compliant".to_string(),
+                updated_at: "2026-07-19T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(state_error
+            .to_string()
+            .contains("unsupported incoming Tiga policy version"));
     }
 
     #[test]

@@ -65,16 +65,28 @@ impl TigaPolicyStore {
         let (scope_type, scope_id) = scope_parts(scope);
         conn.inner()
             .query_row(
-                "SELECT policy_json, exception_id FROM tiga_policy_overrides
+                "SELECT policy_json, exception_id, integrity_tag FROM tiga_policy_overrides
                  WHERE scope_type = ?1 AND scope_id = ?2",
                 params![scope_type, scope_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(|(json, exception_id)| {
+            .map(|(json, exception_id, tag)| {
                 let policy_override = serde_json::from_str(&json).map_err(|e| {
                     StorageError::Validation(format!("invalid stored Tiga policy override: {e}"))
                 })?;
+                verify_optional_integrity_tag(
+                    conn,
+                    b"tiga-policy-override",
+                    &policy_override,
+                    tag.as_deref(),
+                )?;
                 Ok(StoredPolicyOverride {
                     policy_override,
                     exception_id,
@@ -174,7 +186,7 @@ impl TigaPolicyStore {
         conn.inner()
             .query_row(
                 "SELECT target_scope, target_id, approved_override_json, reason,
-                        expires_at_unix_secs
+                        expires_at_unix_secs, integrity_tag
                  FROM tiga_policy_exceptions
                  WHERE exception_id = ?1 AND revoked_at IS NULL",
                 params![exception_id],
@@ -185,22 +197,30 @@ impl TigaPolicyStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
                     ))
                 },
             )
             .optional()?
             .map(
-                |(scope_type, scope_id, json, reason, expires_at_unix_secs)| {
+                |(scope_type, scope_id, json, reason, expires_at_unix_secs, tag)| {
                     let approved_override = serde_json::from_str(&json).map_err(|e| {
                         StorageError::Validation(format!("invalid stored Tiga exception: {e}"))
                     })?;
-                    Ok(PolicyException {
+                    let exception = PolicyException {
                         exception_id: exception_id.to_string(),
                         target: parse_scope(&scope_type, &scope_id)?,
                         approved_override,
                         reason,
                         expires_at_unix_secs,
-                    })
+                    };
+                    verify_optional_integrity_tag(
+                        conn,
+                        b"tiga-policy-exception",
+                        &exception,
+                        tag.as_deref(),
+                    )?;
+                    Ok(exception)
                 },
             )
             .transpose()
@@ -334,7 +354,8 @@ impl TigaService {
     ) -> StorageResult<Vec<SecurityAuditEvent>> {
         let mut stmt = conn.inner().prepare(
             "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
-                    session_id, device_id, reason_codes_json, constraints_json, exception_id
+                    session_id, device_id, reason_codes_json, constraints_json,
+                    exception_id, integrity_tag
              FROM security_audit_events
              ORDER BY occurred_at DESC, event_id DESC LIMIT ?1",
         )?;
@@ -351,6 +372,7 @@ impl TigaService {
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<Vec<u8>>>(11)?,
             ))
         })?;
         let mut events = Vec::new();
@@ -367,8 +389,9 @@ impl TigaService {
                 reasons,
                 constraints,
                 exception_id,
+                integrity_tag,
             ) = row?;
-            events.push(SecurityAuditEvent {
+            let event = SecurityAuditEvent {
                 event_id,
                 occurred_at,
                 operation: parse_enum_storage_value(&operation)?,
@@ -381,7 +404,14 @@ impl TigaService {
                 constraints: serde_json::from_str(&constraints)
                     .map_err(|e| StorageError::Validation(e.to_string()))?,
                 exception_id,
-            });
+            };
+            verify_optional_integrity_tag(
+                conn,
+                b"tiga-security-audit",
+                &event,
+                integrity_tag.as_deref(),
+            )?;
+            events.push(event);
         }
         Ok(events)
     }
@@ -889,7 +919,7 @@ fn integrity_tag<T: Serialize>(
     })
 }
 
-fn optional_integrity_tag<T: Serialize>(
+pub(crate) fn optional_integrity_tag<T: Serialize>(
     conn: &VaultConnection,
     domain: &[u8],
     value: &T,
@@ -901,6 +931,28 @@ fn optional_integrity_tag<T: Serialize>(
     hmac_sha256(&keyring.integrity_subkey, &[domain, &encoded])
         .map(Some)
         .map_err(StorageError::Crypto)
+}
+
+pub(crate) fn verify_optional_integrity_tag<T: Serialize>(
+    conn: &VaultConnection,
+    domain: &[u8],
+    value: &T,
+    stored_tag: Option<&[u8]>,
+) -> StorageResult<()> {
+    let Some(stored_tag) = stored_tag else {
+        return Ok(());
+    };
+    let Some(expected_tag) = optional_integrity_tag(conn, domain, value)? else {
+        // Locked sync can carry a vault-key HMAC but cannot verify it until a
+        // later unlocked read.
+        return Ok(());
+    };
+    if expected_tag.as_slice() != stored_tag {
+        return Err(StorageError::Validation(
+            "Tiga record integrity tag mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn track_scope_policy_change(
@@ -1337,6 +1389,58 @@ mod tests {
             TigaService::list_security_audit_events(&conn, 10).unwrap(),
             vec![event]
         );
+    }
+
+    #[test]
+    fn authenticated_tiga_records_reject_tampering_on_read() {
+        let (conn, ctx, project_id, _) = setup();
+        let device = standard_device();
+        let session = session(UnlockMethodType::Password, 1_000);
+        TigaService::set_policy_override_authorized(
+            &conn,
+            &ctx,
+            TigaScope::Project {
+                project_id: project_id.clone(),
+            },
+            TigaPolicyOverride {
+                clipboard_allowed: Some(false),
+                ..Default::default()
+            },
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_000,
+            },
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE tiga_policy_overrides SET policy_json = ?1
+                 WHERE scope_type = 'project' AND scope_id = ?2",
+                params![r#"{"clipboard_allowed":true}"#, project_id],
+            )
+            .unwrap();
+        let error = TigaService::resolve_policy_for_project(&conn, &project_id).unwrap_err();
+        assert!(error.to_string().contains("integrity tag mismatch"));
+
+        let decision = TigaService::authorize_operation(
+            &conn,
+            &TigaScope::Vault,
+            TigaOperation::CopySecret,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(decision.outcome, AuthorizationOutcome::AllowWithConstraints);
+        conn.inner()
+            .execute("UPDATE security_audit_events SET outcome = 'deny'", [])
+            .unwrap();
+        let error = TigaService::list_security_audit_events(&conn, 10).unwrap_err();
+        assert!(error.to_string().contains("integrity tag mismatch"));
     }
 
     #[test]
