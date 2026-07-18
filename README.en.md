@@ -6,6 +6,8 @@ This directory contains the Rust workspace and implementation notes for Monica M
 
 MDBX is Monica's local-first encrypted vault format. It is designed around stable long-term storage, Git-like logical history, sync conflict handling, native attachments, snapshots, and Tiga security modes.
 
+The current format generation is **MDBX2**, stored as `MDBX-2`. MDBX2 automatically and transactionally upgrades `MDBX-1` and `MDBX-1-DRAFT` vaults. See `docs/09-mdbx2-compatibility.md` for the compatibility contract.
+
 For the normative format documents, see `docs/`.
 
 The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibility paths must be preserved whenever possible, and data safety comes before convenience.
@@ -47,6 +49,7 @@ Read the spec set in `docs/` before changing storage behavior:
 - `docs/02-storage-sync-spec.md`
 - `docs/03-security-spec.md`
 - `docs/06-sqlite-schema-v1.zh-CN.md`
+- `docs/09-mdbx2-compatibility.md`
 
 The `docs/` directory defines the format and product constraints. The Rust workspace implements those constraints and documents practical integration.
 
@@ -121,6 +124,13 @@ For exported methods, JSON payload rules, binding generation, iOS packaging note
 
 Key capabilities currently verified in the Rust storage core:
 
+- Writable open automatically upgrades MDBX-1 and MDBX-1-DRAFT vaults to MDBX-2; migration is idempotent and unknown critical extensions block writes.
+- Tiga2 expands Sky/Multi/Power into versioned runtime policies for sessions, reveal, clipboard, export, attachments, recovery, device assurance, and audit.
+- Scoped policy changes strengthen by default. Exact exceptions, authorization decisions, and audit events sync across devices, with stricter conflict resolution.
+- MDBX-1 and early MDBX-2 schema 2 vaults upgrade atomically to schema 3. Legacy weak overrides and non-compliant unlock setups enter remediation without locking users out.
+- Snapshot creation and restore are atomic. Restore recreates the exact active set, tags, and attachment chunks and records one restore head plus object versions for affected objects.
+- CLI sync bundles use the storage-core state payload and `SyncApplyRepo`; the duplicate direct-SQL apply path has been removed.
+
 - Snapshots include and restore active `attachment_chunks`; older metadata-only snapshots remain compatible.
 - Entry, project, and attachment rows are recorded in `object_versions` for divergent three-way merge.
 - Different-field concurrent entry/project changes write a two-parent merge commit; same-field changes create unresolved conflicts.
@@ -148,6 +158,9 @@ Client code should not directly write:
 - `device_heads`
 - `branches`
 - `project_tags`
+- `tiga_policy_overrides`
+- `tiga_policy_exceptions`
+- `security_audit_events`
 
 Batch user operations should normally produce one user-level commit, not one commit per object.
 

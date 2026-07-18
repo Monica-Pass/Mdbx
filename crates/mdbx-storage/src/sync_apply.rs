@@ -3,6 +3,7 @@ use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
 use mdbx_core::model::ConflictObjectType;
+use mdbx_core::tiga::{TigaMode, TigaPolicyOverride};
 use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit};
 
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
@@ -12,7 +13,8 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, ProjectRow,
-    ProjectTagSetRow, SyncStatePayload,
+    ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
+    TigaPolicyOverrideRow, TigaVaultStateRow,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -227,8 +229,295 @@ impl SyncApplyRepo {
         if let Some(project_tags) = &state.project_tags {
             Self::apply_project_tags(conn, project_tags)?;
         }
+        if let Some(vault_state) = &state.tiga_vault_state {
+            Self::apply_tiga_vault_state(conn, vault_state)?;
+        }
+        if let Some(exceptions) = &state.tiga_policy_exceptions {
+            Self::apply_tiga_policy_exceptions(conn, exceptions)?;
+        }
+        if let Some(overrides) = &state.tiga_policy_overrides {
+            Self::apply_tiga_policy_overrides(conn, overrides)?;
+        }
+        if let Some(audit_events) = &state.security_audit_events {
+            Self::apply_security_audit_events(conn, audit_events)?;
+        }
         Self::apply_branches(conn, &state.branches)?;
         Ok(conflicts)
+    }
+
+    fn apply_tiga_vault_state(
+        conn: &VaultConnection,
+        incoming: &TigaVaultStateRow,
+    ) -> StorageResult<()> {
+        let local: TigaVaultStateRow = conn.inner().query_row(
+            "SELECT default_tiga_mode, tiga_policy_version, tiga_compliance_status, updated_at
+             FROM vault_meta",
+            [],
+            |row| {
+                Ok(TigaVaultStateRow {
+                    default_tiga_mode: row.get(0)?,
+                    policy_version: row.get::<_, i64>(1)? as u32,
+                    compliance_status: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )?;
+        let local_mode: TigaMode = local
+            .default_tiga_mode
+            .parse()
+            .map_err(StorageError::Validation)?;
+        let incoming_mode: TigaMode = incoming
+            .default_tiga_mode
+            .parse()
+            .map_err(StorageError::Validation)?;
+        let mode = std::cmp::max(local_mode, incoming_mode).to_string();
+        let compliance =
+            stricter_compliance_status(&local.compliance_status, &incoming.compliance_status)?;
+        conn.inner().execute(
+            "UPDATE vault_meta SET default_tiga_mode = ?1, tiga_policy_version = ?2,
+             tiga_compliance_status = ?3, updated_at = ?4",
+            params![
+                mode,
+                std::cmp::max(local.policy_version, incoming.policy_version),
+                compliance,
+                std::cmp::max(&local.updated_at, &incoming.updated_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn apply_tiga_policy_exceptions(
+        conn: &VaultConnection,
+        incoming_rows: &[TigaPolicyExceptionRow],
+    ) -> StorageResult<()> {
+        for incoming in incoming_rows {
+            let local = conn
+                .inner()
+                .query_row(
+                    "SELECT exception_id, target_scope, target_id, approved_override_json,
+                            reason, expires_at_unix_secs, created_at,
+                            created_by_session_id, revoked_at, integrity_tag
+                     FROM tiga_policy_exceptions WHERE exception_id = ?1",
+                    params![incoming.exception_id],
+                    |row| {
+                        Ok(TigaPolicyExceptionRow {
+                            exception_id: row.get(0)?,
+                            target_scope: row.get(1)?,
+                            target_id: row.get(2)?,
+                            approved_override_json: row.get(3)?,
+                            reason: row.get(4)?,
+                            expires_at_unix_secs: row.get(5)?,
+                            created_at: row.get(6)?,
+                            created_by_session_id: row.get(7)?,
+                            revoked_at: row.get(8)?,
+                            integrity_tag: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            if let Some(local) = local {
+                if !same_exception_identity(&local, incoming) {
+                    return Err(StorageError::Validation(format!(
+                        "Tiga exception {} was rewritten during sync",
+                        incoming.exception_id
+                    )));
+                }
+                let revoked_at = earliest_present(local.revoked_at, incoming.revoked_at.clone());
+                let integrity_tag = incoming
+                    .integrity_tag
+                    .as_ref()
+                    .or(local.integrity_tag.as_ref());
+                conn.inner().execute(
+                    "UPDATE tiga_policy_exceptions SET revoked_at = ?1, integrity_tag = ?2
+                     WHERE exception_id = ?3",
+                    params![revoked_at, integrity_tag, incoming.exception_id],
+                )?;
+            } else {
+                conn.inner().execute(
+                    "INSERT INTO tiga_policy_exceptions
+                        (exception_id, target_scope, target_id, approved_override_json,
+                         reason, expires_at_unix_secs, created_at, created_by_session_id,
+                         revoked_at, integrity_tag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        incoming.exception_id,
+                        incoming.target_scope,
+                        incoming.target_id,
+                        incoming.approved_override_json,
+                        incoming.reason,
+                        incoming.expires_at_unix_secs,
+                        incoming.created_at,
+                        incoming.created_by_session_id,
+                        incoming.revoked_at,
+                        incoming.integrity_tag,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_tiga_policy_overrides(
+        conn: &VaultConnection,
+        incoming_rows: &[TigaPolicyOverrideRow],
+    ) -> StorageResult<()> {
+        for incoming in incoming_rows {
+            let incoming_policy: TigaPolicyOverride = serde_json::from_str(&incoming.policy_json)
+                .map_err(|e| {
+                StorageError::Validation(format!("invalid incoming Tiga policy: {e}"))
+            })?;
+            let local = conn
+                .inner()
+                .query_row(
+                    "SELECT scope_type, scope_id, policy_json, exception_id, updated_at,
+                            updated_by_device_id, integrity_tag
+                     FROM tiga_policy_overrides
+                     WHERE scope_type = ?1 AND scope_id = ?2",
+                    params![incoming.scope_type, incoming.scope_id],
+                    |row| {
+                        Ok(TigaPolicyOverrideRow {
+                            scope_type: row.get(0)?,
+                            scope_id: row.get(1)?,
+                            policy_json: row.get(2)?,
+                            exception_id: row.get(3)?,
+                            updated_at: row.get(4)?,
+                            updated_by_device_id: row.get(5)?,
+                            integrity_tag: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            let merged = if let Some(local) = local {
+                let local_policy: TigaPolicyOverride = serde_json::from_str(&local.policy_json)
+                    .map_err(|e| {
+                        StorageError::Validation(format!("invalid local Tiga policy: {e}"))
+                    })?;
+                let merged_policy = local_policy.merge_stricter(&incoming_policy);
+                let exception_id =
+                    if merged_policy == local_policy && merged_policy != incoming_policy {
+                        local.exception_id.clone()
+                    } else if merged_policy == incoming_policy && merged_policy != local_policy {
+                        incoming.exception_id.clone()
+                    } else if local.exception_id == incoming.exception_id {
+                        local.exception_id.clone()
+                    } else {
+                        None
+                    };
+                let incoming_wins_metadata = incoming.updated_at >= local.updated_at;
+                TigaPolicyOverrideRow {
+                    scope_type: incoming.scope_type.clone(),
+                    scope_id: incoming.scope_id.clone(),
+                    policy_json: serde_json::to_string(&merged_policy)
+                        .map_err(|e| StorageError::Validation(e.to_string()))?,
+                    exception_id,
+                    updated_at: std::cmp::max(local.updated_at, incoming.updated_at.clone()),
+                    updated_by_device_id: if incoming_wins_metadata {
+                        incoming.updated_by_device_id.clone()
+                    } else {
+                        local.updated_by_device_id
+                    },
+                    integrity_tag: if merged_policy == incoming_policy {
+                        incoming.integrity_tag.clone()
+                    } else if merged_policy == local_policy {
+                        local.integrity_tag
+                    } else {
+                        None
+                    },
+                }
+            } else {
+                incoming.clone()
+            };
+
+            conn.inner().execute(
+                "INSERT INTO tiga_policy_overrides
+                    (scope_type, scope_id, policy_json, exception_id, updated_at,
+                     updated_by_device_id, integrity_tag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                    policy_json = excluded.policy_json,
+                    exception_id = excluded.exception_id,
+                    updated_at = excluded.updated_at,
+                    updated_by_device_id = excluded.updated_by_device_id,
+                    integrity_tag = excluded.integrity_tag",
+                params![
+                    merged.scope_type,
+                    merged.scope_id,
+                    merged.policy_json,
+                    merged.exception_id,
+                    merged.updated_at,
+                    merged.updated_by_device_id,
+                    merged.integrity_tag,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_security_audit_events(
+        conn: &VaultConnection,
+        incoming_rows: &[SecurityAuditEventRow],
+    ) -> StorageResult<()> {
+        for incoming in incoming_rows {
+            let local = conn
+                .inner()
+                .query_row(
+                    "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                            session_id, device_id, reason_codes_json, constraints_json,
+                            exception_id, integrity_tag
+                     FROM security_audit_events WHERE event_id = ?1",
+                    params![incoming.event_id],
+                    |row| {
+                        Ok(SecurityAuditEventRow {
+                            event_id: row.get(0)?,
+                            occurred_at: row.get(1)?,
+                            operation: row.get(2)?,
+                            outcome: row.get(3)?,
+                            scope_type: row.get(4)?,
+                            scope_id: row.get(5)?,
+                            session_id: row.get(6)?,
+                            device_id: row.get(7)?,
+                            reason_codes_json: row.get(8)?,
+                            constraints_json: row.get(9)?,
+                            exception_id: row.get(10)?,
+                            integrity_tag: row.get(11)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(local) = local {
+                if !same_audit_identity(&local, incoming) {
+                    return Err(StorageError::Validation(format!(
+                        "security audit event {} was rewritten during sync",
+                        incoming.event_id
+                    )));
+                }
+            } else {
+                conn.inner().execute(
+                    "INSERT INTO security_audit_events
+                        (event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                         session_id, device_id, reason_codes_json, constraints_json,
+                         exception_id, integrity_tag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        incoming.event_id,
+                        incoming.occurred_at,
+                        incoming.operation,
+                        incoming.outcome,
+                        incoming.scope_type,
+                        incoming.scope_id,
+                        incoming.session_id,
+                        incoming.device_id,
+                        incoming.reason_codes_json,
+                        incoming.constraints_json,
+                        incoming.exception_id,
+                        incoming.integrity_tag,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_projects(
@@ -1534,6 +1823,55 @@ fn bump_object_clock(clock: &str) -> String {
     format!(r#"{{"counter":{}}}"#, counter + 1)
 }
 
+fn stricter_compliance_status<'a>(a: &'a str, b: &'a str) -> StorageResult<&'a str> {
+    fn rank(value: &str) -> Option<u8> {
+        match value {
+            "compliant" => Some(0),
+            "exception" => Some(1),
+            "remediation-required" => Some(2),
+            _ => None,
+        }
+    }
+    let a_rank =
+        rank(a).ok_or_else(|| StorageError::Validation(format!("invalid Tiga status: {a}")))?;
+    let b_rank =
+        rank(b).ok_or_else(|| StorageError::Validation(format!("invalid Tiga status: {b}")))?;
+    Ok(if a_rank >= b_rank { a } else { b })
+}
+
+fn earliest_present(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn same_exception_identity(a: &TigaPolicyExceptionRow, b: &TigaPolicyExceptionRow) -> bool {
+    a.exception_id == b.exception_id
+        && a.target_scope == b.target_scope
+        && a.target_id == b.target_id
+        && a.approved_override_json == b.approved_override_json
+        && a.reason == b.reason
+        && a.expires_at_unix_secs == b.expires_at_unix_secs
+        && a.created_at == b.created_at
+        && a.created_by_session_id == b.created_by_session_id
+}
+
+fn same_audit_identity(a: &SecurityAuditEventRow, b: &SecurityAuditEventRow) -> bool {
+    a.event_id == b.event_id
+        && a.occurred_at == b.occurred_at
+        && a.operation == b.operation
+        && a.outcome == b.outcome
+        && a.scope_type == b.scope_type
+        && a.scope_id == b.scope_id
+        && a.session_id == b.session_id
+        && a.device_id == b.device_id
+        && a.reason_codes_json == b.reason_codes_json
+        && a.constraints_json == b.constraints_json
+        && a.exception_id == b.exception_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,6 +1881,7 @@ mod tests {
     use crate::repo::{AttachmentRepo, EntryRepo, ObjectVersionRepo, ProjectRepo};
     use crate::sync_state::collect_sync_state_payload;
     use mdbx_core::model::{ChangeScope, Commit, CommitKind, ConflictResolution, EntryType};
+    use mdbx_core::tiga::TIGA_POLICY_VERSION;
     use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit, TombstoneRecord};
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -1552,6 +1891,115 @@ mod tests {
         initialize_vault(&conn, &VaultInitParams::default()).unwrap();
         let ctx = CommitContext::new("device-a".to_string());
         (conn, ctx)
+    }
+
+    #[test]
+    fn synced_tiga_policy_conflicts_merge_to_stricter_fields() {
+        let (conn, _) = setup();
+        let local = TigaPolicyOverride {
+            clipboard_allowed: Some(true),
+            clipboard_ttl_secs: Some(30),
+            minimum_auth_factors: Some(2),
+            ..Default::default()
+        };
+        conn.inner()
+            .execute(
+                "INSERT INTO tiga_policy_overrides
+                    (scope_type, scope_id, policy_json, exception_id, updated_at,
+                     updated_by_device_id, integrity_tag)
+                 VALUES ('vault', '', ?1, NULL, '2026-01-01T00:00:00Z', 'local', NULL)",
+                params![serde_json::to_string(&local).unwrap()],
+            )
+            .unwrap();
+        let incoming = TigaPolicyOverride {
+            clipboard_allowed: Some(false),
+            clipboard_ttl_secs: Some(10),
+            minimum_auth_factors: Some(1),
+            ..Default::default()
+        };
+        SyncApplyRepo::apply_tiga_policy_overrides(
+            &conn,
+            &[TigaPolicyOverrideRow {
+                scope_type: "vault".to_string(),
+                scope_id: String::new(),
+                policy_json: serde_json::to_string(&incoming).unwrap(),
+                exception_id: None,
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                updated_by_device_id: "remote".to_string(),
+                integrity_tag: None,
+            }],
+        )
+        .unwrap();
+        let stored: String = conn
+            .inner()
+            .query_row(
+                "SELECT policy_json FROM tiga_policy_overrides
+                 WHERE scope_type = 'vault' AND scope_id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: TigaPolicyOverride = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored.clipboard_allowed, Some(false));
+        assert_eq!(stored.clipboard_ttl_secs, Some(10));
+        assert_eq!(stored.minimum_auth_factors, Some(2));
+    }
+
+    #[test]
+    fn synced_tiga_vault_state_never_lowers_profile_or_compliance() {
+        let (conn, _) = setup();
+        conn.inner()
+            .execute(
+                "UPDATE vault_meta SET default_tiga_mode = 'power',
+                 tiga_compliance_status = 'remediation-required'",
+                [],
+            )
+            .unwrap();
+        SyncApplyRepo::apply_tiga_vault_state(
+            &conn,
+            &TigaVaultStateRow {
+                default_tiga_mode: "sky".to_string(),
+                policy_version: 1,
+                compliance_status: "compliant".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let state: (String, i64, String) = conn
+            .inner()
+            .query_row(
+                "SELECT default_tiga_mode, tiga_policy_version, tiga_compliance_status
+                 FROM vault_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "power");
+        assert_eq!(state.1, i64::from(TIGA_POLICY_VERSION));
+        assert_eq!(state.2, "remediation-required");
+    }
+
+    #[test]
+    fn synced_audit_event_id_cannot_be_rewritten() {
+        let (conn, _) = setup();
+        let mut event = SecurityAuditEventRow {
+            event_id: "event-1".to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            operation: "copy-secret".to_string(),
+            outcome: "allow".to_string(),
+            scope_type: "vault".to_string(),
+            scope_id: String::new(),
+            session_id: None,
+            device_id: Some("device-a".to_string()),
+            reason_codes_json: "[]".to_string(),
+            constraints_json: "[]".to_string(),
+            exception_id: None,
+            integrity_tag: None,
+        };
+        SyncApplyRepo::apply_security_audit_events(&conn, &[event.clone()]).unwrap();
+        event.outcome = "deny".to_string();
+        let error = SyncApplyRepo::apply_security_audit_events(&conn, &[event]).unwrap_err();
+        assert!(error.to_string().contains("was rewritten"));
     }
 
     fn make_commit(

@@ -2,15 +2,21 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
 use mdbx_core::model::{Attachment, Entry, EntryType, Project, Snapshot};
+use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
+use crate::repo::object_version::ObjectVersionRepo;
+use crate::sync_state::ProjectTagSetRow;
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 /// Snapshot 内部负载。
 ///
@@ -24,7 +30,9 @@ struct SnapshotPayload {
     entries: Vec<Entry>,
     attachments: Vec<Attachment>,
     #[serde(default)]
-    attachment_chunks: Vec<AttachmentChunk>,
+    attachment_chunks: Option<Vec<AttachmentChunk>>,
+    #[serde(default)]
+    project_tags: Option<Vec<ProjectTagSetRow>>,
 }
 
 /// Snapshot 持久化仓库。
@@ -39,59 +47,60 @@ impl SnapshotRepo {
 
     /// 创建 snapshot：捕获当前所有未删除对象的元数据。
     pub fn create_snapshot(conn: &VaultConnection, ctx: &CommitContext) -> StorageResult<Snapshot> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let snapshot_id = Uuid::new_v4().to_string();
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let snapshot_id = Uuid::new_v4().to_string();
 
-        let vault_id: String = conn
-            .inner()
-            .query_row("SELECT vault_id FROM vault_meta", [], |row| row.get(0))
-            .map_err(StorageError::Database)?;
+            let (vault_id, format_version): (String, String) = conn
+                .inner()
+                .query_row(
+                    "SELECT vault_id, format_version FROM vault_meta",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(StorageError::Database)?;
 
-        let projects = read_all_active_projects(conn)?;
-        let entries = read_all_active_entries(conn)?;
-        let attachments = read_all_active_attachments(conn)?;
-        let attachment_chunks = read_all_active_attachment_chunks(conn)?;
+            let payload = SnapshotPayload {
+                vault_id,
+                format_version,
+                snapshot_created_at: now.clone(),
+                projects: read_all_active_projects(conn)?,
+                entries: read_all_active_entries(conn)?,
+                attachments: read_all_active_attachments(conn)?,
+                attachment_chunks: Some(read_all_active_attachment_chunks(conn)?),
+                project_tags: Some(read_all_active_project_tags(conn)?),
+            };
 
-        let payload = SnapshotPayload {
-            vault_id,
-            format_version: "MDBX-1".to_string(),
-            snapshot_created_at: now.clone(),
-            projects,
-            entries,
-            attachments,
-            attachment_chunks,
-        };
+            let snapshot_json = serde_json::to_vec(&payload)
+                .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
+            let snapshot_ct = Self::encrypt_payload(conn, &snapshot_id, &snapshot_json)?;
+            let snapshot_hash = compute_sha256_hex(&snapshot_ct);
 
-        let snapshot_json = serde_json::to_vec(&payload)
-            .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
-        let snapshot_ct = Self::encrypt_payload(conn, &snapshot_id, &snapshot_json)?;
-        let snapshot_hash = compute_sha256_hex(&snapshot_ct);
+            let commit_id =
+                ctx.create_commit(conn, "snapshot", "multi", &[snapshot_id.clone()], &[])?;
 
-        // 创建 snapshot commit（kind="snapshot", scope="multi"）
-        let commit_id =
-            ctx.create_commit(conn, "snapshot", "multi", &[snapshot_id.clone()], &[])?;
+            conn.inner().execute(
+                "INSERT INTO snapshots (snapshot_id, base_commit_id, snapshot_ct,
+                 snapshot_hash, created_at, created_by_device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    snapshot_id,
+                    commit_id,
+                    snapshot_ct,
+                    snapshot_hash,
+                    now,
+                    ctx.device_id,
+                ],
+            )?;
 
-        conn.inner().execute(
-            "INSERT INTO snapshots (snapshot_id, base_commit_id, snapshot_ct,
-             snapshot_hash, created_at, created_by_device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+            Ok(Snapshot {
                 snapshot_id,
-                commit_id,
+                base_commit_id: commit_id,
                 snapshot_ct,
                 snapshot_hash,
-                now,
-                ctx.device_id,
-            ],
-        )?;
-
-        Ok(Snapshot {
-            snapshot_id,
-            base_commit_id: commit_id,
-            snapshot_ct,
-            snapshot_hash,
-            created_at: now,
-            created_by_device_id: ctx.device_id.clone(),
+                created_at: now,
+                created_by_device_id: ctx.device_id.clone(),
+            })
         })
     }
 
@@ -103,7 +112,23 @@ impl SnapshotRepo {
     ///
     /// 每个对象使用 INSERT OR REPLACE，保持原始 ID 不变。
     /// 恢复完成后创建一个 "snapshot" 类型的 commit。
-    pub fn restore_snapshot(
+    pub fn restore_snapshot_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        snapshot_id: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<AuthorizationDecision> {
+        let (_, decision) = TigaService::execute_authorized(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::RestoreSnapshot,
+            context,
+            || Self::restore_snapshot(conn, ctx, snapshot_id),
+        )?;
+        Ok(decision)
+    }
+
+    pub(crate) fn restore_snapshot(
         conn: &VaultConnection,
         ctx: &CommitContext,
         snapshot_id: &str,
@@ -124,31 +149,113 @@ impl SnapshotRepo {
         let payload: SnapshotPayload = serde_json::from_slice(&snapshot_json)
             .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
 
-        // 按依赖顺序恢复：projects → entries → attachments
-        for p in &payload.projects {
-            upsert_project(conn, p)?;
-        }
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let active_projects = active_ids(conn, "projects", "project_id")?;
+            let active_entries = active_ids(conn, "entries", "entry_id")?;
+            let active_attachments = active_ids(conn, "attachments", "attachment_id")?;
 
-        for e in &payload.entries {
-            upsert_entry(conn, e)?;
-        }
+            let snapshot_projects = id_set(payload.projects.iter().map(|p| p.project_id.as_str()));
+            let snapshot_entries = id_set(payload.entries.iter().map(|e| e.entry_id.as_str()));
+            let snapshot_attachments =
+                id_set(payload.attachments.iter().map(|a| a.attachment_id.as_str()));
 
-        for a in &payload.attachments {
-            upsert_attachment(conn, a)?;
-        }
+            let removed_projects = difference(&active_projects, &snapshot_projects);
+            let removed_entries = difference(&active_entries, &snapshot_entries);
+            let removed_attachments = difference(&active_attachments, &snapshot_attachments);
 
-        restore_attachment_chunks(conn, &payload.attachment_chunks)?;
+            let mut changed_ids = vec![snapshot_id.to_string()];
+            changed_ids.extend(snapshot_projects.iter().cloned());
+            changed_ids.extend(snapshot_entries.iter().cloned());
+            changed_ids.extend(snapshot_attachments.iter().cloned());
+            changed_ids.extend(removed_projects.iter().cloned());
+            changed_ids.extend(removed_entries.iter().cloned());
+            changed_ids.extend(removed_attachments.iter().cloned());
+            changed_ids.sort();
+            changed_ids.dedup();
 
-        // 创建恢复 commit
-        ctx.create_commit(
-            conn,
-            "snapshot",
-            "multi",
-            &[snapshot_id.to_string()],
-            &[snap.base_commit_id],
-        )?;
+            let restore_commit_id = ctx.create_commit(
+                conn,
+                "snapshot",
+                "multi",
+                &changed_ids,
+                &[snap.base_commit_id.clone()],
+            )?;
 
-        Ok(())
+            // Restore in dependency order, but give every row a new causal head.
+            for project in &payload.projects {
+                upsert_project(conn, project, &restore_commit_id, &now, &ctx.device_id)?;
+                ObjectVersionRepo::record_project_current(
+                    conn,
+                    &restore_commit_id,
+                    &project.project_id,
+                )?;
+            }
+            for entry in &payload.entries {
+                upsert_entry(conn, entry, &restore_commit_id, &now, &ctx.device_id)?;
+                ObjectVersionRepo::record_entry_current(conn, &restore_commit_id, &entry.entry_id)?;
+            }
+            for attachment in &payload.attachments {
+                upsert_attachment(conn, attachment, &restore_commit_id, &now, &ctx.device_id)?;
+                ObjectVersionRepo::record_attachment_current(
+                    conn,
+                    &restore_commit_id,
+                    &attachment.attachment_id,
+                )?;
+            }
+
+            if let Some(chunks) = &payload.attachment_chunks {
+                restore_attachment_chunks(conn, &snapshot_attachments, chunks)?;
+            }
+            if let Some(tag_sets) = &payload.project_tags {
+                restore_project_tags(conn, &snapshot_projects, tag_sets)?;
+            }
+
+            // Objects created after the snapshot remain in history but leave the
+            // active set through a tracked soft delete.
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "attachment",
+                "attachments",
+                "attachment_id",
+                &removed_attachments,
+                &restore_commit_id,
+                &now,
+            )?;
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "entry",
+                "entries",
+                "entry_id",
+                &removed_entries,
+                &restore_commit_id,
+                &now,
+            )?;
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "project",
+                "projects",
+                "project_id",
+                &removed_projects,
+                &restore_commit_id,
+                &now,
+            )?;
+
+            for id in &removed_attachments {
+                ObjectVersionRepo::record_attachment_current(conn, &restore_commit_id, id)?;
+            }
+            for id in &removed_entries {
+                ObjectVersionRepo::record_entry_current(conn, &restore_commit_id, id)?;
+            }
+            for id in &removed_projects {
+                ObjectVersionRepo::record_project_current(conn, &restore_commit_id, id)?;
+            }
+
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -411,13 +518,58 @@ fn read_all_active_attachment_chunks(
     Ok(chunks)
 }
 
-fn upsert_project(conn: &VaultConnection, p: &Project) -> StorageResult<()> {
+fn read_all_active_project_tags(conn: &VaultConnection) -> StorageResult<Vec<ProjectTagSetRow>> {
+    let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut stmt = conn.inner().prepare(
+        "SELECT p.project_id, t.tag
+         FROM projects p
+         LEFT JOIN project_tags t ON t.project_id = p.project_id
+         WHERE p.deleted = 0
+         ORDER BY p.project_id, t.tag",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (project_id, tag) = row?;
+        let tags = by_project.entry(project_id).or_default();
+        if let Some(tag) = tag {
+            tags.push(tag);
+        }
+    }
+    Ok(by_project
+        .into_iter()
+        .map(|(project_id, tags)| ProjectTagSetRow { project_id, tags })
+        .collect())
+}
+
+fn upsert_project(
+    conn: &VaultConnection,
+    p: &Project,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
     conn.inner().execute(
-        "INSERT OR REPLACE INTO projects (project_id, title_ct, summary_ct, group_id,
+        "INSERT INTO projects (project_id, title_ct, summary_ct, group_id,
          icon_ref, favorite, archived, deleted, tiga_mode_override, object_clock,
          head_commit_id, attachment_count, created_at, updated_at,
          created_by_device_id, updated_by_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(project_id) DO UPDATE SET
+            title_ct = excluded.title_ct,
+            summary_ct = excluded.summary_ct,
+            group_id = excluded.group_id,
+            icon_ref = excluded.icon_ref,
+            favorite = excluded.favorite,
+            archived = excluded.archived,
+            deleted = 0,
+            tiga_mode_override = excluded.tiga_mode_override,
+            object_clock = excluded.object_clock,
+            head_commit_id = excluded.head_commit_id,
+            attachment_count = excluded.attachment_count,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
         params![
             p.project_id,
             p.title_ct,
@@ -426,27 +578,44 @@ fn upsert_project(conn: &VaultConnection, p: &Project) -> StorageResult<()> {
             p.icon_ref,
             p.favorite as i32,
             p.archived as i32,
-            p.deleted as i32,
             p.tiga_mode_override.as_ref().map(|m| m.to_string()),
-            p.object_clock,
-            p.head_commit_id,
+            bump_clock(&p.object_clock),
+            restore_commit_id,
             p.attachment_count as i32,
             p.created_at,
-            p.updated_at,
+            now,
             p.created_by_device_id,
-            p.updated_by_device_id,
+            device_id,
         ],
     )?;
     Ok(())
 }
 
-fn upsert_entry(conn: &VaultConnection, e: &Entry) -> StorageResult<()> {
+fn upsert_entry(
+    conn: &VaultConnection,
+    e: &Entry,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
     conn.inner().execute(
-        "INSERT OR REPLACE INTO entries (entry_id, project_id, entry_type, title_ct,
+        "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
          payload_ct, payload_schema_version, tiga_mode_override, object_clock,
          head_commit_id, deleted, created_at, updated_at,
          created_by_device_id, updated_by_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13)
+         ON CONFLICT(entry_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            entry_type = excluded.entry_type,
+            title_ct = excluded.title_ct,
+            payload_ct = excluded.payload_ct,
+            payload_schema_version = excluded.payload_schema_version,
+            tiga_mode_override = excluded.tiga_mode_override,
+            object_clock = excluded.object_clock,
+            head_commit_id = excluded.head_commit_id,
+            deleted = 0,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
         params![
             e.entry_id,
             e.project_id,
@@ -455,25 +624,44 @@ fn upsert_entry(conn: &VaultConnection, e: &Entry) -> StorageResult<()> {
             e.payload_ct,
             e.payload_schema_version as i32,
             e.tiga_mode_override.as_ref().map(|m| m.to_string()),
-            e.object_clock,
-            e.head_commit_id,
-            e.deleted as i32,
+            bump_clock(&e.object_clock),
+            restore_commit_id,
             e.created_at,
-            e.updated_at,
+            now,
             e.created_by_device_id,
-            e.updated_by_device_id,
+            device_id,
         ],
     )?;
     Ok(())
 }
 
-fn upsert_attachment(conn: &VaultConnection, a: &Attachment) -> StorageResult<()> {
+fn upsert_attachment(
+    conn: &VaultConnection,
+    a: &Attachment,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
     conn.inner().execute(
-        "INSERT OR REPLACE INTO attachments (attachment_id, project_id, entry_id,
+        "INSERT INTO attachments (attachment_id, project_id, entry_id,
          file_name_ct, media_type_ct, storage_mode, content_hash,
          original_size, stored_size, chunk_count, head_commit_id,
          deleted, created_at, updated_at, created_by_device_id, updated_by_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15)
+         ON CONFLICT(attachment_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            entry_id = excluded.entry_id,
+            file_name_ct = excluded.file_name_ct,
+            media_type_ct = excluded.media_type_ct,
+            storage_mode = excluded.storage_mode,
+            content_hash = excluded.content_hash,
+            original_size = excluded.original_size,
+            stored_size = excluded.stored_size,
+            chunk_count = excluded.chunk_count,
+            head_commit_id = excluded.head_commit_id,
+            deleted = 0,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
         params![
             a.attachment_id,
             a.project_id,
@@ -485,12 +673,11 @@ fn upsert_attachment(conn: &VaultConnection, a: &Attachment) -> StorageResult<()
             a.original_size as i64,
             a.stored_size as i64,
             a.chunk_count as i32,
-            a.head_commit_id,
-            a.deleted as i32,
+            restore_commit_id,
             a.created_at,
-            a.updated_at,
+            now,
             a.created_by_device_id,
-            a.updated_by_device_id,
+            device_id,
         ],
     )?;
     Ok(())
@@ -498,19 +685,9 @@ fn upsert_attachment(conn: &VaultConnection, a: &Attachment) -> StorageResult<()
 
 fn restore_attachment_chunks(
     conn: &VaultConnection,
+    attachment_ids: &HashSet<String>,
     chunks: &[AttachmentChunk],
 ) -> StorageResult<()> {
-    if chunks.is_empty() {
-        return Ok(());
-    }
-
-    let mut attachment_ids: Vec<&str> = chunks
-        .iter()
-        .map(|chunk| chunk.attachment_id.as_str())
-        .collect();
-    attachment_ids.sort_unstable();
-    attachment_ids.dedup();
-
     for attachment_id in attachment_ids {
         conn.inner().execute(
             "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
@@ -538,6 +715,108 @@ fn restore_attachment_chunks(
     Ok(())
 }
 
+fn restore_project_tags(
+    conn: &VaultConnection,
+    project_ids: &HashSet<String>,
+    tag_sets: &[ProjectTagSetRow],
+) -> StorageResult<()> {
+    for project_id in project_ids {
+        conn.inner().execute(
+            "DELETE FROM project_tags WHERE project_id = ?1",
+            params![project_id],
+        )?;
+    }
+    for row in tag_sets {
+        for tag in &row.tags {
+            conn.inner().execute(
+                "INSERT OR IGNORE INTO project_tags (project_id, tag) VALUES (?1, ?2)",
+                params![row.project_id, tag],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn active_ids(
+    conn: &VaultConnection,
+    table: &str,
+    id_column: &str,
+) -> StorageResult<HashSet<String>> {
+    let mut stmt = conn.inner().prepare(&format!(
+        "SELECT {id_column} FROM {table} WHERE deleted = 0"
+    ))?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
+}
+
+fn id_set<'a>(ids: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    ids.map(str::to_string).collect()
+}
+
+fn difference(left: &HashSet<String>, right: &HashSet<String>) -> Vec<String> {
+    let mut ids: Vec<String> = left.difference(right).cloned().collect();
+    ids.sort();
+    ids
+}
+
+#[allow(clippy::too_many_arguments)]
+fn soft_delete_for_restore(
+    conn: &VaultConnection,
+    ctx: &CommitContext,
+    object_type: &str,
+    table: &str,
+    id_column: &str,
+    object_ids: &[String],
+    restore_commit_id: &str,
+    now: &str,
+) -> StorageResult<()> {
+    for object_id in object_ids {
+        ctx.create_tombstone(conn, object_type, object_id)?;
+        if table == "attachments" {
+            conn.inner().execute(
+                &format!(
+                    "UPDATE {table} SET deleted = 1, head_commit_id = ?2,
+                     updated_at = ?3, updated_by_device_id = ?4 WHERE {id_column} = ?1"
+                ),
+                params![object_id, restore_commit_id, now, ctx.device_id],
+            )?;
+        } else {
+            let clock: String = conn.inner().query_row(
+                &format!("SELECT object_clock FROM {table} WHERE {id_column} = ?1"),
+                params![object_id],
+                |row| row.get(0),
+            )?;
+            conn.inner().execute(
+                &format!(
+                    "UPDATE {table} SET deleted = 1, object_clock = ?2,
+                     head_commit_id = ?3, updated_at = ?4,
+                     updated_by_device_id = ?5 WHERE {id_column} = ?1"
+                ),
+                params![
+                    object_id,
+                    bump_clock(&clock),
+                    restore_commit_id,
+                    now,
+                    ctx.device_id
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn bump_clock(clock: &str) -> String {
+    let counter = serde_json::from_str::<serde_json::Value>(clock)
+        .ok()
+        .and_then(|value| value.get("counter")?.as_u64())
+        .unwrap_or(0);
+    format!(r#"{{"counter":{}}}"#, counter + 1)
+}
+
 fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -555,6 +834,10 @@ mod tests {
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
+    use crate::search::SearchService;
+    use crate::tiga::TigaService;
+    use mdbx_core::model::{UnlockMethodType, VaultSession};
+    use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -566,6 +849,27 @@ mod tests {
 
     fn login_payload() -> serde_json::Value {
         serde_json::json!({"username": "alice", "password": "s3cret"})
+    }
+
+    fn restore_session(now: i64) -> VaultSession {
+        VaultSession {
+            session_id: "restore-session".to_string(),
+            unlock_method: UnlockMethodType::Password,
+            created_at: chrono::DateTime::from_timestamp(now, 0)
+                .unwrap()
+                .to_rfc3339(),
+            assurance: SessionAssurance::from_unlock_method(UnlockMethodType::Password, now),
+        }
+    }
+
+    fn restore_device() -> DeviceContext {
+        DeviceContext {
+            device_id: Some("test-device".to_string()),
+            assurance: DeviceAssurance::Standard,
+            secure_clipboard_available: false,
+            screen_capture_protection_available: false,
+            secure_temp_files_available: true,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -585,11 +889,68 @@ mod tests {
 
         // 验证 payload 可反序列化
         let payload: SnapshotPayload = serde_json::from_slice(&snap.snapshot_ct).unwrap();
-        assert_eq!(payload.format_version, "MDBX-1");
+        assert_eq!(payload.format_version, crate::migration::FORMAT_V2);
         assert!(payload.projects.is_empty());
         assert!(payload.entries.is_empty());
         assert!(payload.attachments.is_empty());
-        assert!(payload.attachment_chunks.is_empty());
+        assert!(payload.attachment_chunks.unwrap().is_empty());
+    }
+
+    #[test]
+    fn authorized_restore_is_atomic_with_security_audit() {
+        let (conn, ctx) = setup();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        let session = restore_session(1_000);
+        let device = restore_device();
+        let decision = SnapshotRepo::restore_snapshot_authorized(
+            &conn,
+            &ctx,
+            &snapshot.snapshot_id,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+        assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
+        let events = TigaService::list_security_audit_events(&conn, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, TigaOperation::RestoreSnapshot);
+    }
+
+    #[test]
+    fn restore_without_session_is_denied_before_snapshot_changes() {
+        let (conn, ctx) = setup();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        let device = restore_device();
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let error = SnapshotRepo::restore_snapshot_authorized(
+            &conn,
+            &ctx,
+            &snapshot.snapshot_id,
+            TigaAuthorizationContext {
+                session: None,
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+        let after_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before_commits, after_commits);
+        assert_eq!(
+            TigaService::list_security_audit_events(&conn, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -718,9 +1079,9 @@ mod tests {
         let payload: SnapshotPayload = serde_json::from_slice(&snap.snapshot_ct).unwrap();
 
         assert_eq!(payload.attachments.len(), 1);
-        assert_eq!(payload.attachment_chunks.len(), 3);
-        assert!(payload
-            .attachment_chunks
+        let chunks = payload.attachment_chunks.unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
             .iter()
             .all(|chunk| chunk.attachment_id == att.attachment_id));
     }
@@ -1084,5 +1445,166 @@ mod tests {
             .unwrap();
         assert_eq!(a1_restored.entry_id, Some(e1.entry_id));
         assert_eq!(a1_restored.storage_mode, StorageMode::EmbeddedInline);
+    }
+
+    #[test]
+    fn restore_reinstates_exact_active_set_tags_and_causal_heads() {
+        let (conn, ctx) = setup();
+        let original = ProjectRepo::create(&conn, &ctx, "Original", None, None).unwrap();
+        SearchService::set_tags_tracked(
+            &conn,
+            &ctx,
+            &original.project_id,
+            &["snapshot-tag".to_string()],
+        )
+        .unwrap();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+
+        SearchService::set_tags_tracked(
+            &conn,
+            &ctx,
+            &original.project_id,
+            &["later-tag".to_string()],
+        )
+        .unwrap();
+        let later_project = ProjectRepo::create(&conn, &ctx, "Later", None, None).unwrap();
+        let later_entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &later_project.project_id,
+            EntryType::Login,
+            Some("Later login"),
+            &login_payload(),
+        )
+        .unwrap();
+        let later_attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &later_project.project_id,
+            Some(&later_entry.entry_id),
+            "later.bin",
+            None,
+            "",
+            0,
+        )
+        .unwrap();
+
+        SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).unwrap();
+
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+        assert_eq!(ProjectRepo::list_deleted(&conn).unwrap().len(), 1);
+        assert!(
+            EntryRepo::get_by_id(&conn, &later_entry.entry_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            AttachmentRepo::get_by_id(&conn, &later_attachment.attachment_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            SearchService::list_tags(&conn, &original.project_id).unwrap(),
+            vec!["snapshot-tag".to_string()]
+        );
+
+        let restore_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (object_type, object_id) in [
+            ("project", original.project_id.as_str()),
+            ("project", later_project.project_id.as_str()),
+            ("entry", later_entry.entry_id.as_str()),
+            ("attachment", later_attachment.attachment_id.as_str()),
+        ] {
+            let count: i64 = conn
+                .inner()
+                .query_row(
+                    "SELECT COUNT(*) FROM object_versions
+                     WHERE object_type = ?1 AND object_id = ?2 AND commit_id = ?3",
+                    params![object_type, object_id, restore_head],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "missing restore version for {object_type}:{object_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_failure_rolls_back_commit_heads_and_rows() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Login"),
+            &login_payload(),
+        )
+        .unwrap();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+
+        let mut payload: SnapshotPayload = serde_json::from_slice(&snapshot.snapshot_ct).unwrap();
+        payload.entries[0].project_id = "missing-project".to_string();
+        let invalid_payload = serde_json::to_vec(&payload).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = ?1, snapshot_hash = ?2
+                 WHERE snapshot_id = ?3",
+                params![
+                    invalid_payload,
+                    compute_sha256_hex(&invalid_payload),
+                    snapshot.snapshot_id
+                ],
+            )
+            .unwrap();
+
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let before_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).is_err());
+
+        let after_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let after_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_commits, before_commits);
+        assert_eq!(after_head, before_head);
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+        assert_eq!(
+            EntryRepo::list_by_project(&conn, &project.project_id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

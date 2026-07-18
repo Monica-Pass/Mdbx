@@ -71,8 +71,9 @@ MDBX 必须坚持：
 ### 3.1 格式与恢复
 
 - `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
-- snapshot 已覆盖 project、entry、attachment metadata 和 active `attachment_chunks`；仍需补齐旧 reader/新 reader、未知字段保留、非关键扩展等兼容测试。
-- 缺少格式兼容测试：旧 reader、新 reader、未知字段保留、非关键扩展。
+- MDBX2 已加入 `MDBX-1` / `MDBX-1-DRAFT` 自动事务迁移、schema migration 记录、最低 reader/writer 版本和未知 critical extension 写入拒绝。
+- snapshot 已覆盖 project、entry、attachment metadata、project tags 和 active `attachment_chunks`；旧 snapshot 缺少新增字段时保持现有兼容数据。
+- 仍需继续扩展真实旧版本 golden vault、旧 reader 行为和未知非关键字段保留矩阵。
 
 ### 3.2 同步与冲突
 
@@ -87,7 +88,7 @@ MDBX 必须坚持：
 ### 3.3 变更历史覆盖
 
 - 搜索类临时索引已明确不写 commit；用户可见 tag 修改已有 tracked API。仍需为未来新增维护操作逐项分类是否属于用户可见历史。
-- project、entry、attachment、conflict resolution、tracked tag 的主要写入链路已收窄崩溃窗口。后续仍需为 snapshot restore、bulk import、batch move/copy 等批量用户级 mutation 设计更高层的合并 commit API。
+- project、entry、attachment、conflict resolution、tracked tag、Tiga mutation 和 snapshot restore 已进入原子事务。后续仍需为 bulk import、batch move/copy 等批量用户级 mutation 设计更高层的合并 commit API。
 
 ### 3.4 性能与增量
 
@@ -193,6 +194,7 @@ MDBX 必须坚持：
 - KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments，并扩展到真实二进制 `.kdbx` 解析/写入。
 - RFC 结构补齐：header、schema、crypto、commit、sync、snapshot、extensions。
 - 兼容性测试矩阵落地。
+- MDBX-1 / MDBX-1-DRAFT 到 MDBX2 的顺序自动迁移已落地；后续代际必须继续通过 migration registry 逐代升级。
 - CLI 已增加 `health`、`benchmark`、`snapshot`、`sync bundle/apply`、`import-kdbx-json`、`export-kdbx-json`；后续如要使用 `import-kdbx`/`export-kdbx` 名称，必须先实现真实二进制 `.kdbx` 支持。
 
 验收：

@@ -1,4 +1,5 @@
 use mdbx_core::model::EntryType;
+use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::error::StorageResult;
@@ -6,6 +7,8 @@ use crate::import::kdbx_model::{ExportResult, KdbxAttachment, KdbxEntry};
 use crate::repo::attachment::AttachmentRepo;
 use crate::repo::entry::EntryRepo;
 use crate::repo::project::ProjectRepo;
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 /// KDBX 条目导出器。
 ///
@@ -19,9 +22,40 @@ use crate::repo::project::ProjectRepo;
 /// 这是导入器的逆操作，用于 KDBX 格式导出或互操作桥接。
 pub struct KdbxExporter;
 
+pub type ExportedProject = (KdbxEntry, u32, Vec<String>);
+
 impl KdbxExporter {
+    pub fn export_all_authorized(
+        conn: &VaultConnection,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(ExportResult, AuthorizationDecision)> {
+        TigaService::execute_authorized(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ExportData,
+            context,
+            || Ok(Self::export_all(conn)),
+        )
+    }
+
+    pub fn export_one_authorized(
+        conn: &VaultConnection,
+        project: &mdbx_core::model::Project,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(ExportedProject, AuthorizationDecision)> {
+        TigaService::execute_authorized(
+            conn,
+            &TigaScope::Project {
+                project_id: project.project_id.clone(),
+            },
+            TigaOperation::ExportData,
+            context,
+            || Self::export_one(conn, project),
+        )
+    }
+
     /// 从 MDBX vault 导出所有未删除的 project 为 KDBX 条目列表。
-    pub fn export_all(conn: &VaultConnection) -> ExportResult {
+    pub(crate) fn export_all(conn: &VaultConnection) -> ExportResult {
         let mut result = ExportResult {
             entries_exported: 0,
             attachments_exported: 0,
@@ -65,7 +99,7 @@ impl KdbxExporter {
     /// 导出单个 project 为 KDBX 条目。
     ///
     /// 返回 (KdbxEntry, attachment_count, warnings)。
-    pub fn export_one(
+    pub(crate) fn export_one(
         conn: &VaultConnection,
         project: &mdbx_core::model::Project,
     ) -> StorageResult<(KdbxEntry, u32, Vec<String>)> {
@@ -231,12 +265,16 @@ impl KdbxExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::StorageError;
     use crate::import::kdbx_model::{KdbxAttachment, KdbxEntry};
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::commit_ctx::CommitContext;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
+    use crate::tiga::TigaService;
+    use mdbx_core::model::{UnlockMethodType, VaultSession};
+    use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -244,6 +282,27 @@ mod tests {
         initialize_vault(&conn, &params).unwrap();
         let ctx = CommitContext::new("test-device".to_string());
         (conn, ctx)
+    }
+
+    fn session(now: i64, method: UnlockMethodType) -> VaultSession {
+        VaultSession {
+            session_id: "export-session".to_string(),
+            unlock_method: method,
+            created_at: chrono::DateTime::from_timestamp(now, 0)
+                .unwrap()
+                .to_rfc3339(),
+            assurance: SessionAssurance::from_unlock_method(method, now),
+        }
+    }
+
+    fn device(assurance: DeviceAssurance) -> DeviceContext {
+        DeviceContext {
+            device_id: Some("test-device".to_string()),
+            assurance,
+            secure_clipboard_available: true,
+            screen_capture_protection_available: true,
+            secure_temp_files_available: true,
+        }
     }
 
     /// 辅助：创建一个测试用 project + login entry
@@ -287,6 +346,55 @@ mod tests {
         assert_eq!(result.entries_exported, 1);
         assert_eq!(result.projects_skipped, 0);
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn authorized_export_records_decision_before_returning_plaintext() {
+        let (conn, ctx) = setup();
+        create_test_project(&conn, &ctx, "GitHub", "alice", "s3cret");
+        let session = session(1_000, UnlockMethodType::Password);
+        let device = device(DeviceAssurance::Standard);
+        let (result, decision) = KdbxExporter::export_all_authorized(
+            &conn,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.entries_exported, 1);
+        assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
+        assert_eq!(
+            TigaService::list_security_audit_events(&conn, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn power_export_is_denied_even_with_strong_current_session() {
+        let (conn, ctx) = setup();
+        create_test_project(&conn, &ctx, "GitHub", "alice", "s3cret");
+        conn.inner()
+            .execute("UPDATE vault_meta SET default_tiga_mode = 'power'", [])
+            .unwrap();
+        let session = session(1_000, UnlockMethodType::PasswordSecurityKey);
+        let device = device(DeviceAssurance::TrustedHardware);
+        let error = KdbxExporter::export_all_authorized(
+            &conn,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+        let events = TigaService::list_security_audit_events(&conn, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, AuthorizationOutcome::Deny);
     }
 
     #[test]

@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::EntryType;
-use mdbx_core::tiga::TigaMode;
+use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::repo::{CommitContext, EntryRepo, ProjectRepo};
+use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use zeroize::Zeroizing;
 
@@ -260,7 +261,21 @@ impl MdbxVault {
     ) -> Result<(), MdbxFfiError> {
         let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         let key_material = Zeroizing::new(key_material);
-        UnlockService::setup_security_key(&mut conn, key_material.as_slice())?;
+        let session = conn.active_session().cloned().ok_or_else(|| {
+            MdbxFfiError::from(StorageError::Validation(
+                "adding a security key requires an active unlock session".to_string(),
+            ))
+        })?;
+        let device = ffi_device_context(&self.device_id);
+        UnlockService::setup_security_key_authorized(
+            &mut conn,
+            key_material.as_slice(),
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?;
         Ok(())
     }
 
@@ -275,9 +290,41 @@ impl MdbxVault {
     ) -> Result<(), MdbxFfiError> {
         let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         let new_password = Zeroizing::new(new_password);
-        UnlockService::reset_password_with_mode(&mut conn, new_password.as_str(), mode.into())?;
+        let session = conn.active_session().cloned().ok_or_else(|| {
+            MdbxFfiError::from(StorageError::Validation(
+                "resetting the password requires an active unlock session".to_string(),
+            ))
+        })?;
+        let device = ffi_device_context(&self.device_id);
+        UnlockService::reset_password_authorized(
+            &mut conn,
+            new_password.as_str(),
+            mode.into(),
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?;
         Ok(())
     }
+}
+
+fn ffi_device_context(device_id: &str) -> DeviceContext {
+    DeviceContext {
+        device_id: Some(device_id.to_string()),
+        assurance: DeviceAssurance::Standard,
+        secure_clipboard_available: false,
+        screen_capture_protection_available: false,
+        secure_temp_files_available: true,
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[uniffi::export]

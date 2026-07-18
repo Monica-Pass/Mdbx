@@ -6,6 +6,8 @@
 
 MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替代某张密码表，而是提供长期可维护的本地数据库、类 Git 的逻辑历史、同步冲突处理、原生附件、快照恢复和 Tiga 安全模式。
 
+当前格式代际为 **MDBX2**，存储值为 `MDBX-2`。MDBX2 可自动、事务性地升级 `MDBX-1` 与 `MDBX-1-DRAFT` vault；兼容契约见 `docs/09-mdbx2-compatibility.zh-CN.md`。
+
 规范性文档在 `docs/`。
 
 MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能力必须尽量保留兼容路径，数据安全永远优先于一时方便。
@@ -47,6 +49,7 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
 - `docs/02-storage-sync-spec.zh-CN.md`
 - `docs/03-security-spec.zh-CN.md`
 - `docs/06-sqlite-schema-v1.zh-CN.md`
+- `docs/09-mdbx2-compatibility.zh-CN.md`
 
 `docs/` 定义格式和产品约束；Rust workspace 负责实现这些约束，并提供实际客户端接入说明。
 
@@ -121,6 +124,13 @@ cargo run -p mdbx-cli -- --help
 
 当前 Rust storage core 已验证的关键能力：
 
+- MDBX-1 / MDBX-1-DRAFT 在可写打开时自动升级为 MDBX-2；迁移幂等，未知 critical extension 会拒绝写入。
+- Tiga2 将 Sky/Multi/Power 展开为版本化运行时策略，覆盖会话、显示、剪贴板、导出、附件、恢复、设备保证和审计。
+- Tiga2 策略覆盖默认只能加强；精确降级例外、授权决定和审计事件进入同步，冲突采用更严格结果。
+- MDBX-1 和早期 MDBX-2 schema 2 原子升级到 schema 3；旧弱覆盖与不合规解锁配置进入整改状态，不会突然锁死用户。
+- snapshot 创建和恢复为原子操作；恢复会重建精确 active set、tags 和 attachment chunks，并为所有受影响对象记录统一 restore head 与 object version。
+- CLI sync bundle 只使用 storage core 的标准 state payload 和 `SyncApplyRepo`，不再维护第二套直接 SQL apply 路径。
+
 - snapshot 会携带并恢复 active `attachment_chunks`，旧 metadata-only snapshot 仍保持兼容。
 - entry、project、attachment 已记录 `object_versions` 行快照，用于非快进三方合并。
 - entry/project 不同字段并发修改会写入双 parent merge commit；同字段修改会产生 unresolved conflict。
@@ -148,6 +158,9 @@ cargo run -p mdbx-cli -- --help
 - `device_heads`
 - `branches`
 - `project_tags`
+- `tiga_policy_overrides`
+- `tiga_policy_exceptions`
+- `security_audit_events`
 
 批量用户操作通常应该生成一个用户级 commit，而不是每个对象一个 commit。
 

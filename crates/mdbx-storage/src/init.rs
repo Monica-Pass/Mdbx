@@ -3,6 +3,7 @@ use uuid::Uuid;
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::migration::{CURRENT_SCHEMA_VERSION, FORMAT_V1, FORMAT_V2};
 
 pub const INIT_KEY_EPOCH_PROFILE_ID: &str = "mdbx-init-marker-v1";
 
@@ -62,16 +63,25 @@ pub fn initialize_vault(
         mdbx_crypto::aead::generate_key().map_err(StorageError::Crypto)?;
 
     db.execute("BEGIN IMMEDIATE", [])
-        .map_err(|e| StorageError::Database(e))?;
+        .map_err(StorageError::Database)?;
 
     // 闭包内执行所有写入，失败时自动回滚
     let result = (|| -> Result<VaultInitResult, StorageError> {
         // 1. vault_meta
         db.execute(
             "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
-             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
-             VALUES (?1, 'MDBX-1', ?2, ?2, ?3, ?4, '', '')",
-            rusqlite::params![vault_id, now, params.default_tiga_mode, key_epoch_id],
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions,
+             schema_version, min_reader_version, min_writer_version)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, '', '', ?6, ?7, ?2)",
+            rusqlite::params![
+                vault_id,
+                FORMAT_V2,
+                now,
+                params.default_tiga_mode,
+                key_epoch_id,
+                CURRENT_SCHEMA_VERSION,
+                FORMAT_V1,
+            ],
         )?;
 
         // 2. genesis commit
@@ -147,8 +157,7 @@ pub fn initialize_vault(
 
     match result {
         Ok(r) => {
-            db.execute("COMMIT", [])
-                .map_err(|e| StorageError::Database(e))?;
+            db.execute("COMMIT", []).map_err(StorageError::Database)?;
             Ok(r)
         }
         Err(e) => {
@@ -209,7 +218,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(vault_id, result.vault_id);
-        assert_eq!(format_version, "MDBX-1");
+        assert_eq!(format_version, FORMAT_V2);
         assert_eq!(tiga_mode, "power");
         assert_eq!(key_epoch_id, result.key_epoch_id);
     }

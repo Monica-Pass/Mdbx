@@ -1,3 +1,7 @@
+pub mod policy;
+
+pub use policy::*;
+
 /// MDBX Tiga 三安全模式。
 ///
 /// 优先级从低到高: Global < Project < Entry。
@@ -42,24 +46,12 @@ impl TigaMode {
 
     /// 返回当前 Tiga 模式对应的 vault 解锁策略。
     pub fn unlock_policy(&self) -> TigaUnlockPolicy {
-        match self {
-            // Sky 是灵活便携，不是弱安全：仍使用同一套 KDF/AEAD/keyring，
-            // 只是允许用户保留更容易跨设备恢复的解锁方式。
-            TigaMode::Sky => TigaUnlockPolicy {
-                allows_portable_unlock: true,
-                recommends_security_key: false,
-                requires_combined_password_security_key: false,
-            },
-            TigaMode::Multi => TigaUnlockPolicy {
-                allows_portable_unlock: true,
-                recommends_security_key: true,
-                requires_combined_password_security_key: false,
-            },
-            TigaMode::Power => TigaUnlockPolicy {
-                allows_portable_unlock: false,
-                recommends_security_key: true,
-                requires_combined_password_security_key: true,
-            },
+        let policy = self.policy();
+        TigaUnlockPolicy {
+            allows_portable_unlock: policy.unlock.portable_unlock_allowed,
+            recommends_security_key: policy.unlock.security_key_recommended,
+            requires_combined_password_security_key: policy.unlock.minimum_auth_factors >= 2
+                && policy.unlock.security_key_required,
         }
     }
 }

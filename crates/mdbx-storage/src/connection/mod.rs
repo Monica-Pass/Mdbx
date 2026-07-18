@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 use std::path::Path;
 
+use mdbx_core::model::VaultSession;
 use mdbx_crypto::keyring::Keyring;
 
 use crate::error::{StorageError, StorageResult};
@@ -18,6 +19,7 @@ use crate::schema;
 pub struct VaultConnection {
     pub(crate) conn: Connection,
     pub(crate) keyring: Option<Keyring>,
+    pub(crate) active_session: Option<VaultSession>,
 }
 
 impl VaultConnection {
@@ -26,9 +28,11 @@ impl VaultConnection {
         let conn = Connection::open(path)?;
         Self::apply_pragmas(&conn)?;
         Self::cleanup_legacy_persistent_fts(&conn)?;
+        crate::migration::upgrade_to_latest(&conn)?;
         Ok(Self {
             conn,
             keyring: None,
+            active_session: None,
         })
     }
 
@@ -41,6 +45,7 @@ impl VaultConnection {
         Ok(Self {
             conn,
             keyring: None,
+            active_session: None,
         })
     }
 
@@ -53,6 +58,7 @@ impl VaultConnection {
         Ok(Self {
             conn,
             keyring: None,
+            active_session: None,
         })
     }
 
@@ -63,7 +69,7 @@ impl VaultConnection {
              PRAGMA secure_delete=ON;
              PRAGMA busy_timeout=5000;",
         )
-        .map_err(|e| StorageError::Database(e))
+        .map_err(StorageError::Database)
     }
 
     fn cleanup_legacy_persistent_fts(conn: &Connection) -> StorageResult<()> {
@@ -109,11 +115,51 @@ impl VaultConnection {
         }
     }
 
+    pub(crate) fn with_immediate_transaction_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .map_err(StorageError::Database)?;
+        match f(self) {
+            Ok(value) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT;") {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    Err(StorageError::Database(error))
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
     /// 附加密钥环，启用字段级加密。
     ///
     /// 在解锁成功后调用。此后所有 `_ct` 字段在写入时加密、读取时解密。
     pub fn attach_keyring(&mut self, keyring: Keyring) {
         self.keyring = Some(keyring);
+    }
+
+    pub fn attach_session(&mut self, session: VaultSession) {
+        self.active_session = Some(session);
+    }
+
+    pub fn active_session(&self) -> Option<&VaultSession> {
+        self.active_session.as_ref()
+    }
+
+    pub fn clear_session(&mut self) {
+        self.active_session = None;
+        self.keyring = None;
     }
 
     /// 获取密钥环的引用（存在时）。

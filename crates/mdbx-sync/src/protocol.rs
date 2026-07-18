@@ -177,13 +177,15 @@ pub struct BatchBuilder {
 
 impl BatchBuilder {
     pub fn new(max_per_batch: usize) -> Self {
-        Self { max_per_batch }
+        Self {
+            max_per_batch: max_per_batch.max(1),
+        }
     }
 
     /// 将 commit 列表拆分为多个批次。
     pub fn build_batches(&self, commits: Vec<SerializedCommit>) -> Vec<CommitBatch> {
         let total = commits.len();
-        let batch_count = (total + self.max_per_batch - 1) / self.max_per_batch;
+        let batch_count = total.div_ceil(self.max_per_batch);
 
         commits
             .chunks(self.max_per_batch)
@@ -239,10 +241,7 @@ mod tests {
         let hello = HelloRequest::new(
             "device-b",
             remote_heads,
-            vec!["abc123", "def456"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            ["abc123", "def456"].iter().map(|s| s.to_string()).collect(),
         );
         negotiator.on_hello(&hello).unwrap();
 
@@ -269,7 +268,7 @@ mod tests {
         let negotiator = SyncNegotiator::new(
             "device-a",
             vec![],
-            vec!["a", "b", "c"].iter().map(|s| s.to_string()).collect(),
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect(),
         );
 
         let want = negotiator.compute_want(&["a".into(), "d".into(), "e".into()]);
@@ -281,7 +280,7 @@ mod tests {
         let mut negotiator = SyncNegotiator::new(
             "device-a",
             vec![],
-            vec!["a", "b", "c"].iter().map(|s| s.to_string()).collect(),
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect(),
         );
 
         let hello = HelloRequest::new("device-b", vec![], vec!["a".to_string(), "d".to_string()]);
@@ -350,6 +349,12 @@ mod tests {
         assert!(!batches[1].is_last);
         assert_eq!(batches[2].batch_index, 2);
         assert!(batches[2].is_last);
+    }
+
+    #[test]
+    fn test_batch_builder_zero_limit_uses_safe_minimum() {
+        let builder = BatchBuilder::new(0);
+        assert_eq!(builder.max_per_batch, 1);
     }
 
     #[test]

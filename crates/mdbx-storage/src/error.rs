@@ -1,3 +1,4 @@
+use mdbx_core::tiga::AuthorizationDecision;
 use mdbx_crypto::error::CryptoError;
 use thiserror::Error;
 
@@ -17,6 +18,9 @@ pub enum StorageError {
 
     #[error("validation error: {0}")]
     Validation(String),
+
+    #[error("Tiga authorization did not allow the operation: {0:?}")]
+    Authorization(AuthorizationDecision),
 
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),

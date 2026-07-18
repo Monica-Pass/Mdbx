@@ -164,6 +164,23 @@ pub struct VaultMeta {
     pub compat_flags: String,
     /// 关键扩展标识
     pub critical_extensions: String,
+    /// 内部 schema 序号。旧序列化数据缺失时按 MDBX-1 处理。
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// 最低可读取格式代际。
+    #[serde(default = "default_mdbx1_version")]
+    pub min_reader_version: String,
+    /// 最低可安全写入格式代际。
+    #[serde(default = "default_mdbx1_version")]
+    pub min_writer_version: String,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+fn default_mdbx1_version() -> String {
+    "MDBX-1".to_string()
 }
 
 /// 密钥轮换时期的记录。
@@ -305,5 +322,29 @@ impl std::str::FromStr for ConflictResolution {
             "custom" => Ok(ConflictResolution::Custom),
             _ => Err(format!("unknown ConflictResolution: {}", s)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_vault_meta_defaults_to_mdbx1_compatibility() {
+        let meta: VaultMeta = serde_json::from_value(serde_json::json!({
+            "vault_id": "vault-1",
+            "format_version": "MDBX-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "default_tiga_mode": "multi",
+            "active_key_epoch_id": "epoch-1",
+            "compat_flags": "",
+            "critical_extensions": ""
+        }))
+        .unwrap();
+
+        assert_eq!(meta.schema_version, 1);
+        assert_eq!(meta.min_reader_version, "MDBX-1");
+        assert_eq!(meta.min_writer_version, "MDBX-1");
     }
 }

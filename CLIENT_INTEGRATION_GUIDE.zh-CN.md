@@ -462,6 +462,27 @@ Tiga 模式的解锁策略 SHOULD 按以下语义呈现：
 - `Multi`：默认平衡。客户端 SHOULD 建议用户添加安全密钥，但 MUST 保留清晰的可恢复路径，例如强密码。网盘中的 `.mdbx` 文件可以同步到新设备，新设备可通过已配置的便携解锁方式打开；如果安全密钥或等价平台凭据可用，也可以通过安全密钥方式打开。
 - `Power`：最高防护。客户端 SHOULD 引导用户配置密码 + 安全密钥组合解锁方式。若仍保留独立密码或 PIN 解锁，客户端 SHOULD 明确提示这会降低 Power 模式对离线爆破的防护强度。
 
+Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSession`，并为每次敏感操作提供真实的 `DeviceContext`。不得为了通过 Power 策略而伪造硬件保证、secure clipboard 或防截屏能力。
+
+客户端拥有的操作必须先调用 `TigaService::authorize_operation`，并执行返回约束：
+
+- 显示秘密：`RevealSecret`
+- 复制秘密：`CopySecret`
+- 附件明文处理：`DecryptAttachment`
+- 后台访问：`BackgroundAccess`
+- 锁定状态密文同步：`SyncCiphertext`
+
+授权结果为 `Allow` 或 `AllowWithConstraints` 时才可继续。`RequireFreshAuthentication`、`RequireAdditionalFactor` 和 `Deny` 都不得通过 UI 确认框绕过。
+
+存储拥有的高风险操作必须使用已授权 API：
+
+- KDBX 导出：`KdbxExporter::export_all_authorized` / `export_one_authorized`
+- 快照恢复：`SnapshotRepo::restore_snapshot_authorized`
+- 解锁方式新增、修改、重置和删除：`UnlockService` 的 `*_authorized` 方法
+- Tiga profile 与稀疏覆盖：`TigaService` 的 `*_authorized` 方法
+
+第一种解锁方式允许 bootstrap；已有解锁方式后，bootstrap API 必须拒绝。`remediation-required` 状态只允许用户完成解锁方式整改，不会放宽导出、显示或其他 Power 操作。
+
 安全密钥参与解锁时，客户端 MUST NOT 把硬件密钥本体、challenge 响应、派生 key material 或可重放的等价材料写入 `.mdbx` 之外的日志、缓存或同步元数据。支持硬件密钥本身并不会让网盘存储变得不安全或不可用；是否便携取决于 vault 配置了哪些解锁路径。仅配置安全密钥且没有便携解锁方式的 vault 在新设备上需要同一把硬件密钥或等价平台凭据；客户端 SHOULD 在用户启用这种配置前说明恢复影响。
 
 客户端 MUST NOT 把主密码、派生密钥、epoch key 写入日志。
@@ -515,6 +536,8 @@ Tiga 模式的解锁策略 SHOULD 按以下语义呈现：
 客户端打开 vault 时 MUST 检查 `format_version`。
 
 遇到未知 critical extension MUST 拒绝写入，最多只读打开。
+
+客户端可以负责迁移提示、升级前备份、进度和整改 UI，但格式转换必须调用 storage core。不得在 Android、iOS、桌面端分别实现一套 MDBX1 字段迁移。
 
 ### 7.2 ID 稳定性
 

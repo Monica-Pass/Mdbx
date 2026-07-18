@@ -9,6 +9,7 @@ use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
+use crate::repo::object_version::ObjectVersionRepo;
 use crate::repo::project::ProjectRepo;
 
 /// Tiga 模式三级参数服务。
@@ -36,28 +37,28 @@ impl TigaService {
     }
 
     /// 更新全局默认 Tiga 模式。
-    pub fn set_global_default(
+    pub(crate) fn set_global_default(
         conn: &VaultConnection,
         ctx: &CommitContext,
         mode: TigaMode,
     ) -> StorageResult<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        ctx.create_commit(
-            conn,
-            "change",
-            "vault-meta",
-            &["vault-meta:tiga-default".to_string()],
-            &current_device_head(conn, ctx)?
-                .into_iter()
-                .collect::<Vec<_>>(),
-        )?;
-        conn.inner()
-            .execute(
+        conn.with_immediate_transaction(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            ctx.create_commit(
+                conn,
+                "change",
+                "vault-meta",
+                &["vault-meta:tiga-default".to_string()],
+                &current_device_head(conn, ctx)?
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )?;
+            conn.inner().execute(
                 "UPDATE vault_meta SET default_tiga_mode = ?1, updated_at = ?2",
                 params![mode.to_string(), now],
-            )
-            .map_err(StorageError::Database)?;
-        Ok(())
+            )?;
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -75,42 +76,41 @@ impl TigaService {
     }
 
     /// 设置 project 级 Tiga 覆盖。
-    pub fn set_project_override(
+    pub(crate) fn set_project_override(
         conn: &VaultConnection,
         ctx: &CommitContext,
         project_id: &str,
         mode: Option<TigaMode>,
     ) -> StorageResult<()> {
-        let project = ProjectRepo::get_by_id(conn, project_id)?
-            .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
-        let mode_str = mode.map(|m| m.to_string());
-        let commit_id =
-            ctx.commit_object_change(conn, "projects", project_id, "change", "project")?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let object_clock = bump_clock(&project.object_clock);
-        conn.inner().execute(
-            "UPDATE projects SET tiga_mode_override = ?1, object_clock = ?2,
-             head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
-             WHERE project_id = ?6",
-            params![
-                mode_str,
-                object_clock,
-                commit_id,
-                now,
-                ctx.device_id,
-                project_id
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// 清除 project 级覆盖（回退到全局默认）。
-    pub fn clear_project_override(
-        conn: &VaultConnection,
-        ctx: &CommitContext,
-        project_id: &str,
-    ) -> StorageResult<()> {
-        Self::set_project_override(conn, ctx, project_id, None)
+        conn.with_immediate_transaction(|| {
+            let project = ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+            if project.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "cannot change Tiga mode on a deleted project".to_string(),
+                ));
+            }
+            let mode_str = mode.map(|m| m.to_string());
+            let commit_id =
+                ctx.commit_object_change(conn, "projects", project_id, "change", "project")?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let object_clock = bump_clock(&project.object_clock);
+            conn.inner().execute(
+                "UPDATE projects SET tiga_mode_override = ?1, object_clock = ?2,
+                 head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
+                 WHERE project_id = ?6",
+                params![
+                    mode_str,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                    project_id
+                ],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -128,41 +128,41 @@ impl TigaService {
     }
 
     /// 设置 entry 级 Tiga 覆盖。
-    pub fn set_entry_override(
+    pub(crate) fn set_entry_override(
         conn: &VaultConnection,
         ctx: &CommitContext,
         entry_id: &str,
         mode: Option<TigaMode>,
     ) -> StorageResult<()> {
-        let entry = EntryRepo::get_by_id(conn, entry_id)?
-            .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
-        let mode_str = mode.map(|m| m.to_string());
-        let commit_id = ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let object_clock = bump_clock(&entry.object_clock);
-        conn.inner().execute(
-            "UPDATE entries SET tiga_mode_override = ?1, object_clock = ?2,
-             head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
-             WHERE entry_id = ?6",
-            params![
-                mode_str,
-                object_clock,
-                commit_id,
-                now,
-                ctx.device_id,
-                entry_id
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// 清除 entry 级覆盖（回退到 project 或全局默认）。
-    pub fn clear_entry_override(
-        conn: &VaultConnection,
-        ctx: &CommitContext,
-        entry_id: &str,
-    ) -> StorageResult<()> {
-        Self::set_entry_override(conn, ctx, entry_id, None)
+        conn.with_immediate_transaction(|| {
+            let entry = EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+            if entry.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "cannot change Tiga mode on a deleted entry".to_string(),
+                ));
+            }
+            let mode_str = mode.map(|m| m.to_string());
+            let commit_id =
+                ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let object_clock = bump_clock(&entry.object_clock);
+            conn.inner().execute(
+                "UPDATE entries SET tiga_mode_override = ?1, object_clock = ?2,
+                 head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
+                 WHERE entry_id = ?6",
+                params![
+                    mode_str,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id,
+                    entry_id
+                ],
+            )?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -211,7 +211,7 @@ impl TigaService {
     }
 }
 
-fn current_device_head(
+pub(crate) fn current_device_head(
     conn: &VaultConnection,
     ctx: &CommitContext,
 ) -> StorageResult<Option<String>> {
@@ -226,7 +226,7 @@ fn current_device_head(
         .map(|r| r.flatten())
 }
 
-fn bump_clock(clock: &str) -> String {
+pub(crate) fn bump_clock(clock: &str) -> String {
     let counter: u64 = serde_json::from_str::<serde_json::Value>(clock)
         .ok()
         .and_then(|v| v.get("counter")?.as_u64())
@@ -345,7 +345,7 @@ mod tests {
         let (conn, ctx, project_id) = setup();
 
         TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Sky)).unwrap();
-        TigaService::clear_project_override(&conn, &ctx, &project_id).unwrap();
+        TigaService::set_project_override(&conn, &ctx, &project_id, None).unwrap();
 
         let ov = TigaService::get_project_override(&conn, &project_id).unwrap();
         assert!(ov.is_none());
@@ -411,7 +411,7 @@ mod tests {
         .unwrap();
 
         TigaService::set_entry_override(&conn, &ctx, &entry.entry_id, Some(TigaMode::Sky)).unwrap();
-        TigaService::clear_entry_override(&conn, &ctx, &entry.entry_id).unwrap();
+        TigaService::set_entry_override(&conn, &ctx, &entry.entry_id, None).unwrap();
 
         let ov = TigaService::get_entry_override(&conn, &entry.entry_id).unwrap();
         assert!(ov.is_none());
@@ -583,5 +583,113 @@ mod tests {
             )
             .unwrap();
         assert!(val.is_none());
+    }
+
+    #[test]
+    fn tracked_overrides_record_object_versions_at_new_heads() {
+        let (conn, ctx, project_id) = setup();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            mdbx_core::model::EntryType::Login,
+            Some("E"),
+            &login_payload(),
+        )
+        .unwrap();
+
+        TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power)).unwrap();
+        TigaService::set_entry_override(&conn, &ctx, &entry.entry_id, Some(TigaMode::Sky)).unwrap();
+
+        let project = ProjectRepo::get_by_id(&conn, &project_id).unwrap().unwrap();
+        let entry = EntryRepo::get_by_id(&conn, &entry.entry_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            ObjectVersionRepo::get_project(&conn, &project_id, &project.head_commit_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ObjectVersionRepo::get_entry(&conn, &entry.entry_id, &entry.head_commit_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn project_override_failure_rolls_back_commit_and_heads() {
+        let (conn, ctx, project_id) = setup();
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let before_project = ProjectRepo::get_by_id(&conn, &project_id).unwrap().unwrap();
+        let before_branch: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.inner()
+            .execute_batch(
+                "CREATE TRIGGER fail_tiga_update
+                 BEFORE UPDATE OF tiga_mode_override ON projects
+                 BEGIN SELECT RAISE(ABORT, 'injected tiga failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power))
+                .is_err()
+        );
+
+        let after_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let after_project = ProjectRepo::get_by_id(&conn, &project_id).unwrap().unwrap();
+        let after_branch: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_commits, before_commits);
+        assert_eq!(after_project.head_commit_id, before_project.head_commit_id);
+        assert_eq!(after_branch, before_branch);
+        assert!(after_project.tiga_mode_override.is_none());
+    }
+
+    #[test]
+    fn deleted_objects_reject_tiga_changes() {
+        let (conn, ctx, project_id) = setup();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            mdbx_core::model::EntryType::Login,
+            Some("E"),
+            &login_payload(),
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &entry.entry_id).unwrap();
+        assert!(TigaService::set_entry_override(
+            &conn,
+            &ctx,
+            &entry.entry_id,
+            Some(TigaMode::Power)
+        )
+        .is_err());
+
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        assert!(
+            TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power))
+                .is_err()
+        );
     }
 }

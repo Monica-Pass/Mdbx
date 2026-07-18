@@ -5,11 +5,13 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use mdbx_core::model::{KdfParams, UnlockMethod, UnlockMethodType, VaultSession};
-use mdbx_core::tiga::TigaMode;
+use mdbx_core::tiga::{TigaMode, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 /// AEAD 包装 vault 密钥时使用的 AAD。
 const VAULT_KEY_WRAP_AAD: &[u8] = b"mdbx-vault-key-wrap";
@@ -56,6 +58,11 @@ impl UnlockService {
     ///
     /// PIN 至少需要 4 位数字。PIN 派生的密钥用于包装 vault 密钥材料。
     pub fn setup_pin(conn: &mut VaultConnection, pin: &str) -> StorageResult<UnlockMethod> {
+        Self::ensure_bootstrap_available(conn)?;
+        Self::setup_pin_raw(conn, pin)
+    }
+
+    fn setup_pin_raw(conn: &mut VaultConnection, pin: &str) -> StorageResult<UnlockMethod> {
         Self::validate_pin(pin)?;
 
         let normalized = pin.trim();
@@ -73,13 +80,16 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(
+        let method = Self::store_method(
             conn,
             UnlockMethodType::Pin,
             &kdf_params,
             &wrapped,
             &active_epoch_wrapped,
-        )
+        )?;
+        Self::create_and_attach_session(conn, UnlockMethodType::Pin)?;
+        Self::refresh_tiga_compliance(conn)?;
+        Ok(method)
     }
 
     /// 配置密码解锁方式（默认 Multi 模式）。
@@ -102,6 +112,15 @@ impl UnlockService {
         password: &str,
         mode: TigaMode,
     ) -> StorageResult<UnlockMethod> {
+        Self::ensure_bootstrap_available(conn)?;
+        Self::setup_password_with_mode_raw(conn, password, mode)
+    }
+
+    fn setup_password_with_mode_raw(
+        conn: &mut VaultConnection,
+        password: &str,
+        mode: TigaMode,
+    ) -> StorageResult<UnlockMethod> {
         Self::validate_password(password)?;
 
         let normalized = Self::normalize_unicode(password);
@@ -119,17 +138,28 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(
+        let method = Self::store_method(
             conn,
             UnlockMethodType::Password,
             &kdf_params,
             &wrapped,
             &active_epoch_wrapped,
-        )
+        )?;
+        Self::create_and_attach_session(conn, UnlockMethodType::Password)?;
+        Self::refresh_tiga_compliance(conn)?;
+        Ok(method)
     }
 
     /// 配置安全密钥解锁方式。
     pub fn setup_security_key(
+        conn: &mut VaultConnection,
+        key_data: &[u8],
+    ) -> StorageResult<UnlockMethod> {
+        Self::ensure_bootstrap_available(conn)?;
+        Self::setup_security_key_raw(conn, key_data)
+    }
+
+    fn setup_security_key_raw(
         conn: &mut VaultConnection,
         key_data: &[u8],
     ) -> StorageResult<UnlockMethod> {
@@ -153,13 +183,16 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(
+        let method = Self::store_method(
             conn,
             UnlockMethodType::SecurityKey,
             &kdf_params,
             &wrapped,
             &active_epoch_wrapped,
-        )
+        )?;
+        Self::create_and_attach_session(conn, UnlockMethodType::SecurityKey)?;
+        Self::refresh_tiga_compliance(conn)?;
+        Ok(method)
     }
 
     /// 配置密码 + 安全密钥组合解锁方式。
@@ -168,6 +201,16 @@ impl UnlockService {
     /// 的推荐入口。它不会移除已有便携方式，客户端可通过策略评估引导用户
     /// 是否保留恢复路径。
     pub fn setup_password_security_key(
+        conn: &mut VaultConnection,
+        password: &str,
+        key_data: &[u8],
+        mode: TigaMode,
+    ) -> StorageResult<UnlockMethod> {
+        Self::ensure_bootstrap_available(conn)?;
+        Self::setup_password_security_key_raw(conn, password, key_data, mode)
+    }
+
+    fn setup_password_security_key_raw(
         conn: &mut VaultConnection,
         password: &str,
         key_data: &[u8],
@@ -195,13 +238,79 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::store_method(
+        let method = Self::store_method(
             conn,
             UnlockMethodType::PasswordSecurityKey,
             &kdf_params,
             &wrapped,
             &active_epoch_wrapped,
+        )?;
+        Self::create_and_attach_session(conn, UnlockMethodType::PasswordSecurityKey)?;
+        Self::refresh_tiga_compliance(conn)?;
+        Ok(method)
+    }
+
+    pub fn setup_pin_authorized(
+        conn: &mut VaultConnection,
+        pin: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<UnlockMethod> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::setup_pin_raw(conn, pin),
         )
+        .map(|(method, _)| method)
+    }
+
+    pub fn setup_password_authorized(
+        conn: &mut VaultConnection,
+        password: &str,
+        mode: TigaMode,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<UnlockMethod> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::setup_password_with_mode_raw(conn, password, mode),
+        )
+        .map(|(method, _)| method)
+    }
+
+    pub fn setup_security_key_authorized(
+        conn: &mut VaultConnection,
+        key_data: &[u8],
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<UnlockMethod> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::setup_security_key_raw(conn, key_data),
+        )
+        .map(|(method, _)| method)
+    }
+
+    pub fn setup_password_security_key_authorized(
+        conn: &mut VaultConnection,
+        password: &str,
+        key_data: &[u8],
+        mode: TigaMode,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<UnlockMethod> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::setup_password_security_key_raw(conn, password, key_data, mode),
+        )
+        .map(|(method, _)| method)
     }
 
     // -----------------------------------------------------------------------
@@ -228,7 +337,7 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::create_session(UnlockMethodType::Pin)
+        Self::create_and_attach_session(conn, UnlockMethodType::Pin)
     }
 
     /// 使用密码解锁 vault。
@@ -255,7 +364,7 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::create_session(UnlockMethodType::Password)
+        Self::create_and_attach_session(conn, UnlockMethodType::Password)
     }
 
     /// 使用安全密钥解锁 vault。
@@ -281,7 +390,7 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::create_session(UnlockMethodType::SecurityKey)
+        Self::create_and_attach_session(conn, UnlockMethodType::SecurityKey)
     }
 
     /// 使用密码 + 安全密钥组合方式解锁 vault。
@@ -316,7 +425,7 @@ impl UnlockService {
         let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
         conn.attach_keyring(keyring);
 
-        Self::create_session(UnlockMethodType::PasswordSecurityKey)
+        Self::create_and_attach_session(conn, UnlockMethodType::PasswordSecurityKey)
     }
 
     // -----------------------------------------------------------------------
@@ -326,7 +435,7 @@ impl UnlockService {
     /// 修改 PIN。
     ///
     /// 用旧 PIN 解包 vault_key，再用新 PIN 重新包裹。
-    pub fn change_pin(
+    pub(crate) fn change_pin(
         conn: &mut VaultConnection,
         old_pin: &str,
         new_pin: &str,
@@ -372,13 +481,30 @@ impl UnlockService {
             &new_kdf_params,
             &new_wrapped,
             &active_epoch_wrapped,
+        )?;
+        Self::refresh_tiga_compliance(conn)
+    }
+
+    pub fn change_pin_authorized(
+        conn: &mut VaultConnection,
+        old_pin: &str,
+        new_pin: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<()> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::change_pin(conn, old_pin, new_pin),
         )
+        .map(|_| ())
     }
 
     /// 修改密码（保持原有 Tiga 安全等级）。
     ///
     /// 用旧密码解包 vault_key，再用新密码重新包裹。
-    pub fn change_password(
+    pub(crate) fn change_password(
         conn: &mut VaultConnection,
         old_password: &str,
         new_password: &str,
@@ -422,14 +548,31 @@ impl UnlockService {
             &new_kdf_params,
             &new_wrapped,
             &active_epoch_wrapped,
+        )?;
+        Self::refresh_tiga_compliance(conn)
+    }
+
+    pub fn change_password_authorized(
+        conn: &mut VaultConnection,
+        old_password: &str,
+        new_password: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<()> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::change_password(conn, old_password, new_password),
         )
+        .map(|_| ())
     }
 
     /// 重设密码。
     ///
     /// 仅允许在已经解锁的连接上调用。该路径不需要旧密码明文，而是复用当前
     /// keyring 中的 vault_key，用新密码重新包裹同一个 vault key。
-    pub fn reset_password_with_mode(
+    pub(crate) fn reset_password_with_mode(
         conn: &mut VaultConnection,
         new_password: &str,
         mode: TigaMode,
@@ -468,7 +611,23 @@ impl UnlockService {
         let vault_ctx = Self::read_vault_context(conn)?;
         let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
         conn.attach_keyring(keyring);
-        Ok(())
+        Self::refresh_tiga_compliance(conn)
+    }
+
+    pub fn reset_password_authorized(
+        conn: &mut VaultConnection,
+        new_password: &str,
+        mode: TigaMode,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<()> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::reset_password_with_mode(conn, new_password, mode),
+        )
+        .map(|_| ())
     }
 
     // -----------------------------------------------------------------------
@@ -590,10 +749,34 @@ impl UnlockService {
         })
     }
 
+    fn refresh_tiga_compliance(conn: &VaultConnection) -> StorageResult<()> {
+        let mode = TigaService::get_global_default(conn)?;
+        let assessment = Self::assess_tiga_unlock_policy(conn, mode)?;
+        let current: String =
+            conn.inner()
+                .query_row("SELECT tiga_compliance_status FROM vault_meta", [], |row| {
+                    row.get(0)
+                })?;
+        let status = if assessment.satisfies_policy {
+            if current == "exception" {
+                "exception"
+            } else {
+                "compliant"
+            }
+        } else {
+            "remediation-required"
+        };
+        conn.inner().execute(
+            "UPDATE vault_meta SET tiga_compliance_status = ?1, updated_at = ?2",
+            rusqlite::params![status, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// 删除指定类型的解锁方式。
     ///
     /// 至少需要保留一种解锁方式。
-    pub fn remove_method(conn: &VaultConnection, method_id: &str) -> StorageResult<()> {
+    pub(crate) fn remove_method(conn: &VaultConnection, method_id: &str) -> StorageResult<()> {
         let methods = Self::list_methods(conn)?;
         if methods.len() <= 1 {
             return Err(StorageError::Validation(
@@ -612,7 +795,22 @@ impl UnlockService {
         if affected == 0 {
             return Err(StorageError::NotFound(method_id.to_string()));
         }
-        Ok(())
+        Self::refresh_tiga_compliance(conn)
+    }
+
+    pub fn remove_method_authorized(
+        conn: &mut VaultConnection,
+        method_id: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<()> {
+        TigaService::execute_authorized_mut(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ChangeUnlockMethods,
+            context,
+            |conn| Self::remove_method(conn, method_id),
+        )
+        .map(|_| ())
     }
 
     /// Validate that vault_meta.active_key_epoch_id points at exactly one active
@@ -739,7 +937,7 @@ impl UnlockService {
             .query_row("SELECT vault_id FROM vault_meta LIMIT 1", [], |row| {
                 row.get(0)
             })
-            .map_err(|e| StorageError::Database(e))?;
+            .map_err(StorageError::Database)?;
         Ok(vault_id.into_bytes())
     }
 
@@ -751,8 +949,7 @@ impl UnlockService {
             parallelism: kdf_params.parallelism,
             output_len: kdf_params.output_len as usize,
         };
-        kdf::derive_key(credential, &kdf_params.salt, &argon2_params)
-            .map_err(|e| StorageError::Crypto(e))
+        kdf::derive_key(credential, &kdf_params.salt, &argon2_params).map_err(StorageError::Crypto)
     }
 
     fn combine_password_and_security_key(password: &[u8], key_data: &[u8]) -> Vec<u8> {
@@ -780,8 +977,7 @@ impl UnlockService {
         let now = chrono::Utc::now().to_rfc3339();
         let kdf_params_ct = kdf_params.to_json_bytes();
 
-        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
-        let result = (|| -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
             conn.inner().execute(
                 "INSERT INTO unlock_methods (method_id, method_type, kdf_profile_id,
                  kdf_params_ct, wrapped_vault_key_ct, created_at, updated_at)
@@ -798,15 +994,7 @@ impl UnlockService {
             Self::bind_active_key_epoch(conn, active_epoch_wrapped_ct, &now)?;
             Self::validate_active_key_epoch(conn)?;
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => conn.inner().execute_batch("COMMIT;")?,
-            Err(err) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                return Err(err);
-            }
-        }
+        })?;
 
         Ok(UnlockMethod {
             method_id,
@@ -828,8 +1016,7 @@ impl UnlockService {
         active_epoch_wrapped_ct: &[u8],
     ) -> StorageResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
-        let result = (|| -> StorageResult<()> {
+        conn.with_immediate_transaction(|| {
             let affected = conn.inner().execute(
                 "UPDATE unlock_methods
                  SET kdf_params_ct = ?1, wrapped_vault_key_ct = ?2, updated_at = ?3
@@ -851,18 +1038,7 @@ impl UnlockService {
             Self::bind_active_key_epoch(conn, active_epoch_wrapped_ct, &now)?;
             Self::validate_active_key_epoch(conn)?;
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.inner().execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                Err(err)
-            }
-        }
+        })
     }
 
     fn bind_active_key_epoch(
@@ -935,16 +1111,41 @@ impl UnlockService {
 
     /// 创建解锁会话。
     fn create_session(method: UnlockMethodType) -> StorageResult<VaultSession> {
+        let now = chrono::Utc::now();
         Ok(VaultSession {
             session_id: Uuid::new_v4().to_string(),
             unlock_method: method,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.to_rfc3339(),
+            assurance: mdbx_core::tiga::SessionAssurance::from_unlock_method(
+                method,
+                now.timestamp(),
+            ),
         })
+    }
+
+    fn create_and_attach_session(
+        conn: &mut VaultConnection,
+        method: UnlockMethodType,
+    ) -> StorageResult<VaultSession> {
+        let session = Self::create_session(method)?;
+        conn.attach_session(session.clone());
+        Ok(session)
     }
 
     // -----------------------------------------------------------------------
     // VALIDATION
     // -----------------------------------------------------------------------
+
+    fn ensure_bootstrap_available(conn: &VaultConnection) -> StorageResult<()> {
+        if Self::list_methods(conn)?.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageError::Validation(
+                "unlock bootstrap is only available before the first method; use an authorized unlock-method mutation"
+                    .to_string(),
+            ))
+        }
+    }
 
     fn validate_pin(pin: &str) -> StorageResult<()> {
         let trimmed = pin.trim();
@@ -989,12 +1190,108 @@ impl UnlockService {
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
+    use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext};
 
     fn setup() -> VaultConnection {
         let conn = VaultConnection::open_in_memory().unwrap();
         let params = VaultInitParams::default();
         initialize_vault(&conn, &params).unwrap();
         conn
+    }
+
+    fn standard_device() -> DeviceContext {
+        DeviceContext {
+            device_id: Some("test-device".to_string()),
+            assurance: DeviceAssurance::Standard,
+            secure_clipboard_available: true,
+            screen_capture_protection_available: true,
+            secure_temp_files_available: true,
+        }
+    }
+
+    #[test]
+    fn bootstrap_api_rejects_a_second_unlock_method() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+        let error = UnlockService::setup_pin(&mut conn, "123456").unwrap_err();
+        assert!(error.to_string().contains("bootstrap is only available"));
+        assert_eq!(UnlockService::list_methods(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn authorized_unlock_method_addition_is_audited() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+        let session = conn.active_session().unwrap().clone();
+        let device = standard_device();
+        UnlockService::setup_pin_authorized(
+            &mut conn,
+            "123456",
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: session.assurance.authenticated_at_unix_secs + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(UnlockService::list_methods(&conn).unwrap().len(), 2);
+        let events = TigaService::list_security_audit_events(&conn, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, TigaOperation::ChangeUnlockMethods);
+        assert_eq!(events[0].outcome, AuthorizationOutcome::Allow);
+    }
+
+    #[test]
+    fn power_remediation_can_add_combined_method_then_become_compliant() {
+        let mut conn = setup();
+        conn.inner()
+            .execute("UPDATE vault_meta SET default_tiga_mode = 'power'", [])
+            .unwrap();
+        UnlockService::setup_password_with_mode(&mut conn, "password", TigaMode::Power).unwrap();
+        assert_eq!(
+            TigaService::get_policy_state(&conn).unwrap().compliance,
+            mdbx_core::tiga::PolicyCompliance::RemediationRequired
+        );
+
+        let password_session = conn.active_session().unwrap().clone();
+        let device = standard_device();
+        UnlockService::setup_password_security_key_authorized(
+            &mut conn,
+            "password",
+            b"hardware-key-material-32bytes!!!",
+            TigaMode::Power,
+            TigaAuthorizationContext {
+                session: Some(&password_session),
+                device: &device,
+                now_unix_secs: password_session.assurance.authenticated_at_unix_secs + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            TigaService::get_policy_state(&conn).unwrap().compliance,
+            mdbx_core::tiga::PolicyCompliance::RemediationRequired
+        );
+
+        let password_method = UnlockService::list_methods(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|method| method.method_type == UnlockMethodType::Password)
+            .unwrap();
+        let combined_session = conn.active_session().unwrap().clone();
+        UnlockService::remove_method_authorized(
+            &mut conn,
+            &password_method.method_id,
+            TigaAuthorizationContext {
+                session: Some(&combined_session),
+                device: &device,
+                now_unix_secs: combined_session.assurance.authenticated_at_unix_secs + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            TigaService::get_policy_state(&conn).unwrap().compliance,
+            mdbx_core::tiga::PolicyCompliance::Compliant
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1358,7 +1655,12 @@ mod tests {
             TigaMode::Power,
         )
         .unwrap();
-        UnlockService::setup_password(&mut conn, "fallback-password").unwrap();
+        UnlockService::setup_password_with_mode_raw(
+            &mut conn,
+            "fallback-password",
+            TigaMode::Multi,
+        )
+        .unwrap();
 
         let assessment = UnlockService::assess_tiga_unlock_policy(&conn, TigaMode::Power).unwrap();
         assert!(!assessment.satisfies_policy);
@@ -1399,7 +1701,8 @@ mod tests {
     fn test_list_methods() {
         let mut conn = setup();
         UnlockService::setup_pin(&mut conn, "123456").unwrap();
-        UnlockService::setup_password(&mut conn, "password").unwrap();
+        UnlockService::setup_password_with_mode_raw(&mut conn, "password", TigaMode::Multi)
+            .unwrap();
 
         let methods = UnlockService::list_methods(&conn).unwrap();
         assert_eq!(methods.len(), 2);
@@ -1427,7 +1730,9 @@ mod tests {
     fn test_remove_method() {
         let mut conn = setup();
         UnlockService::setup_pin(&mut conn, "123456").unwrap();
-        let pw = UnlockService::setup_password(&mut conn, "password").unwrap();
+        let pw =
+            UnlockService::setup_password_with_mode_raw(&mut conn, "password", TigaMode::Multi)
+                .unwrap();
 
         let methods = UnlockService::list_methods(&conn).unwrap();
         assert_eq!(methods.len(), 2);
@@ -1730,7 +2035,7 @@ mod tests {
         let vault_key_1 = conn.keyring().unwrap().vault_key.clone();
 
         // 再设置 PIN — 应复用同一个 vault_key
-        UnlockService::setup_pin(&mut conn, "123456").unwrap();
+        UnlockService::setup_pin_raw(&mut conn, "123456").unwrap();
         let vault_key_2 = conn.keyring().unwrap().vault_key.clone();
 
         assert_eq!(vault_key_1, vault_key_2);
@@ -1740,7 +2045,7 @@ mod tests {
     fn test_both_methods_unlock_to_same_keyring() {
         let mut conn = setup();
         UnlockService::setup_password(&mut conn, "password").unwrap();
-        UnlockService::setup_pin(&mut conn, "123456").unwrap();
+        UnlockService::setup_pin_raw(&mut conn, "123456").unwrap();
 
         let vault_id: String = conn
             .inner()

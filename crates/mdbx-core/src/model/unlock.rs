@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::tiga::TigaMode;
+use crate::tiga::{SessionAssurance, TigaMode};
 
 /// 用户可见的解锁方式。
 ///
@@ -18,15 +18,6 @@ pub enum UnlockMethodType {
 }
 
 impl UnlockMethodType {
-    pub fn to_string(&self) -> String {
-        match self {
-            Self::Pin => "pin".to_string(),
-            Self::Password => "password".to_string(),
-            Self::SecurityKey => "security_key".to_string(),
-            Self::PasswordSecurityKey => "password_security_key".to_string(),
-        }
-    }
-
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "pin" => Ok(Self::Pin),
@@ -55,6 +46,17 @@ impl UnlockMethodType {
     }
 }
 
+impl std::fmt::Display for UnlockMethodType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pin => write!(f, "pin"),
+            Self::Password => write!(f, "password"),
+            Self::SecurityKey => write!(f, "security_key"),
+            Self::PasswordSecurityKey => write!(f, "password_security_key"),
+        }
+    }
+}
+
 /// 已配置的解锁方式记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnlockMethod {
@@ -73,6 +75,7 @@ pub struct VaultSession {
     pub session_id: String,
     pub unlock_method: UnlockMethodType,
     pub created_at: String,
+    pub assurance: SessionAssurance,
 }
 
 /// KDF 参数配置。

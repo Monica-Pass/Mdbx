@@ -14,6 +14,14 @@ const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncStatePayload {
     pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiga_vault_state: Option<TigaVaultStateRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiga_policy_overrides: Option<Vec<TigaPolicyOverrideRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiga_policy_exceptions: Option<Vec<TigaPolicyExceptionRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_audit_events: Option<Vec<SecurityAuditEventRow>>,
     pub projects: Vec<ProjectRow>,
     pub entries: Vec<EntryRow>,
     pub attachments: Vec<AttachmentRow>,
@@ -21,6 +29,55 @@ pub struct SyncStatePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_tags: Option<Vec<ProjectTagSetRow>>,
     pub branches: Vec<BranchRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TigaVaultStateRow {
+    pub default_tiga_mode: String,
+    pub policy_version: u32,
+    pub compliance_status: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TigaPolicyOverrideRow {
+    pub scope_type: String,
+    pub scope_id: String,
+    pub policy_json: String,
+    pub exception_id: Option<String>,
+    pub updated_at: String,
+    pub updated_by_device_id: String,
+    pub integrity_tag: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TigaPolicyExceptionRow {
+    pub exception_id: String,
+    pub target_scope: String,
+    pub target_id: String,
+    pub approved_override_json: String,
+    pub reason: String,
+    pub expires_at_unix_secs: Option<i64>,
+    pub created_at: String,
+    pub created_by_session_id: Option<String>,
+    pub revoked_at: Option<String>,
+    pub integrity_tag: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityAuditEventRow {
+    pub event_id: String,
+    pub occurred_at: String,
+    pub operation: String,
+    pub outcome: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub session_id: Option<String>,
+    pub device_id: Option<String>,
+    pub reason_codes_json: String,
+    pub constraints_json: String,
+    pub exception_id: Option<String>,
+    pub integrity_tag: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +167,10 @@ pub struct BranchRow {
 pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayload> {
     Ok(SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
+        tiga_vault_state: Some(load_tiga_vault_state(conn)?),
+        tiga_policy_overrides: Some(load_tiga_policy_override_rows(conn)?),
+        tiga_policy_exceptions: Some(load_tiga_policy_exception_rows(conn)?),
+        security_audit_events: Some(load_security_audit_event_rows(conn)?),
         projects: load_project_rows(conn)?,
         entries: load_entry_rows(conn)?,
         attachments: load_attachment_rows(conn)?,
@@ -117,6 +178,110 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         project_tags: Some(load_project_tag_set_rows(conn)?),
         branches: load_branch_rows(conn)?,
     })
+}
+
+fn load_tiga_vault_state(conn: &VaultConnection) -> StorageResult<TigaVaultStateRow> {
+    conn.inner()
+        .query_row(
+            "SELECT default_tiga_mode, tiga_policy_version, tiga_compliance_status, updated_at
+             FROM vault_meta",
+            [],
+            |row| {
+                Ok(TigaVaultStateRow {
+                    default_tiga_mode: row.get(0)?,
+                    policy_version: row.get::<_, i64>(1)? as u32,
+                    compliance_status: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .map_err(StorageError::Database)
+}
+
+fn load_tiga_policy_override_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<TigaPolicyOverrideRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT scope_type, scope_id, policy_json, exception_id, updated_at,
+                updated_by_device_id, integrity_tag
+         FROM tiga_policy_overrides ORDER BY scope_type, scope_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TigaPolicyOverrideRow {
+            scope_type: row.get(0)?,
+            scope_id: row.get(1)?,
+            policy_json: row.get(2)?,
+            exception_id: row.get(3)?,
+            updated_at: row.get(4)?,
+            updated_by_device_id: row.get(5)?,
+            integrity_tag: row.get(6)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_tiga_policy_exception_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<TigaPolicyExceptionRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT exception_id, target_scope, target_id, approved_override_json, reason,
+                expires_at_unix_secs, created_at, created_by_session_id, revoked_at,
+                integrity_tag
+         FROM tiga_policy_exceptions ORDER BY created_at, exception_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TigaPolicyExceptionRow {
+            exception_id: row.get(0)?,
+            target_scope: row.get(1)?,
+            target_id: row.get(2)?,
+            approved_override_json: row.get(3)?,
+            reason: row.get(4)?,
+            expires_at_unix_secs: row.get(5)?,
+            created_at: row.get(6)?,
+            created_by_session_id: row.get(7)?,
+            revoked_at: row.get(8)?,
+            integrity_tag: row.get(9)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_security_audit_event_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<SecurityAuditEventRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                session_id, device_id, reason_codes_json, constraints_json,
+                exception_id, integrity_tag
+         FROM security_audit_events ORDER BY occurred_at, event_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SecurityAuditEventRow {
+            event_id: row.get(0)?,
+            occurred_at: row.get(1)?,
+            operation: row.get(2)?,
+            outcome: row.get(3)?,
+            scope_type: row.get(4)?,
+            scope_id: row.get(5)?,
+            session_id: row.get(6)?,
+            device_id: row.get(7)?,
+            reason_codes_json: row.get(8)?,
+            constraints_json: row.get(9)?,
+            exception_id: row.get(10)?,
+            integrity_tag: row.get(11)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> StorageResult<Vec<T>> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub fn collect_sync_state_payload(conn: &VaultConnection) -> StorageResult<ObjectPayload> {

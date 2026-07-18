@@ -52,7 +52,8 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 7. `06-sqlite-schema-v1.zh-CN.md`
 8. `07-low-end-model-task-breakdown.zh-CN.md`
 9. `08-implementation-completion-plan.zh-CN.md`
-10. `11-monica-pass-cli-development.zh-CN.md`
+10. `09-mdbx2-compatibility.zh-CN.md`
+11. `11-monica-pass-cli-development.zh-CN.md`
 
 ## 文档职责
 
@@ -83,6 +84,9 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 
 - `08-implementation-completion-plan.zh-CN.md`
   - 当前实现完成计划，记录已经完成的安全、同步、tracked mutation 和客户端接入事项。
+
+- `09-mdbx2-compatibility.zh-CN.md`
+  - MDBX2 格式代际、MDBX-1 自动升级、版本字段和迁移失败安全规则。
 
 - `11-monica-pass-cli-development.zh-CN.md`
   - Monica Pass CLI 开发与接入说明。

@@ -462,6 +462,27 @@ Clients should present Tiga unlock policy with these semantics:
 - `Multi`: balanced default. Clients should recommend adding a security key, but must keep a clear recovery path such as a strong password. A cloud-synced `.mdbx` file can be opened on a new device through any configured portable unlock path, or through a security-key path when the required hardware key or equivalent platform credential is available.
 - `Power`: strongest protection. Clients should guide users toward a password + security key combined unlock method. If standalone password or PIN unlock remains configured, clients should clearly warn that it weakens Power-mode resistance to offline brute-force attacks.
 
+Tiga2 is more than profile display. After unlock, clients must retain the `VaultSession` and provide truthful `DeviceContext` evidence for every sensitive operation. A client must not claim hardware assurance, secure clipboard support, or screen-capture protection merely to satisfy Power policy.
+
+Client-owned actions must call `TigaService::authorize_operation` and honor every returned constraint:
+
+- secret reveal: `RevealSecret`
+- secret copy: `CopySecret`
+- attachment plaintext handling: `DecryptAttachment`
+- background access: `BackgroundAccess`
+- locked ciphertext sync: `SyncCiphertext`
+
+Only `Allow` and `AllowWithConstraints` permit the action. `RequireFreshAuthentication`, `RequireAdditionalFactor`, and `Deny` cannot be bypassed with a confirmation dialog.
+
+Storage-owned high-risk operations must use their authorized APIs:
+
+- KDBX export: `KdbxExporter::export_all_authorized` / `export_one_authorized`
+- snapshot restore: `SnapshotRepo::restore_snapshot_authorized`
+- unlock-method add/change/reset/remove: the `UnlockService` `*_authorized` methods
+- Tiga profile and sparse policy changes: the `TigaService` `*_authorized` methods
+
+The first unlock method may use the bootstrap path. Once a method exists, bootstrap APIs reject further additions. `remediation-required` relaxes only the unlock-method repair workflow; it does not weaken Power export, reveal, or other operations.
+
 When a security key participates in unlock, clients must not log or cache the hardware key itself, challenge responses, derived key material, or replayable equivalent material. Hardware-key support does not make cloud-drive storage unsafe or unusable by itself; portability depends on the configured unlock paths. A vault configured only with security-key unlock and no portable unlock path will require the same hardware key or equivalent platform credential on a new device, so clients should explain this recovery impact before enabling that configuration.
 
 Clients must not log master passwords, derived keys, or epoch keys.
@@ -515,6 +536,8 @@ At minimum, sync state should include:
 Clients must check `format_version` when opening a vault.
 
 If the vault contains an unknown critical extension, the client must refuse writes. Read-only mode is acceptable if it can be guaranteed safe.
+
+Clients may own migration prompts, pre-upgrade backup placement, progress, and remediation UI, but the storage core must perform the format conversion. Android, iOS, and desktop clients must not maintain separate MDBX1 field-mapping implementations.
 
 ### 7.2 Stable IDs
 

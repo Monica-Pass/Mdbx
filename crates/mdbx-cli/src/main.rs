@@ -1,9 +1,8 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
-use mdbx_core::tiga::TigaMode;
+use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::import::{KdbxEntry, KdbxExporter, KdbxImporter};
@@ -12,13 +11,14 @@ use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::CommitContext;
 use mdbx_storage::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
 use mdbx_storage::search::SearchService;
+use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
 use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_state_payload;
+use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
-    build_bundle, read_bundle, write_bundle, ObjectPayload, SerializedCommit, TombstoneRecord,
+    build_bundle, read_bundle, write_bundle, CommitBatch, SerializedCommit, TombstoneRecord,
 };
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
 
 fn prompt(prompt_text: &str) -> String {
     eprint!("{}", prompt_text);
@@ -391,6 +391,16 @@ fn open_or_create_vault(
 
 fn ctx() -> CommitContext {
     CommitContext::new("cli-device".to_string())
+}
+
+fn cli_device_context() -> DeviceContext {
+    DeviceContext {
+        device_id: Some("cli-device".to_string()),
+        assurance: DeviceAssurance::Standard,
+        secure_clipboard_available: false,
+        screen_capture_protection_available: false,
+        secure_temp_files_available: true,
+    }
 }
 
 fn apply_unlock_args(conn: &mut VaultConnection, unlock: UnlockArgs<'_>) -> Result<(), String> {
@@ -1014,8 +1024,21 @@ fn cmd_snapshot(conn: &mut VaultConnection, action: SnapshotAction) -> Result<()
             }
         }
         SnapshotAction::Restore { snapshot_id } => {
-            SnapshotRepo::restore_snapshot(conn, &ctx, &snapshot_id)
-                .map_err(|e| format!("{}", e))?;
+            let device = cli_device_context();
+            let session = conn
+                .active_session()
+                .ok_or_else(|| "snapshot restore requires an active unlock session".to_string())?;
+            SnapshotRepo::restore_snapshot_authorized(
+                conn,
+                &ctx,
+                &snapshot_id,
+                TigaAuthorizationContext {
+                    session: Some(session),
+                    device: &device,
+                    now_unix_secs: chrono::Utc::now().timestamp(),
+                },
+            )
+            .map_err(|e| format!("{}", e))?;
             println!("Restored from snapshot {}", snapshot_id);
         }
     }
@@ -1036,7 +1059,7 @@ fn cmd_search(
         .as_deref()
         .map(|s| s.parse::<EntryType>())
         .transpose()
-        .map_err(|_| format!("unknown entry type"))?;
+        .map_err(|_| "unknown entry type".to_string())?;
 
     let results = SearchService::search(conn, query.as_deref(), tag.as_deref(), et, None, None)
         .map_err(|e| format!("{}", e))?;
@@ -1060,104 +1083,6 @@ fn cmd_search(
 // SYNC
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CliSyncStatePayload {
-    format: String,
-    projects: Vec<ProjectRow>,
-    entries: Vec<EntryRow>,
-    attachments: Vec<AttachmentRow>,
-    attachment_chunks: Vec<AttachmentChunkRow>,
-    branches: Vec<BranchRow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectRow {
-    project_id: String,
-    title_ct: Vec<u8>,
-    summary_ct: Option<Vec<u8>>,
-    group_id: Option<String>,
-    icon_ref: Option<String>,
-    favorite: bool,
-    archived: bool,
-    deleted: bool,
-    tiga_mode_override: Option<String>,
-    object_clock: String,
-    head_commit_id: String,
-    attachment_count: u32,
-    created_at: String,
-    updated_at: String,
-    created_by_device_id: String,
-    updated_by_device_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EntryRow {
-    entry_id: String,
-    project_id: String,
-    entry_type: String,
-    title_ct: Option<Vec<u8>>,
-    payload_ct: Vec<u8>,
-    payload_schema_version: u32,
-    tiga_mode_override: Option<String>,
-    object_clock: String,
-    head_commit_id: String,
-    deleted: bool,
-    created_at: String,
-    updated_at: String,
-    created_by_device_id: String,
-    updated_by_device_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AttachmentRow {
-    attachment_id: String,
-    project_id: String,
-    entry_id: Option<String>,
-    file_name_ct: Vec<u8>,
-    media_type_ct: Option<Vec<u8>>,
-    storage_mode: String,
-    content_hash: String,
-    original_size: u64,
-    stored_size: u64,
-    chunk_count: u32,
-    head_commit_id: String,
-    deleted: bool,
-    created_at: String,
-    updated_at: String,
-    created_by_device_id: String,
-    updated_by_device_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AttachmentChunkRow {
-    attachment_id: String,
-    chunk_index: u32,
-    chunk_hash: String,
-    chunk_ct: Option<Vec<u8>>,
-    external_uri_ct: Option<Vec<u8>>,
-    stored_size: u64,
-    created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BranchRow {
-    branch_id: String,
-    branch_name: String,
-    head_commit_id: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Default)]
-struct ApplySummary {
-    commits_imported: usize,
-    commits_skipped: usize,
-    objects_inserted: usize,
-    objects_fast_forwarded: usize,
-    objects_skipped: usize,
-    conflicts_created: usize,
-}
-
 fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String> {
     match action {
         SyncAction::Bundle { output } => {
@@ -1179,13 +1104,11 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
                 read_bundle(&mut input).map_err(|e| format!("bundle read failed: {}", e))?;
             let summary = apply_sync_bundle(conn, &bundle)?;
             println!(
-                "Applied bundle: imported={} skipped={} inserted={} fast-forwarded={} object-skipped={} conflicts={}",
-                summary.commits_imported,
-                summary.commits_skipped,
-                summary.objects_inserted,
-                summary.objects_fast_forwarded,
-                summary.objects_skipped,
-                summary.conflicts_created
+                "Applied bundle: applied={} skipped={} conflicts={} missing-parents={}",
+                summary.applied_commits,
+                summary.skipped_commits,
+                summary.conflict_count,
+                summary.missing_parent_count
             );
             Ok(())
         }
@@ -1267,9 +1190,18 @@ fn cmd_export_kdbx_json(conn: &VaultConnection, output: PathBuf) -> Result<(), S
     let mut attachments_exported = 0u32;
     let mut projects_skipped = 0u32;
 
+    let device = cli_device_context();
+    let session = conn
+        .active_session()
+        .ok_or_else(|| "KDBX export requires an active unlock session".to_string())?;
+    let authorization = TigaAuthorizationContext {
+        session: Some(session),
+        device: &device,
+        now_unix_secs: chrono::Utc::now().timestamp(),
+    };
     for project in ProjectRepo::list_all(conn).map_err(|e| format!("{}", e))? {
-        match KdbxExporter::export_one(conn, &project) {
-            Ok((entry, attachment_count, project_warnings)) => {
+        match KdbxExporter::export_one_authorized(conn, &project, authorization) {
+            Ok(((entry, attachment_count, project_warnings), _decision)) => {
                 entries.push(entry);
                 attachments_exported += attachment_count;
                 warnings.extend(project_warnings);
@@ -1303,17 +1235,6 @@ fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, S
     let vault_id = vault_id(conn)?;
     let source_device_id = latest_device_id(conn)?.unwrap_or_else(|| "cli-device".to_string());
     let mut commits = load_serialized_commits(conn)?;
-    if let Some(first) = commits.first_mut() {
-        let state = collect_sync_state(conn)?;
-        let state_bytes = serde_json::to_vec(&state)
-            .map_err(|e| format!("failed to serialize sync state: {}", e))?;
-        first.object_payloads.push(ObjectPayload {
-            object_type: "mdbx-cli/state-v1".to_string(),
-            object_id: "state".to_string(),
-            ciphertext: state_bytes,
-            associated_data: b"mdbx-cli/state-v1".to_vec(),
-        });
-    }
     if let Some(last) = commits.last_mut() {
         last.object_payloads.push(
             collect_core_sync_state_payload(conn)
@@ -1326,7 +1247,7 @@ fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, S
 fn apply_sync_bundle(
     conn: &VaultConnection,
     bundle: &mdbx_sync::SyncBundle,
-) -> Result<ApplySummary, String> {
+) -> Result<ApplyBatchResult, String> {
     let local_vault_id = vault_id(conn)?;
     if bundle.vault_id != local_vault_id {
         return Err(format!(
@@ -1335,33 +1256,13 @@ fn apply_sync_bundle(
         ));
     }
 
-    let mut summary = ApplySummary::default();
-    insert_bundle_commits(conn, bundle, &mut summary)?;
-    insert_bundle_tombstones(conn, bundle)?;
-    refresh_device_heads(conn)?;
-
-    let state = bundle
-        .commits
-        .iter()
-        .flat_map(|commit| commit.object_payloads.iter())
-        .find(|payload| payload.object_type == "mdbx-cli/state-v1" && payload.object_id == "state")
-        .ok_or_else(|| "bundle does not contain mdbx-cli/state-v1 payload".to_string())
-        .and_then(|payload| {
-            serde_json::from_slice::<CliSyncStatePayload>(&payload.ciphertext)
-                .map_err(|e| format!("failed to decode sync state payload: {}", e))
-        })?;
-
-    if state.format != "mdbx-cli-sync-state-v1" {
-        return Err(format!("unsupported sync state format: {}", state.format));
-    }
-
-    apply_projects(conn, &state.projects, &mut summary)?;
-    apply_entries(conn, &state.entries, &mut summary)?;
-    let replace_attachment_chunks = apply_attachments(conn, &state.attachments, &mut summary)?;
-    apply_attachment_chunks(conn, &state.attachment_chunks, &replace_attachment_chunks)?;
-    apply_branches(conn, &state.branches)?;
-
-    Ok(summary)
+    let device_id = latest_device_id(conn)?.unwrap_or_else(|| "mdbx-cli-sync".to_string());
+    SyncApplyRepo::apply_batch(
+        conn,
+        &CommitContext::new(device_id),
+        &CommitBatch::new(bundle.commits.clone(), 0, true),
+    )
+    .map_err(|e| format!("storage-core sync apply failed: {e}"))
 }
 
 fn vault_id(conn: &VaultConnection) -> Result<String, String> {
@@ -1501,824 +1402,6 @@ fn parse_change_scope(value: &str) -> ChangeScope {
         "key-epoch" => ChangeScope::KeyEpoch,
         _ => ChangeScope::Multi,
     }
-}
-
-fn collect_sync_state(conn: &VaultConnection) -> Result<CliSyncStatePayload, String> {
-    Ok(CliSyncStatePayload {
-        format: "mdbx-cli-sync-state-v1".to_string(),
-        projects: load_project_rows(conn)?,
-        entries: load_entry_rows(conn)?,
-        attachments: load_attachment_rows(conn)?,
-        attachment_chunks: load_attachment_chunk_rows(conn)?,
-        branches: load_branch_rows(conn)?,
-    })
-}
-
-fn load_project_rows(conn: &VaultConnection) -> Result<Vec<ProjectRow>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT project_id, title_ct, summary_ct, group_id, icon_ref,
-                    favorite, archived, deleted, tiga_mode_override, object_clock,
-                    head_commit_id, attachment_count, created_at, updated_at,
-                    created_by_device_id, updated_by_device_id
-             FROM projects
-             ORDER BY updated_at ASC, project_id ASC",
-        )
-        .map_err(|e| format!("failed to query projects: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(ProjectRow {
-                project_id: row.get(0)?,
-                title_ct: row.get(1)?,
-                summary_ct: row.get(2)?,
-                group_id: row.get(3)?,
-                icon_ref: row.get(4)?,
-                favorite: row.get::<_, i32>(5)? != 0,
-                archived: row.get::<_, i32>(6)? != 0,
-                deleted: row.get::<_, i32>(7)? != 0,
-                tiga_mode_override: row.get(8)?,
-                object_clock: row.get(9)?,
-                head_commit_id: row.get(10)?,
-                attachment_count: row.get::<_, i64>(11)? as u32,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
-                created_by_device_id: row.get(14)?,
-                updated_by_device_id: row.get(15)?,
-            })
-        })
-        .map_err(|e| format!("failed to map projects: {}", e))?;
-    collect_rows(rows, "project")
-}
-
-fn load_entry_rows(conn: &VaultConnection) -> Result<Vec<EntryRow>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT entry_id, project_id, entry_type, title_ct, payload_ct,
-                    payload_schema_version, tiga_mode_override, object_clock,
-                    head_commit_id, deleted, created_at, updated_at,
-                    created_by_device_id, updated_by_device_id
-             FROM entries
-             ORDER BY updated_at ASC, entry_id ASC",
-        )
-        .map_err(|e| format!("failed to query entries: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(EntryRow {
-                entry_id: row.get(0)?,
-                project_id: row.get(1)?,
-                entry_type: row.get(2)?,
-                title_ct: row.get(3)?,
-                payload_ct: row.get(4)?,
-                payload_schema_version: row.get::<_, i64>(5)? as u32,
-                tiga_mode_override: row.get(6)?,
-                object_clock: row.get(7)?,
-                head_commit_id: row.get(8)?,
-                deleted: row.get::<_, i32>(9)? != 0,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                created_by_device_id: row.get(12)?,
-                updated_by_device_id: row.get(13)?,
-            })
-        })
-        .map_err(|e| format!("failed to map entries: {}", e))?;
-    collect_rows(rows, "entry")
-}
-
-fn load_attachment_rows(conn: &VaultConnection) -> Result<Vec<AttachmentRow>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT attachment_id, project_id, entry_id, file_name_ct,
-                    media_type_ct, storage_mode, content_hash,
-                    original_size, stored_size, chunk_count, head_commit_id,
-                    deleted, created_at, updated_at,
-                    created_by_device_id, updated_by_device_id
-             FROM attachments
-             ORDER BY updated_at ASC, attachment_id ASC",
-        )
-        .map_err(|e| format!("failed to query attachments: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(AttachmentRow {
-                attachment_id: row.get(0)?,
-                project_id: row.get(1)?,
-                entry_id: row.get(2)?,
-                file_name_ct: row.get(3)?,
-                media_type_ct: row.get(4)?,
-                storage_mode: row.get(5)?,
-                content_hash: row.get(6)?,
-                original_size: row.get::<_, i64>(7)? as u64,
-                stored_size: row.get::<_, i64>(8)? as u64,
-                chunk_count: row.get::<_, i64>(9)? as u32,
-                head_commit_id: row.get(10)?,
-                deleted: row.get::<_, i32>(11)? != 0,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
-                created_by_device_id: row.get(14)?,
-                updated_by_device_id: row.get(15)?,
-            })
-        })
-        .map_err(|e| format!("failed to map attachments: {}", e))?;
-    collect_rows(rows, "attachment")
-}
-
-fn load_attachment_chunk_rows(conn: &VaultConnection) -> Result<Vec<AttachmentChunkRow>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT attachment_id, chunk_index, chunk_hash, chunk_ct,
-                    external_uri_ct, stored_size, created_at
-             FROM attachment_chunks
-             ORDER BY attachment_id ASC, chunk_index ASC",
-        )
-        .map_err(|e| format!("failed to query attachment chunks: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(AttachmentChunkRow {
-                attachment_id: row.get(0)?,
-                chunk_index: row.get::<_, i64>(1)? as u32,
-                chunk_hash: row.get(2)?,
-                chunk_ct: row.get(3)?,
-                external_uri_ct: row.get(4)?,
-                stored_size: row.get::<_, i64>(5)? as u64,
-                created_at: row.get(6)?,
-            })
-        })
-        .map_err(|e| format!("failed to map attachment chunks: {}", e))?;
-    collect_rows(rows, "attachment chunk")
-}
-
-fn load_branch_rows(conn: &VaultConnection) -> Result<Vec<BranchRow>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT branch_id, branch_name, head_commit_id, created_at, updated_at
-             FROM branches
-             ORDER BY branch_name ASC, branch_id ASC",
-        )
-        .map_err(|e| format!("failed to query branches: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(BranchRow {
-                branch_id: row.get(0)?,
-                branch_name: row.get(1)?,
-                head_commit_id: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-            })
-        })
-        .map_err(|e| format!("failed to map branches: {}", e))?;
-    collect_rows(rows, "branch")
-}
-
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-    label: &str,
-) -> Result<Vec<T>, String> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| format!("failed to read {} row: {}", label, e))?);
-    }
-    Ok(out)
-}
-
-fn insert_bundle_commits(
-    conn: &VaultConnection,
-    bundle: &mdbx_sync::SyncBundle,
-    summary: &mut ApplySummary,
-) -> Result<(), String> {
-    for serialized in &bundle.commits {
-        let exists = commit_exists(conn, &serialized.commit.commit_id)?;
-        if exists {
-            summary.commits_skipped += 1;
-        } else {
-            conn.inner()
-                .execute(
-                    "INSERT INTO commits (commit_id, device_id, local_seq, commit_kind,
-                     change_scope, changed_object_ids_ct, vector_clock, message_ct,
-                     created_at, integrity_tag)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        serialized.commit.commit_id,
-                        serialized.commit.device_id,
-                        serialized.commit.local_seq as i64,
-                        serialized.commit.commit_kind.to_string(),
-                        serialized.commit.change_scope.to_string(),
-                        serialized.commit.changed_object_ids_ct,
-                        serialized.commit.vector_clock,
-                        serialized.commit.message_ct,
-                        serialized.commit.created_at,
-                        serialized.commit.integrity_tag,
-                    ],
-                )
-                .map_err(|e| {
-                    format!(
-                        "failed to insert commit {}: {}",
-                        serialized.commit.commit_id, e
-                    )
-                })?;
-            summary.commits_imported += 1;
-        }
-
-        for parent_id in &serialized.parent_ids {
-            conn.inner()
-                .execute(
-                    "INSERT OR IGNORE INTO commit_parents (commit_id, parent_commit_id)
-                     VALUES (?1, ?2)",
-                    params![serialized.commit.commit_id, parent_id],
-                )
-                .map_err(|e| {
-                    format!(
-                        "failed to insert commit parent {} -> {}: {}",
-                        serialized.commit.commit_id, parent_id, e
-                    )
-                })?;
-        }
-    }
-    Ok(())
-}
-
-fn insert_bundle_tombstones(
-    conn: &VaultConnection,
-    bundle: &mdbx_sync::SyncBundle,
-) -> Result<(), String> {
-    for tombstone in bundle.commits.iter().flat_map(|commit| &commit.tombstones) {
-        conn.inner()
-            .execute(
-                "INSERT OR IGNORE INTO tombstones (tombstone_id, target_object_type,
-                 target_object_id, delete_clock, deleted_by_device_id, deleted_at,
-                 purge_eligible_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                params![
-                    tombstone.tombstone_id,
-                    tombstone.target_object_type,
-                    tombstone.target_object_id,
-                    tombstone.delete_clock,
-                    tombstone.deleted_by_device_id,
-                    tombstone.deleted_at,
-                ],
-            )
-            .map_err(|e| {
-                format!(
-                    "failed to insert tombstone {}: {}",
-                    tombstone.tombstone_id, e
-                )
-            })?;
-    }
-    Ok(())
-}
-
-fn commit_exists(conn: &VaultConnection, commit_id: &str) -> Result<bool, String> {
-    let count: i64 = conn
-        .inner()
-        .query_row(
-            "SELECT COUNT(*) FROM commits WHERE commit_id = ?1",
-            params![commit_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("failed to check commit {}: {}", commit_id, e))?;
-    Ok(count > 0)
-}
-
-fn refresh_device_heads(conn: &VaultConnection) -> Result<(), String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT device_id, commit_id, created_at
-             FROM commits
-             WHERE (device_id, local_seq) IN (
-                 SELECT device_id, MAX(local_seq) FROM commits GROUP BY device_id
-             )",
-        )
-        .map_err(|e| format!("failed to query imported device heads: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("failed to map device heads: {}", e))?;
-    let mut heads = Vec::new();
-    for row in rows {
-        heads.push(row.map_err(|e| format!("failed to read device head row: {}", e))?);
-    }
-    drop(stmt);
-
-    for (device_id, head_commit_id, last_seen_at) in heads {
-        conn.inner()
-            .execute(
-                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
-                 VALUES (?1, ?2, ?3, 0)
-                 ON CONFLICT(device_id) DO UPDATE SET
-                    head_commit_id = excluded.head_commit_id,
-                    last_seen_at = excluded.last_seen_at",
-                params![device_id, head_commit_id, last_seen_at],
-            )
-            .map_err(|e| format!("failed to refresh device head: {}", e))?;
-    }
-    Ok(())
-}
-
-fn apply_projects(
-    conn: &VaultConnection,
-    projects: &[ProjectRow],
-    summary: &mut ApplySummary,
-) -> Result<(), String> {
-    for row in projects {
-        match object_apply_decision(
-            conn,
-            "projects",
-            "project_id",
-            &row.project_id,
-            &row.head_commit_id,
-        )? {
-            ObjectDecision::Insert => {
-                conn.inner().execute(
-                    "INSERT INTO projects (project_id, title_ct, summary_ct, group_id, icon_ref,
-                     favorite, archived, deleted, tiga_mode_override, object_clock,
-                     head_commit_id, attachment_count, created_at, updated_at,
-                     created_by_device_id, updated_by_device_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                    params![
-                        row.project_id,
-                        row.title_ct,
-                        row.summary_ct,
-                        row.group_id,
-                        row.icon_ref,
-                        row.favorite as i32,
-                        row.archived as i32,
-                        row.deleted as i32,
-                        row.tiga_mode_override,
-                        row.object_clock,
-                        row.head_commit_id,
-                        row.attachment_count as i64,
-                        row.created_at,
-                        row.updated_at,
-                        row.created_by_device_id,
-                        row.updated_by_device_id,
-                    ],
-                ).map_err(|e| format!("failed to insert project {}: {}", row.project_id, e))?;
-                summary.objects_inserted += 1;
-            }
-            ObjectDecision::FastForward => {
-                conn.inner()
-                    .execute(
-                        "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
-                     icon_ref = ?5, favorite = ?6, archived = ?7, deleted = ?8,
-                     tiga_mode_override = ?9, object_clock = ?10, head_commit_id = ?11,
-                     attachment_count = ?12, created_at = ?13, updated_at = ?14,
-                     created_by_device_id = ?15, updated_by_device_id = ?16
-                     WHERE project_id = ?1",
-                        params![
-                            row.project_id,
-                            row.title_ct,
-                            row.summary_ct,
-                            row.group_id,
-                            row.icon_ref,
-                            row.favorite as i32,
-                            row.archived as i32,
-                            row.deleted as i32,
-                            row.tiga_mode_override,
-                            row.object_clock,
-                            row.head_commit_id,
-                            row.attachment_count as i64,
-                            row.created_at,
-                            row.updated_at,
-                            row.created_by_device_id,
-                            row.updated_by_device_id,
-                        ],
-                    )
-                    .map_err(|e| format!("failed to update project {}: {}", row.project_id, e))?;
-                summary.objects_fast_forwarded += 1;
-            }
-            ObjectDecision::Conflict { local_head } => {
-                create_sync_conflict(
-                    conn,
-                    "project",
-                    &row.project_id,
-                    &local_head,
-                    &row.head_commit_id,
-                )?;
-                summary.conflicts_created += 1;
-            }
-            ObjectDecision::Skip => summary.objects_skipped += 1,
-        }
-    }
-    Ok(())
-}
-
-fn apply_entries(
-    conn: &VaultConnection,
-    entries: &[EntryRow],
-    summary: &mut ApplySummary,
-) -> Result<(), String> {
-    for row in entries {
-        match object_apply_decision(
-            conn,
-            "entries",
-            "entry_id",
-            &row.entry_id,
-            &row.head_commit_id,
-        )? {
-            ObjectDecision::Insert => {
-                conn.inner()
-                    .execute(
-                        "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
-                     payload_ct, payload_schema_version, tiga_mode_override, object_clock,
-                     head_commit_id, deleted, created_at, updated_at,
-                     created_by_device_id, updated_by_device_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                        params![
-                            row.entry_id,
-                            row.project_id,
-                            row.entry_type,
-                            row.title_ct,
-                            row.payload_ct,
-                            row.payload_schema_version as i64,
-                            row.tiga_mode_override,
-                            row.object_clock,
-                            row.head_commit_id,
-                            row.deleted as i32,
-                            row.created_at,
-                            row.updated_at,
-                            row.created_by_device_id,
-                            row.updated_by_device_id,
-                        ],
-                    )
-                    .map_err(|e| format!("failed to insert entry {}: {}", row.entry_id, e))?;
-                summary.objects_inserted += 1;
-            }
-            ObjectDecision::FastForward => {
-                conn.inner()
-                    .execute(
-                        "UPDATE entries SET project_id = ?2, entry_type = ?3, title_ct = ?4,
-                     payload_ct = ?5, payload_schema_version = ?6, tiga_mode_override = ?7,
-                     object_clock = ?8, head_commit_id = ?9, deleted = ?10,
-                     created_at = ?11, updated_at = ?12,
-                     created_by_device_id = ?13, updated_by_device_id = ?14
-                     WHERE entry_id = ?1",
-                        params![
-                            row.entry_id,
-                            row.project_id,
-                            row.entry_type,
-                            row.title_ct,
-                            row.payload_ct,
-                            row.payload_schema_version as i64,
-                            row.tiga_mode_override,
-                            row.object_clock,
-                            row.head_commit_id,
-                            row.deleted as i32,
-                            row.created_at,
-                            row.updated_at,
-                            row.created_by_device_id,
-                            row.updated_by_device_id,
-                        ],
-                    )
-                    .map_err(|e| format!("failed to update entry {}: {}", row.entry_id, e))?;
-                summary.objects_fast_forwarded += 1;
-            }
-            ObjectDecision::Conflict { local_head } => {
-                create_sync_conflict(
-                    conn,
-                    "entry",
-                    &row.entry_id,
-                    &local_head,
-                    &row.head_commit_id,
-                )?;
-                summary.conflicts_created += 1;
-            }
-            ObjectDecision::Skip => summary.objects_skipped += 1,
-        }
-    }
-    Ok(())
-}
-
-fn apply_attachments(
-    conn: &VaultConnection,
-    attachments: &[AttachmentRow],
-    summary: &mut ApplySummary,
-) -> Result<HashSet<String>, String> {
-    let mut replace_chunks = HashSet::new();
-    for row in attachments {
-        match object_apply_decision(
-            conn,
-            "attachments",
-            "attachment_id",
-            &row.attachment_id,
-            &row.head_commit_id,
-        )? {
-            ObjectDecision::Insert => {
-                conn.inner().execute(
-                    "INSERT INTO attachments (attachment_id, project_id, entry_id,
-                     file_name_ct, media_type_ct, storage_mode, content_hash,
-                     original_size, stored_size, chunk_count, head_commit_id,
-                     deleted, created_at, updated_at, created_by_device_id, updated_by_device_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                    params![
-                        row.attachment_id,
-                        row.project_id,
-                        row.entry_id,
-                        row.file_name_ct,
-                        row.media_type_ct,
-                        row.storage_mode,
-                        row.content_hash,
-                        row.original_size as i64,
-                        row.stored_size as i64,
-                        row.chunk_count as i64,
-                        row.head_commit_id,
-                        row.deleted as i32,
-                        row.created_at,
-                        row.updated_at,
-                        row.created_by_device_id,
-                        row.updated_by_device_id,
-                    ],
-                ).map_err(|e| format!("failed to insert attachment {}: {}", row.attachment_id, e))?;
-                replace_chunks.insert(row.attachment_id.clone());
-                summary.objects_inserted += 1;
-            }
-            ObjectDecision::FastForward => {
-                conn.inner()
-                    .execute(
-                        "UPDATE attachments SET project_id = ?2, entry_id = ?3,
-                     file_name_ct = ?4, media_type_ct = ?5, storage_mode = ?6,
-                     content_hash = ?7, original_size = ?8, stored_size = ?9,
-                     chunk_count = ?10, head_commit_id = ?11, deleted = ?12,
-                     created_at = ?13, updated_at = ?14,
-                     created_by_device_id = ?15, updated_by_device_id = ?16
-                     WHERE attachment_id = ?1",
-                        params![
-                            row.attachment_id,
-                            row.project_id,
-                            row.entry_id,
-                            row.file_name_ct,
-                            row.media_type_ct,
-                            row.storage_mode,
-                            row.content_hash,
-                            row.original_size as i64,
-                            row.stored_size as i64,
-                            row.chunk_count as i64,
-                            row.head_commit_id,
-                            row.deleted as i32,
-                            row.created_at,
-                            row.updated_at,
-                            row.created_by_device_id,
-                            row.updated_by_device_id,
-                        ],
-                    )
-                    .map_err(|e| {
-                        format!("failed to update attachment {}: {}", row.attachment_id, e)
-                    })?;
-                conn.inner()
-                    .execute(
-                        "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
-                        params![row.attachment_id],
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "failed to clear chunks for attachment {}: {}",
-                            row.attachment_id, e
-                        )
-                    })?;
-                replace_chunks.insert(row.attachment_id.clone());
-                summary.objects_fast_forwarded += 1;
-            }
-            ObjectDecision::Conflict { local_head } => {
-                create_sync_conflict(
-                    conn,
-                    "attachment",
-                    &row.attachment_id,
-                    &local_head,
-                    &row.head_commit_id,
-                )?;
-                summary.conflicts_created += 1;
-            }
-            ObjectDecision::Skip => summary.objects_skipped += 1,
-        }
-    }
-    Ok(replace_chunks)
-}
-
-fn apply_attachment_chunks(
-    conn: &VaultConnection,
-    chunks: &[AttachmentChunkRow],
-    replace_attachment_chunks: &HashSet<String>,
-) -> Result<(), String> {
-    for row in chunks {
-        if !replace_attachment_chunks.contains(&row.attachment_id) {
-            continue;
-        }
-        conn.inner()
-            .execute(
-                "INSERT OR REPLACE INTO attachment_chunks (attachment_id, chunk_index,
-             chunk_hash, chunk_ct, external_uri_ct, stored_size, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    row.attachment_id,
-                    row.chunk_index as i64,
-                    row.chunk_hash,
-                    row.chunk_ct,
-                    row.external_uri_ct,
-                    row.stored_size as i64,
-                    row.created_at,
-                ],
-            )
-            .map_err(|e| {
-                format!(
-                    "failed to upsert attachment chunk {}#{}: {}",
-                    row.attachment_id, row.chunk_index, e
-                )
-            })?;
-    }
-    Ok(())
-}
-
-fn apply_branches(conn: &VaultConnection, branches: &[BranchRow]) -> Result<(), String> {
-    for row in branches {
-        if !commit_exists(conn, &row.head_commit_id)? {
-            continue;
-        }
-        let local_head: Option<String> = conn
-            .inner()
-            .query_row(
-                "SELECT head_commit_id FROM branches WHERE branch_id = ?1",
-                params![row.branch_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to read branch {}: {}", row.branch_id, e))?;
-
-        let should_upsert = match local_head {
-            None => true,
-            Some(local_head) if local_head == row.head_commit_id => false,
-            Some(local_head) => is_ancestor_commit(conn, &local_head, &row.head_commit_id)?,
-        };
-        if should_upsert {
-            conn.inner()
-                .execute(
-                    "INSERT INTO branches (branch_id, branch_name, head_commit_id, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(branch_id) DO UPDATE SET
-                        branch_name = excluded.branch_name,
-                        head_commit_id = excluded.head_commit_id,
-                        updated_at = excluded.updated_at",
-                    params![
-                        row.branch_id,
-                        row.branch_name,
-                        row.head_commit_id,
-                        row.created_at,
-                        row.updated_at,
-                    ],
-                )
-                .map_err(|e| format!("failed to upsert branch {}: {}", row.branch_id, e))?;
-        }
-    }
-    Ok(())
-}
-
-enum ObjectDecision {
-    Insert,
-    FastForward,
-    Conflict { local_head: String },
-    Skip,
-}
-
-fn object_apply_decision(
-    conn: &VaultConnection,
-    table: &str,
-    id_column: &str,
-    object_id: &str,
-    incoming_head: &str,
-) -> Result<ObjectDecision, String> {
-    let sql = format!(
-        "SELECT head_commit_id FROM {} WHERE {} = ?1",
-        table, id_column
-    );
-    let local_head: Option<String> = conn
-        .inner()
-        .query_row(&sql, params![object_id], |row| row.get(0))
-        .optional()
-        .map_err(|e| format!("failed to read {} {} head: {}", table, object_id, e))?;
-
-    let Some(local_head) = local_head else {
-        return Ok(ObjectDecision::Insert);
-    };
-    if local_head == incoming_head {
-        return Ok(ObjectDecision::Skip);
-    }
-    if is_ancestor_commit(conn, &local_head, incoming_head)? {
-        return Ok(ObjectDecision::FastForward);
-    }
-    if is_ancestor_commit(conn, incoming_head, &local_head)? {
-        return Ok(ObjectDecision::Skip);
-    }
-    Ok(ObjectDecision::Conflict { local_head })
-}
-
-fn is_ancestor_commit(
-    conn: &VaultConnection,
-    ancestor: &str,
-    descendant: &str,
-) -> Result<bool, String> {
-    if ancestor == descendant {
-        return Ok(true);
-    }
-    let mut stack = vec![descendant.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(commit_id) = stack.pop() {
-        if !seen.insert(commit_id.clone()) {
-            continue;
-        }
-        let parents = parent_ids_for_commit(conn, &commit_id)?;
-        for parent in parents {
-            if parent == ancestor {
-                return Ok(true);
-            }
-            stack.push(parent);
-        }
-    }
-    Ok(false)
-}
-
-fn create_sync_conflict(
-    conn: &VaultConnection,
-    object_type: &str,
-    object_id: &str,
-    local_commit_id: &str,
-    incoming_commit_id: &str,
-) -> Result<(), String> {
-    let existing: i64 = conn
-        .inner()
-        .query_row(
-            "SELECT COUNT(*) FROM conflicts
-             WHERE object_type = ?1 AND object_id = ?2
-               AND local_commit_id = ?3 AND incoming_commit_id = ?4
-               AND resolution = 'unresolved'",
-            params![object_type, object_id, local_commit_id, incoming_commit_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("failed to check existing conflict: {}", e))?;
-    if existing > 0 {
-        return Ok(());
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let base_commit_id = nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
-        .unwrap_or_else(|| "unknown".to_string());
-    conn.inner()
-        .execute(
-            "INSERT INTO conflicts (conflict_id, object_type, object_id,
-             base_commit_id, local_commit_id, incoming_commit_id,
-             conflicting_fields, resolution, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unresolved', ?8)",
-            params![
-                uuid::Uuid::new_v4().to_string(),
-                object_type,
-                object_id,
-                base_commit_id,
-                local_commit_id,
-                incoming_commit_id,
-                r#"["<object>"]"#,
-                now,
-            ],
-        )
-        .map_err(|e| format!("failed to create sync conflict: {}", e))?;
-    Ok(())
-}
-
-fn nearest_known_common_parent(
-    conn: &VaultConnection,
-    left: &str,
-    right: &str,
-) -> Result<Option<String>, String> {
-    let left_ancestors = ancestor_set(conn, left)?;
-    let mut stack = vec![right.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(commit_id) = stack.pop() {
-        if !seen.insert(commit_id.clone()) {
-            continue;
-        }
-        if left_ancestors.contains(&commit_id) {
-            return Ok(Some(commit_id));
-        }
-        stack.extend(parent_ids_for_commit(conn, &commit_id)?);
-    }
-    Ok(None)
-}
-
-fn ancestor_set(conn: &VaultConnection, head: &str) -> Result<HashSet<String>, String> {
-    let mut result = HashSet::new();
-    let mut stack = vec![head.to_string()];
-    while let Some(commit_id) = stack.pop() {
-        if !result.insert(commit_id.clone()) {
-            continue;
-        }
-        stack.extend(parent_ids_for_commit(conn, &commit_id)?);
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
