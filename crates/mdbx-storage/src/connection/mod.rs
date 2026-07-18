@@ -157,6 +157,12 @@ impl VaultConnection {
         self.active_session.as_ref()
     }
 
+    pub(crate) fn touch_active_session(&mut self, now_unix_secs: i64) {
+        if let Some(session) = self.active_session.as_mut() {
+            session.assurance = session.assurance.touched(now_unix_secs);
+        }
+    }
+
     pub fn clear_session(&mut self) {
         self.active_session = None;
         self.keyring = None;

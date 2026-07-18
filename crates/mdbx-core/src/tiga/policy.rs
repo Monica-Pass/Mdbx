@@ -1147,10 +1147,12 @@ impl TigaPolicy {
                 }
             }
             TigaOperation::DecryptAttachment => {
-                if !self.data_handling.attachment_temp_files_allowed {
-                    constraints.push(AuthorizationConstraint::NoPlaintextPersistence);
-                } else if context.device.secure_temp_files_available {
+                if self.data_handling.attachment_temp_files_allowed
+                    && context.device.secure_temp_files_available
+                {
                     constraints.push(AuthorizationConstraint::UseSecureTemporaryFiles);
+                } else {
+                    constraints.push(AuthorizationConstraint::NoPlaintextPersistence);
                 }
             }
             TigaOperation::RestoreSnapshot
@@ -1532,5 +1534,23 @@ mod tests {
         );
         assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
         assert!(decision.audit_required);
+    }
+
+    #[test]
+    fn attachment_without_secure_temp_files_forbids_plaintext_persistence() {
+        let decision = TigaMode::Sky.policy().authorize(
+            TigaOperation::DecryptAttachment,
+            AuthorizationContext {
+                session: Some(&session(UnlockMethodType::Password, 100)),
+                device: &DeviceContext::default(),
+                now_unix_secs: 100,
+            },
+        );
+
+        assert_eq!(decision.outcome, AuthorizationOutcome::AllowWithConstraints);
+        assert_eq!(
+            decision.constraints,
+            vec![AuthorizationConstraint::NoPlaintextPersistence]
+        );
     }
 }

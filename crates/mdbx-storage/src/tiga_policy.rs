@@ -273,6 +273,11 @@ impl TigaService {
             )
             .map_err(StorageError::Database)
             .and_then(|(policy_version, status)| {
+                if policy_version != TIGA_POLICY_VERSION {
+                    return Err(StorageError::Validation(format!(
+                        "unsupported Tiga policy version {policy_version}; expected {TIGA_POLICY_VERSION}"
+                    )));
+                }
                 Ok(TigaPolicyState {
                     policy_version,
                     compliance: parse_compliance(&status)?,
@@ -419,6 +424,29 @@ impl TigaService {
             conn.with_immediate_transaction(|| {
                 record_authorization_event(conn, scope, operation, context, &decision, None)
             })?;
+        }
+        Ok(decision)
+    }
+
+    /// Authorize a client-owned operation using the connection's active
+    /// session. A successful decision renews only the idle-activity timestamp;
+    /// the original authentication time and absolute lifetime are unchanged.
+    pub fn authorize_operation_with_active_session(
+        conn: &mut VaultConnection,
+        scope: &TigaScope,
+        operation: TigaOperation,
+        device: &DeviceContext,
+        now_unix_secs: i64,
+    ) -> StorageResult<AuthorizationDecision> {
+        let session = conn.active_session().cloned();
+        let context = TigaAuthorizationContext {
+            session: session.as_ref(),
+            device,
+            now_unix_secs,
+        };
+        let decision = Self::authorize_operation(conn, scope, operation, context)?;
+        if decision_allows(&decision) && operation != TigaOperation::SyncCiphertext {
+            conn.touch_active_session(now_unix_secs);
         }
         Ok(decision)
     }
@@ -1133,6 +1161,72 @@ mod tests {
         assert_eq!(state.compliance, PolicyCompliance::Compliant);
         let resolved = TigaService::resolve_vault_policy(&conn).unwrap();
         assert_eq!(resolved.policy.profile, TigaMode::Multi);
+    }
+
+    #[test]
+    fn unknown_policy_version_fails_closed() {
+        let (conn, _, _, _) = setup();
+        conn.inner()
+            .execute(
+                "UPDATE vault_meta SET tiga_policy_version = ?1",
+                params![i64::from(TIGA_POLICY_VERSION + 1)],
+            )
+            .unwrap();
+
+        let error = TigaService::get_policy_state(&conn).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported Tiga policy version"));
+    }
+
+    #[test]
+    fn active_session_authorization_renews_idle_but_not_absolute_lifetime() {
+        let (mut conn, _, _, _) = setup();
+        conn.attach_session(session(UnlockMethodType::Password, 100));
+        let device = standard_device();
+
+        let first = TigaService::authorize_operation_with_active_session(
+            &mut conn,
+            &TigaScope::Vault,
+            TigaOperation::DecryptAttachment,
+            &device,
+            200,
+        )
+        .unwrap();
+        assert!(decision_allows(&first));
+        let assurance = &conn.active_session().unwrap().assurance;
+        assert_eq!(assurance.authenticated_at_unix_secs, 100);
+        assert_eq!(assurance.last_activity_at_unix_secs, 200);
+
+        let renewed = TigaService::authorize_operation_with_active_session(
+            &mut conn,
+            &TigaScope::Vault,
+            TigaOperation::DecryptAttachment,
+            &device,
+            750,
+        )
+        .unwrap();
+        assert!(decision_allows(&renewed));
+
+        let expired = TigaService::authorize_operation_with_active_session(
+            &mut conn,
+            &TigaScope::Vault,
+            TigaOperation::DecryptAttachment,
+            &device,
+            7_300,
+        )
+        .unwrap();
+        assert_eq!(
+            expired.outcome,
+            AuthorizationOutcome::RequireFreshAuthentication
+        );
+        assert_eq!(
+            conn.active_session()
+                .unwrap()
+                .assurance
+                .last_activity_at_unix_secs,
+            750
+        );
     }
 
     #[test]
