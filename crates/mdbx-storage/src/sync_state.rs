@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
+use crate::tiga_policy::{optional_integrity_tag, verify_optional_integrity_tag};
 
 pub const SYNC_STATE_OBJECT_TYPE: &str = "mdbx-storage/state-v1";
 pub const LEGACY_CLI_SYNC_STATE_OBJECT_TYPE: &str = "mdbx-cli/state-v1";
@@ -14,6 +16,8 @@ const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncStatePayload {
     pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_epoch_state: Option<KeyEpochState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiga_vault_state: Option<TigaVaultStateRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,6 +33,49 @@ pub struct SyncStatePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_tags: Option<Vec<ProjectTagSetRow>>,
     pub branches: Vec<BranchRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyEpochState {
+    pub active_key_epoch_id: String,
+    pub epochs: Vec<KeyEpochRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_tag: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyEpochRow {
+    pub key_epoch_id: String,
+    pub status: String,
+    pub wrapped_epoch_key_ct: Vec<u8>,
+    pub kdf_profile_id: String,
+    pub created_at: String,
+    pub activated_at: Option<String>,
+    pub retired_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct KeyEpochIntegrityValue<'a> {
+    active_key_epoch_id: &'a str,
+    epochs: &'a [KeyEpochRow],
+}
+
+impl KeyEpochState {
+    fn integrity_value(&self) -> KeyEpochIntegrityValue<'_> {
+        KeyEpochIntegrityValue {
+            active_key_epoch_id: &self.active_key_epoch_id,
+            epochs: &self.epochs,
+        }
+    }
+
+    pub fn verify_integrity(&self, conn: &VaultConnection) -> StorageResult<()> {
+        verify_optional_integrity_tag(
+            conn,
+            b"key-epoch-sync-state-v1",
+            &self.integrity_value(),
+            self.integrity_tag.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +222,7 @@ pub struct BranchRow {
 pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayload> {
     Ok(SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
+        key_epoch_state: Some(load_key_epoch_state(conn)?),
         tiga_vault_state: Some(load_tiga_vault_state(conn)?),
         tiga_policy_overrides: Some(load_tiga_policy_override_rows(conn)?),
         tiga_policy_exceptions: Some(load_tiga_policy_exception_rows(conn)?),
@@ -185,6 +233,53 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         attachment_chunks: load_attachment_chunk_rows(conn)?,
         project_tags: Some(load_project_tag_set_rows(conn)?),
         branches: load_branch_rows(conn)?,
+    })
+}
+
+fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
+    let active_key_epoch_id: String = conn
+        .inner()
+        .query_row(
+            "SELECT active_key_epoch_id FROM vault_meta LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Database)?;
+    let mut stmt = conn.inner().prepare(
+        "SELECT key_epoch_id, status, wrapped_epoch_key_ct, kdf_profile_id,
+                created_at, activated_at, retired_at
+         FROM key_epochs ORDER BY key_epoch_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(KeyEpochRow {
+            key_epoch_id: row.get(0)?,
+            status: row.get(1)?,
+            wrapped_epoch_key_ct: row.get(2)?,
+            kdf_profile_id: row.get(3)?,
+            created_at: row.get(4)?,
+            activated_at: row.get(5)?,
+            retired_at: row.get(6)?,
+        })
+    })?;
+    let epochs = collect_rows(rows)?;
+    let integrity_value = KeyEpochIntegrityValue {
+        active_key_epoch_id: &active_key_epoch_id,
+        epochs: &epochs,
+    };
+    let integrity_tag = optional_integrity_tag(conn, b"key-epoch-sync-state-v1", &integrity_value)?;
+    if epochs
+        .iter()
+        .any(|row| row.kdf_profile_id == RANDOM_KEY_EPOCH_PROFILE_ID)
+        && integrity_tag.is_none()
+    {
+        return Err(StorageError::Validation(
+            "vault must be unlocked to synchronize random key epochs".to_string(),
+        ));
+    }
+    Ok(KeyEpochState {
+        active_key_epoch_id,
+        epochs,
+        integrity_tag,
     })
 }
 
@@ -525,6 +620,7 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::{CommitContext, ProjectRepo};
     use crate::search::SearchService;
+    use crate::unlock::UnlockService;
 
     fn setup() -> (VaultConnection, CommitContext) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -553,5 +649,39 @@ mod tests {
 
         assert_eq!(tagged_tags.tags, vec!["work".to_string()]);
         assert!(empty_tags.tags.is_empty());
+    }
+
+    #[test]
+    fn collect_sync_state_includes_authenticated_key_epoch_state_when_unlocked() {
+        let (mut conn, _) = setup();
+        UnlockService::setup_password(&mut conn, "sync epoch password").unwrap();
+
+        let state = collect_sync_state(&conn).unwrap().key_epoch_state.unwrap();
+        assert_eq!(state.epochs.len(), 1);
+        assert_eq!(state.epochs[0].key_epoch_id, state.active_key_epoch_id);
+        assert_eq!(state.epochs[0].status, "active");
+        assert!(state.integrity_tag.is_some());
+        state.verify_integrity(&conn).unwrap();
+    }
+
+    #[test]
+    fn legacy_sync_state_without_key_epochs_still_deserializes() {
+        let payload = ObjectPayload {
+            object_type: SYNC_STATE_OBJECT_TYPE.to_string(),
+            object_id: SYNC_STATE_OBJECT_ID.to_string(),
+            ciphertext: serde_json::to_vec(&serde_json::json!({
+                "format": SYNC_STATE_FORMAT,
+                "projects": [],
+                "entries": [],
+                "attachments": [],
+                "attachment_chunks": [],
+                "branches": []
+            }))
+            .unwrap(),
+            associated_data: SYNC_STATE_OBJECT_TYPE.as_bytes().to_vec(),
+        };
+
+        let decoded = decode_sync_state_payload(&payload).unwrap().unwrap();
+        assert!(decoded.key_epoch_state.is_none());
     }
 }
