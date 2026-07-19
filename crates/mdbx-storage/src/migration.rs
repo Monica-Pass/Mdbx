@@ -23,6 +23,7 @@ pub const MIGRATION_PURGE_RECEIPTS: &str = "mdbx-2-purge-receipts-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
+const MAX_PRE_MIGRATION_INTEGRITY_ISSUES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
@@ -122,7 +123,13 @@ pub fn inspect_migration(conn: &Connection) -> StorageResult<MigrationInfo> {
 pub fn inspect_migration_path(path: &Path) -> StorageResult<MigrationInfo> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(StorageError::Database)?;
-    inspect_migration(&conn)
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(StorageError::Database)?;
+    let info = inspect_migration(&conn)?;
+    if info.initialized && info.requires_upgrade && !info.unknown_critical_extensions {
+        verify_pre_migration_integrity(&conn)?;
+    }
+    Ok(info)
 }
 
 pub(crate) fn preflight_existing_vault(path: &Path) -> StorageResult<MigrationInfo> {
@@ -189,6 +196,29 @@ pub fn upgrade_to_latest(conn: &Connection) -> StorageResult<Option<FormatInfo>>
     };
 
     reject_unknown_critical_extensions(&critical_extensions)?;
+    let requires_upgrade = match format_version.as_str() {
+        FORMAT_V1 | FORMAT_V1_DRAFT => true,
+        FORMAT_V2 => {
+            let schema_version = if v2::column_exists(conn, "vault_meta", "schema_version")? {
+                conn.query_row("SELECT schema_version FROM vault_meta LIMIT 1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+                .unwrap_or(1) as u32
+            } else {
+                1
+            };
+            schema_version < CURRENT_SCHEMA_VERSION
+        }
+        other => {
+            return Err(StorageError::Validation(format!(
+                "unsupported MDBX format version: {other}"
+            )))
+        }
+    };
+    if requires_upgrade {
+        verify_pre_migration_integrity(conn)?;
+    }
 
     match format_version.as_str() {
         FORMAT_V1 | FORMAT_V1_DRAFT => migrate_v1_to_v2(conn, &format_version)?,
@@ -672,6 +702,80 @@ fn table_exists(conn: &Connection, table: &str) -> StorageResult<bool> {
     .map_err(StorageError::Database)
 }
 
+fn verify_pre_migration_integrity(conn: &Connection) -> StorageResult<()> {
+    let has_legacy_fts = table_exists(conn, "project_titles_fts")?;
+    let sqlite_check = "integrity_check";
+    let mut integrity_check = conn
+        .prepare(&format!("PRAGMA {sqlite_check}"))
+        .map_err(|error| pre_migration_check_error(sqlite_check, error))?;
+    let integrity_check_rows = integrity_check
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| pre_migration_check_error(sqlite_check, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| pre_migration_check_error(sqlite_check, error))?;
+    if integrity_check_rows.is_empty() {
+        return Err(StorageError::Validation(format!(
+            "pre-migration SQLite {sqlite_check} failed: no result returned"
+        )));
+    }
+    let integrity_issues = integrity_check_rows
+        .into_iter()
+        .filter(|result| result != "ok")
+        .filter(|result| !(has_legacy_fts && is_legacy_fts_readonly_integrity_issue(result)))
+        .take(MAX_PRE_MIGRATION_INTEGRITY_ISSUES)
+        .collect::<Vec<_>>();
+    if !integrity_issues.is_empty() {
+        return Err(StorageError::Validation(format!(
+            "pre-migration SQLite {sqlite_check} failed: {}",
+            integrity_issues.join("; ")
+        )));
+    }
+
+    let mut foreign_key_check = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|error| pre_migration_check_error("foreign_key_check", error))?;
+    let rows = foreign_key_check
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| pre_migration_check_error("foreign_key_check", error))?;
+    let mut violations = Vec::new();
+    for violation in rows.take(MAX_PRE_MIGRATION_INTEGRITY_ISSUES) {
+        let (table, row_id, parent, foreign_key_id) =
+            violation.map_err(|error| pre_migration_check_error("foreign_key_check", error))?;
+        violations.push(format!(
+            "table={table}, rowid={}, parent={parent}, fk={foreign_key_id}",
+            row_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    }
+    if !violations.is_empty() {
+        return Err(StorageError::Validation(format!(
+            "pre-migration foreign_key_check failed: {}",
+            violations.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+fn pre_migration_check_error(check: &str, error: rusqlite::Error) -> StorageError {
+    StorageError::Validation(format!(
+        "pre-migration SQLite {check} could not complete: {error}"
+    ))
+}
+
+fn is_legacy_fts_readonly_integrity_issue(result: &str) -> bool {
+    result.contains("unable to validate the inverted index for FTS5 table")
+        && result.contains("main.project_titles_fts")
+        && result.contains("attempt to write a readonly database")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,6 +794,19 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    fn create_v1_file(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        crate::schema::v1::create_all_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('disk-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+            [],
+        )
+        .unwrap();
     }
 
     fn insert_legacy_password(conn: &Connection) -> Vec<u8> {
@@ -1018,6 +1135,141 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_migration_integrity_rejects_foreign_key_damage_without_writing() {
+        let path = std::env::temp_dir().join(format!(
+            "mdbx-fk-damaged-upgrade-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+        create_v1_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute(
+                "INSERT INTO entries
+                    (entry_id, project_id, entry_type, payload_ct, object_clock,
+                     head_commit_id, created_at, updated_at,
+                     created_by_device_id, updated_by_device_id)
+                 VALUES ('orphan-entry', 'missing-project', 'note', X'01', '{}',
+                         'missing-commit', '2026-01-01T00:00:00Z',
+                         '2026-01-01T00:00:00Z', 'device-1', 'device-1')",
+                [],
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let error = upgrade_path(&path).unwrap_err();
+
+        assert!(error.to_string().contains("foreign_key_check failed"));
+        assert!(error.to_string().contains("table=entries"));
+        assert!(error.to_string().contains("parent=projects"));
+        let open_error = VaultConnection::open(&path).err().unwrap();
+        assert!(open_error.to_string().contains("foreign_key_check failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let inspection_error = inspect_migration_path(&path).unwrap_err();
+        assert!(inspection_error
+            .to_string()
+            .contains("foreign_key_check failed"));
+        let format: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_migration_integrity_rejects_btree_damage_without_writing() {
+        let path = std::env::temp_dir().join(format!(
+            "mdbx-btree-damaged-upgrade-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+        create_v1_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema
+                 SET rootpage = (SELECT rootpage FROM sqlite_schema WHERE name = 'projects')
+                 WHERE name = 'idx_entries_project_id';
+                 PRAGMA writable_schema=OFF;",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let error = upgrade_path(&path).unwrap_err();
+
+        assert!(error.to_string().contains("integrity_check"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_migration_integrity_is_enforced_on_existing_connection() {
+        let conn = v1_database();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO entries
+                (entry_id, project_id, entry_type, payload_ct, object_clock,
+                 head_commit_id, created_at, updated_at,
+                 created_by_device_id, updated_by_device_id)
+             VALUES ('orphan-entry', 'missing-project', 'note', X'01', '{}',
+                     'missing-commit', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 'device-1', 'device-1')",
+            [],
+        )
+        .unwrap();
+
+        let error = upgrade_to_latest(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("foreign_key_check failed"));
+        let format: String = conn
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
+        assert!(!v2::column_exists(&conn, "vault_meta", "schema_version").unwrap());
+    }
+
+    #[test]
+    fn pre_migration_integrity_accepts_legacy_wal_state() {
+        let path = std::env::temp_dir().join(format!(
+            "mdbx-wal-integrity-upgrade-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        crate::schema::v1::create_all_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('wal-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+            [],
+        )
+        .unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        assert!(wal_path.exists());
+
+        let plan = inspect_migration_path(&path).unwrap();
+        assert!(plan.requires_upgrade);
+        let upgraded = upgrade_path(&path).unwrap().unwrap();
+        assert_eq!(upgraded.format_version, FORMAT_V2);
+        assert_eq!(upgraded.schema_version, CURRENT_SCHEMA_VERSION);
+
+        drop(conn);
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(shm_path);
         let _ = std::fs::remove_file(path);
     }
 

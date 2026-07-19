@@ -990,6 +990,61 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 }
 
 #[test]
+fn migration_integrity_gate_rejects_damaged_legacy_vault_without_writing() {
+    let vault_path = temp_vault_path("migration-integrity-gate");
+    {
+        let conn = rusqlite::Connection::open(vault_path.path()).unwrap();
+        mdbx_storage::schema::v1::create_all_tables(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('ffi-damaged-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries
+                (entry_id, project_id, entry_type, payload_ct, object_clock,
+                 head_commit_id, created_at, updated_at,
+                 created_by_device_id, updated_by_device_id)
+             VALUES ('orphan-entry', 'missing-project', 'note', X'01', '{}',
+                     'missing-commit', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 'device-1', 'device-1')",
+            [],
+        )
+        .unwrap();
+    }
+    let before = fs::read(vault_path.path()).unwrap();
+    let inspection_error = inspect_vault_migration(vault_path.as_path_string()).unwrap_err();
+    assert!(inspection_error
+        .to_string()
+        .contains("foreign_key_check failed"));
+
+    let upgrade_error = upgrade_vault(vault_path.as_path_string()).unwrap_err();
+    assert!(upgrade_error
+        .to_string()
+        .contains("foreign_key_check failed"));
+    let open_error = open_vault(
+        vault_path.as_path_string(),
+        "unused password 12345!".to_string(),
+        "ffi-damaged-device".to_string(),
+    )
+    .err()
+    .unwrap();
+    assert!(open_error.to_string().contains("foreign_key_check failed"));
+    assert_eq!(fs::read(vault_path.path()).unwrap(), before);
+    let format: String = rusqlite::Connection::open(vault_path.path())
+        .unwrap()
+        .query_row("SELECT format_version FROM vault_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(format, "MDBX-1");
+}
+
+#[test]
 fn clients_can_backup_legacy_vault_before_explicit_upgrade() {
     let vault_path = temp_vault_path("pre-migration-backup-source");
     let backup_path = temp_vault_path("pre-migration-backup-target");
