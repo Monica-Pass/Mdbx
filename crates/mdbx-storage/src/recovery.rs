@@ -72,7 +72,17 @@ impl RecoveryVerifier {
             }),
         }
 
-        // 4. 检查孤儿记录
+        // 4. 检查 snapshot 完整性
+        match Self::check_snapshots(conn) {
+            Ok(snapshot_issues) => issues.extend(snapshot_issues),
+            Err(e) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "snapshots".to_string(),
+                description: format!("snapshot check failed: {}", e),
+            }),
+        }
+
+        // 5. 检查孤儿记录
         match Self::check_orphans(conn) {
             Ok(orphan_issues) => issues.extend(orphan_issues),
             Err(e) => issues.push(HealthIssue {
@@ -82,7 +92,7 @@ impl RecoveryVerifier {
             }),
         }
 
-        // 5. 检查陈旧 head
+        // 6. 检查陈旧 head
         match Self::check_stale_heads(conn) {
             Ok(head_issues) => issues.extend(head_issues),
             Err(e) => issues.push(HealthIssue {
@@ -488,6 +498,36 @@ impl RecoveryVerifier {
         Ok(issues)
     }
 
+    /// 检查所有 snapshot 的公开 hash，并在解锁后验证认证密文与 payload 结构。
+    pub fn check_snapshots(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
+        use crate::repo::snapshot::SnapshotRepo;
+
+        let mut stmt = conn
+            .inner()
+            .prepare("SELECT snapshot_id FROM snapshots ORDER BY created_at, snapshot_id")
+            .map_err(StorageError::Database)?;
+        let snapshot_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+
+        let mut issues = Vec::new();
+        for snapshot_id in snapshot_ids {
+            if !SnapshotRepo::verify_integrity(conn, &snapshot_id)? {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "snapshots".to_string(),
+                    description: format!(
+                        "snapshot {} failed hash or authenticated payload verification",
+                        snapshot_id
+                    ),
+                });
+            }
+        }
+        Ok(issues)
+    }
+
     /// 验证快照完整性（hash 校验）。
     pub fn verify_snapshot_integrity(
         conn: &VaultConnection,
@@ -725,6 +765,59 @@ mod tests {
             .iter()
             .any(|i| i.severity >= IssueSeverity::Error);
         assert!(!has_errors, "unexpected errors: {:?}", result.issues);
+    }
+
+    #[test]
+    fn full_health_check_reports_snapshot_hash_mismatch() {
+        use crate::repo::snapshot::SnapshotRepo;
+
+        let (conn, ctx, _project_id) = setup();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = X'0000' WHERE snapshot_id = ?1",
+                rusqlite::params![snapshot.snapshot_id],
+            )
+            .unwrap();
+
+        let result = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(!result.healthy);
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Error
+                && issue.category == "snapshots"
+                && issue.description.contains(&snapshot.snapshot_id)
+        }));
+    }
+
+    #[test]
+    fn full_health_check_authenticates_unlocked_snapshot_payload() {
+        use crate::repo::snapshot::SnapshotRepo;
+        use sha2::{Digest, Sha256};
+
+        let (mut conn, ctx, _project_id) = setup();
+        attach_test_keyring(&mut conn);
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        assert!(RecoveryVerifier::full_health_check(&conn).unwrap().healthy);
+
+        let mut tampered = snapshot.snapshot_ct;
+        let last = tampered.last_mut().unwrap();
+        *last ^= 0x01;
+        let recomputed_hash = format!("{:x}", Sha256::digest(&tampered));
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = ?1, snapshot_hash = ?2
+                 WHERE snapshot_id = ?3",
+                rusqlite::params![tampered, recomputed_hash, snapshot.snapshot_id],
+            )
+            .unwrap();
+
+        let result = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(!result.healthy);
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Error
+                && issue.category == "snapshots"
+                && issue.description.contains(&snapshot.snapshot_id)
+        }));
     }
 
     // -----------------------------------------------------------------------

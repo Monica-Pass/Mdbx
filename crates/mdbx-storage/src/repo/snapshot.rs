@@ -315,7 +315,19 @@ impl SnapshotRepo {
             Some(s) => s,
             None => return Ok(false),
         };
-        Ok(compute_sha256_hex(&snap.snapshot_ct) == snap.snapshot_hash)
+        if compute_sha256_hex(&snap.snapshot_ct) != snap.snapshot_hash {
+            return Ok(false);
+        }
+
+        if conn.keyring().is_none() {
+            return Ok(true);
+        }
+
+        let plaintext = match Self::decrypt_payload(conn, snapshot_id, &snap.snapshot_ct) {
+            Ok(plaintext) => plaintext,
+            Err(_) => return Ok(false),
+        };
+        Ok(serde_json::from_slice::<SnapshotPayload>(&plaintext).is_ok())
     }
 
     // -----------------------------------------------------------------------
