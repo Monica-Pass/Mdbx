@@ -1345,18 +1345,19 @@ fn operation_for_commit(
 ) -> rusqlite::Result<Option<CommitOperationMetadata>> {
     conn.inner()
         .query_row(
-            "SELECT operation_id, operation_kind, branch_name, change_summary_ct,
-                    request_hash, integrity_tag
+            "SELECT operation_id, operation_kind, branch_id, branch_name,
+                    change_summary_ct, request_hash, integrity_tag
              FROM commit_operations WHERE commit_id = ?1",
             params![commit_id],
             |row| {
                 Ok(CommitOperationMetadata {
                     operation_id: row.get(0)?,
                     operation_kind: row.get(1)?,
-                    branch_name: row.get(2)?,
-                    change_summary_ct: row.get(3)?,
-                    request_hash: row.get(4)?,
-                    integrity_tag: row.get(5)?,
+                    branch_id: row.get(2)?,
+                    branch_name: row.get(3)?,
+                    change_summary_ct: row.get(4)?,
+                    request_hash: row.get(5)?,
+                    integrity_tag: row.get(6)?,
                 })
             },
         )

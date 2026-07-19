@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS commit_operations (
     operation_id       TEXT PRIMARY KEY NOT NULL,
     commit_id          TEXT NOT NULL UNIQUE,
     operation_kind     TEXT NOT NULL,
+    branch_id          TEXT,
     branch_name        TEXT NOT NULL,
     change_summary_ct  BLOB NOT NULL,
     request_hash       BLOB NOT NULL,
@@ -35,6 +36,11 @@ CREATE INDEX IF NOT EXISTS idx_commit_operations_commit
     ON commit_operations (commit_id);
 CREATE INDEX IF NOT EXISTS idx_commit_operations_kind
     ON commit_operations (operation_kind, created_at);";
+
+pub const COMMIT2_BRANCH_ID_INDEX_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_commit_operations_branch
+    ON commit_operations (branch_id, created_at)
+    WHERE branch_id IS NOT NULL;";
 
 pub const TIGA_POLICY_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS tiga_policy_exceptions (
@@ -132,6 +138,8 @@ pub fn create_extensions(conn: &Connection) -> StorageResult<()> {
     conn.execute_batch(&format!(
         "{SCHEMA_MIGRATIONS_DDL}{COMMIT2_DDL}{TIGA_POLICY_DDL}"
     ))?;
+    add_column_if_missing(conn, "commit_operations", "branch_id", "TEXT")?;
+    conn.execute_batch(COMMIT2_BRANCH_ID_INDEX_DDL)?;
     add_column_if_missing(conn, "security_audit_events", "operation_id", "TEXT")?;
     add_column_if_missing(conn, "security_audit_events", "commit_id", "TEXT")?;
     add_column_if_missing(

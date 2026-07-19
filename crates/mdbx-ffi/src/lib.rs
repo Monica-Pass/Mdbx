@@ -17,8 +17,8 @@ use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::repo::{
-    CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo,
-    CommitOperation, EntryRepo, OperationExecution, ProjectRepo,
+    BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
+    CommitHistoryRepo, CommitOperation, EntryRepo, OperationExecution, ProjectRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -181,6 +181,27 @@ pub struct MdbxCommitHistoryItem {
 pub struct MdbxCommitHistoryPage {
     pub items: Vec<MdbxCommitHistoryItem>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryItemV2 {
+    pub item: MdbxCommitHistoryItem,
+    pub branch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryPageV2 {
+    pub items: Vec<MdbxCommitHistoryItemV2>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxBranchInfo {
+    pub branch_id: String,
+    pub branch_name: String,
+    pub head_commit_id: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -887,34 +908,37 @@ impl MdbxVault {
         operation_kind: String,
         commands: Vec<MdbxWriteCommand>,
     ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
-        validate_write_operation(&operation_id, &operation_kind, &commands)?;
-        let intent = serde_json::to_vec(&commands)?;
-        let intent_hash = Sha256::digest(intent).to_vec();
-        let changed_objects = write_operation_changes(&commands);
-        let operation = CommitOperation::new(
+        execute_write_operation_for_branch(self, None, operation_id, operation_kind, commands)
+    }
+
+    pub fn execute_write_operation_on_branch(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            Some(branch_id),
             operation_id,
             operation_kind,
-            "main",
-            "change",
-            write_operation_scope(&changed_objects),
-            changed_objects,
+            commands,
         )
-        .with_intent_hash(intent_hash);
+    }
 
+    pub fn list_branches(&self) -> Result<Vec<MdbxBranchInfo>, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        let ctx = CommitContext::new(self.device_id.clone());
-        let execution = ctx.run_operation(&conn, operation, |scoped| {
-            execute_write_commands(&conn, scoped, &commands)
-        })?;
-        let (commit_id, already_committed) = match execution {
-            OperationExecution::Applied { commit_id, .. } => (commit_id, false),
-            OperationExecution::AlreadyCommitted { commit_id } => (commit_id, true),
-        };
-        Ok(write_operation_result(
-            &commands,
-            commit_id,
-            already_committed,
-        ))
+        Ok(BranchRepo::list(&conn)?
+            .into_iter()
+            .map(|branch| MdbxBranchInfo {
+                branch_id: branch.branch_id,
+                branch_name: branch.branch_name,
+                head_commit_id: branch.head_commit_id,
+                created_at: branch.created_at,
+                updated_at: branch.updated_at,
+            })
+            .collect())
     }
 
     pub fn list_commit_history(
@@ -933,6 +957,24 @@ impl MdbxVault {
     ) -> Result<Option<MdbxCommitHistoryItem>, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(CommitHistoryRepo::get(&conn, &commit_id)?.map(commit_history_item_from_storage))
+    }
+
+    pub fn list_commit_history_v2(
+        &self,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxCommitHistoryPageV2, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let page = CommitHistoryRepo::list(&conn, page_size as usize, cursor.as_deref())?;
+        Ok(commit_history_page_v2_from_storage(page))
+    }
+
+    pub fn get_commit_history_v2(
+        &self,
+        commit_id: String,
+    ) -> Result<Option<MdbxCommitHistoryItemV2>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(CommitHistoryRepo::get(&conn, &commit_id)?.map(commit_history_item_v2_from_storage))
     }
 
     pub fn create_entry(
@@ -1583,6 +1625,46 @@ fn execute_write_commands(
     Ok(())
 }
 
+fn execute_write_operation_for_branch(
+    vault: &MdbxVault,
+    branch_id: Option<String>,
+    operation_id: String,
+    operation_kind: String,
+    commands: Vec<MdbxWriteCommand>,
+) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+    validate_write_operation(&operation_id, &operation_kind, &commands)?;
+    let intent = serde_json::to_vec(&commands)?;
+    let intent_hash = Sha256::digest(intent).to_vec();
+    let changed_objects = write_operation_changes(&commands);
+    let mut operation = CommitOperation::new(
+        operation_id,
+        operation_kind,
+        branch_id.as_deref().map(|_| "").unwrap_or("main"),
+        "change",
+        write_operation_scope(&changed_objects),
+        changed_objects,
+    )
+    .with_intent_hash(intent_hash);
+    if let Some(branch_id) = branch_id {
+        operation = operation.with_branch_id(branch_id);
+    }
+
+    let conn = vault.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+    let ctx = CommitContext::new(vault.device_id.clone());
+    let execution = ctx.run_operation(&conn, operation, |scoped| {
+        execute_write_commands(&conn, scoped, &commands)
+    })?;
+    let (commit_id, already_committed) = match execution {
+        OperationExecution::Applied { commit_id, .. } => (commit_id, false),
+        OperationExecution::AlreadyCommitted { commit_id } => (commit_id, true),
+    };
+    Ok(write_operation_result(
+        &commands,
+        commit_id,
+        already_committed,
+    ))
+}
+
 fn write_operation_result(
     commands: &[MdbxWriteCommand],
     commit_id: String,
@@ -1614,6 +1696,24 @@ fn commit_history_page_from_storage(page: CommitHistoryPage) -> MdbxCommitHistor
             .map(commit_history_item_from_storage)
             .collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+fn commit_history_page_v2_from_storage(page: CommitHistoryPage) -> MdbxCommitHistoryPageV2 {
+    MdbxCommitHistoryPageV2 {
+        items: page
+            .items
+            .into_iter()
+            .map(commit_history_item_v2_from_storage)
+            .collect(),
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn commit_history_item_v2_from_storage(item: CommitHistoryItem) -> MdbxCommitHistoryItemV2 {
+    MdbxCommitHistoryItemV2 {
+        branch_id: item.branch_id.clone(),
+        item: commit_history_item_from_storage(item),
     }
 }
 

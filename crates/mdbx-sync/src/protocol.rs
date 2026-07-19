@@ -123,7 +123,7 @@ impl SyncNegotiator {
 
         for local in &self.local_heads {
             let remote_match = self.remote_heads.iter().any(|r| {
-                r.branch_name == local.branch_name && r.head_commit_id == local.head_commit_id
+                same_branch_identity(r, local) && r.head_commit_id == local.head_commit_id
             });
             if !remote_match {
                 return false;
@@ -138,7 +138,7 @@ impl SyncNegotiator {
             .iter()
             .filter(|remote| {
                 !self.local_heads.iter().any(|local| {
-                    local.branch_name == remote.branch_name
+                    same_branch_identity(local, remote)
                         && local.head_commit_id == remote.head_commit_id
                 })
             })
@@ -165,6 +165,13 @@ impl SyncNegotiator {
 
     pub fn remote_known_commit_ids(&self) -> &HashSet<String> {
         &self.remote_known_commit_ids
+    }
+}
+
+fn same_branch_identity(left: &BranchHead, right: &BranchHead) -> bool {
+    match (left.branch_id.as_deref(), right.branch_id.as_deref()) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.branch_name == right.branch_name,
     }
 }
 
@@ -215,6 +222,15 @@ mod tests {
 
     fn make_head(branch: &str, commit: &str) -> BranchHead {
         BranchHead {
+            branch_id: None,
+            branch_name: branch.to_string(),
+            head_commit_id: commit.to_string(),
+        }
+    }
+
+    fn make_head_with_id(branch_id: &str, branch: &str, commit: &str) -> BranchHead {
+        BranchHead {
+            branch_id: Some(branch_id.to_string()),
             branch_name: branch.to_string(),
             head_commit_id: commit.to_string(),
         }
@@ -249,6 +265,30 @@ mod tests {
         let ahead = negotiator.ahead_branches();
         assert_eq!(ahead.len(), 1);
         assert_eq!(ahead[0].head_commit_id, "def456");
+    }
+
+    #[test]
+    fn branch_id_survives_display_name_changes() {
+        let local_heads = vec![make_head_with_id("branch-1", "main", "abc123")];
+        let remote_heads = vec![make_head_with_id("branch-1", "renamed", "abc123")];
+        let mut negotiator = SyncNegotiator::new("device-a", local_heads, vec!["abc123".into()]);
+        let hello = HelloRequest::new("device-b", remote_heads, vec!["abc123".into()]);
+        negotiator.on_hello(&hello).unwrap();
+
+        assert!(negotiator.is_already_synced());
+        assert!(negotiator.ahead_branches().is_empty());
+    }
+
+    #[test]
+    fn duplicate_names_with_different_ids_are_distinct_branches() {
+        let local_heads = vec![make_head_with_id("branch-1", "review", "abc123")];
+        let remote_heads = vec![make_head_with_id("branch-2", "review", "abc123")];
+        let mut negotiator = SyncNegotiator::new("device-a", local_heads, vec!["abc123".into()]);
+        let hello = HelloRequest::new("device-b", remote_heads, vec!["abc123".into()]);
+        negotiator.on_hello(&hello).unwrap();
+
+        assert!(!negotiator.is_already_synced());
+        assert_eq!(negotiator.ahead_branches().len(), 1);
     }
 
     #[test]

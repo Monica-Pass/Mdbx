@@ -1,4 +1,5 @@
 pub mod attachment;
+pub mod branch;
 pub mod commit_ctx;
 pub mod commit_history;
 pub mod conflict;
@@ -9,6 +10,7 @@ pub mod snapshot;
 pub mod tombstone;
 
 pub use attachment::AttachmentRepo;
+pub use branch::BranchRepo;
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use conflict::ConflictRepo;

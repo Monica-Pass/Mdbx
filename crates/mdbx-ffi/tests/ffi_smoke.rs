@@ -206,7 +206,7 @@ fn write_operation_rolls_back_every_command_on_failure() {
 }
 
 #[test]
-fn commit_history_pages_include_operation_and_legacy_records() {
+fn branch_history_pages_include_stable_identity_and_legacy_records() {
     let vault_path = temp_vault_path("commit-history");
     let vault = create_vault(
         vault_path.as_path_string(),
@@ -214,9 +214,29 @@ fn commit_history_pages_include_operation_and_legacy_records() {
         "ffi-history-device".to_string(),
     )
     .unwrap();
+    let branches = vault.list_branches().unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].branch_name, "main");
+    let main_branch_id = branches[0].branch_id.clone();
+    let before = count_rows(vault_path.path(), "commits");
+    assert!(vault
+        .execute_write_operation_on_branch(
+            "missing-branch-id".to_string(),
+            "history-missing-branch".to_string(),
+            "create-project".to_string(),
+            vec![MdbxWriteCommand::CreateProject {
+                project_id: Uuid::new_v4().to_string(),
+                title: "Missing Branch".to_string(),
+            }],
+        )
+        .is_err());
+    assert_eq!(count_rows(vault_path.path(), "commits"), before);
+    assert_eq!(count_rows(vault_path.path(), "commit_operations"), 0);
+
     let project_id = Uuid::new_v4().to_string();
-    vault
-        .execute_write_operation(
+    let execution = vault
+        .execute_write_operation_on_branch(
+            main_branch_id.clone(),
             "history-typed-summary".to_string(),
             "create-project".to_string(),
             vec![MdbxWriteCommand::CreateProject {
@@ -237,6 +257,23 @@ fn commit_history_pages_include_operation_and_legacy_records() {
         .unwrap()
         .unwrap();
     assert_eq!(detail.commit_id, first.items[0].commit_id);
+
+    let first_v2 = vault.list_commit_history_v2(1, None).unwrap();
+    assert_eq!(first_v2.items.len(), 1);
+    assert_eq!(
+        first_v2.items[0].branch_id.as_deref(),
+        Some(main_branch_id.as_str())
+    );
+    assert_eq!(first_v2.items[0].item.commit_id, execution.commit_id);
+    let detail_v2 = vault
+        .get_commit_history_v2(first_v2.items[0].item.commit_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        detail_v2.branch_id.as_deref(),
+        Some(main_branch_id.as_str())
+    );
+    assert_eq!(detail_v2.item.commit_id, execution.commit_id);
 
     let second = vault.list_commit_history(1, first.next_cursor).unwrap();
     assert_eq!(second.items.len(), 1);
@@ -507,7 +544,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(5));
+    assert_eq!(upgraded.schema_version, Some(6));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())

@@ -55,7 +55,7 @@ pub struct HelloRequest {
     pub protocol_version: u32,
 
     /// 此设备已知的全部分支 head。
-    /// `(branch_name, head_commit_id)`。
+    /// New peers identify a branch by `branch_id`; legacy peers use the name.
     pub heads: Vec<BranchHead>,
 
     /// 此设备已知的全部 commit ID（用于 skip 已存在的 commit）。
@@ -65,6 +65,8 @@ pub struct HelloRequest {
 /// 单个分支的 head 信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchHead {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
     pub branch_name: String,
     pub head_commit_id: String,
 }
@@ -142,6 +144,8 @@ pub struct SerializedCommit {
 pub struct CommitOperationMetadata {
     pub operation_id: String,
     pub operation_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
     pub branch_name: String,
     pub change_summary_ct: Vec<u8>,
     pub request_hash: Vec<u8>,
@@ -257,5 +261,31 @@ impl CommitBatch {
             is_last,
             batch_index,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_without_branch_ids_deserializes() {
+        let head: BranchHead =
+            serde_json::from_str(r#"{"branch_name":"main","head_commit_id":"commit-1"}"#).unwrap();
+        let operation: CommitOperationMetadata = serde_json::from_str(
+            r#"{
+                "operation_id":"operation-1",
+                "operation_kind":"edit",
+                "branch_name":"main",
+                "change_summary_ct":[1,2],
+                "request_hash":[3,4],
+                "integrity_tag":[5,6]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(head.branch_id, None);
+        assert_eq!(operation.branch_id, None);
+        assert_eq!(operation.branch_name, "main");
     }
 }

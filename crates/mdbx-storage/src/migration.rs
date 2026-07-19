@@ -11,11 +11,12 @@ use crate::schema::v2;
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
 pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlation-v1";
+pub const MIGRATION_STABLE_BRANCH_ID: &str = "mdbx-2-stable-branch-id-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
@@ -303,6 +304,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
             params![MIGRATION_TIGA_AUDIT_CORRELATION, FORMAT_V2, now],
         )?;
         conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_STABLE_BRANCH_ID, FORMAT_V2, now],
+        )?;
+        conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
              tiga_compliance_status = ?3, min_writer_version = ?4, updated_at = ?5",
             params![
@@ -476,6 +483,11 @@ fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
                 "MDBX-2 vault is missing required vault_meta column {column}"
             )));
         }
+    }
+    if !v2::column_exists(conn, "commit_operations", "branch_id")? {
+        return Err(StorageError::Validation(
+            "MDBX-2 vault is missing required commit_operations column branch_id".to_string(),
+        ));
     }
     if !table_exists(conn, "schema_migrations")? {
         return Err(StorageError::Validation(
@@ -728,6 +740,7 @@ mod tests {
         assert!(v2::column_exists(&conn, "security_audit_events", "policy_version").unwrap());
         assert!(v2::column_exists(&conn, "security_audit_events", "policy_fingerprint").unwrap());
         assert!(table_exists(&conn, "commit_operations").unwrap());
+        assert!(v2::column_exists(&conn, "commit_operations", "branch_id").unwrap());
         assert!(table_exists(&conn, "commit_device_sequences").unwrap());
     }
 
@@ -791,6 +804,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_correlation_migration_count, 1);
+        let stable_branch_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_STABLE_BRANCH_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable_branch_migration_count, 1);
     }
 
     #[test]
@@ -856,6 +877,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(correlation, (None, None, None, None));
+    }
+
+    #[test]
+    fn schema5_operation_rows_gain_nullable_branch_ids() {
+        let conn = v1_database();
+        for (column, definition) in [
+            ("schema_version", "INTEGER NOT NULL DEFAULT 5"),
+            ("min_reader_version", "TEXT NOT NULL DEFAULT 'MDBX-1'"),
+            ("min_writer_version", "TEXT NOT NULL DEFAULT 'MDBX-2'"),
+        ] {
+            v2::add_column_if_missing(&conn, "vault_meta", column, definition).unwrap();
+        }
+        conn.execute_batch(v2::SCHEMA_MIGRATIONS_DDL).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE commit_operations (
+                operation_id TEXT PRIMARY KEY NOT NULL,
+                commit_id TEXT NOT NULL UNIQUE,
+                operation_kind TEXT NOT NULL,
+                branch_name TEXT NOT NULL,
+                change_summary_ct BLOB NOT NULL,
+                request_hash BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                integrity_tag BLOB NOT NULL,
+                FOREIGN KEY (commit_id) REFERENCES commits(commit_id)
+             );
+             INSERT INTO commits
+                (commit_id, device_id, local_seq, commit_kind, change_scope,
+                 changed_object_ids_ct, vector_clock, created_at, integrity_tag)
+             VALUES ('legacy-commit', 'device-1', 1, 'change', 'project', X'5B5D',
+                     '{}', '2026-01-01T00:00:00Z', X'00');
+             INSERT INTO commit_operations
+                (operation_id, commit_id, operation_kind, branch_name, change_summary_ct,
+                 request_hash, created_at, integrity_tag)
+             VALUES ('legacy-operation', 'legacy-commit', 'change', 'main', X'5B5D',
+                     X'01', '2026-01-01T00:00:00Z', X'02');
+             UPDATE vault_meta SET format_version = 'MDBX-2', schema_version = 5;",
+        )
+        .unwrap();
+
+        let info = upgrade_to_latest(&conn).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        let branch_id: Option<String> = conn
+            .query_row(
+                "SELECT branch_id FROM commit_operations WHERE operation_id = 'legacy-operation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(branch_id.is_none());
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub struct CommitHistoryItem {
     pub created_at: String,
     pub operation_id: Option<String>,
     pub operation_kind: Option<String>,
+    pub branch_id: Option<String>,
     pub branch_name: Option<String>,
     pub message: Option<String>,
     pub changes: Vec<CommitChange>,
@@ -55,7 +56,7 @@ impl CommitHistoryRepo {
             "SELECT c.commit_id, c.device_id, c.local_seq, c.commit_kind,
                     c.change_scope, c.changed_object_ids_ct, c.vector_clock,
                     c.message_ct, c.created_at, c.integrity_tag,
-                    o.operation_id, o.operation_kind, o.branch_name,
+                    o.operation_id, o.operation_kind, o.branch_id, o.branch_name,
                     o.change_summary_ct, o.request_hash, o.integrity_tag
              FROM commits c
              LEFT JOIN commit_operations o ON o.commit_id = c.commit_id
@@ -84,10 +85,11 @@ impl CommitHistoryRepo {
                     integrity_tag: row.get(9)?,
                     operation_id: row.get(10)?,
                     operation_kind: row.get(11)?,
-                    branch_name: row.get(12)?,
-                    change_summary_ct: row.get(13)?,
-                    request_hash: row.get(14)?,
-                    operation_integrity_tag: row.get(15)?,
+                    branch_id: row.get(12)?,
+                    branch_name: row.get(13)?,
+                    change_summary_ct: row.get(14)?,
+                    request_hash: row.get(15)?,
+                    operation_integrity_tag: row.get(16)?,
                 })
             },
         )?;
@@ -121,7 +123,7 @@ impl CommitHistoryRepo {
                 "SELECT c.commit_id, c.device_id, c.local_seq, c.commit_kind,
                         c.change_scope, c.changed_object_ids_ct, c.vector_clock,
                         c.message_ct, c.created_at, c.integrity_tag,
-                        o.operation_id, o.operation_kind, o.branch_name,
+                        o.operation_id, o.operation_kind, o.branch_id, o.branch_name,
                         o.change_summary_ct, o.request_hash, o.integrity_tag
                  FROM commits c
                  LEFT JOIN commit_operations o ON o.commit_id = c.commit_id
@@ -141,10 +143,11 @@ impl CommitHistoryRepo {
                         integrity_tag: row.get(9)?,
                         operation_id: row.get(10)?,
                         operation_kind: row.get(11)?,
-                        branch_name: row.get(12)?,
-                        change_summary_ct: row.get(13)?,
-                        request_hash: row.get(14)?,
-                        operation_integrity_tag: row.get(15)?,
+                        branch_id: row.get(12)?,
+                        branch_name: row.get(13)?,
+                        change_summary_ct: row.get(14)?,
+                        request_hash: row.get(15)?,
+                        operation_integrity_tag: row.get(16)?,
                     })
                 },
             )
@@ -205,6 +208,7 @@ impl CommitHistoryRepo {
                 operation_kind: row.operation_kind.clone().ok_or_else(|| {
                     StorageError::Validation("operation summary has no operation kind".to_string())
                 })?,
+                branch_id: row.branch_id.clone(),
                 branch_name: row.branch_name.clone().ok_or_else(|| {
                     StorageError::Validation("operation summary has no branch".to_string())
                 })?,
@@ -277,6 +281,7 @@ impl CommitHistoryRepo {
             created_at: row.created_at,
             operation_id: row.operation_id,
             operation_kind: row.operation_kind,
+            branch_id: row.branch_id,
             branch_name: row.branch_name,
             message,
             changes,
@@ -300,6 +305,7 @@ struct RawHistoryRow {
     integrity_tag: Vec<u8>,
     operation_id: Option<String>,
     operation_kind: Option<String>,
+    branch_id: Option<String>,
     branch_name: Option<String>,
     change_summary_ct: Option<Vec<u8>>,
     request_hash: Option<Vec<u8>>,
@@ -449,5 +455,30 @@ mod tests {
             )
             .unwrap();
         assert!(CommitHistoryRepo::get(&conn, &commit_id).is_err());
+    }
+
+    #[test]
+    fn tampered_operation_branch_id_is_rejected() {
+        let (conn, ctx) = setup();
+        let operation = crate::repo::CommitOperation::new(
+            "history-branch-tamper",
+            "edit",
+            "main",
+            "change",
+            "project",
+            vec![],
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE commit_operations SET branch_id = 'tampered-branch-id'
+                 WHERE commit_id = ?1",
+                rusqlite::params![commit_id],
+            )
+            .unwrap();
+
+        let error = CommitHistoryRepo::get(&conn, &commit_id).unwrap_err();
+
+        assert!(error.to_string().contains("integrity mismatch"));
     }
 }

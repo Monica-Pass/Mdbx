@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；Commit2 与 Tiga 审计关联使用 `5`。
+  - 当前内部 schema 序号；稳定分支身份使用 `6`。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 5
+schema_version    = 6
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -61,6 +61,8 @@ tiga_policy_version = 2
 `commits` 表与 DAG 作为 MDBX1 兼容投影。schema 4 随后以增量迁移升级到 schema 5，增加可空的
 Tiga 审计关联与策略证据字段；旧审计记录继续以空值读取。
 
+schema 5 随后以增量迁移升级到 schema 6，增加可空的 `commit_operations.branch_id` 与查询索引。旧 operation 行继续保留空的分支 ID，因为其 V1 请求哈希与完整性标签只认证 `branch_name`，迁移过程不得推断并回填该字段。
+
 ## 4. Schema 演进规则
 
 - 新字段 SHOULD 可空或带安全默认值。
@@ -78,7 +80,7 @@ MDBX2 同时收紧以下实现边界：
 - snapshot 创建和恢复进入原子事务。
 - snapshot 恢复重建精确 active set；快照后新增对象保留历史行，但通过 tombstone 离开 active set。
 - snapshot 恢复为所有受影响对象写入统一 causal head 和 object version。
-- Commit2 增加幂等 operation ID、结构化变更摘要、分支感知 head、合并后的 vector clock 和
+- Commit2 增加幂等 operation ID、结构化变更摘要、稳定分支身份、合并后的 vector clock 和
   原子设备序列分配，不重写任何历史 commit。
 - 同步协议与离线 bundle 使用 v2 传输 operation 元数据；MDBX2 仍可转换读取没有 operation
   元数据的 v1 bundle。
@@ -111,7 +113,15 @@ MDBX2 同时收紧以下实现边界：
 - 客户端不得自行复制 MDBX1 到 MDBX2 的字段转换逻辑。
 - “兼容上一代”表示新代可以读取并升级上一代；不承诺旧二进制理解 MDBX2 新策略并安全写入。
 
-### 7.1 客户端可控迁移 API
+### 7.1 稳定分支身份
+
+`branch_id` 是分支的不可变内部身份。`branch_name` 是可修改的显示属性，同时作为 schema 6 之前接口的兼容选择条件。多个分支可以使用相同显示名称。
+
+新 operation 元数据同时认证稳定 ID 与提交时的显示名称。基于 ID 的请求只选择一个分支，显示名称修改后仍可按原 operation ID 重试。仅提供名称的请求只在该名称唯一时生效。旧 operation 行的 ID 为空，继续使用 V1 请求哈希与完整性算法；迁移过程不得为这些行补写 ID。
+
+同步双方均提供 ID 时按 ID 比较分支；任一方缺少 ID 时按旧名称比较。相同 ID 与不同名称表示同一分支，相同名称与不同 ID 表示不同分支。旧同步消息缺少 `branch_id` 时仍可反序列化。
+
+### 7.2 客户端可控迁移 API
 
 兼容默认路径仍然支持 `VaultConnection::open` 自动升级，保证旧客户端或简单调用方不会因为代际差异无法打开 vault。需要在 UI 中先提示、备份并取得用户同意的客户端，应先调用：
 
@@ -125,21 +135,21 @@ MDBX2 同时收紧以下实现边界：
 
 转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。未知 critical extension 可以被检查并展示，但显式升级必须拒绝写入。
 
-### 7.2 客户端 operation 写入 API
+### 7.3 客户端 operation 写入 API
 
-移动端和桌面端的多步编辑应通过 UniFFI `MdbxVault::execute_write_operation` 提交。接口只接受有限的类型化命令：创建项目、创建/更新/删除/恢复/移动条目；接口不暴露 SQL。
+移动端和桌面端应先通过 UniFFI `MdbxVault::list_branches` 获取稳定 ID，再通过 `execute_write_operation_on_branch` 提交指定分支的多步编辑。原有 `execute_write_operation` 继续作为 main 分支兼容入口。接口只接受有限的类型化命令：创建项目、创建、更新、删除、恢复、移动条目；接口不暴露 SQL。
 
 每个创建命令必须携带客户端生成的稳定 UUID。客户端在首次调用和重试时复用同一 `operation_id` 与完整命令列表。storage 会将命令作为一个事务和一个 commit 执行；已完成 operation 的重试只返回 commit ID 与请求中的对象 ID，不再次执行写入。相同 operation ID 搭配不同命令内容会被拒绝，任一命令失败会回滚整个批次。
 
 原有单项 FFI 方法继续保留，作为 MDBX1 兼容投影和简单调用入口；需要把一个用户动作合并为单一历史节点时，应使用 operation API。
 
-### 7.3 Commit 历史读取 API
+### 7.4 Commit 历史读取 API
 
-客户端通过 `MdbxVault::list_commit_history` 使用稳定游标分页读取历史，通过 `get_commit_history` 读取单条详情。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。
+原有 `MdbxCommitHistoryItem`、`list_commit_history` 与 `get_commit_history` 保持字段布局和方法语义，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxCommitHistoryItemV2`、`list_commit_history_v2` 与 `get_commit_history_v2` 读取可空的稳定分支 ID。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。
 
 operation 摘要中的 action 使用 `create`、`update`、`delete`、`restore`、`move` 或兼容用的 `change`；fields 使用稳定的领域字段名。repository 产生的泛化 `change` 只作为占位，不会覆盖客户端已经提供的具体摘要。
 
-### 7.4 Tiga 审计读取 API
+### 7.5 Tiga 审计读取 API
 
 原有 UniFFI `MdbxSecurityAuditEvent` 记录与 `list_security_audit_events` 方法保持不变，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxSecurityAuditEventV2` 与 `list_security_audit_events_v2` 读取可空的 operation ID、commit ID、策略版本和策略指纹。
 

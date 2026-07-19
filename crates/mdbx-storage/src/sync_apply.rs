@@ -13,7 +13,7 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::conflict::ConflictDetector;
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
+use crate::repo::{BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, ProjectRow,
     ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
@@ -83,12 +83,16 @@ impl SyncApplyRepo {
             }
         }
 
+        let branch_id = serialized
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.branch_id.as_deref());
         let branch_name = serialized
             .operation
             .as_ref()
             .map(|operation| operation.branch_name.as_str())
             .unwrap_or("main");
-        let local_head = Self::current_branch_head(conn, branch_name)?;
+        let local_head = Self::current_branch_head(conn, branch_id, branch_name)?;
         let fast_forward = local_head
             .as_deref()
             .map(|head| serialized.parent_ids.iter().any(|parent| parent == head))
@@ -100,7 +104,12 @@ impl SyncApplyRepo {
             if fast_forward {
                 let payload_conflicts = Self::apply_fast_forward_payloads(conn, ctx, serialized)?;
                 if payload_conflicts == 0 {
-                    Self::advance_branch(conn, branch_name, &serialized.commit.commit_id)?;
+                    Self::advance_branch(
+                        conn,
+                        branch_id,
+                        branch_name,
+                        &serialized.commit.commit_id,
+                    )?;
                 }
                 Self::sync_device_head(conn, serialized)?;
                 Ok(if payload_conflicts == 0 {
@@ -242,13 +251,14 @@ impl SyncApplyRepo {
 
         conn.inner().execute(
             "INSERT INTO commit_operations
-             (operation_id, commit_id, operation_kind, branch_name, change_summary_ct,
-              request_hash, created_at, integrity_tag)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (operation_id, commit_id, operation_kind, branch_id, branch_name,
+              change_summary_ct, request_hash, created_at, integrity_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 operation.operation_id,
                 commit_id,
                 operation.operation_kind,
+                operation.branch_id,
                 operation.branch_name,
                 operation.change_summary_ct,
                 operation.request_hash,
@@ -1863,31 +1873,38 @@ impl SyncApplyRepo {
 
     fn current_branch_head(
         conn: &VaultConnection,
+        branch_id: Option<&str>,
         branch_name: &str,
     ) -> StorageResult<Option<String>> {
-        conn.inner()
-            .query_row(
-                "SELECT head_commit_id FROM branches WHERE branch_name = ?1 ORDER BY updated_at DESC LIMIT 1",
-                params![branch_name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(StorageError::Database)
+        if let Some(branch_id) = branch_id {
+            return Ok(BranchRepo::get_by_id(conn, branch_id)?.map(|branch| branch.head_commit_id));
+        }
+        match BranchRepo::resolve_unique_name(conn, branch_name) {
+            Ok(branch) => Ok(Some(branch.head_commit_id)),
+            Err(StorageError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn advance_branch(
         conn: &VaultConnection,
+        branch_id: Option<&str>,
         branch_name: &str,
         commit_id: &str,
     ) -> StorageResult<()> {
+        let branch = match branch_id {
+            Some(branch_id) => BranchRepo::require_by_id(conn, branch_id)?,
+            None => BranchRepo::resolve_unique_name(conn, branch_name)?,
+        };
         let now = chrono::Utc::now().to_rfc3339();
         let updated = conn.inner().execute(
-            "UPDATE branches SET head_commit_id = ?1, updated_at = ?2 WHERE branch_name = ?3",
-            params![commit_id, now, branch_name],
+            "UPDATE branches SET head_commit_id = ?1, updated_at = ?2 WHERE branch_id = ?3",
+            params![commit_id, now, branch.branch_id],
         )?;
-        if updated == 0 {
+        if updated != 1 {
             return Err(StorageError::NotFound(format!(
-                "branch {branch_name} not found"
+                "branch ID {} not found",
+                branch.branch_id
             )));
         }
         Ok(())
@@ -2409,18 +2426,19 @@ mod tests {
     ) -> rusqlite::Result<Option<CommitOperationMetadata>> {
         conn.inner()
             .query_row(
-                "SELECT operation_id, operation_kind, branch_name, change_summary_ct,
-                        request_hash, integrity_tag
+                "SELECT operation_id, operation_kind, branch_id, branch_name,
+                        change_summary_ct, request_hash, integrity_tag
                  FROM commit_operations WHERE commit_id = ?1",
                 params![commit_id],
                 |row| {
                     Ok(CommitOperationMetadata {
                         operation_id: row.get(0)?,
                         operation_kind: row.get(1)?,
-                        branch_name: row.get(2)?,
-                        change_summary_ct: row.get(3)?,
-                        request_hash: row.get(4)?,
-                        integrity_tag: row.get(5)?,
+                        branch_id: row.get(2)?,
+                        branch_name: row.get(3)?,
+                        change_summary_ct: row.get(4)?,
+                        request_hash: row.get(5)?,
+                        integrity_tag: row.get(6)?,
                     })
                 },
             )
@@ -2849,13 +2867,21 @@ mod tests {
                 .unwrap();
         assert_eq!(result.applied_commits, 1);
 
-        let stored: (String, String, String) = target
+        let stored: (String, String, Option<String>, String) = target
             .inner()
             .query_row(
-                "SELECT operation_id, operation_kind, branch_name
+                "SELECT operation_id, operation_kind, branch_id, branch_name
                  FROM commit_operations WHERE commit_id = ?1",
                 params![commit_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let source_branch_id: String = source
+            .inner()
+            .query_row(
+                "SELECT branch_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
@@ -2863,6 +2889,7 @@ mod tests {
             (
                 "sync-operation-1".to_string(),
                 "batch-move".to_string(),
+                Some(source_branch_id),
                 "main".to_string()
             )
         );

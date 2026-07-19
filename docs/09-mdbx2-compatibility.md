@@ -20,7 +20,7 @@ An upgraded vault records:
 
 ```text
 format_version     = MDBX-2
-schema_version     = 5
+schema_version     = 6
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -34,7 +34,7 @@ On writable open, MDBX2 reads format metadata, rejects unsupported critical exte
 
 Tiga1 profiles are mapped to Tiga policy version 2 in the same transaction. Existing weaker project or entry profiles become deterministic remediation exceptions. An unlock configuration that does not yet satisfy the new profile is marked `remediation-required`; migration never rewrites KDF parameters or wrapped vault-key bytes and does not deny access solely because remediation is pending.
 
-Early MDBX2 vaults with schema versions 2 or 3 upgrade in place to schema version 4 without changing the `MDBX-2` format marker. Schema 4 adds operation-level commit metadata and atomic per-device sequence state while retaining the original `commits` table and DAG as the MDBX1-compatible projection. Schema 4 vaults then upgrade additively to schema 5, which adds nullable Tiga audit correlation and policy-evidence fields. Existing audit rows remain valid with null values.
+Early MDBX2 vaults with schema versions 2 or 3 upgrade in place to schema version 4 without changing the `MDBX-2` format marker. Schema 4 adds operation-level commit metadata and atomic per-device sequence state while retaining the original `commits` table and DAG as the MDBX1-compatible projection. Schema 4 vaults then upgrade additively to schema 5, which adds nullable Tiga audit correlation and policy-evidence fields. Existing audit rows remain valid with null values. Schema 5 vaults upgrade additively to schema 6, which adds a nullable `commit_operations.branch_id` and its lookup index. Existing operation rows retain a null branch ID because their V1 request hashes and integrity tags authenticate only `branch_name`.
 
 Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 executes `MDBX-1 -> MDBX-2 -> MDBX-3`.
 
@@ -49,13 +49,21 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - Authorized Tiga mutations record the exact Commit2 `operation_id` and `commit_id` in the same transaction. Rejected decisions and non-mutating disclosures have no commit association.
 - New audit events record the Tiga policy version and a SHA-256 fingerprint of the resolved policy used for the decision. The evidence is captured before a policy mutation changes the active policy.
 - Audit synchronization authenticates the new fields, verifies that the operation and commit identify the same `commit_operations` row, and rejects immutable-event rewrites. MDBX1 and early MDBX2 audit rows retain null correlation and evidence fields.
-- Commit2 adds idempotent operation IDs, typed change summaries, branch-aware heads, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
+- Commit2 adds idempotent operation IDs, typed change summaries, stable branch identity, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
 - Sync protocol and offline bundles use version 2 for operation metadata; MDBX2 readers still convert version 1 bundles with no operation metadata.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
 
 ## Client/Core Boundary
 
 Clients own upgrade prompts, backup placement, progress UI, platform capability evidence, and remediation interactions. The storage core owns format detection, deterministic conversion, transactions, rollback, idempotence, and validation. Clients must not reimplement the MDBX1-to-MDBX2 field mapping.
+
+### Stable Branch Identity
+
+`branch_id` is the immutable internal identity of a branch. `branch_name` is a mutable display attribute and a compatibility selector for interfaces created before schema 6. Multiple branches may have the same display name.
+
+New operation metadata authenticates both the stable ID and the display name recorded at commit time. ID-based requests select exactly one branch and remain retryable after a display-name change. A name-only request is accepted only when the name identifies exactly one branch. Existing operation rows with a null ID continue to use the V1 request-hash and integrity algorithms; migration does not infer or write IDs into those rows.
+
+Synchronization compares branch IDs when both peers provide them. If either peer omits the ID, comparison falls back to the legacy name. The same ID with different names represents one branch, while the same name with different IDs represents separate branches. Serialized branch heads and operation metadata accept a missing `branch_id` for older peers.
 
 ### Client-Controlled Migration APIs
 
@@ -65,7 +73,7 @@ After the client has obtained consent and completed its backup workflow, it can 
 
 ### Client Operation Write API
 
-Mobile and desktop clients should submit multi-step edits through the UniFFI `MdbxVault::execute_write_operation` method. The boundary accepts a finite typed command set for project creation and entry create, update, delete, restore, and move operations; it never exposes SQL.
+Mobile and desktop clients should call `MdbxVault::list_branches` to obtain stable IDs and submit branch-specific multi-step edits through `execute_write_operation_on_branch`. The original `execute_write_operation` method remains available as the main-branch compatibility entry point. The boundary accepts a finite typed command set for project creation and entry create, update, delete, restore, and move operations; it never exposes SQL.
 
 Every create command carries a client-generated stable UUID. The client reuses the same `operation_id` and complete command list for the initial call and retries. Storage executes the command list as one transaction and one commit. A completed operation retry returns the commit ID and the object IDs from the request without running mutations again. Reusing an operation ID with different command content is rejected, and failure of any command rolls back the entire batch.
 
@@ -73,7 +81,7 @@ The existing single-mutation FFI methods remain available as the MDBX1-compatibl
 
 ### Commit History Read API
 
-Clients page through history with `MdbxVault::list_commit_history` using the returned keyset cursor and fetch one detail with `get_commit_history`. Results include operation metadata, branch, parents, typed change summaries, and a compatibility flag; MDBX1 commits without operation metadata remain visible through a compatibility summary. Clients must treat the storage-returned cursor as opaque and must not recreate pagination with offsets.
+The original `MdbxCommitHistoryItem`, `list_commit_history`, and `get_commit_history` interfaces remain unchanged for generated clients from the previous interface generation. MDBX2 clients use `MdbxCommitHistoryItemV2`, `list_commit_history_v2`, and `get_commit_history_v2` to read the optional stable branch ID. Results include operation metadata, branch, parents, typed change summaries, and a compatibility flag; MDBX1 commits without operation metadata remain visible through a compatibility summary. Clients must treat the storage-returned keyset cursor as opaque and must not recreate pagination with offsets.
 
 Operation summaries use `create`, `update`, `delete`, `restore`, `move`, or the compatibility `change` action, with stable domain field names. Repository-generated generic `change` records are placeholders and never overwrite a more specific client-provided summary.
 
