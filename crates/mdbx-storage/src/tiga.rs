@@ -41,10 +41,10 @@ impl TigaService {
         conn: &VaultConnection,
         ctx: &CommitContext,
         mode: TigaMode,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
-            ctx.create_commit(
+            let commit_id = ctx.create_commit(
                 conn,
                 "change",
                 "vault-meta",
@@ -57,7 +57,7 @@ impl TigaService {
                 "UPDATE vault_meta SET default_tiga_mode = ?1, updated_at = ?2",
                 params![mode.to_string(), now],
             )?;
-            Ok(())
+            Ok(commit_id)
         })
     }
 
@@ -81,7 +81,7 @@ impl TigaService {
         ctx: &CommitContext,
         project_id: &str,
         mode: Option<TigaMode>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         conn.with_immediate_transaction(|| {
             let project = ProjectRepo::get_by_id(conn, project_id)?
                 .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
@@ -109,7 +109,7 @@ impl TigaService {
                 ],
             )?;
             ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
-            Ok(())
+            Ok(commit_id)
         })
     }
 
@@ -133,7 +133,7 @@ impl TigaService {
         ctx: &CommitContext,
         entry_id: &str,
         mode: Option<TigaMode>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         conn.with_immediate_transaction(|| {
             let entry = EntryRepo::get_by_id(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
@@ -161,7 +161,7 @@ impl TigaService {
                 ],
             )?;
             ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
-            Ok(())
+            Ok(commit_id)
         })
     }
 

@@ -11,10 +11,11 @@ use crate::schema::v2;
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
+pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlation-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
@@ -296,6 +297,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
             params![MIGRATION_COMMIT2, FORMAT_V2, now],
         )?;
         conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_TIGA_AUDIT_CORRELATION, FORMAT_V2, now],
+        )?;
+        conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
              tiga_compliance_status = ?3, min_writer_version = ?4, updated_at = ?5",
             params![
@@ -485,6 +492,18 @@ fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
                 "MDBX-2 vault is missing required table {table}"
+            )));
+        }
+    }
+    for column in [
+        "operation_id",
+        "commit_id",
+        "policy_version",
+        "policy_fingerprint",
+    ] {
+        if !v2::column_exists(conn, "security_audit_events", column)? {
+            return Err(StorageError::Validation(format!(
+                "MDBX-2 vault is missing required security_audit_events column {column}"
             )));
         }
     }
@@ -704,6 +723,10 @@ mod tests {
         assert!(table_exists(&conn, "tiga_policy_overrides").unwrap());
         assert!(table_exists(&conn, "tiga_policy_exceptions").unwrap());
         assert!(table_exists(&conn, "security_audit_events").unwrap());
+        assert!(v2::column_exists(&conn, "security_audit_events", "operation_id").unwrap());
+        assert!(v2::column_exists(&conn, "security_audit_events", "commit_id").unwrap());
+        assert!(v2::column_exists(&conn, "security_audit_events", "policy_version").unwrap());
+        assert!(v2::column_exists(&conn, "security_audit_events", "policy_fingerprint").unwrap());
         assert!(table_exists(&conn, "commit_operations").unwrap());
         assert!(table_exists(&conn, "commit_device_sequences").unwrap());
     }
@@ -760,6 +783,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(commit2_migration_count, 1);
+        let audit_correlation_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_TIGA_AUDIT_CORRELATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_correlation_migration_count, 1);
+    }
+
+    #[test]
+    fn schema4_audit_rows_gain_nullable_correlation_fields() {
+        let conn = v1_database();
+        v2::add_column_if_missing(
+            &conn,
+            "vault_meta",
+            "schema_version",
+            "INTEGER NOT NULL DEFAULT 4",
+        )
+        .unwrap();
+        v2::add_column_if_missing(
+            &conn,
+            "vault_meta",
+            "min_reader_version",
+            "TEXT NOT NULL DEFAULT 'MDBX-1'",
+        )
+        .unwrap();
+        v2::add_column_if_missing(
+            &conn,
+            "vault_meta",
+            "min_writer_version",
+            "TEXT NOT NULL DEFAULT 'MDBX-2'",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE security_audit_events (
+                event_id TEXT PRIMARY KEY NOT NULL,
+                occurred_at TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                session_id TEXT,
+                device_id TEXT,
+                reason_codes_json TEXT NOT NULL,
+                constraints_json TEXT NOT NULL,
+                exception_id TEXT,
+                integrity_tag BLOB
+             );
+             INSERT INTO security_audit_events
+                (event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                 reason_codes_json, constraints_json)
+             VALUES ('legacy-event', '2026-01-01T00:00:00Z', 'copy-secret', 'allow',
+                     'vault', '', '[]', '[]');",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE vault_meta SET format_version = 'MDBX-2', schema_version = 4",
+            [],
+        )
+        .unwrap();
+
+        let info = upgrade_to_latest(&conn).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        let correlation: (Option<String>, Option<String>, Option<i64>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT operation_id, commit_id, policy_version, policy_fingerprint
+                 FROM security_audit_events WHERE event_id = 'legacy-event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(correlation, (None, None, None, None));
     }
 
     #[test]

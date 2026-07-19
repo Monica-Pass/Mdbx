@@ -77,6 +77,14 @@ pub struct SecurityAuditEventRow {
     pub reason_codes_json: String,
     pub constraints_json: String,
     pub exception_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fingerprint: Option<Vec<u8>>,
     pub integrity_tag: Option<Vec<u8>>,
 }
 
@@ -252,7 +260,8 @@ fn load_security_audit_event_rows(
     let mut stmt = conn.inner().prepare(
         "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
                 session_id, device_id, reason_codes_json, constraints_json,
-                exception_id, integrity_tag
+                exception_id, operation_id, commit_id, policy_version,
+                policy_fingerprint, integrity_tag
          FROM security_audit_events ORDER BY occurred_at, event_id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -268,7 +277,11 @@ fn load_security_audit_event_rows(
             reason_codes_json: row.get(8)?,
             constraints_json: row.get(9)?,
             exception_id: row.get(10)?,
-            integrity_tag: row.get(11)?,
+            operation_id: row.get(11)?,
+            commit_id: row.get(12)?,
+            policy_version: row.get::<_, Option<i64>>(13)?.map(|value| value as u32),
+            policy_fingerprint: row.get(14)?,
+            integrity_tag: row.get(15)?,
         })
     })?;
     collect_rows(rows)

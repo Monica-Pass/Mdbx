@@ -658,6 +658,27 @@ pub struct MdbxSecurityAuditEvent {
     pub exception_id: Option<String>,
 }
 
+/// MDBX2 audit projection. The original record and list method remain stable
+/// for existing generated clients; this version adds commit correlation and
+/// the exact policy evidence used for authorization.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSecurityAuditEventV2 {
+    pub event_id: String,
+    pub occurred_at: String,
+    pub operation: MdbxTigaOperation,
+    pub outcome: MdbxAuthorizationOutcome,
+    pub scope: MdbxTigaScope,
+    pub session_id: Option<String>,
+    pub device_id: Option<String>,
+    pub reasons: Vec<MdbxAuthorizationReason>,
+    pub constraints: Vec<MdbxAuthorizationConstraint>,
+    pub exception_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub commit_id: Option<String>,
+    pub policy_version: Option<u32>,
+    pub policy_fingerprint: Option<Vec<u8>>,
+}
+
 impl From<SecurityAuditEvent> for MdbxSecurityAuditEvent {
     fn from(value: SecurityAuditEvent) -> Self {
         Self {
@@ -671,6 +692,27 @@ impl From<SecurityAuditEvent> for MdbxSecurityAuditEvent {
             reasons: value.reasons.into_iter().map(Into::into).collect(),
             constraints: value.constraints.into_iter().map(Into::into).collect(),
             exception_id: value.exception_id,
+        }
+    }
+}
+
+impl From<SecurityAuditEvent> for MdbxSecurityAuditEventV2 {
+    fn from(value: SecurityAuditEvent) -> Self {
+        Self {
+            event_id: value.event_id,
+            occurred_at: value.occurred_at,
+            operation: value.operation.into(),
+            outcome: value.outcome.into(),
+            scope: scope_from_core(value.scope),
+            session_id: value.session_id,
+            device_id: value.device_id,
+            reasons: value.reasons.into_iter().map(Into::into).collect(),
+            constraints: value.constraints.into_iter().map(Into::into).collect(),
+            exception_id: value.exception_id,
+            operation_id: value.operation_id,
+            commit_id: value.commit_id,
+            policy_version: value.policy_version,
+            policy_fingerprint: value.policy_fingerprint,
         }
     }
 }
@@ -760,6 +802,19 @@ impl MdbxVault {
         &self,
         limit: u32,
     ) -> Result<Vec<MdbxSecurityAuditEvent>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(
+            TigaService::list_security_audit_events(&conn, limit as usize)?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+    }
+
+    pub fn list_security_audit_events_v2(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MdbxSecurityAuditEventV2>, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(
             TigaService::list_security_audit_events(&conn, limit as usize)?

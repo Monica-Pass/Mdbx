@@ -507,7 +507,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(4));
+    assert_eq!(upgraded.schema_version, Some(5));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())
@@ -591,6 +591,24 @@ fn exposes_tiga_policy_typed_authorization_and_exact_exceptions() {
     assert!(audit
         .iter()
         .any(|event| event.operation == MdbxTigaOperation::ChangeSecurityPolicy));
+    let audit_v2 = vault.list_security_audit_events_v2(20).unwrap();
+    let policy_change = audit_v2
+        .iter()
+        .find(|event| event.operation == MdbxTigaOperation::ChangeSecurityPolicy)
+        .unwrap();
+    assert!(policy_change.operation_id.is_some());
+    assert!(policy_change.commit_id.is_some());
+    assert_eq!(policy_change.policy_version, Some(2));
+    assert_eq!(
+        policy_change.policy_fingerprint.as_deref().map(<[u8]>::len),
+        Some(32)
+    );
+    let copy_v2 = audit_v2
+        .iter()
+        .find(|event| event.operation == MdbxTigaOperation::CopySecret)
+        .unwrap();
+    assert!(copy_v2.commit_id.is_none());
+    assert_eq!(copy_v2.policy_version, Some(2));
 }
 
 #[test]

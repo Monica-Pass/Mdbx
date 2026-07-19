@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；Commit2 与完整 Tiga2 策略使用 `4`。
+  - 当前内部 schema 序号；Commit2 与 Tiga 审计关联使用 `5`。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 4
+schema_version    = 5
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -58,7 +58,8 @@ tiga_policy_version = 2
 
 早期 schema 2 或 schema 3 的 MDBX2 vault 会原地升级到 schema 4，不改变 `MDBX-2`
 格式标记。schema 4 增加 operation-level commit 元数据和设备原子序列状态，同时继续保留旧
-`commits` 表与 DAG 作为 MDBX1 兼容投影。
+`commits` 表与 DAG 作为 MDBX1 兼容投影。schema 4 随后以增量迁移升级到 schema 5，增加可空的
+Tiga 审计关联与策略证据字段；旧审计记录继续以空值读取。
 
 ## 4. Schema 演进规则
 
@@ -84,6 +85,9 @@ MDBX2 同时收紧以下实现边界：
 - 新 snapshot 明确携带 project tags 和 attachment chunks；旧快照缺少这些字段时不清空现有兼容数据。
 - Tiga global/project/entry mutation 的 commit、对象更新、head 和 object version 原子提交。
 - Tiga2 增加版本化策略、精确例外和类型化安全审计；策略状态、覆盖、例外和审计进入同步状态。
+- 产生数据变更的 Tiga 授权在同一事务中记录 Commit2 `operation_id` 与 `commit_id`；拒绝决定和不产生数据库变更的敏感操作没有 commit 关联。
+- 新审计记录保存作出决定时的 Tiga 策略版本，以及生效策略序列化内容的 SHA-256 指纹。策略修改前先固定该证据，因此审计记录描述的是授权所采用的策略。
+- 审计同步认证新增字段，验证 operation 与 commit 指向同一条 `commit_operations` 记录，并拒绝改写已有事件。MDBX1 与早期 MDBX2 审计记录保留空的关联和证据字段。
 - 早期 `MDBX-2/schema 2` 自动执行 `schema 2 -> schema 3`，不改变格式代际。
 - 迁移不得修改现有 KDF 参数或 wrapped vault key；凭据相关升级只能在用户成功认证后执行。
 - CLI bundle apply 统一使用 `mdbx-storage::SyncApplyRepo`，不再维护独立 SQL 同步实现。
@@ -134,3 +138,9 @@ MDBX2 同时收紧以下实现边界：
 客户端通过 `MdbxVault::list_commit_history` 使用稳定游标分页读取历史，通过 `get_commit_history` 读取单条详情。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。
 
 operation 摘要中的 action 使用 `create`、`update`、`delete`、`restore`、`move` 或兼容用的 `change`；fields 使用稳定的领域字段名。repository 产生的泛化 `change` 只作为占位，不会覆盖客户端已经提供的具体摘要。
+
+### 7.4 Tiga 审计读取 API
+
+原有 UniFFI `MdbxSecurityAuditEvent` 记录与 `list_security_audit_events` 方法保持不变，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxSecurityAuditEventV2` 与 `list_security_audit_events_v2` 读取可空的 operation ID、commit ID、策略版本和策略指纹。
+
+只要 `commit_id` 存在，`operation_id` 就必须存在且两者必须匹配同一条 `commit_operations` 记录。storage 在本地读取和同步导入时执行该验证。两者均为空表示该记录来自 schema 5 之前，或者本次授权没有产生数据库 commit。

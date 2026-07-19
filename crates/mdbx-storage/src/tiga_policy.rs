@@ -1,5 +1,6 @@
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use mdbx_core::model::VaultSession;
 use mdbx_core::tiga::{
@@ -40,6 +41,14 @@ pub struct SecurityAuditEvent {
     pub reasons: Vec<AuthorizationReason>,
     pub constraints: Vec<AuthorizationConstraint>,
     pub exception_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fingerprint: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +56,38 @@ pub struct TigaAuthorizationContext<'a> {
     pub session: Option<&'a VaultSession>,
     pub device: &'a DeviceContext,
     pub now_unix_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizationEvidence {
+    policy_version: u32,
+    policy_fingerprint: Vec<u8>,
+}
+
+impl AuthorizationEvidence {
+    fn audit_context<'a>(
+        &'a self,
+        exception_id: Option<&'a str>,
+        commit_id: Option<&'a str>,
+    ) -> AuditRecordContext<'a> {
+        AuditRecordContext {
+            evidence: self,
+            exception_id,
+            commit_id,
+        }
+    }
+}
+
+struct AuditRecordContext<'a> {
+    evidence: &'a AuthorizationEvidence,
+    exception_id: Option<&'a str>,
+    commit_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+struct EvaluatedAuthorization {
+    decision: AuthorizationDecision,
+    evidence: AuthorizationEvidence,
 }
 
 #[derive(Debug, Clone)]
@@ -260,8 +301,10 @@ impl TigaPolicyStore {
             "INSERT INTO security_audit_events
                 (event_id, occurred_at, operation, outcome, scope_type, scope_id,
                  session_id, device_id, reason_codes_json, constraints_json,
-                 exception_id, integrity_tag)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 exception_id, operation_id, commit_id, policy_version,
+                 policy_fingerprint, integrity_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16)",
             params![
                 event.event_id,
                 event.occurred_at,
@@ -276,6 +319,10 @@ impl TigaPolicyStore {
                 serde_json::to_string(&event.constraints)
                     .map_err(|e| StorageError::Validation(e.to_string()))?,
                 event.exception_id,
+                event.operation_id,
+                event.commit_id,
+                event.policy_version.map(i64::from),
+                event.policy_fingerprint,
                 integrity_tag,
             ],
         )?;
@@ -355,7 +402,8 @@ impl TigaService {
         let mut stmt = conn.inner().prepare(
             "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
                     session_id, device_id, reason_codes_json, constraints_json,
-                    exception_id, integrity_tag
+                    exception_id, operation_id, commit_id, policy_version,
+                    policy_fingerprint, integrity_tag
              FROM security_audit_events
              ORDER BY occurred_at DESC, event_id DESC LIMIT ?1",
         )?;
@@ -372,7 +420,11 @@ impl TigaService {
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<Vec<u8>>>(11)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+                row.get::<_, Option<Vec<u8>>>(15)?,
             ))
         })?;
         let mut events = Vec::new();
@@ -389,6 +441,10 @@ impl TigaService {
                 reasons,
                 constraints,
                 exception_id,
+                operation_id,
+                commit_id,
+                policy_version,
+                policy_fingerprint,
                 integrity_tag,
             ) = row?;
             let event = SecurityAuditEvent {
@@ -404,6 +460,18 @@ impl TigaService {
                 constraints: serde_json::from_str(&constraints)
                     .map_err(|e| StorageError::Validation(e.to_string()))?,
                 exception_id,
+                operation_id,
+                commit_id,
+                policy_version: policy_version
+                    .map(|version| {
+                        u32::try_from(version).map_err(|_| {
+                            StorageError::Validation(format!(
+                                "invalid Tiga audit policy version {version}"
+                            ))
+                        })
+                    })
+                    .transpose()?,
+                policy_fingerprint,
             };
             verify_optional_integrity_tag(
                 conn,
@@ -411,6 +479,8 @@ impl TigaService {
                 &event,
                 integrity_tag.as_deref(),
             )?;
+            validate_audit_evidence(&event)?;
+            validate_audit_correlation(conn, &event)?;
             events.push(event);
         }
         Ok(events)
@@ -422,6 +492,15 @@ impl TigaService {
         operation: TigaOperation,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<AuthorizationDecision> {
+        Ok(Self::evaluate_operation_with_evidence(conn, scope, operation, context)?.decision)
+    }
+
+    fn evaluate_operation_with_evidence(
+        conn: &VaultConnection,
+        scope: &TigaScope,
+        operation: TigaOperation,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<EvaluatedAuthorization> {
         let mut resolved = resolve_scope_policy(conn, scope)?;
         if operation == TigaOperation::ChangeUnlockMethods
             && resolved.compliance == PolicyCompliance::RemediationRequired
@@ -431,14 +510,24 @@ impl TigaService {
             resolved.policy.administration.minimum_auth_factors = 1;
             resolved.policy.minimum_device_assurance = mdbx_core::tiga::DeviceAssurance::Standard;
         }
-        Ok(resolved.policy.authorize(
+        let policy_version = resolved.policy.policy_version;
+        let encoded_policy = serde_json::to_vec(&resolved.policy)
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        let decision = resolved.policy.authorize(
             operation,
             AuthorizationContext {
                 session: context.session.map(|session| &session.assurance),
                 device: context.device,
                 now_unix_secs: context.now_unix_secs,
             },
-        ))
+        );
+        Ok(EvaluatedAuthorization {
+            decision,
+            evidence: AuthorizationEvidence {
+                policy_version,
+                policy_fingerprint: Sha256::digest(encoded_policy).to_vec(),
+            },
+        })
     }
 
     /// Evaluate an operation and persist its audit event before the caller
@@ -449,13 +538,20 @@ impl TigaService {
         operation: TigaOperation,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<AuthorizationDecision> {
-        let decision = Self::evaluate_operation(conn, scope, operation, context)?;
-        if decision.audit_required {
+        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+        if evaluated.decision.audit_required {
             conn.with_immediate_transaction(|| {
-                record_authorization_event(conn, scope, operation, context, &decision, None)
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )
             })?;
         }
-        Ok(decision)
+        Ok(evaluated.decision)
     }
 
     /// Authorize a client-owned operation using the connection's active
@@ -488,19 +584,33 @@ impl TigaService {
         context: TigaAuthorizationContext<'_>,
         action: impl FnOnce() -> StorageResult<T>,
     ) -> StorageResult<(T, AuthorizationDecision)> {
-        let decision = Self::evaluate_operation(conn, scope, operation, context)?;
-        if !decision_allows(&decision) {
+        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+        if !decision_allows(&evaluated.decision) {
             conn.with_immediate_transaction(|| {
-                record_authorization_event(conn, scope, operation, context, &decision, None)
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )
             })?;
-            return Err(StorageError::Authorization(decision));
+            return Err(StorageError::Authorization(evaluated.decision));
         }
         conn.with_immediate_transaction(|| {
             let value = action()?;
-            if decision.audit_required {
-                record_authorization_event(conn, scope, operation, context, &decision, None)?;
+            if evaluated.decision.audit_required {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )?;
             }
-            Ok((value, decision))
+            Ok((value, evaluated.decision))
         })
     }
 
@@ -511,19 +621,70 @@ impl TigaService {
         context: TigaAuthorizationContext<'_>,
         action: impl FnOnce(&mut VaultConnection) -> StorageResult<T>,
     ) -> StorageResult<(T, AuthorizationDecision)> {
-        let decision = Self::evaluate_operation(conn, scope, operation, context)?;
-        if !decision_allows(&decision) {
+        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+        if !decision_allows(&evaluated.decision) {
             conn.with_immediate_transaction(|| {
-                record_authorization_event(conn, scope, operation, context, &decision, None)
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )
             })?;
-            return Err(StorageError::Authorization(decision));
+            return Err(StorageError::Authorization(evaluated.decision));
         }
         conn.with_immediate_transaction_mut(|conn| {
             let value = action(conn)?;
-            if decision.audit_required {
-                record_authorization_event(conn, scope, operation, context, &decision, None)?;
+            if evaluated.decision.audit_required {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )?;
             }
-            Ok((value, decision))
+            Ok((value, evaluated.decision))
+        })
+    }
+
+    pub(crate) fn execute_authorized_with_commit<T>(
+        conn: &VaultConnection,
+        scope: &TigaScope,
+        operation: TigaOperation,
+        context: TigaAuthorizationContext<'_>,
+        action: impl FnOnce() -> StorageResult<(T, String)>,
+    ) -> StorageResult<(T, AuthorizationDecision)> {
+        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+        if !decision_allows(&evaluated.decision) {
+            conn.with_immediate_transaction(|| {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, None),
+                )
+            })?;
+            return Err(StorageError::Authorization(evaluated.decision));
+        }
+        conn.with_immediate_transaction(|| {
+            let (value, commit_id) = action()?;
+            if evaluated.decision.audit_required {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated.evidence.audit_context(None, Some(&commit_id)),
+                )?;
+            }
+            Ok((value, evaluated.decision))
         })
     }
 
@@ -535,7 +696,7 @@ impl TigaService {
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<()> {
         let scope = TigaScope::Vault;
-        let decision = authorize_mutation(conn, &scope, context)?;
+        let evaluated = authorize_mutation(conn, &scope, context)?;
         let current_mode = Self::get_global_default(conn)?;
         let policy_override = TigaPolicyOverride::for_vault_profile(mode);
         let resolved = match TigaPolicyResolver::resolve(
@@ -547,7 +708,7 @@ impl TigaService {
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
-                record_resolution_denial(conn, &scope, context, &error)?;
+                record_resolution_denial(conn, &scope, context, &evaluated.evidence, &error)?;
                 return Err(policy_error(error));
             }
         };
@@ -565,15 +726,7 @@ impl TigaService {
             if let Some(exception) = exception {
                 persist_exception(conn, exception, context)?;
             }
-            record_authorization_event(
-                conn,
-                &scope,
-                TigaOperation::ChangeSecurityPolicy,
-                context,
-                &decision,
-                resolved.exception_id.as_deref(),
-            )?;
-            if resolved.compliance == PolicyCompliance::Exception {
+            let commit_id = if resolved.compliance == PolicyCompliance::Exception {
                 TigaPolicyStore::put_override(
                     conn,
                     &scope,
@@ -582,11 +735,11 @@ impl TigaService {
                     ctx.device_id.as_str(),
                     override_tag.as_deref(),
                 )?;
-                track_scope_policy_change(conn, ctx, &scope)?;
+                track_scope_policy_change(conn, ctx, &scope)?
             } else {
                 TigaPolicyStore::delete_override(conn, &scope)?;
-                Self::set_global_default(conn, ctx, mode)?;
-            }
+                Self::set_global_default(conn, ctx, mode)?
+            };
             conn.inner().execute(
                 "UPDATE vault_meta SET tiga_policy_version = ?1,
                  tiga_compliance_status = ?2",
@@ -594,6 +747,16 @@ impl TigaService {
                     TIGA_POLICY_VERSION,
                     compliance_storage_value(resolved.compliance)
                 ],
+            )?;
+            record_authorization_event(
+                conn,
+                &scope,
+                TigaOperation::ChangeSecurityPolicy,
+                context,
+                &evaluated.decision,
+                evaluated
+                    .evidence
+                    .audit_context(resolved.exception_id.as_deref(), Some(&commit_id)),
             )?;
             Ok(())
         })
@@ -610,7 +773,7 @@ impl TigaService {
         let scope = TigaScope::Project {
             project_id: project_id.to_string(),
         };
-        let decision = authorize_mutation(conn, &scope, context)?;
+        let evaluated = authorize_mutation(conn, &scope, context)?;
         let exception_id = if let Some(mode) = mode {
             let parent = Self::resolve_vault_policy(conn)?;
             let policy_override = TigaPolicyOverride::for_resource_profile(mode);
@@ -623,7 +786,7 @@ impl TigaService {
             ) {
                 Ok(resolved) => resolved.exception_id,
                 Err(error) => {
-                    record_resolution_denial(conn, &scope, context, &error)?;
+                    record_resolution_denial(conn, &scope, context, &evaluated.evidence, &error)?;
                     return Err(policy_error(error));
                 }
             }
@@ -635,15 +798,17 @@ impl TigaService {
             if let Some(exception) = exception {
                 persist_exception(conn, exception, context)?;
             }
+            let commit_id = Self::set_project_override(conn, ctx, project_id, mode)?;
             record_authorization_event(
                 conn,
                 &scope,
                 TigaOperation::ChangeSecurityPolicy,
                 context,
-                &decision,
-                exception_id.as_deref(),
-            )?;
-            Self::set_project_override(conn, ctx, project_id, mode)
+                &evaluated.decision,
+                evaluated
+                    .evidence
+                    .audit_context(exception_id.as_deref(), Some(&commit_id)),
+            )
         })
     }
 
@@ -660,7 +825,7 @@ impl TigaService {
         let scope = TigaScope::Entry {
             entry_id: entry_id.to_string(),
         };
-        let decision = authorize_mutation(conn, &scope, context)?;
+        let evaluated = authorize_mutation(conn, &scope, context)?;
         let exception_id = if let Some(mode) = mode {
             let parent = Self::resolve_policy_for_project(conn, &entry.project_id)?;
             let policy_override = TigaPolicyOverride::for_resource_profile(mode);
@@ -673,7 +838,7 @@ impl TigaService {
             ) {
                 Ok(resolved) => resolved.exception_id,
                 Err(error) => {
-                    record_resolution_denial(conn, &scope, context, &error)?;
+                    record_resolution_denial(conn, &scope, context, &evaluated.evidence, &error)?;
                     return Err(policy_error(error));
                 }
             }
@@ -685,15 +850,17 @@ impl TigaService {
             if let Some(exception) = exception {
                 persist_exception(conn, exception, context)?;
             }
+            let commit_id = Self::set_entry_override(conn, ctx, entry_id, mode)?;
             record_authorization_event(
                 conn,
                 &scope,
                 TigaOperation::ChangeSecurityPolicy,
                 context,
-                &decision,
-                exception_id.as_deref(),
-            )?;
-            Self::set_entry_override(conn, ctx, entry_id, mode)
+                &evaluated.decision,
+                evaluated
+                    .evidence
+                    .audit_context(exception_id.as_deref(), Some(&commit_id)),
+            )
         })
     }
 
@@ -705,7 +872,7 @@ impl TigaService {
         exception: Option<&PolicyException>,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<ResolvedTigaPolicy> {
-        let decision = authorize_mutation(conn, &scope, context)?;
+        let evaluated = authorize_mutation(conn, &scope, context)?;
         let parent = resolve_parent_policy(conn, &scope)?;
         let resolved = match TigaPolicyResolver::resolve(
             &parent.policy,
@@ -716,7 +883,7 @@ impl TigaService {
         ) {
             Ok(resolved) => combine_resolution(parent, resolved),
             Err(error) => {
-                record_resolution_denial(conn, &scope, context, &error)?;
+                record_resolution_denial(conn, &scope, context, &evaluated.evidence, &error)?;
                 return Err(policy_error(error));
             }
         };
@@ -734,14 +901,16 @@ impl TigaService {
                 ctx.device_id.as_str(),
                 Some(&override_tag),
             )?;
-            track_scope_policy_change(conn, ctx, &scope)?;
+            let commit_id = track_scope_policy_change(conn, ctx, &scope)?;
             record_authorization_event(
                 conn,
                 &scope,
                 TigaOperation::ChangeSecurityPolicy,
                 context,
-                &decision,
-                resolved.exception_id.as_deref(),
+                &evaluated.decision,
+                evaluated
+                    .evidence
+                    .audit_context(resolved.exception_id.as_deref(), Some(&commit_id)),
             )?;
             Ok(())
         })?;
@@ -754,17 +923,17 @@ impl TigaService {
         scope: TigaScope,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<()> {
-        let decision = authorize_mutation(conn, &scope, context)?;
+        let evaluated = authorize_mutation(conn, &scope, context)?;
         conn.with_immediate_transaction(|| {
             TigaPolicyStore::delete_override(conn, &scope)?;
-            track_scope_policy_change(conn, ctx, &scope)?;
+            let commit_id = track_scope_policy_change(conn, ctx, &scope)?;
             record_authorization_event(
                 conn,
                 &scope,
                 TigaOperation::ChangeSecurityPolicy,
                 context,
-                &decision,
-                None,
+                &evaluated.decision,
+                evaluated.evidence.audit_context(None, Some(&commit_id)),
             )
         })
     }
@@ -807,28 +976,32 @@ fn authorize_mutation(
     conn: &VaultConnection,
     scope: &TigaScope,
     context: TigaAuthorizationContext<'_>,
-) -> StorageResult<AuthorizationDecision> {
-    let decision =
-        TigaService::evaluate_operation(conn, scope, TigaOperation::ChangeSecurityPolicy, context)?;
-    if !decision_allows(&decision) {
+) -> StorageResult<EvaluatedAuthorization> {
+    let evaluated = TigaService::evaluate_operation_with_evidence(
+        conn,
+        scope,
+        TigaOperation::ChangeSecurityPolicy,
+        context,
+    )?;
+    if !decision_allows(&evaluated.decision) {
         conn.with_immediate_transaction(|| {
             record_authorization_event(
                 conn,
                 scope,
                 TigaOperation::ChangeSecurityPolicy,
                 context,
-                &decision,
-                None,
+                &evaluated.decision,
+                evaluated.evidence.audit_context(None, None),
             )
         })?;
-        return Err(StorageError::Authorization(decision));
+        return Err(StorageError::Authorization(evaluated.decision));
     }
     if context.session.is_none() || conn.keyring().is_none() {
         return Err(StorageError::Validation(
             "security policy mutations require an unlocked vault session".to_string(),
         ));
     }
-    Ok(decision)
+    Ok(evaluated)
 }
 
 fn decision_allows(decision: &AuthorizationDecision) -> bool {
@@ -842,6 +1015,7 @@ fn record_resolution_denial(
     conn: &VaultConnection,
     scope: &TigaScope,
     context: TigaAuthorizationContext<'_>,
+    evidence: &AuthorizationEvidence,
     error: &PolicyResolutionError,
 ) -> StorageResult<()> {
     let reason = match error {
@@ -864,7 +1038,7 @@ fn record_resolution_denial(
             TigaOperation::ChangeSecurityPolicy,
             context,
             &decision,
-            None,
+            evidence.audit_context(None, None),
         )
     })
 }
@@ -889,8 +1063,12 @@ fn record_authorization_event(
     operation: TigaOperation,
     context: TigaAuthorizationContext<'_>,
     decision: &AuthorizationDecision,
-    exception_id: Option<&str>,
+    audit: AuditRecordContext<'_>,
 ) -> StorageResult<()> {
+    let operation_id = audit
+        .commit_id
+        .map(|commit_id| operation_id_for_commit(conn, commit_id))
+        .transpose()?;
     let event = SecurityAuditEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         occurred_at: chrono::DateTime::from_timestamp(context.now_unix_secs, 0)
@@ -903,10 +1081,71 @@ fn record_authorization_event(
         device_id: context.device.device_id.clone(),
         reasons: decision.reasons.clone(),
         constraints: decision.constraints.clone(),
-        exception_id: exception_id.map(str::to_string),
+        exception_id: audit.exception_id.map(str::to_string),
+        operation_id,
+        commit_id: audit.commit_id.map(str::to_string),
+        policy_version: Some(audit.evidence.policy_version),
+        policy_fingerprint: Some(audit.evidence.policy_fingerprint.clone()),
     };
     let tag = optional_integrity_tag(conn, b"tiga-security-audit", &event)?;
     TigaPolicyStore::record_audit_event(conn, &event, tag.as_deref())
+}
+
+fn operation_id_for_commit(conn: &VaultConnection, commit_id: &str) -> StorageResult<String> {
+    conn.inner()
+        .query_row(
+            "SELECT operation_id FROM commit_operations WHERE commit_id = ?1",
+            params![commit_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Validation(format!(
+                "commit {commit_id} has no Commit2 operation metadata"
+            ))
+        })
+}
+
+pub(crate) fn validate_audit_evidence(event: &SecurityAuditEvent) -> StorageResult<()> {
+    match (&event.policy_version, &event.policy_fingerprint) {
+        (None, None) => Ok(()),
+        (Some(version), Some(fingerprint)) if *version > 0 && fingerprint.len() == 32 => Ok(()),
+        _ => Err(StorageError::Validation(format!(
+            "security audit event {} has incomplete policy evidence",
+            event.event_id
+        ))),
+    }
+}
+
+pub(crate) fn validate_audit_correlation(
+    conn: &VaultConnection,
+    event: &SecurityAuditEvent,
+) -> StorageResult<()> {
+    match (&event.operation_id, &event.commit_id) {
+        (_, None) => Ok(()),
+        (Some(operation_id), Some(commit_id)) => {
+            let matches: bool = conn.inner().query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM commit_operations
+                    WHERE operation_id = ?1 AND commit_id = ?2
+                 )",
+                params![operation_id, commit_id],
+                |row| row.get(0),
+            )?;
+            if matches {
+                Ok(())
+            } else {
+                Err(StorageError::Validation(format!(
+                    "security audit event {} references mismatched operation and commit",
+                    event.event_id
+                )))
+            }
+        }
+        (None, Some(_)) => Err(StorageError::Validation(format!(
+            "security audit event {} has a commit without an operation",
+            event.event_id
+        ))),
+    }
 }
 
 fn integrity_tag<T: Serialize>(
@@ -959,10 +1198,10 @@ fn track_scope_policy_change(
     conn: &VaultConnection,
     ctx: &CommitContext,
     scope: &TigaScope,
-) -> StorageResult<()> {
-    match scope {
+) -> StorageResult<String> {
+    let commit_id = match scope {
         TigaScope::Vault => {
-            ctx.create_commit(
+            let commit_id = ctx.create_commit(
                 conn,
                 "change",
                 "vault-meta",
@@ -975,6 +1214,7 @@ fn track_scope_policy_change(
                 "UPDATE vault_meta SET updated_at = ?1",
                 params![chrono::Utc::now().to_rfc3339()],
             )?;
+            commit_id
         }
         TigaScope::Project { project_id } => {
             let project = ProjectRepo::get_by_id(conn, project_id)?
@@ -998,6 +1238,7 @@ fn track_scope_policy_change(
                 ],
             )?;
             ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
+            commit_id
         }
         TigaScope::Entry { entry_id } => {
             let entry = EntryRepo::get_by_id(conn, entry_id)?
@@ -1021,9 +1262,10 @@ fn track_scope_policy_change(
                 ],
             )?;
             ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+            commit_id
         }
-    }
-    Ok(())
+    };
+    Ok(commit_id)
 }
 
 fn compliance_storage_value(compliance: PolicyCompliance) -> &'static str {
@@ -1383,6 +1625,10 @@ mod tests {
             reasons: Vec::new(),
             constraints: vec![AuthorizationConstraint::ClearClipboardAfterSeconds(30)],
             exception_id: None,
+            operation_id: None,
+            commit_id: None,
+            policy_version: None,
+            policy_fingerprint: None,
         };
         TigaPolicyStore::record_audit_event(&conn, &event, None).unwrap();
         assert_eq!(
@@ -1441,6 +1687,67 @@ mod tests {
             .unwrap();
         let error = TigaService::list_security_audit_events(&conn, 10).unwrap_err();
         assert!(error.to_string().contains("integrity tag mismatch"));
+    }
+
+    #[test]
+    fn audit_correlation_and_policy_evidence_are_structurally_validated_on_read() {
+        let (conn, ctx, project_id, _) = setup();
+        let device = standard_device();
+        let session = session(UnlockMethodType::Password, 1_000);
+        TigaService::set_policy_override_authorized(
+            &conn,
+            &ctx,
+            TigaScope::Project {
+                project_id: project_id.clone(),
+            },
+            TigaPolicyOverride {
+                clipboard_allowed: Some(false),
+                ..Default::default()
+            },
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_000,
+            },
+        )
+        .unwrap();
+        let event = TigaService::list_security_audit_events(&conn, 10)
+            .unwrap()
+            .remove(0);
+        let original_commit_id = event.commit_id.unwrap();
+        let other_commit_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_id FROM commits WHERE commit_id != ?1 ORDER BY created_at LIMIT 1",
+                params![original_commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE security_audit_events
+                 SET commit_id = ?1, integrity_tag = NULL WHERE event_id = ?2",
+                params![other_commit_id, event.event_id],
+            )
+            .unwrap();
+        let correlation_error = TigaService::list_security_audit_events(&conn, 10).unwrap_err();
+        assert!(correlation_error
+            .to_string()
+            .contains("mismatched operation and commit"));
+
+        conn.inner()
+            .execute(
+                "UPDATE security_audit_events
+                 SET commit_id = ?1, policy_fingerprint = X'00'
+                 WHERE event_id = ?2",
+                params![original_commit_id, event.event_id],
+            )
+            .unwrap();
+        let evidence_error = TigaService::list_security_audit_events(&conn, 10).unwrap_err();
+        assert!(evidence_error
+            .to_string()
+            .contains("incomplete policy evidence"));
     }
 
     #[test]
@@ -1514,6 +1821,25 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation, TigaOperation::ChangeSecurityPolicy);
         assert_eq!(events[0].outcome, AuthorizationOutcome::Allow);
+        assert_eq!(events[0].commit_id.as_deref(), Some(after.as_str()));
+        let operation_id = events[0]
+            .operation_id
+            .as_deref()
+            .expect("authorized mutation must reference its operation");
+        let stored_commit: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_id FROM commit_operations WHERE operation_id = ?1",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_commit, after);
+        assert_eq!(events[0].policy_version, Some(TIGA_POLICY_VERSION));
+        assert_eq!(
+            events[0].policy_fingerprint.as_deref().map(<[u8]>::len),
+            Some(32)
+        );
     }
 
     #[test]
@@ -1552,6 +1878,13 @@ mod tests {
         assert_eq!(
             events[0].outcome,
             AuthorizationOutcome::RequireFreshAuthentication
+        );
+        assert!(events[0].operation_id.is_none());
+        assert!(events[0].commit_id.is_none());
+        assert_eq!(events[0].policy_version, Some(TIGA_POLICY_VERSION));
+        assert_eq!(
+            events[0].policy_fingerprint.as_deref().map(<[u8]>::len),
+            Some(32)
         );
     }
 

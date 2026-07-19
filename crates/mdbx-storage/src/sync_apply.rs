@@ -20,7 +20,8 @@ use crate::sync_state::{
     TigaPolicyOverrideRow, TigaVaultStateRow,
 };
 use crate::tiga_policy::{
-    optional_integrity_tag, verify_optional_integrity_tag, SecurityAuditEvent,
+    optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
+    verify_optional_integrity_tag, SecurityAuditEvent,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -583,12 +584,15 @@ impl SyncApplyRepo {
                 &incoming_event,
                 incoming.integrity_tag.as_deref(),
             )?;
+            validate_audit_evidence(&incoming_event)?;
+            validate_audit_correlation(conn, &incoming_event)?;
             let local = conn
                 .inner()
                 .query_row(
                     "SELECT event_id, occurred_at, operation, outcome, scope_type, scope_id,
                             session_id, device_id, reason_codes_json, constraints_json,
-                            exception_id, integrity_tag
+                            exception_id, operation_id, commit_id, policy_version,
+                            policy_fingerprint, integrity_tag
                      FROM security_audit_events WHERE event_id = ?1",
                     params![incoming.event_id],
                     |row| {
@@ -604,7 +608,13 @@ impl SyncApplyRepo {
                             reason_codes_json: row.get(8)?,
                             constraints_json: row.get(9)?,
                             exception_id: row.get(10)?,
-                            integrity_tag: row.get(11)?,
+                            operation_id: row.get(11)?,
+                            commit_id: row.get(12)?,
+                            policy_version: row
+                                .get::<_, Option<i64>>(13)?
+                                .map(|value| value as u32),
+                            policy_fingerprint: row.get(14)?,
+                            integrity_tag: row.get(15)?,
                         })
                     },
                 )
@@ -617,6 +627,8 @@ impl SyncApplyRepo {
                     &local_event,
                     local.integrity_tag.as_deref(),
                 )?;
+                validate_audit_evidence(&local_event)?;
+                validate_audit_correlation(conn, &local_event)?;
                 if !same_audit_identity(&local, incoming) {
                     return Err(StorageError::Validation(format!(
                         "security audit event {} was rewritten during sync",
@@ -628,8 +640,10 @@ impl SyncApplyRepo {
                     "INSERT INTO security_audit_events
                         (event_id, occurred_at, operation, outcome, scope_type, scope_id,
                          session_id, device_id, reason_codes_json, constraints_json,
-                         exception_id, integrity_tag)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         exception_id, operation_id, commit_id, policy_version,
+                         policy_fingerprint, integrity_tag)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             ?13, ?14, ?15, ?16)",
                     params![
                         incoming.event_id,
                         incoming.occurred_at,
@@ -642,6 +656,10 @@ impl SyncApplyRepo {
                         incoming.reason_codes_json,
                         incoming.constraints_json,
                         incoming.exception_id,
+                        incoming.operation_id,
+                        incoming.commit_id,
+                        incoming.policy_version.map(i64::from),
+                        incoming.policy_fingerprint,
                         incoming.integrity_tag,
                     ],
                 )?;
@@ -2009,6 +2027,10 @@ fn same_audit_identity(a: &SecurityAuditEventRow, b: &SecurityAuditEventRow) -> 
         && a.reason_codes_json == b.reason_codes_json
         && a.constraints_json == b.constraints_json
         && a.exception_id == b.exception_id
+        && a.operation_id == b.operation_id
+        && a.commit_id == b.commit_id
+        && a.policy_version == b.policy_version
+        && a.policy_fingerprint == b.policy_fingerprint
 }
 
 fn policy_exception_from_row(row: &TigaPolicyExceptionRow) -> StorageResult<PolicyException> {
@@ -2037,6 +2059,10 @@ fn security_audit_event_from_row(row: &SecurityAuditEventRow) -> StorageResult<S
         constraints: serde_json::from_str::<Vec<AuthorizationConstraint>>(&row.constraints_json)
             .map_err(|error| StorageError::Validation(error.to_string()))?,
         exception_id: row.exception_id.clone(),
+        operation_id: row.operation_id.clone(),
+        commit_id: row.commit_id.clone(),
+        policy_version: row.policy_version,
+        policy_fingerprint: row.policy_fingerprint.clone(),
     })
 }
 
@@ -2069,9 +2095,16 @@ mod tests {
     use crate::repo::{
         AttachmentRepo, CommitChange, CommitOperation, EntryRepo, ObjectVersionRepo, ProjectRepo,
     };
-    use crate::sync_state::collect_sync_state_payload;
-    use mdbx_core::model::{ChangeScope, Commit, CommitKind, ConflictResolution, EntryType};
-    use mdbx_core::tiga::TIGA_POLICY_VERSION;
+    use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
+    use crate::tiga::TigaService;
+    use crate::tiga_policy::TigaAuthorizationContext;
+    use mdbx_core::model::{
+        ChangeScope, Commit, CommitKind, ConflictResolution, EntryType, UnlockMethodType,
+        VaultSession,
+    };
+    use mdbx_core::tiga::{
+        DeviceAssurance, DeviceContext, SessionAssurance, TigaScope, TIGA_POLICY_VERSION,
+    };
     use mdbx_crypto::keyring::Keyring;
     use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit, TombstoneRecord};
     use std::path::PathBuf;
@@ -2229,6 +2262,10 @@ mod tests {
             reason_codes_json: "[]".to_string(),
             constraints_json: "[]".to_string(),
             exception_id: None,
+            operation_id: None,
+            commit_id: None,
+            policy_version: None,
+            policy_fingerprint: None,
             integrity_tag: None,
         };
         SyncApplyRepo::apply_security_audit_events(&conn, &[event.clone()]).unwrap();
@@ -2961,6 +2998,113 @@ mod tests {
             AttachmentRepo::read_content(&target, &attachment.attachment_id).unwrap(),
             b"hello from source"
         );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn audit_commit_correlation_roundtrips_and_rejects_tampering() {
+        let source_path = temp_vault_path("audit-correlation-source");
+        let target_path = temp_vault_path("audit-correlation-target");
+        let mut source = VaultConnection::create(&source_path).unwrap();
+        initialize_vault(
+            &source,
+            &VaultInitParams {
+                device_id: "device-a".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        checkpoint(&source);
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        source.attach_keyring(
+            Keyring::from_vault_key(&[11_u8; 32], b"sync-audit-correlation").unwrap(),
+        );
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let project = ProjectRepo::create(&source, &source_ctx, "P", None, None).unwrap();
+        let session = VaultSession {
+            session_id: "session-a".to_string(),
+            unlock_method: UnlockMethodType::Password,
+            created_at: "1970-01-01T00:16:40Z".to_string(),
+            assurance: SessionAssurance::from_unlock_method(UnlockMethodType::Password, 1_000),
+        };
+        let device = DeviceContext {
+            device_id: Some("device-a".to_string()),
+            assurance: DeviceAssurance::Standard,
+            secure_clipboard_available: true,
+            screen_capture_protection_available: false,
+            secure_temp_files_available: true,
+        };
+        TigaService::set_policy_override_authorized(
+            &source,
+            &source_ctx,
+            TigaScope::Project {
+                project_id: project.project_id,
+            },
+            TigaPolicyOverride {
+                clipboard_allowed: Some(false),
+                ..Default::default()
+            },
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+        let source_event = TigaService::list_security_audit_events(&source, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let audit_commit_id = source_event.commit_id.clone().unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &audit_commit_id);
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        target.attach_keyring(
+            Keyring::from_vault_key(&[11_u8; 32], b"sync-audit-correlation").unwrap(),
+        );
+        let target_ctx = CommitContext::new("device-b".to_string());
+        SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+            .unwrap();
+
+        let target_event = TigaService::list_security_audit_events(&target, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(target_event, source_event);
+
+        let synced_row = collect_sync_state(&source)
+            .unwrap()
+            .security_audit_events
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut rewritten_correlation = synced_row.clone();
+        rewritten_correlation.operation_id = Some("rewritten-operation".to_string());
+        rewritten_correlation.integrity_tag = None;
+        let correlation_error =
+            SyncApplyRepo::apply_security_audit_events(&target, &[rewritten_correlation])
+                .unwrap_err();
+        assert!(correlation_error
+            .to_string()
+            .contains("mismatched operation and commit"));
+
+        let mut rewritten_evidence = synced_row;
+        rewritten_evidence.policy_fingerprint.as_mut().unwrap()[0] ^= 1;
+        let evidence_error =
+            SyncApplyRepo::apply_security_audit_events(&target, &[rewritten_evidence]).unwrap_err();
+        assert!(evidence_error
+            .to_string()
+            .contains("integrity tag mismatch"));
 
         drop(source);
         drop(target);

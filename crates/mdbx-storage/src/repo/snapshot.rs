@@ -118,12 +118,12 @@ impl SnapshotRepo {
         snapshot_id: &str,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<AuthorizationDecision> {
-        let (_, decision) = TigaService::execute_authorized(
+        let (_, decision) = TigaService::execute_authorized_with_commit(
             conn,
             &TigaScope::Vault,
             TigaOperation::RestoreSnapshot,
             context,
-            || Self::restore_snapshot(conn, ctx, snapshot_id),
+            || Self::restore_snapshot(conn, ctx, snapshot_id).map(|commit_id| ((), commit_id)),
         )?;
         Ok(decision)
     }
@@ -132,7 +132,7 @@ impl SnapshotRepo {
         conn: &VaultConnection,
         ctx: &CommitContext,
         snapshot_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         let snap = SnapshotRepo::get_by_id(conn, snapshot_id)?
             .ok_or_else(|| StorageError::NotFound(snapshot_id.to_string()))?;
 
@@ -254,7 +254,7 @@ impl SnapshotRepo {
                 ObjectVersionRepo::record_project_current(conn, &restore_commit_id, id)?;
             }
 
-            Ok(())
+            Ok(restore_commit_id)
         })
     }
 
@@ -917,6 +917,31 @@ mod tests {
         let events = TigaService::list_security_audit_events(&conn, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].operation, TigaOperation::RestoreSnapshot);
+        let commit_id = events[0]
+            .commit_id
+            .as_deref()
+            .expect("authorized restore must reference its commit");
+        let operation_id = events[0]
+            .operation_id
+            .as_deref()
+            .expect("authorized restore must reference its operation");
+        let stored_operation: String = conn
+            .inner()
+            .query_row(
+                "SELECT operation_id FROM commit_operations WHERE commit_id = ?1",
+                params![commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_operation, operation_id);
+        assert_eq!(
+            events[0].policy_version,
+            Some(mdbx_core::tiga::TIGA_POLICY_VERSION)
+        );
+        assert_eq!(
+            events[0].policy_fingerprint.as_deref().map(<[u8]>::len),
+            Some(32)
+        );
     }
 
     #[test]
@@ -1583,7 +1608,19 @@ mod tests {
             )
             .unwrap();
 
-        assert!(SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).is_err());
+        let session = restore_session(1_000);
+        let device = restore_device();
+        assert!(SnapshotRepo::restore_snapshot_authorized(
+            &conn,
+            &ctx,
+            &snapshot.snapshot_id,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .is_err());
 
         let after_commits: i64 = conn
             .inner()
@@ -1599,6 +1636,9 @@ mod tests {
             .unwrap();
         assert_eq!(after_commits, before_commits);
         assert_eq!(after_head, before_head);
+        assert!(TigaService::list_security_audit_events(&conn, 10)
+            .unwrap()
+            .is_empty());
         assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
         assert_eq!(
             EntryRepo::list_by_project(&conn, &project.project_id)

@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS security_audit_events (
     reason_codes_json    TEXT NOT NULL,
     constraints_json     TEXT NOT NULL,
     exception_id         TEXT,
+    operation_id         TEXT,
+    commit_id            TEXT,
+    policy_version       INTEGER CHECK (policy_version IS NULL OR policy_version > 0),
+    policy_fingerprint   BLOB,
     integrity_tag        BLOB
 );
 
@@ -81,6 +85,14 @@ CREATE INDEX IF NOT EXISTS idx_security_audit_occurred
     ON security_audit_events (occurred_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_tiga_exceptions_target
     ON tiga_policy_exceptions (target_scope, target_id, revoked_at);";
+
+pub const TIGA_AUDIT_CORRELATION_INDEX_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_security_audit_operation
+    ON security_audit_events (operation_id)
+    WHERE operation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_security_audit_commit
+    ON security_audit_events (commit_id)
+    WHERE commit_id IS NOT NULL;";
 
 /// Add MDBX2-only schema objects to a newly created database.
 ///
@@ -119,8 +131,18 @@ pub fn create_extensions(conn: &Connection) -> StorageResult<()> {
     )?;
     conn.execute_batch(&format!(
         "{SCHEMA_MIGRATIONS_DDL}{COMMIT2_DDL}{TIGA_POLICY_DDL}"
-    ))
-    .map_err(StorageError::Database)
+    ))?;
+    add_column_if_missing(conn, "security_audit_events", "operation_id", "TEXT")?;
+    add_column_if_missing(conn, "security_audit_events", "commit_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "security_audit_events",
+        "policy_version",
+        "INTEGER CHECK (policy_version IS NULL OR policy_version > 0)",
+    )?;
+    add_column_if_missing(conn, "security_audit_events", "policy_fingerprint", "BLOB")?;
+    conn.execute_batch(TIGA_AUDIT_CORRELATION_INDEX_DDL)
+        .map_err(StorageError::Database)
 }
 
 pub(crate) fn add_column_if_missing(
