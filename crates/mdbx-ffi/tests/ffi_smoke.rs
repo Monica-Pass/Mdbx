@@ -137,6 +137,46 @@ fn create_rejects_existing_vault_and_preserves_contents() {
 }
 
 #[test]
+fn open_and_upgrade_missing_paths_do_not_create_files() {
+    let open_path = temp_vault_path("open-missing");
+    assert!(open_vault(
+        open_path.as_path_string(),
+        "unused password 12345!".to_string(),
+        "ffi-open-missing-device".to_string(),
+    )
+    .is_err());
+    assert!(!open_path.path().exists());
+
+    let upgrade_path = temp_vault_path("upgrade-missing");
+    assert!(upgrade_vault(upgrade_path.as_path_string()).is_err());
+    assert!(!upgrade_path.path().exists());
+}
+
+#[test]
+fn open_and_upgrade_reject_non_mdbx_sqlite_without_modification() {
+    let vault_path = temp_vault_path("open-non-mdbx");
+    {
+        let conn = rusqlite::Connection::open(vault_path.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE unrelated_data (value TEXT NOT NULL);
+             INSERT INTO unrelated_data VALUES ('preserve-me');",
+        )
+        .unwrap();
+    }
+    let before = fs::read(vault_path.path()).unwrap();
+
+    assert!(open_vault(
+        vault_path.as_path_string(),
+        "unused password 12345!".to_string(),
+        "ffi-open-non-mdbx-device".to_string(),
+    )
+    .is_err());
+    assert_eq!(fs::read(vault_path.path()).unwrap(), before);
+    assert!(upgrade_vault(vault_path.as_path_string()).is_err());
+    assert_eq!(fs::read(vault_path.path()).unwrap(), before);
+}
+
+#[test]
 fn write_operation_coalesces_commands_and_retries_idempotently() {
     let vault_path = temp_vault_path("write-operation");
     let vault = create_vault(

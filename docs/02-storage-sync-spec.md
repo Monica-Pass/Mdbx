@@ -20,6 +20,12 @@ Vault creation MUST atomically reserve a path that does not exist. An existing r
 
 Creation remains pending until schema creation, vault metadata, the genesis commit, the initial branch, the device head, the initial key epoch, and the first unlock method have all succeeded. Failure before that point MUST close the SQLite connection and remove the main database plus any WAL and SHM sidecars created by the same attempt. Opening or upgrading an established vault uses the open and migration interfaces, never the create interface.
 
+### Existing Vault Open Lifecycle
+
+Open and explicit upgrade MUST first inspect the file through a read-only SQLite handle. The preflight must confirm an initialized `vault_meta` row, a supported MDBX format generation, and the absence of unknown critical extensions before any writable handle, WAL mode change, migration, or compatibility cleanup is allowed.
+
+The writable handle MUST use read-write flags without SQLite create permission. A missing path or an uninitialized SQLite database is an error and must remain unchanged. Connection-only settings such as foreign-key enforcement and busy timeout may be applied before migration; persistent WAL and secure-delete settings plus legacy plaintext-index cleanup are applied only after identity validation and a successful transactional migration.
+
 ## 2. Internal Storage Goals
 
 The internal layout MUST support all of the following:

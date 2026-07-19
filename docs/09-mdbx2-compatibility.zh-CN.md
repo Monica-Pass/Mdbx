@@ -133,7 +133,7 @@ MDBX2 同时收紧以下实现边界：
 - `mdbx_storage::migration::upgrade_path`
 - UniFFI：`upgrade_vault`
 
-转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。未知 critical extension 可以被检查并展示，但显式升级必须拒绝写入。
+转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。open 与显式升级会在建立可写连接前重复执行只读身份预检；路径缺失、未初始化的 SQLite 数据库与未知 critical extension 均会被拒绝，文件内容保持不变。
 
 ### 7.3 客户端 operation 写入 API
 

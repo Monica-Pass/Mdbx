@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -75,10 +75,12 @@ impl Drop for PendingVaultCreation {
 impl VaultConnection {
     /// 打开已有的 `.mdbx` 文件。
     pub fn open(path: &Path) -> StorageResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::apply_pragmas(&conn)?;
-        Self::cleanup_legacy_persistent_fts(&conn)?;
+        crate::migration::preflight_existing_vault(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        Self::apply_connection_pragmas(&conn)?;
         crate::migration::upgrade_to_latest(&conn)?;
+        Self::apply_persistent_pragmas(&conn)?;
+        Self::cleanup_legacy_persistent_fts(&conn)?;
         Ok(Self {
             conn,
             keyring: None,
@@ -96,7 +98,8 @@ impl VaultConnection {
 
         let result = (|| {
             let conn = Connection::open(path)?;
-            Self::apply_pragmas(&conn)?;
+            Self::apply_connection_pragmas(&conn)?;
+            Self::apply_persistent_pragmas(&conn)?;
             schema::create_all_tables(&conn)?;
             Self::cleanup_legacy_persistent_fts(&conn)?;
             Ok(Self {
@@ -114,7 +117,8 @@ impl VaultConnection {
     /// 打开内存数据库（用于测试）。
     pub fn open_in_memory() -> StorageResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::apply_pragmas(&conn)?;
+        Self::apply_connection_pragmas(&conn)?;
+        Self::apply_persistent_pragmas(&conn)?;
         schema::create_all_tables(&conn)?;
         Self::cleanup_legacy_persistent_fts(&conn)?;
         Ok(Self {
@@ -124,12 +128,18 @@ impl VaultConnection {
         })
     }
 
-    fn apply_pragmas(conn: &Connection) -> StorageResult<()> {
+    fn apply_connection_pragmas(conn: &Connection) -> StorageResult<()> {
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;",
+        )
+        .map_err(StorageError::Database)
+    }
+
+    fn apply_persistent_pragmas(conn: &Connection) -> StorageResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA secure_delete=ON;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA secure_delete=ON;",
         )
         .map_err(StorageError::Database)
     }
@@ -282,8 +292,14 @@ mod tests {
 
     fn create_legacy_fts_db(path: &Path) {
         let conn = Connection::open(path).unwrap();
+        crate::schema::v1::create_all_tables(&conn).unwrap();
         conn.execute_batch(
-            "CREATE VIRTUAL TABLE main.project_titles_fts USING fts5(
+            "INSERT INTO vault_meta
+                (vault_id, format_version, created_at, updated_at,
+                 default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('legacy-fts-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '');
+             CREATE VIRTUAL TABLE main.project_titles_fts USING fts5(
                 project_id UNINDEXED,
                 title,
                 tokenize='unicode61 remove_diacritics 2'
@@ -366,6 +382,63 @@ mod tests {
         assert_eq!(fs::read(&shm).unwrap(), b"existing shm data");
         let _ = fs::remove_file(wal);
         let _ = fs::remove_file(shm);
+    }
+
+    #[test]
+    fn open_missing_path_does_not_create_a_file() {
+        let path = temp_db_path("missing-open");
+
+        let result = VaultConnection::open(&path);
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn open_rejects_non_mdbx_sqlite_without_modifying_it() {
+        let path = temp_db_path("non-mdbx-open");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE unrelated_data (value TEXT NOT NULL);
+                 INSERT INTO unrelated_data VALUES ('preserve-me');",
+            )
+            .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let result = VaultConnection::open(&path);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_rejects_unknown_critical_extensions_before_writable_open() {
+        let path = temp_db_path("unknown-critical-open");
+        let creation = PendingVaultCreation::begin(&path).unwrap();
+        initialize_vault(creation.connection(), &VaultInitParams::default()).unwrap();
+        let connection = creation.commit();
+        connection
+            .inner()
+            .execute(
+                "UPDATE vault_meta SET critical_extensions = 'future-critical'",
+                [],
+            )
+            .unwrap();
+        connection
+            .inner()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+
+        let error = VaultConnection::open(&path).err().unwrap();
+
+        assert!(error.to_string().contains("critical extensions"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        remove_vault_files(&path);
     }
 
     #[test]

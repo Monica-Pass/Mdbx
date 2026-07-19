@@ -1644,6 +1644,26 @@ mod tests {
     }
 
     #[test]
+    fn non_mdbx_sqlite_is_rejected_without_modification() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE unrelated_data (value TEXT NOT NULL);
+                 INSERT INTO unrelated_data VALUES ('preserve-me');",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let result = run(locked_cli(&path, Commands::Unlock));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn cli_can_entry_crud_move_and_copy() {
         let vault = TempVault::new();
         let path = vault.path();

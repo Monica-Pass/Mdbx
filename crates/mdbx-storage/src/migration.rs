@@ -119,12 +119,32 @@ pub fn inspect_migration_path(path: &Path) -> StorageResult<MigrationInfo> {
     inspect_migration(&conn)
 }
 
+pub(crate) fn preflight_existing_vault(path: &Path) -> StorageResult<MigrationInfo> {
+    let info = inspect_migration_path(path)?;
+    if !info.initialized {
+        return Err(StorageError::Validation(format!(
+            "not an initialized MDBX vault: {}",
+            path.display()
+        )));
+    }
+    if info.unknown_critical_extensions {
+        return Err(StorageError::Validation(
+            "vault requires unsupported critical extensions".to_string(),
+        ));
+    }
+    Ok(info)
+}
+
 /// Explicitly upgrade a vault file through the storage-core migration path.
 /// The existing `VaultConnection::open` path remains an automatic-upgrade
 /// compatibility path; clients that need consent and backup orchestration can
 /// call this function after `inspect_migration_path`.
 pub fn upgrade_path(path: &Path) -> StorageResult<Option<FormatInfo>> {
-    let conn = Connection::open(path).map_err(StorageError::Database)?;
+    preflight_existing_vault(path)?;
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(StorageError::Database)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        .map_err(StorageError::Database)?;
     upgrade_to_latest(&conn)
 }
 
@@ -702,6 +722,42 @@ mod tests {
         assert_eq!(info.format_version.as_deref(), Some(FORMAT_V2));
         assert_eq!(info.schema_version, Some(CURRENT_SCHEMA_VERSION));
         assert!(!info.requires_upgrade);
+    }
+
+    #[test]
+    fn explicit_upgrade_missing_path_does_not_create_a_file() {
+        let path = std::env::temp_dir().join(format!(
+            "mdbx-missing-upgrade-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = upgrade_path(&path);
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn explicit_upgrade_rejects_non_mdbx_sqlite_without_modifying_it() {
+        let path = std::env::temp_dir().join(format!(
+            "mdbx-non-vault-upgrade-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE unrelated_data (value TEXT NOT NULL);
+                 INSERT INTO unrelated_data VALUES ('preserve-me');",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let result = upgrade_path(&path);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
