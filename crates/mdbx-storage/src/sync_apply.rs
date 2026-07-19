@@ -2395,8 +2395,7 @@ impl SyncApplyRepo {
              VALUES (?1, ?2, ?3, 0)
              ON CONFLICT(device_id) DO UPDATE SET
                 head_commit_id = excluded.head_commit_id,
-                last_seen_at = excluded.last_seen_at,
-                revoked = 0",
+                last_seen_at = excluded.last_seen_at",
             params![
                 serialized.commit.device_id,
                 serialized.commit.commit_id,
@@ -3085,6 +3084,55 @@ mod tests {
                 associated_data: vec![],
             }],
         }
+    }
+
+    #[test]
+    fn synced_device_head_preserves_local_revocation() {
+        let (conn, _) = setup();
+        let first = make_commit(
+            "remote-1",
+            "remote-device",
+            1,
+            Vec::new(),
+            vec!["project-1".to_string()],
+            "project-1",
+            "project",
+        );
+        SyncApplyRepo::insert_commit(&conn, &first).unwrap();
+        conn.inner()
+            .execute(
+                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![
+                    first.commit.device_id,
+                    first.commit.commit_id,
+                    first.commit.created_at
+                ],
+            )
+            .unwrap();
+
+        let second = make_commit(
+            "remote-2",
+            "remote-device",
+            2,
+            vec!["remote-1".to_string()],
+            vec!["project-1".to_string()],
+            "project-1",
+            "project",
+        );
+        SyncApplyRepo::insert_commit(&conn, &second).unwrap();
+        SyncApplyRepo::sync_device_head(&conn, &second).unwrap();
+
+        let stored: (String, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id, revoked FROM device_heads WHERE device_id = ?1",
+                params![second.commit.device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, second.commit.commit_id);
+        assert_eq!(stored.1, 1);
     }
 
     fn temp_vault_path(label: &str) -> PathBuf {
