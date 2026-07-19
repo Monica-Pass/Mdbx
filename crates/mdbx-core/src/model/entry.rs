@@ -94,7 +94,7 @@ impl ObjectTypeId {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Custom(value) => {
-                validate_object_type_id(value)?;
+                validate_extension_id(value)?;
                 if matches!(
                     value.as_str(),
                     "login"
@@ -137,7 +137,7 @@ impl std::str::FromStr for ObjectTypeId {
             "api-token" => Ok(Self::ApiToken),
             "document-ref" => Ok(Self::DocumentRef),
             value => {
-                validate_object_type_id(value)?;
+                validate_extension_id(value)?;
                 Ok(Self::Custom(value.to_string()))
             }
         }
@@ -163,7 +163,7 @@ impl<'de> Deserialize<'de> for ObjectTypeId {
     }
 }
 
-fn validate_object_type_id(value: &str) -> Result<(), String> {
+pub(crate) fn validate_extension_id(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 128 {
         return Err("object type ID must contain 1 to 128 bytes".to_string());
     }

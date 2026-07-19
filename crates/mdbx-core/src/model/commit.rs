@@ -58,6 +58,9 @@ pub enum ChangeScope {
     Project,
     Entry,
     Attachment,
+    ObjectRelation,
+    ObjectLabel,
+    ObjectLabelAssignment,
     VaultMeta,
     KeyEpoch,
     /// 跨越多个对象类型
@@ -70,6 +73,9 @@ impl std::fmt::Display for ChangeScope {
             ChangeScope::Project => write!(f, "project"),
             ChangeScope::Entry => write!(f, "entry"),
             ChangeScope::Attachment => write!(f, "attachment"),
+            ChangeScope::ObjectRelation => write!(f, "object-relation"),
+            ChangeScope::ObjectLabel => write!(f, "object-label"),
+            ChangeScope::ObjectLabelAssignment => write!(f, "object-label-assignment"),
             ChangeScope::VaultMeta => write!(f, "vault-meta"),
             ChangeScope::KeyEpoch => write!(f, "key-epoch"),
             ChangeScope::Multi => write!(f, "multi"),
@@ -124,6 +130,9 @@ pub enum TombstoneTargetType {
     Entry,
     Attachment,
     Branch,
+    ObjectRelation,
+    ObjectLabel,
+    ObjectLabelAssignment,
 }
 
 impl std::fmt::Display for TombstoneTargetType {
@@ -133,6 +142,11 @@ impl std::fmt::Display for TombstoneTargetType {
             TombstoneTargetType::Entry => write!(f, "entry"),
             TombstoneTargetType::Attachment => write!(f, "attachment"),
             TombstoneTargetType::Branch => write!(f, "branch"),
+            TombstoneTargetType::ObjectRelation => write!(f, "object-relation"),
+            TombstoneTargetType::ObjectLabel => write!(f, "object-label"),
+            TombstoneTargetType::ObjectLabelAssignment => {
+                write!(f, "object-label-assignment")
+            }
         }
     }
 }
@@ -146,6 +160,9 @@ impl std::str::FromStr for TombstoneTargetType {
             "entry" => Ok(TombstoneTargetType::Entry),
             "attachment" => Ok(TombstoneTargetType::Attachment),
             "branch" => Ok(TombstoneTargetType::Branch),
+            "object-relation" => Ok(TombstoneTargetType::ObjectRelation),
+            "object-label" => Ok(TombstoneTargetType::ObjectLabel),
+            "object-label-assignment" => Ok(TombstoneTargetType::ObjectLabelAssignment),
             _ => Err(format!("unknown TombstoneTargetType: {}", s)),
         }
     }

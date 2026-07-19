@@ -9,6 +9,9 @@ pub type BranchId = String;
 pub type KeyEpochId = String;
 pub type SnapshotId = String;
 pub type TombstoneId = String;
+pub type ObjectRelationId = String;
+pub type ObjectLabelId = String;
+pub type ObjectLabelAssignmentId = String;
 
 /// hex(SHA-256) 形式的 hash。
 pub type ContentHash = String;

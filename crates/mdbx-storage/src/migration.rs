@@ -6,17 +6,18 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::v2;
+use crate::schema::{v2, v7};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
 pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlation-v1";
 pub const MIGRATION_STABLE_BRANCH_ID: &str = "mdbx-2-stable-branch-id-v1";
+pub const MIGRATION_GENERIC_METADATA: &str = "mdbx-2-generic-metadata-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -201,7 +202,7 @@ pub fn upgrade_to_latest(conn: &Connection) -> StorageResult<Option<FormatInfo>>
 }
 
 pub fn read_format_info(conn: &Connection) -> StorageResult<FormatInfo> {
-    validate_v2_schema(conn)?;
+    validate_current_schema(conn)?;
     conn.query_row(
         "SELECT format_version, schema_version, min_reader_version, min_writer_version
          FROM vault_meta LIMIT 1",
@@ -244,6 +245,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         conn.execute_batch(v2::SCHEMA_MIGRATIONS_DDL)
             .map_err(StorageError::Database)?;
         v2::create_extensions(conn)?;
+        v7::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -300,12 +302,13 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         1
     };
     if schema_version >= CURRENT_SCHEMA_VERSION {
-        return validate_v2_schema(conn);
+        return validate_current_schema(conn);
     }
 
     conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
     let result = (|| -> StorageResult<()> {
         v2::create_extensions(conn)?;
+        v7::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
@@ -331,6 +334,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_STABLE_BRANCH_ID, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_GENERIC_METADATA, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -359,7 +368,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
             Err(error)
         }
     }?;
-    validate_v2_schema(conn)
+    validate_current_schema(conn)
 }
 
 fn migrate_tiga1_policy(conn: &Connection, now: &str) -> StorageResult<bool> {
@@ -493,7 +502,7 @@ fn legacy_unlock_configuration_complies(conn: &Connection, mode: TigaMode) -> St
     })
 }
 
-fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
+fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
     for column in [
         "schema_version",
         "min_reader_version",
@@ -523,6 +532,9 @@ fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
         "security_audit_events",
         "commit_operations",
         "commit_device_sequences",
+        "object_relations",
+        "object_labels",
+        "object_label_assignments",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -825,6 +837,42 @@ mod tests {
     }
 
     #[test]
+    fn schema6_vault_gains_generic_metadata_tables() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        conn.inner()
+            .execute_batch(
+                "DROP TABLE object_label_assignments;
+                 DROP TABLE object_labels;
+                 DROP TABLE object_relations;
+                 DELETE FROM schema_migrations WHERE migration_id = 'mdbx-2-generic-metadata-v1';
+                 UPDATE vault_meta SET schema_version = 6;",
+            )
+            .unwrap();
+
+        let inspection = inspect_migration(conn.inner()).unwrap();
+        assert!(inspection.requires_upgrade);
+        let info = upgrade_to_latest(conn.inner()).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        for table in [
+            "object_relations",
+            "object_labels",
+            "object_label_assignments",
+        ] {
+            assert!(table_exists(conn.inner(), table).unwrap());
+        }
+        let migration_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_GENERIC_METADATA],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
     fn explicit_upgrade_missing_path_does_not_create_a_file() {
         let path = std::env::temp_dir().join(format!(
             "mdbx-missing-upgrade-{}.mdbx",
@@ -898,6 +946,9 @@ mod tests {
         assert!(table_exists(&conn, "commit_operations").unwrap());
         assert!(v2::column_exists(&conn, "commit_operations", "branch_id").unwrap());
         assert!(table_exists(&conn, "commit_device_sequences").unwrap());
+        assert!(table_exists(&conn, "object_relations").unwrap());
+        assert!(table_exists(&conn, "object_labels").unwrap());
+        assert!(table_exists(&conn, "object_label_assignments").unwrap());
     }
 
     #[test]
