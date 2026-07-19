@@ -4,6 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = [
+    "kdbx-import",
+    "kdbx-export",
+    "benchmarks",
+    "derived-search-index",
+]
+core = []
+kdbx-import = []
+kdbx-export = []
+derived-search-index = []
+benchmarks = ["derived-search-index"]
+
 [dependencies]
 mdbx-core = { path = "../mdbx-core" }
 mdbx-crypto = { path = "../mdbx-crypto" }

@@ -10,7 +10,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 mdbx-core = { path = "../mdbx-core" }
-mdbx-storage = { path = "../mdbx-storage" }
+mdbx-storage = { path = "../mdbx-storage", default-features = false, features = ["core"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

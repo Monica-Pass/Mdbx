@@ -1226,6 +1226,7 @@ mod tests {
     };
     use crate::repo::object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
     use crate::repo::project::ProjectRepo;
+    #[cfg(feature = "derived-search-index")]
     use crate::search::SearchService;
     use crate::tiga::TigaService;
     use mdbx_core::model::{EntryType, RelationKindId, UnlockMethodType, VaultSession};
@@ -1999,6 +2000,7 @@ mod tests {
         assert_eq!(a1_restored.storage_mode, StorageMode::EmbeddedInline);
     }
 
+    #[cfg(feature = "derived-search-index")]
     #[test]
     fn restore_reinstates_exact_active_set_tags_and_causal_heads() {
         let (conn, ctx) = setup();

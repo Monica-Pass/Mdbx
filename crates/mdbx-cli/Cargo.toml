@@ -4,13 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["search", "benchmark", "kdbx-import", "kdbx-export"]
+core = ["mdbx-storage/core"]
+search = ["mdbx-storage/derived-search-index"]
+benchmark = ["mdbx-storage/benchmarks"]
+kdbx-import = ["mdbx-storage/kdbx-import"]
+kdbx-export = ["mdbx-storage/kdbx-export"]
+
 [[bin]]
 name = "mdbx"
 path = "src/main.rs"
 
 [dependencies]
 mdbx-core = { path = "../mdbx-core" }
-mdbx-storage = { path = "../mdbx-storage" }
+mdbx-storage = { path = "../mdbx-storage", default-features = false }
 mdbx-sync = { path = "../mdbx-sync" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }

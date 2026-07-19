@@ -4,13 +4,20 @@ use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::backup::BackupService;
+#[cfg(feature = "benchmark")]
 use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
-use mdbx_storage::import::{KdbxEntry, KdbxExporter, KdbxImporter};
+#[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
+use mdbx_storage::import::KdbxEntry;
+#[cfg(feature = "kdbx-export")]
+use mdbx_storage::import::KdbxExporter;
+#[cfg(feature = "kdbx-import")]
+use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::CommitContext;
 use mdbx_storage::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
+#[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
 use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
 use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_state_payload;
@@ -90,6 +97,7 @@ enum Commands {
         action: SnapshotAction,
     },
     /// 全文搜索
+    #[cfg(feature = "search")]
     Search {
         /// 搜索关键词
         query: Option<String>,
@@ -113,17 +121,20 @@ enum Commands {
         output: PathBuf,
     },
     /// 运行本地 benchmark harness
+    #[cfg(feature = "benchmark")]
     Benchmark {
         /// 每个 benchmark 的迭代次数
         #[arg(short, long, default_value_t = 20)]
         iterations: u32,
     },
     /// 从 KDBX JSON 互操作文件导入
+    #[cfg(feature = "kdbx-import")]
     ImportKdbxJson {
         /// 输入 JSON 文件，内容为 KdbxEntry 数组
         file: PathBuf,
     },
     /// 导出为 KDBX JSON 互操作文件
+    #[cfg(feature = "kdbx-export")]
     ExportKdbxJson {
         /// 输出 JSON 文件
         output: PathBuf,
@@ -344,6 +355,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_snapshot(&mut conn, action)
         }
+        #[cfg(feature = "search")]
         Commands::Search {
             query,
             tag,
@@ -361,11 +373,14 @@ fn run(cli: Cli) -> Result<(), String> {
             cmd_health(&conn)
         }
         Commands::Backup { output } => cmd_backup(&cli.vault, output),
+        #[cfg(feature = "benchmark")]
         Commands::Benchmark { iterations } => cmd_benchmark(iterations),
+        #[cfg(feature = "kdbx-import")]
         Commands::ImportKdbxJson { file } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_import_kdbx_json(&mut conn, file)
         }
+        #[cfg(feature = "kdbx-export")]
         Commands::ExportKdbxJson { output } => {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_export_kdbx_json(&conn, output)
@@ -1061,6 +1076,7 @@ fn cmd_snapshot(conn: &mut VaultConnection, action: SnapshotAction) -> Result<()
 // SEARCH
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "search")]
 fn cmd_search(
     conn: &mut VaultConnection,
     query: Option<String>,
@@ -1181,6 +1197,7 @@ fn severity_label(severity: IssueSeverity) -> &'static str {
     }
 }
 
+#[cfg(feature = "benchmark")]
 fn cmd_benchmark(iterations: u32) -> Result<(), String> {
     if iterations == 0 {
         return Err("iterations must be greater than zero".to_string());
@@ -1190,6 +1207,7 @@ fn cmd_benchmark(iterations: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "kdbx-import")]
 fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(), String> {
     let bytes =
         std::fs::read(&file).map_err(|e| format!("failed to read '{}': {}", file.display(), e))?;
@@ -1210,6 +1228,7 @@ fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(),
     Ok(())
 }
 
+#[cfg(feature = "kdbx-export")]
 fn cmd_export_kdbx_json(conn: &VaultConnection, output: PathBuf) -> Result<(), String> {
     let mut entries: Vec<KdbxEntry> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -2224,6 +2243,7 @@ mod tests {
             .contains("pass --unlock-password or --unlock-pin"));
     }
 
+    #[cfg(feature = "benchmark")]
     #[test]
     fn cli_exposes_health_and_benchmark() {
         let vault = TempVault::new();
@@ -2234,6 +2254,7 @@ mod tests {
         run(cli(&path, Commands::Benchmark { iterations: 1 })).unwrap();
     }
 
+    #[cfg(all(feature = "kdbx-import", feature = "kdbx-export"))]
     #[test]
     fn cli_can_import_and_export_kdbx_json() {
         let vault = TempVault::new();

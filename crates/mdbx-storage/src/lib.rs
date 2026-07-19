@@ -1,10 +1,13 @@
 pub mod backup;
+#[cfg(feature = "benchmarks")]
 pub mod benchmark;
+pub mod capability;
 pub(crate) mod commit_integrity;
 pub mod conflict;
 pub mod connection;
 pub(crate) mod crypto_layer;
 pub mod error;
+#[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 pub mod import;
 pub mod init;
 pub mod key_epoch;
@@ -12,6 +15,7 @@ pub mod migration;
 pub mod recovery;
 pub mod repo;
 pub mod schema;
+#[cfg(feature = "derived-search-index")]
 pub mod search;
 pub mod sync_apply;
 pub mod sync_state;

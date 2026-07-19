@@ -84,3 +84,23 @@ Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payloa
 ### Capability Features
 
 Cargo features select optional adapters and tools. Default builds retain current behavior. Minimal builds may remove imports, benchmarks, or domain indexes while keeping the same file reader, compatibility migrator, encryption, and generic object interfaces.
+
+The supported storage profiles are:
+
+| Profile | Cargo selection | Included behavior |
+|---|---|---|
+| Full | default features | Mandatory database core, KDBX JSON import and export, benchmark harness, and the MDBX1 derived search adapter |
+| Core | `--no-default-features --features core` | Mandatory database core only |
+
+Optional storage features are additive:
+
+| Feature | Capability |
+|---|---|
+| `kdbx-import` | KDBX JSON import adapter |
+| `kdbx-export` | KDBX JSON export adapter |
+| `derived-search-index` | Legacy password-project search and temporary FTS index |
+| `benchmarks` | Local benchmark harness; enables `derived-search-index` |
+
+`CapabilitySet::current()` exposes the compiled capability set to Rust clients. Mandatory fields always report true in a supported build. Optional fields reflect Cargo feature selection.
+
+When a domain adapter is absent, the Generic Object Module continues to read, authenticate, preserve, snapshot, synchronize, and recover its namespaced ObjectTypeIds as opaque records. Adapter-specific Rust modules and CLI commands are absent from that build. An absent adapter never authorizes plaintext interpretation, rewrites the type identity, or removes stored data. Unknown critical storage extensions continue to fail before writable open.

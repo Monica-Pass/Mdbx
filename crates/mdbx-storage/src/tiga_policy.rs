@@ -577,6 +577,7 @@ impl TigaService {
         Ok(decision)
     }
 
+    #[cfg(feature = "kdbx-export")]
     pub(crate) fn execute_authorized<T>(
         conn: &VaultConnection,
         scope: &TigaScope,

@@ -774,7 +774,10 @@ fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
-    use crate::repo::{CommitContext, ProjectRepo};
+    use crate::repo::CommitContext;
+    #[cfg(feature = "derived-search-index")]
+    use crate::repo::ProjectRepo;
+    #[cfg(feature = "derived-search-index")]
     use crate::search::SearchService;
     use crate::unlock::UnlockService;
 
@@ -785,6 +788,7 @@ mod tests {
         (conn, ctx)
     }
 
+    #[cfg(feature = "derived-search-index")]
     #[test]
     fn collect_sync_state_includes_empty_project_tag_sets() {
         let (conn, ctx) = setup();

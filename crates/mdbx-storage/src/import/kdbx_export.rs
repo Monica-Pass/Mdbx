@@ -266,6 +266,7 @@ impl KdbxExporter {
 mod tests {
     use super::*;
     use crate::error::StorageError;
+    #[cfg(feature = "kdbx-import")]
     use crate::import::kdbx_model::{KdbxAttachment, KdbxEntry};
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::attachment::AttachmentRepo;
@@ -610,6 +611,7 @@ mod tests {
     // IMPORT → EXPORT ROUNDTRIP
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "kdbx-import")]
     #[test]
     fn test_import_export_roundtrip() {
         let (conn, ctx) = setup();
