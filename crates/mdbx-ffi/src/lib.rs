@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
-    Conflict, ConflictObjectType, ConflictResolution, EntryType, ObjectTypeId, RelationKindId,
-    Tombstone, UnlockMethodType,
+    Conflict, ConflictObjectType, ConflictResolution, EntryType, ObjectSummary, ObjectTypeId,
+    RelationKindId, Tombstone, UnlockMethodType,
 };
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
@@ -26,9 +26,9 @@ use mdbx_storage::repo::{
     BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
     CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
-    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
-    PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility,
-    TombstonePurgeScheduleResult, TombstoneRepo,
+    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ObjectSummaryRepo,
+    OperationExecution, PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker,
+    TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -352,6 +352,24 @@ pub struct MdbxObjectRecord {
     pub payload_json: String,
     pub payload_schema_version: u32,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectSummary {
+    pub object_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub title: String,
+    pub payload_schema_version: u32,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectSummaryPage {
+    pub items: Vec<MdbxObjectSummary>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1495,6 +1513,32 @@ impl MdbxVault {
             None => EntryRepo::list_by_project(&conn, &collection_id)?,
         };
         objects.iter().map(object_record_from_entry).collect()
+    }
+
+    pub fn list_object_summaries(
+        &self,
+        collection_id: String,
+        object_type_id: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let object_type_id = parse_optional_object_type_id(object_type_id)?;
+        let page = ObjectSummaryRepo::list(
+            &conn,
+            &collection_id,
+            object_type_id.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn update_object(
@@ -2713,6 +2757,24 @@ fn object_record_from_entry(
         payload_schema_version: entry.payload_schema_version,
         deleted: entry.deleted,
     })
+}
+
+fn object_summary_from_core(summary: ObjectSummary) -> MdbxObjectSummary {
+    MdbxObjectSummary {
+        object_id: summary.object_id,
+        collection_id: summary.collection_id,
+        object_type_id: summary.object_type_id.to_string(),
+        title: summary
+            .title
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        payload_schema_version: summary.payload_schema_version,
+        head_commit_id: summary.head_commit_id,
+        deleted: summary.deleted,
+        updated_at: summary.updated_at,
+    }
 }
 
 fn conflict_resolution(choice: MdbxConflictChoice) -> ConflictResolution {

@@ -531,6 +531,85 @@ fn creates_reopens_and_preserves_generic_entries() {
 }
 
 #[test]
+fn generic_object_summaries_are_paginated_and_query_bound() {
+    let vault_path = temp_vault_path("object-summaries");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "summary password 12345!".to_string(),
+        "ffi-summary-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let other_collection = vault.create_project("Other".to_string()).unwrap();
+    for index in 0..5 {
+        vault
+            .create_object(
+                collection.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                format!("Message {index}"),
+                format!(r#"{{"body":"secret body {index}"}}"#),
+                4,
+            )
+            .unwrap();
+    }
+
+    let first = vault
+        .list_object_summaries(
+            collection.project_id.clone(),
+            Some("com.monica.mail.message".to_string()),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first.next_cursor.is_some());
+    assert!(first.items.iter().all(|item| {
+        item.collection_id == collection.project_id
+            && item.object_type_id == "com.monica.mail.message"
+            && item.payload_schema_version == 4
+            && !item.head_commit_id.is_empty()
+    }));
+
+    let second = vault
+        .list_object_summaries(
+            collection.project_id.clone(),
+            Some("com.monica.mail.message".to_string()),
+            2,
+            first.next_cursor.clone(),
+        )
+        .unwrap();
+    assert_eq!(second.items.len(), 2);
+    assert!(second.next_cursor.is_some());
+    let third = vault
+        .list_object_summaries(
+            collection.project_id.clone(),
+            Some("com.monica.mail.message".to_string()),
+            2,
+            second.next_cursor,
+        )
+        .unwrap();
+    assert_eq!(third.items.len(), 1);
+    assert!(third.next_cursor.is_none());
+
+    assert!(vault
+        .list_object_summaries(
+            other_collection.project_id,
+            Some("com.monica.mail.message".to_string()),
+            2,
+            first.next_cursor,
+        )
+        .is_err());
+    let full = vault
+        .list_objects(
+            collection.project_id,
+            Some("com.monica.mail.message".to_string()),
+        )
+        .unwrap();
+    assert_eq!(full.len(), 5);
+    assert!(full[0].payload_json.contains("secret body"));
+}
+
+#[test]
 fn updates_deletes_restores_and_moves_generic_entry() {
     let vault_path = temp_vault_path("mutation");
     let path = vault_path.as_path_string();

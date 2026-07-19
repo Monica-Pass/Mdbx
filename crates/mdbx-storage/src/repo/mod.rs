@@ -6,6 +6,7 @@ pub mod conflict;
 pub mod entry;
 pub mod object_label;
 pub mod object_relation;
+pub mod object_summary;
 pub mod object_version;
 pub mod project;
 pub mod snapshot;
@@ -24,6 +25,7 @@ pub use object_label::{
     ObjectLabelRepo,
 };
 pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
+pub use object_summary::{ObjectSummaryRepo, MAX_OBJECT_SUMMARY_PAGE_SIZE};
 pub use object_version::ObjectVersionRepo;
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;

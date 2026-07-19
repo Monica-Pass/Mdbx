@@ -35,6 +35,27 @@ pub struct Entry {
     pub updated_by_device_id: DeviceId,
 }
 
+/// 通用对象的列表摘要。摘要只包含列表和选择界面需要的元数据，不包含对象载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSummary {
+    pub object_id: EntryId,
+    pub collection_id: ProjectId,
+    pub object_type_id: ObjectTypeId,
+    /// 解密后的标题字节。旧数据允许非 UTF-8 标题，因此核心层保留原始字节。
+    pub title: Option<Vec<u8>>,
+    pub payload_schema_version: u32,
+    pub head_commit_id: CommitId,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+/// 有界对象摘要页。`next_cursor` 是绑定查询条件的存储层不透明游标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSummaryPage {
+    pub items: Vec<ObjectSummary>,
+    pub next_cursor: Option<String>,
+}
+
 /// 通用对象类型标识。旧 EntryType 变体保持兼容，自定义标识精确保留。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectTypeId {
@@ -188,6 +209,27 @@ pub(crate) fn validate_extension_id(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_summary_roundtrips_without_payload_field() {
+        let summary = ObjectSummary {
+            object_id: "object-1".to_string(),
+            collection_id: "collection-1".to_string(),
+            object_type_id: ObjectTypeId::custom("com.monica.mail.message").unwrap(),
+            title: Some(b"message".to_vec()),
+            payload_schema_version: 3,
+            head_commit_id: "commit-1".to_string(),
+            deleted: false,
+            updated_at: "2026-07-20T00:00:00Z".to_string(),
+        };
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert!(encoded.get("payload").is_none());
+        assert!(encoded.get("payload_ct").is_none());
+        assert_eq!(
+            serde_json::from_value::<ObjectSummary>(encoded).unwrap(),
+            summary
+        );
+    }
 
     #[test]
     fn legacy_entry_types_keep_their_names() {

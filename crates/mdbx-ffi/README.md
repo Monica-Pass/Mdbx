@@ -120,6 +120,12 @@ Rotation is not an ordinary idempotent operation API. If a network response is u
 
 Invalid values return `MdbxFfiError::InvalidEntryType`.
 
+### Paginated Object Summaries
+
+Use `list_object_summaries` for collection and search-result screens. It returns a bounded page containing object identity, type, title, payload schema version, head commit, and update time without reading or decrypting `payload_json`.
+
+The opaque `next_cursor` is bound to the requested collection and optional object type. Reusing it with different filters returns an error. Page sizes must be between 1 and 200. Existing `list_objects` and `list_entries` remain available when a caller intentionally needs complete payloads.
+
 ### Payload JSON
 
 `payload_json` must be a valid JSON string. The FFI layer validates that it parses as JSON and stores the parsed value through the storage repository APIs.

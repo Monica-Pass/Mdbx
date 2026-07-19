@@ -16,8 +16,8 @@ use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
-    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, EntryRepo, ProjectRepo,
-    SnapshotRepo,
+    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, EntryRepo,
+    ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
 };
 use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
 #[cfg(feature = "search")]
@@ -733,28 +733,43 @@ fn cmd_entry(conn: &mut VaultConnection, action: EntryAction) -> Result<(), Stri
             project_id,
             entry_type,
         } => {
-            let entries = if let Some(et) = entry_type {
-                let et: EntryType = et
-                    .parse()
-                    .map_err(|_| format!("unknown entry type: {}", et))?;
-                let all = EntryRepo::list_by_type(conn, et).map_err(|e| format!("{}", e))?;
-                all.into_iter()
-                    .filter(|e| e.project_id == project_id)
-                    .collect()
-            } else {
-                EntryRepo::list_by_project(conn, &project_id).map_err(|e| format!("{}", e))?
-            };
-
-            if entries.is_empty() {
-                println!("(no entries)");
+            let entry_type = entry_type
+                .map(|value| {
+                    value
+                        .parse::<EntryType>()
+                        .map_err(|_| format!("unknown entry type: {value}"))
+                })
+                .transpose()?;
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = ObjectSummaryRepo::list(
+                    conn,
+                    &project_id,
+                    entry_type.as_ref(),
+                    100,
+                    cursor.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
+                for object in page.items {
+                    found = true;
+                    let title = object
+                        .title
+                        .as_ref()
+                        .map(|title| String::from_utf8_lossy(title).to_string())
+                        .unwrap_or_else(|| "(untitled)".to_string());
+                    println!(
+                        "{}  {:?}  {}",
+                        object.object_id, object.object_type_id, title
+                    );
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for e in &entries {
-                let title = e
-                    .title_ct
-                    .as_ref()
-                    .map(|t| String::from_utf8_lossy(t).to_string())
-                    .unwrap_or_else(|| "(untitled)".to_string());
-                println!("{}  {:?}  {}", e.entry_id, e.entry_type, title);
+            if !found {
+                println!("(no entries)");
             }
         }
         EntryAction::Create {
@@ -1927,6 +1942,52 @@ mod tests {
             &path,
             Commands::Entry {
                 action: EntryAction::Deleted,
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_entry_list_does_not_decrypt_object_payloads() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Summary Collection".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx(),
+            &project_id,
+            EntryType::Login,
+            Some("Visible title"),
+            &serde_json::json!({"password": "secret"}),
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                params![entry.entry_id],
+            )
+            .unwrap();
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::List {
+                    project_id,
+                    entry_type: Some("login".to_string()),
+                },
             },
         ))
         .unwrap();

@@ -120,6 +120,12 @@ Power 整改通过 `setup_password_security_key_unlock`、`list_unlock_methods` 
 
 未知值会返回 `MdbxFfiError::InvalidEntryType`。
 
+### 分页对象摘要
+
+collection 列表和搜索结果页面应使用 `list_object_summaries`。该接口返回有界分页，只包含对象身份、类型、标题、payload schema 版本、head commit 和更新时间，不读取或解密 `payload_json`。
+
+不透明的 `next_cursor` 与请求的 collection 和可选 object type 绑定。游标用于其他过滤条件时会返回错误。页大小范围为 1 到 200。调用方明确需要完整载荷时，现有 `list_objects` 和 `list_entries` 仍然可用。
+
 ### Payload JSON
 
 `payload_json` 必须是合法 JSON 字符串。FFI 层会校验它能被解析为 JSON，然后通过 storage repository API 写入解析后的值。
