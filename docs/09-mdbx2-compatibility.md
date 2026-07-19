@@ -20,7 +20,7 @@ An upgraded vault records:
 
 ```text
 format_version     = MDBX-2
-schema_version     = 3
+schema_version     = 4
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -34,7 +34,7 @@ On writable open, MDBX2 reads format metadata, rejects unsupported critical exte
 
 Tiga1 profiles are mapped to Tiga policy version 2 in the same transaction. Existing weaker project or entry profiles become deterministic remediation exceptions. An unlock configuration that does not yet satisfy the new profile is marked `remediation-required`; migration never rewrites KDF parameters or wrapped vault-key bytes and does not deny access solely because remediation is pending.
 
-Early MDBX2 vaults with schema version 2 upgrade in place to schema version 3 without changing the `MDBX-2` format marker.
+Early MDBX2 vaults with schema versions 2 or 3 upgrade in place to schema version 4 without changing the `MDBX-2` format marker. Schema 4 adds operation-level commit metadata and atomic per-device sequence state while retaining the original `commits` table and DAG as the MDBX1-compatible projection.
 
 Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 executes `MDBX-1 -> MDBX-2 -> MDBX-3`.
 
@@ -46,6 +46,8 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - New snapshots include project tags and attachment chunks without clearing fields absent from legacy snapshots.
 - Tiga mutations atomically update commits, rows, heads, and object versions.
 - Tiga2 policy state, scoped overrides, exact exceptions, and typed audit events are synchronized. Concurrent policy conflicts merge toward the stricter value.
+- Commit2 adds idempotent operation IDs, typed change summaries, branch-aware heads, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
+- Sync protocol and offline bundles use version 2 for operation metadata; MDBX2 readers still convert version 1 bundles with no operation metadata.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
 
 ## Client/Core Boundary

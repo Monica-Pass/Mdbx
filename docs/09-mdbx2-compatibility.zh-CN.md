@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；完整 Tiga2 策略使用 `3`。
+  - 当前内部 schema 序号；Commit2 与完整 Tiga2 策略使用 `4`。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 3
+schema_version    = 4
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -56,6 +56,10 @@ tiga_policy_version = 2
 
 未来 MDBX3 打开 MDBX-1 时 MUST 顺序执行 `MDBX-1 -> MDBX-2 -> MDBX-3`，不得跳过中间代际迁移。
 
+早期 schema 2 或 schema 3 的 MDBX2 vault 会原地升级到 schema 4，不改变 `MDBX-2`
+格式标记。schema 4 增加 operation-level commit 元数据和设备原子序列状态，同时继续保留旧
+`commits` 表与 DAG 作为 MDBX1 兼容投影。
+
 ## 4. Schema 演进规则
 
 - 新字段 SHOULD 可空或带安全默认值。
@@ -73,6 +77,10 @@ MDBX2 同时收紧以下实现边界：
 - snapshot 创建和恢复进入原子事务。
 - snapshot 恢复重建精确 active set；快照后新增对象保留历史行，但通过 tombstone 离开 active set。
 - snapshot 恢复为所有受影响对象写入统一 causal head 和 object version。
+- Commit2 增加幂等 operation ID、结构化变更摘要、分支感知 head、合并后的 vector clock 和
+  原子设备序列分配，不重写任何历史 commit。
+- 同步协议与离线 bundle 使用 v2 传输 operation 元数据；MDBX2 仍可转换读取没有 operation
+  元数据的 v1 bundle。
 - 新 snapshot 明确携带 project tags 和 attachment chunks；旧快照缺少这些字段时不清空现有兼容数据。
 - Tiga global/project/entry mutation 的 commit、对象更新、head 和 object version 原子提交。
 - Tiga2 增加版本化策略、精确例外和类型化安全审计；策略状态、覆盖、例外和审计进入同步状态。
