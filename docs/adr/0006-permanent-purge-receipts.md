@@ -37,4 +37,4 @@ Old synchronization state and snapshots cannot revive a permanently cleaned stab
 
 The receipt is a durable logical-erasure proof, not a claim that every storage medium has been securely overwritten. Stronger erasure requires later object-key destruction, snapshot lifecycle controls, and deletion of external backup media.
 
-MDBX1 public interfaces and the physical `projects` and `entries` tables remain present. Older MDBX2 schemas migrate automatically to schema 9, and old synchronization payloads remain readable because the receipt collection is optional during deserialization.
+MDBX1 public interfaces and the physical `projects` and `entries` tables remain present. Older MDBX2 schemas migrate automatically through schema 9 and later compatible schema upgrades, and old synchronization payloads remain readable because the receipt collection is optional during deserialization.

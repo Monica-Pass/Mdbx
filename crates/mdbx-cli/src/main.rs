@@ -16,7 +16,8 @@ use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
-    AttachmentRepo, AttachmentWriteOptions, EntryRepo, ProjectRepo, SnapshotRepo,
+    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, EntryRepo, ProjectRepo,
+    SnapshotRepo,
 };
 use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
 #[cfg(feature = "search")]
@@ -421,10 +422,19 @@ fn ctx() -> CommitContext {
 const ATTACHMENT_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 fn export_attachment_to_path(
-    conn: &VaultConnection,
+    conn: &mut VaultConnection,
     attachment_id: &str,
     output: &Path,
 ) -> Result<u64, String> {
+    let device = cli_device_context();
+    AttachmentRepo::authorize_plaintext_access_with_active_session(
+        conn,
+        attachment_id,
+        AttachmentPlaintextPurpose::Export,
+        &device,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|error| error.to_string())?;
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -978,6 +988,15 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
                 let written = export_attachment_to_path(conn, &attachment_id, &path)?;
                 println!("Wrote {} bytes to {}", written, path.display());
             } else {
+                let device = cli_device_context();
+                AttachmentRepo::authorize_plaintext_access_with_active_session(
+                    conn,
+                    &attachment_id,
+                    AttachmentPlaintextPurpose::InMemory,
+                    &device,
+                    chrono::Utc::now().timestamp(),
+                )
+                .map_err(|error| error.to_string())?;
                 let data = AttachmentRepo::read_content(conn, &attachment_id)
                     .map_err(|e| format!("{}", e))?;
                 // stdout — only if looks like text
@@ -1536,6 +1555,7 @@ mod tests {
     use super::*;
     use mdbx_storage::sync_apply::SyncApplyRepo;
     use mdbx_storage::sync_state::SYNC_STATE_OBJECT_TYPE;
+    use mdbx_storage::tiga::TigaService;
     use mdbx_sync::CommitBatch;
     use std::path::{Path, PathBuf};
 
@@ -2150,6 +2170,99 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(remaining_files, vec![output.file_name().unwrap()]);
+
+        let _ = std::fs::remove_file(input);
+    }
+
+    #[test]
+    fn cli_attachment_export_is_denied_before_temporary_file_creation() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Power Export".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let session = conn.active_session().cloned().unwrap();
+        let device = cli_device_context();
+        TigaService::set_project_profile_authorized(
+            &conn,
+            &ctx(),
+            &project_id,
+            Some(TigaMode::Power),
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: chrono::Utc::now().timestamp(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-denied-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&input, b"protected content").unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id: project_id.clone(),
+                    entry_id: None,
+                    file: input.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let attachment = AttachmentRepo::list_by_project(&conn, &project_id)
+            .unwrap()
+            .remove(0);
+        drop(conn);
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = output_dir.path().join("existing.bin");
+        std::fs::write(&output, b"keep existing content").unwrap();
+        let error = run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Get {
+                    attachment_id: attachment.attachment_id.clone(),
+                    output: Some(output.clone()),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("authorization"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep existing content");
+        let remaining_files: Vec<_> = std::fs::read_dir(output_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining_files, vec![output.file_name().unwrap()]);
+
+        let conn = open_unlocked(&path);
+        let event = TigaService::list_security_audit_events(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.operation == mdbx_core::tiga::TigaOperation::ExportData)
+            .unwrap();
+        assert_eq!(
+            event.scope,
+            mdbx_core::tiga::TigaScope::Attachment {
+                attachment_id: attachment.attachment_id
+            }
+        );
+        assert!(event.policy_fingerprint.is_some());
 
         let _ = std::fs::remove_file(input);
     }

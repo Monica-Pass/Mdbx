@@ -578,6 +578,7 @@ pub enum MdbxTigaScopeType {
     Vault,
     Project,
     Entry,
+    Attachment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -595,6 +596,9 @@ impl MdbxTigaScope {
             }),
             MdbxTigaScopeType::Entry => Ok(TigaScope::Entry {
                 entry_id: required_scope_id(self.scope_id, "entry")?,
+            }),
+            MdbxTigaScopeType::Attachment => Ok(TigaScope::Attachment {
+                attachment_id: required_scope_id(self.scope_id, "attachment")?,
             }),
         }
     }
@@ -1184,6 +1188,9 @@ impl MdbxVault {
             }
             TigaScope::Entry { entry_id } => {
                 TigaService::resolve_policy_for_entry(&conn, &entry_id)?
+            }
+            TigaScope::Attachment { attachment_id } => {
+                TigaService::resolve_policy_for_attachment(&conn, &attachment_id)?
             }
         };
         Ok(resolved.into())
@@ -2146,6 +2153,10 @@ fn scope_from_core(value: TigaScope) -> MdbxTigaScope {
             scope_type: MdbxTigaScopeType::Entry,
             scope_id: Some(entry_id),
         },
+        TigaScope::Attachment { attachment_id } => MdbxTigaScope {
+            scope_type: MdbxTigaScopeType::Attachment,
+            scope_id: Some(attachment_id),
+        },
     }
 }
 
@@ -2773,6 +2784,29 @@ fn object_label_assignment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_tiga_scope_roundtrips_through_ffi_types() {
+        let core = MdbxTigaScope {
+            scope_type: MdbxTigaScopeType::Attachment,
+            scope_id: Some("attachment-1".to_string()),
+        }
+        .into_core()
+        .unwrap();
+        assert_eq!(
+            core,
+            TigaScope::Attachment {
+                attachment_id: "attachment-1".to_string()
+            }
+        );
+        assert_eq!(
+            scope_from_core(core),
+            MdbxTigaScope {
+                scope_type: MdbxTigaScopeType::Attachment,
+                scope_id: Some("attachment-1".to_string())
+            }
+        );
+    }
 
     #[test]
     fn conflict_facade_lists_and_resolves_generic_metadata() {

@@ -13,6 +13,7 @@ use mdbx_crypto::integrity::hmac_sha256;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::repo::attachment::AttachmentRepo;
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
@@ -392,6 +393,29 @@ impl TigaService {
         if let Some(mode) = entry.tiga_mode_override {
             resolved = apply_profile_override(conn, resolved, scope.clone(), mode)?;
         }
+        apply_stored_override(conn, resolved, scope)
+    }
+
+    pub fn resolve_policy_for_attachment(
+        conn: &VaultConnection,
+        attachment_id: &str,
+    ) -> StorageResult<ResolvedTigaPolicy> {
+        let (project_id, entry_id): (String, Option<String>) = conn
+            .inner()
+            .query_row(
+                "SELECT project_id, entry_id FROM attachments WHERE attachment_id = ?1",
+                params![attachment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        let scope = TigaScope::Attachment {
+            attachment_id: attachment_id.to_string(),
+        };
+        let resolved = match entry_id {
+            Some(entry_id) => Self::resolve_policy_for_entry(conn, &entry_id)?,
+            None => Self::resolve_policy_for_project(conn, &project_id)?,
+        };
         apply_stored_override(conn, resolved, scope)
     }
 
@@ -950,6 +974,9 @@ fn resolve_scope_policy(
             TigaService::resolve_policy_for_project(conn, project_id)
         }
         TigaScope::Entry { entry_id } => TigaService::resolve_policy_for_entry(conn, entry_id),
+        TigaScope::Attachment { attachment_id } => {
+            TigaService::resolve_policy_for_attachment(conn, attachment_id)
+        }
     }
 }
 
@@ -969,6 +996,21 @@ fn resolve_parent_policy(
             let entry = EntryRepo::get_by_id(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
             TigaService::resolve_policy_for_project(conn, &entry.project_id)
+        }
+        TigaScope::Attachment { attachment_id } => {
+            let (project_id, entry_id): (String, Option<String>) = conn
+                .inner()
+                .query_row(
+                    "SELECT project_id, entry_id FROM attachments WHERE attachment_id = ?1",
+                    params![attachment_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+            match entry_id {
+                Some(entry_id) => TigaService::resolve_policy_for_entry(conn, &entry_id),
+                None => TigaService::resolve_policy_for_project(conn, &project_id),
+            }
         }
     }
 }
@@ -1265,6 +1307,34 @@ fn track_scope_policy_change(
             ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
             commit_id
         }
+        TigaScope::Attachment { attachment_id } => {
+            let attachment = AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))?;
+            if attachment.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "cannot change Tiga policy on a deleted attachment".to_string(),
+                ));
+            }
+            let commit_id = ctx.commit_object_change(
+                conn,
+                "attachments",
+                attachment_id,
+                "change",
+                "attachment",
+            )?;
+            conn.inner().execute(
+                "UPDATE attachments SET head_commit_id = ?1, updated_at = ?2,
+                 updated_by_device_id = ?3 WHERE attachment_id = ?4",
+                params![
+                    commit_id,
+                    chrono::Utc::now().to_rfc3339(),
+                    ctx.device_id,
+                    attachment_id,
+                ],
+            )?;
+            ObjectVersionRepo::record_attachment_current(conn, &commit_id, attachment_id)?;
+            commit_id
+        }
     };
     Ok(commit_id)
 }
@@ -1362,6 +1432,7 @@ pub(crate) fn scope_parts(scope: &TigaScope) -> (&'static str, &str) {
         TigaScope::Vault => ("vault", ""),
         TigaScope::Project { project_id } => ("project", project_id),
         TigaScope::Entry { entry_id } => ("entry", entry_id),
+        TigaScope::Attachment { attachment_id } => ("attachment", attachment_id),
     }
 }
 
@@ -1373,6 +1444,9 @@ fn parse_scope(scope_type: &str, scope_id: &str) -> StorageResult<TigaScope> {
         }),
         "entry" if !scope_id.is_empty() => Ok(TigaScope::Entry {
             entry_id: scope_id.to_string(),
+        }),
+        "attachment" if !scope_id.is_empty() => Ok(TigaScope::Attachment {
+            attachment_id: scope_id.to_string(),
         }),
         _ => Err(StorageError::Validation(format!(
             "invalid Tiga scope {scope_type}:{scope_id}"
@@ -1409,6 +1483,7 @@ fn parse_enum_storage_value<T: for<'de> Deserialize<'de>>(value: &str) -> Storag
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
+    use crate::repo::attachment::{AttachmentPlaintextPurpose, AttachmentRepo};
     use crate::repo::commit_ctx::CommitContext;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
@@ -1554,6 +1629,244 @@ mod tests {
         assert_eq!(resolved.policy.profile, TigaMode::Power);
         assert!(!resolved.policy.egress.export_allowed);
         assert_eq!(resolved.compliance, PolicyCompliance::Compliant);
+    }
+
+    #[test]
+    fn attachment_policy_inherits_entry_and_accepts_its_own_stricter_override() {
+        let (conn, ctx, project_id, entry_id) = setup();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            Some(&entry_id),
+            "mail.eml",
+            Some("message/rfc822"),
+            "",
+            0,
+        )
+        .unwrap();
+        TigaService::set_entry_override(&conn, &ctx, &entry_id, Some(TigaMode::Power)).unwrap();
+
+        let inherited =
+            TigaService::resolve_policy_for_attachment(&conn, &attachment.attachment_id).unwrap();
+        assert_eq!(inherited.policy.profile, TigaMode::Power);
+
+        TigaPolicyStore::put_override(
+            &conn,
+            &TigaScope::Attachment {
+                attachment_id: attachment.attachment_id.clone(),
+            },
+            &TigaPolicyOverride {
+                clipboard_ttl_secs: Some(5),
+                ..Default::default()
+            },
+            None,
+            "device-1",
+            None,
+        )
+        .unwrap();
+        let resolved =
+            TigaService::resolve_policy_for_attachment(&conn, &attachment.attachment_id).unwrap();
+        assert_eq!(resolved.policy.profile, TigaMode::Power);
+        assert_eq!(resolved.policy.disclosure.clipboard_ttl_secs, 5);
+    }
+
+    #[test]
+    fn authorized_attachment_override_updates_head_version_and_audit_scope() {
+        let (conn, ctx, project_id, _) = setup();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "bookmark-export.bin",
+            None,
+            "",
+            0,
+        )
+        .unwrap();
+        let before = attachment.head_commit_id;
+        let session = session(UnlockMethodType::Password, 1_000);
+        let device = standard_device();
+
+        TigaService::set_policy_override_authorized(
+            &conn,
+            &ctx,
+            TigaScope::Attachment {
+                attachment_id: attachment.attachment_id.clone(),
+            },
+            TigaPolicyOverride {
+                clipboard_allowed: Some(false),
+                ..Default::default()
+            },
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+
+        let after = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap()
+            .head_commit_id;
+        assert_ne!(before, after);
+        let version_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions
+                 WHERE object_type = 'attachment' AND object_id = ?1 AND commit_id = ?2",
+                params![attachment.attachment_id, after],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, 1);
+        let event = TigaService::list_security_audit_events(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(event.operation, TigaOperation::ChangeSecurityPolicy);
+        assert_eq!(
+            event.scope,
+            TigaScope::Attachment {
+                attachment_id: attachment.attachment_id
+            }
+        );
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.device_id.as_deref(), Some("device-1"));
+        assert_eq!(event.policy_version, Some(TIGA_POLICY_VERSION));
+        assert!(event.policy_fingerprint.is_some());
+    }
+
+    #[test]
+    fn deleted_attachment_rejects_policy_change_without_persisting_override() {
+        let (conn, ctx, project_id, _) = setup();
+        let attachment =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "deleted.bin", None, "", 0)
+                .unwrap();
+        AttachmentRepo::soft_delete(&conn, &ctx, &attachment.attachment_id).unwrap();
+        let deleted_head = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap()
+            .head_commit_id;
+        let session = session(UnlockMethodType::Password, 1_000);
+        let device = standard_device();
+
+        let error = TigaService::set_policy_override_authorized(
+            &conn,
+            &ctx,
+            TigaScope::Attachment {
+                attachment_id: attachment.attachment_id.clone(),
+            },
+            TigaPolicyOverride {
+                clipboard_allowed: Some(false),
+                ..Default::default()
+            },
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deleted attachment"));
+        let current_head = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap()
+            .head_commit_id;
+        assert_eq!(current_head, deleted_head);
+        let override_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM tiga_policy_overrides
+                 WHERE scope_type = 'attachment' AND scope_id = ?1",
+                params![attachment.attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(override_count, 0);
+    }
+
+    #[test]
+    fn attachment_plaintext_purpose_uses_exact_scope_and_parent_policy() {
+        let (conn, ctx, project_id, entry_id) = setup();
+        let project_attachment =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "project.bin", None, "", 0)
+                .unwrap();
+        let entry_attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            Some(&entry_id),
+            "entry.bin",
+            None,
+            "",
+            0,
+        )
+        .unwrap();
+        let session = session(UnlockMethodType::Password, 1_000);
+        let device = standard_device();
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: 1_010,
+        };
+
+        let in_memory = AttachmentRepo::authorize_plaintext_access(
+            &conn,
+            &project_attachment.attachment_id,
+            AttachmentPlaintextPurpose::InMemory,
+            context,
+        )
+        .unwrap();
+        assert!(in_memory
+            .constraints
+            .contains(&AuthorizationConstraint::NoPlaintextPersistence));
+        let event = TigaService::list_security_audit_events(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(event.operation, TigaOperation::DecryptAttachment);
+        assert_eq!(
+            event.scope,
+            TigaScope::Attachment {
+                attachment_id: project_attachment.attachment_id.clone()
+            }
+        );
+
+        TigaService::set_entry_override(&conn, &ctx, &entry_id, Some(TigaMode::Power)).unwrap();
+        let error = AttachmentRepo::authorize_plaintext_access(
+            &conn,
+            &entry_attachment.attachment_id,
+            AttachmentPlaintextPurpose::Export,
+            context,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+
+        let project_export = AttachmentRepo::authorize_plaintext_access(
+            &conn,
+            &project_attachment.attachment_id,
+            AttachmentPlaintextPurpose::Export,
+            context,
+        )
+        .unwrap();
+        assert!(decision_allows(&project_export));
+
+        TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power)).unwrap();
+        let error = AttachmentRepo::authorize_plaintext_access(
+            &conn,
+            &project_attachment.attachment_id,
+            AttachmentPlaintextPurpose::Export,
+            context,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
     }
 
     #[test]

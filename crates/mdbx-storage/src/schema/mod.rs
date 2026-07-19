@@ -1,4 +1,5 @@
 pub mod v1;
+pub mod v10;
 pub mod v2;
 pub mod v7;
 pub mod v8;
@@ -9,7 +10,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// 当前 schema 版本号。
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// 创建全部表与索引。
 pub fn create_all_tables(conn: &Connection) -> StorageResult<()> {
@@ -17,5 +18,6 @@ pub fn create_all_tables(conn: &Connection) -> StorageResult<()> {
     v2::create_extensions(conn)?;
     v7::create_extensions(conn)?;
     v8::create_extensions(conn)?;
-    v9::create_extensions(conn)
+    v9::create_extensions(conn)?;
+    v10::create_extensions(conn)
 }

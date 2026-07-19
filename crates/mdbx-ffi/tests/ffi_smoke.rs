@@ -976,7 +976,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(9));
+    assert_eq!(upgraded.schema_version, Some(10));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())

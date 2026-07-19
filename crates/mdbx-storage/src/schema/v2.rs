@@ -45,7 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_commit_operations_branch
 pub const TIGA_POLICY_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS tiga_policy_exceptions (
     exception_id         TEXT PRIMARY KEY NOT NULL,
-    target_scope         TEXT NOT NULL CHECK (target_scope IN ('vault', 'project', 'entry')),
+    target_scope         TEXT NOT NULL CHECK (target_scope IN ('vault', 'project', 'entry', 'attachment')),
     target_id            TEXT NOT NULL,
     approved_override_json TEXT NOT NULL,
     reason               TEXT NOT NULL CHECK (length(trim(reason)) > 0),
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS tiga_policy_exceptions (
 );
 
 CREATE TABLE IF NOT EXISTS tiga_policy_overrides (
-    scope_type           TEXT NOT NULL CHECK (scope_type IN ('vault', 'project', 'entry')),
+    scope_type           TEXT NOT NULL CHECK (scope_type IN ('vault', 'project', 'entry', 'attachment')),
     scope_id             TEXT NOT NULL,
     policy_json          TEXT NOT NULL,
     exception_id         TEXT,

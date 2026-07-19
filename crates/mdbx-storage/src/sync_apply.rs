@@ -3001,6 +3001,9 @@ fn tiga_scope_from_parts(scope_type: &str, scope_id: &str) -> StorageResult<Tiga
         "entry" => Ok(TigaScope::Entry {
             entry_id: scope_id.to_string(),
         }),
+        "attachment" => Ok(TigaScope::Attachment {
+            attachment_id: scope_id.to_string(),
+        }),
         other => Err(StorageError::Validation(format!(
             "invalid synced Tiga scope: {other}"
         ))),
@@ -3043,6 +3046,16 @@ mod tests {
     use mdbx_core::tiga::{
         DeviceAssurance, DeviceContext, SessionAssurance, TigaScope, TIGA_POLICY_VERSION,
     };
+
+    #[test]
+    fn synced_tiga_scope_accepts_attachment_ids() {
+        assert_eq!(
+            tiga_scope_from_parts("attachment", "attachment-1").unwrap(),
+            TigaScope::Attachment {
+                attachment_id: "attachment-1".to_string()
+            }
+        );
+    }
     use mdbx_crypto::keyring::Keyring;
     use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit, TombstoneRecord};
     use std::path::{Path, PathBuf};

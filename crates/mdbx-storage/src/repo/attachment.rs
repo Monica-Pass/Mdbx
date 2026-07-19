@@ -8,18 +8,39 @@ use uuid::Uuid;
 
 use mdbx_core::model::attachment::StorageMode;
 use mdbx_core::model::Attachment;
+use mdbx_core::tiga::{
+    AuthorizationDecision, AuthorizationOutcome, DeviceContext, TigaOperation, TigaScope,
+};
 
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 /// 附件元数据的持久化仓库。
 ///
 /// 附件属于一等结构，支持 project 级和 entry 级归属。
 /// 改名只改元数据，不改变 content_hash。
 pub struct AttachmentRepo;
+
+/// 附件明文的使用目的。持久化导出与内存解密采用不同的 TIGA 操作语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentPlaintextPurpose {
+    InMemory,
+    Export,
+}
+
+impl AttachmentPlaintextPurpose {
+    fn operation(self) -> TigaOperation {
+        match self {
+            Self::InMemory => TigaOperation::DecryptAttachment,
+            Self::Export => TigaOperation::ExportData,
+        }
+    }
+}
 
 /// 流式附件写入的资源约束。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +231,76 @@ impl AttachmentRepo {
     // -----------------------------------------------------------------------
     // READ
     // -----------------------------------------------------------------------
+
+    /// 在调用方创建明文缓冲区、临时文件或输出流之前完成授权和审计。
+    pub fn authorize_plaintext_access(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        purpose: AttachmentPlaintextPurpose,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<AuthorizationDecision> {
+        Self::ensure_plaintext_target(conn, attachment_id)?;
+        let scope = TigaScope::Attachment {
+            attachment_id: attachment_id.to_string(),
+        };
+        let decision =
+            TigaService::authorize_operation(conn, &scope, purpose.operation(), context)?;
+        if matches!(
+            decision.outcome,
+            AuthorizationOutcome::Allow | AuthorizationOutcome::AllowWithConstraints
+        ) {
+            Ok(decision)
+        } else {
+            Err(StorageError::Authorization(decision))
+        }
+    }
+
+    /// 使用连接中的活动解锁会话完成附件明文授权，并在成功时续期空闲活动时间。
+    pub fn authorize_plaintext_access_with_active_session(
+        conn: &mut VaultConnection,
+        attachment_id: &str,
+        purpose: AttachmentPlaintextPurpose,
+        device: &DeviceContext,
+        now_unix_secs: i64,
+    ) -> StorageResult<AuthorizationDecision> {
+        Self::ensure_plaintext_target(conn, attachment_id)?;
+        let scope = TigaScope::Attachment {
+            attachment_id: attachment_id.to_string(),
+        };
+        let decision = TigaService::authorize_operation_with_active_session(
+            conn,
+            &scope,
+            purpose.operation(),
+            device,
+            now_unix_secs,
+        )?;
+        if matches!(
+            decision.outcome,
+            AuthorizationOutcome::Allow | AuthorizationOutcome::AllowWithConstraints
+        ) {
+            Ok(decision)
+        } else {
+            Err(StorageError::Authorization(decision))
+        }
+    }
+
+    fn ensure_plaintext_target(conn: &VaultConnection, attachment_id: &str) -> StorageResult<()> {
+        let deleted = conn
+            .inner()
+            .query_row(
+                "SELECT deleted FROM attachments WHERE attachment_id = ?1",
+                params![attachment_id],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        if deleted != 0 {
+            return Err(StorageError::ConstraintViolation(
+                "attachment is deleted".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     pub fn get_by_id(
         conn: &VaultConnection,

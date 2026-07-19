@@ -491,6 +491,7 @@ pub enum TigaScope {
     Vault,
     Project { project_id: String },
     Entry { entry_id: String },
+    Attachment { attachment_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
