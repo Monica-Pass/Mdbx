@@ -20,6 +20,7 @@ use crate::schema;
 pub struct VaultConnection {
     pub(crate) conn: Connection,
     pub(crate) keyring: Option<Keyring>,
+    pub(crate) active_key_epoch_id: Option<String>,
     pub(crate) active_session: Option<VaultSession>,
 }
 
@@ -84,6 +85,7 @@ impl VaultConnection {
         Ok(Self {
             conn,
             keyring: None,
+            active_key_epoch_id: None,
             active_session: None,
         })
     }
@@ -105,6 +107,7 @@ impl VaultConnection {
             Ok(Self {
                 conn,
                 keyring: None,
+                active_key_epoch_id: None,
                 active_session: None,
             })
         })();
@@ -124,6 +127,7 @@ impl VaultConnection {
         Ok(Self {
             conn,
             keyring: None,
+            active_key_epoch_id: None,
             active_session: None,
         })
     }
@@ -219,6 +223,16 @@ impl VaultConnection {
     /// 在解锁成功后调用。此后所有 `_ct` 字段在写入时加密、读取时解密。
     pub fn attach_keyring(&mut self, keyring: Keyring) {
         self.keyring = Some(keyring);
+        self.active_key_epoch_id = None;
+    }
+
+    pub(crate) fn attach_verified_keyring(
+        &mut self,
+        keyring: Keyring,
+        active_key_epoch_id: String,
+    ) {
+        self.keyring = Some(keyring);
+        self.active_key_epoch_id = Some(active_key_epoch_id);
     }
 
     pub fn attach_session(&mut self, session: VaultSession) {
@@ -238,11 +252,17 @@ impl VaultConnection {
     pub fn clear_session(&mut self) {
         self.active_session = None;
         self.keyring = None;
+        self.active_key_epoch_id = None;
     }
 
     /// 获取密钥环的引用（存在时）。
     pub fn keyring(&self) -> Option<&Keyring> {
         self.keyring.as_ref()
+    }
+
+    /// 返回经过解锁流程认证的 active key epoch 身份。
+    pub fn active_key_epoch_id(&self) -> Option<&str> {
+        self.active_key_epoch_id.as_deref()
     }
 
     /// 当前连接是否已启用加密。

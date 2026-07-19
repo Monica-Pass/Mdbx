@@ -76,9 +76,8 @@ impl UnlockService {
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         let method = Self::store_method(
             conn,
@@ -134,9 +133,8 @@ impl UnlockService {
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         let method = Self::store_method(
             conn,
@@ -179,9 +177,8 @@ impl UnlockService {
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         let method = Self::store_method(
             conn,
@@ -234,9 +231,8 @@ impl UnlockService {
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         let method = Self::store_method(
             conn,
@@ -333,9 +329,8 @@ impl UnlockService {
             &method.wrapped_vault_key_ct,
         )?);
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::create_and_attach_session(conn, UnlockMethodType::Pin)
     }
@@ -360,9 +355,8 @@ impl UnlockService {
             &method.wrapped_vault_key_ct,
         )?);
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::create_and_attach_session(conn, UnlockMethodType::Password)
     }
@@ -386,9 +380,8 @@ impl UnlockService {
             &method.wrapped_vault_key_ct,
         )?);
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::create_and_attach_session(conn, UnlockMethodType::SecurityKey)
     }
@@ -421,9 +414,8 @@ impl UnlockService {
             &method.wrapped_vault_key_ct,
         )?);
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::create_and_attach_session(conn, UnlockMethodType::PasswordSecurityKey)
     }
@@ -471,9 +463,8 @@ impl UnlockService {
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
         // 更新密钥环（vault_key 不变，但派生密钥变了）
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::update_method_key(
             conn,
@@ -538,9 +529,8 @@ impl UnlockService {
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(vault_key.as_slice(), &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, vault_key.as_slice())?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
 
         Self::update_method_key(
             conn,
@@ -608,9 +598,8 @@ impl UnlockService {
             &active_epoch_wrapped,
         )?;
 
-        let vault_ctx = Self::read_vault_context(conn)?;
-        let keyring = Keyring::from_vault_key(&vault_key, &vault_ctx)?;
-        conn.attach_keyring(keyring);
+        let (keyring, active_key_epoch_id) = Self::build_keyring(conn, &vault_key)?;
+        conn.attach_verified_keyring(keyring, active_key_epoch_id);
         Self::refresh_tiga_compliance(conn)
     }
 
@@ -817,6 +806,14 @@ impl UnlockService {
     /// key epoch and that its material is either the initialization marker or a
     /// real active epoch wrapping written by unlock setup/change.
     pub fn validate_active_key_epoch(conn: &VaultConnection) -> StorageResult<()> {
+        let vault_key = conn.keyring().map(|keyring| keyring.vault_key.as_slice());
+        Self::validate_active_key_epoch_with_vault_key(conn, vault_key).map(|_| ())
+    }
+
+    fn validate_active_key_epoch_with_vault_key(
+        conn: &VaultConnection,
+        vault_key: Option<&[u8]>,
+    ) -> StorageResult<String> {
         let active_key_epoch_id: String = conn
             .inner()
             .query_row(
@@ -883,6 +880,21 @@ impl UnlockService {
                         "active key epoch wrapping is too short".to_string(),
                     ));
                 }
+                if let Some(vault_key) = vault_key {
+                    let unwrapped =
+                        aead::decrypt(vault_key, &wrapped_epoch_key_ct, ACTIVE_KEY_EPOCH_AAD)
+                            .map_err(|_| {
+                                StorageError::Validation(
+                                    "active key epoch wrapper authentication failed".to_string(),
+                                )
+                            })?;
+                    if unwrapped != vault_key {
+                        return Err(StorageError::Validation(
+                            "active key epoch wrapper does not match the unlocked vault key"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
             other => {
                 return Err(StorageError::Validation(format!(
@@ -892,7 +904,7 @@ impl UnlockService {
             }
         }
 
-        Ok(())
+        Ok(active_key_epoch_id)
     }
 
     // -----------------------------------------------------------------------
@@ -918,6 +930,14 @@ impl UnlockService {
 
     fn wrap_active_key_epoch(vault_key: &[u8]) -> StorageResult<Vec<u8>> {
         aead::encrypt(vault_key, vault_key, ACTIVE_KEY_EPOCH_AAD).map_err(StorageError::Crypto)
+    }
+
+    fn build_keyring(conn: &VaultConnection, vault_key: &[u8]) -> StorageResult<(Keyring, String)> {
+        let active_key_epoch_id =
+            Self::validate_active_key_epoch_with_vault_key(conn, Some(vault_key))?;
+        let vault_ctx = Self::read_vault_context(conn)?;
+        let keyring = Keyring::from_vault_key(vault_key, &vault_ctx)?;
+        Ok((keyring, active_key_epoch_id))
     }
 
     /// 用 unlock_key 解包得到 vault_key。
@@ -1801,19 +1821,78 @@ mod tests {
         UnlockService::setup_password(&mut conn, "password").unwrap();
         UnlockService::validate_active_key_epoch(&conn).unwrap();
 
-        let (profile, wrapped_len): (String, i64) = conn
+        let (epoch_id, profile, wrapped_len): (String, String, i64) = conn
             .inner()
             .query_row(
-                "SELECT kdf_profile_id, length(wrapped_epoch_key_ct)
+                "SELECT key_epoch_id, kdf_profile_id, length(wrapped_epoch_key_ct)
                  FROM key_epochs
                  WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
 
         assert_eq!(profile, ACTIVE_KEY_EPOCH_PROFILE_ID);
         assert!(wrapped_len >= 72);
+        assert_eq!(conn.active_key_epoch_id(), Some(epoch_id.as_str()));
+    }
+
+    #[test]
+    fn unlock_rejects_tampered_active_key_epoch_wrapper() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+        conn.clear_session();
+
+        let mut wrapped: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT wrapped_epoch_key_ct FROM key_epochs
+                 WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *wrapped.last_mut().unwrap() ^= 0x01;
+        conn.inner()
+            .execute(
+                "UPDATE key_epochs SET wrapped_epoch_key_ct = ?1
+                 WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+                rusqlite::params![wrapped],
+            )
+            .unwrap();
+
+        let error = UnlockService::unlock_with_password(&mut conn, "password").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active key epoch wrapper authentication failed"));
+        assert!(conn.keyring().is_none());
+        assert!(conn.active_session().is_none());
+    }
+
+    #[test]
+    fn unlock_rejects_substituted_active_key_epoch_wrapper() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "password").unwrap();
+        let vault_key = conn.keyring().unwrap().vault_key.clone();
+        conn.clear_session();
+
+        let other_vault_key = aead::generate_key().unwrap();
+        let substituted =
+            aead::encrypt(&vault_key, &other_vault_key, ACTIVE_KEY_EPOCH_AAD).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE key_epochs SET wrapped_epoch_key_ct = ?1
+                 WHERE key_epoch_id = (SELECT active_key_epoch_id FROM vault_meta LIMIT 1)",
+                rusqlite::params![substituted],
+            )
+            .unwrap();
+
+        let error = UnlockService::unlock_with_password(&mut conn, "password").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active key epoch wrapper does not match the unlocked vault key"));
+        assert!(conn.keyring().is_none());
+        assert!(conn.active_session().is_none());
     }
 
     #[test]
