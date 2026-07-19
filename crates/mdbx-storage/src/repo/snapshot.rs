@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
-use mdbx_core::model::{Attachment, Entry, Project, Snapshot};
+use mdbx_core::model::{
+    Attachment, Entry, ObjectLabel, ObjectLabelAssignment, ObjectRelation, Project, Snapshot,
+};
 use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
@@ -28,6 +30,12 @@ struct SnapshotPayload {
     snapshot_created_at: String,
     projects: Vec<Project>,
     entries: Vec<Entry>,
+    #[serde(default)]
+    object_relations: Option<Vec<ObjectRelation>>,
+    #[serde(default)]
+    object_labels: Option<Vec<ObjectLabel>>,
+    #[serde(default)]
+    object_label_assignments: Option<Vec<ObjectLabelAssignment>>,
     attachments: Vec<Attachment>,
     #[serde(default)]
     attachment_chunks: Option<Vec<AttachmentChunk>>,
@@ -66,6 +74,9 @@ impl SnapshotRepo {
                 snapshot_created_at: now.clone(),
                 projects: read_all_active_projects(conn)?,
                 entries: read_all_active_entries(conn)?,
+                object_relations: Some(read_all_active_object_relations(conn)?),
+                object_labels: Some(read_all_active_object_labels(conn)?),
+                object_label_assignments: Some(read_all_active_object_label_assignments(conn)?),
                 attachments: read_all_active_attachments(conn)?,
                 attachment_chunks: Some(read_all_active_attachment_chunks(conn)?),
                 project_tags: Some(read_all_active_project_tags(conn)?),
@@ -154,23 +165,62 @@ impl SnapshotRepo {
             let active_projects = active_ids(conn, "projects", "project_id")?;
             let active_entries = active_ids(conn, "entries", "entry_id")?;
             let active_attachments = active_ids(conn, "attachments", "attachment_id")?;
+            let active_relations = active_ids(conn, "object_relations", "relation_id")?;
+            let active_labels = active_ids(conn, "object_labels", "label_id")?;
+            let active_assignments = active_ids(conn, "object_label_assignments", "assignment_id")?;
 
             let snapshot_projects = id_set(payload.projects.iter().map(|p| p.project_id.as_str()));
             let snapshot_entries = id_set(payload.entries.iter().map(|e| e.entry_id.as_str()));
             let snapshot_attachments =
                 id_set(payload.attachments.iter().map(|a| a.attachment_id.as_str()));
+            let snapshot_relations = payload
+                .object_relations
+                .as_deref()
+                .map(|rows| id_set(rows.iter().map(|row| row.relation_id.as_str())))
+                .unwrap_or_default();
+            let snapshot_labels = payload
+                .object_labels
+                .as_deref()
+                .map(|rows| id_set(rows.iter().map(|row| row.label_id.as_str())))
+                .unwrap_or_default();
+            let snapshot_assignments = payload
+                .object_label_assignments
+                .as_deref()
+                .map(|rows| id_set(rows.iter().map(|row| row.assignment_id.as_str())))
+                .unwrap_or_default();
 
             let removed_projects = difference(&active_projects, &snapshot_projects);
             let removed_entries = difference(&active_entries, &snapshot_entries);
             let removed_attachments = difference(&active_attachments, &snapshot_attachments);
+            let removed_relations = payload
+                .object_relations
+                .as_ref()
+                .map(|_| difference(&active_relations, &snapshot_relations))
+                .unwrap_or_default();
+            let removed_labels = payload
+                .object_labels
+                .as_ref()
+                .map(|_| difference(&active_labels, &snapshot_labels))
+                .unwrap_or_default();
+            let removed_assignments = payload
+                .object_label_assignments
+                .as_ref()
+                .map(|_| difference(&active_assignments, &snapshot_assignments))
+                .unwrap_or_default();
 
             let mut changed_ids = vec![snapshot_id.to_string()];
             changed_ids.extend(snapshot_projects.iter().cloned());
             changed_ids.extend(snapshot_entries.iter().cloned());
             changed_ids.extend(snapshot_attachments.iter().cloned());
+            changed_ids.extend(snapshot_relations.iter().cloned());
+            changed_ids.extend(snapshot_labels.iter().cloned());
+            changed_ids.extend(snapshot_assignments.iter().cloned());
             changed_ids.extend(removed_projects.iter().cloned());
             changed_ids.extend(removed_entries.iter().cloned());
             changed_ids.extend(removed_attachments.iter().cloned());
+            changed_ids.extend(removed_relations.iter().cloned());
+            changed_ids.extend(removed_labels.iter().cloned());
+            changed_ids.extend(removed_assignments.iter().cloned());
             changed_ids.sort();
             changed_ids.dedup();
 
@@ -195,6 +245,48 @@ impl SnapshotRepo {
                 upsert_entry(conn, entry, &restore_commit_id, &now, &ctx.device_id)?;
                 ObjectVersionRepo::record_entry_current(conn, &restore_commit_id, &entry.entry_id)?;
             }
+            if let Some(labels) = &payload.object_labels {
+                for label in labels {
+                    upsert_object_label(conn, label, &restore_commit_id, &now, &ctx.device_id)?;
+                    ObjectVersionRepo::record_object_label_current(
+                        conn,
+                        &restore_commit_id,
+                        &label.label_id,
+                    )?;
+                }
+            }
+            if let Some(relations) = &payload.object_relations {
+                for relation in relations {
+                    upsert_object_relation(
+                        conn,
+                        relation,
+                        &restore_commit_id,
+                        &now,
+                        &ctx.device_id,
+                    )?;
+                    ObjectVersionRepo::record_object_relation_current(
+                        conn,
+                        &restore_commit_id,
+                        &relation.relation_id,
+                    )?;
+                }
+            }
+            if let Some(assignments) = &payload.object_label_assignments {
+                for assignment in assignments {
+                    upsert_object_label_assignment(
+                        conn,
+                        assignment,
+                        &restore_commit_id,
+                        &now,
+                        &ctx.device_id,
+                    )?;
+                    ObjectVersionRepo::record_object_label_assignment_current(
+                        conn,
+                        &restore_commit_id,
+                        &assignment.assignment_id,
+                    )?;
+                }
+            }
             for attachment in &payload.attachments {
                 upsert_attachment(conn, attachment, &restore_commit_id, &now, &ctx.device_id)?;
                 ObjectVersionRepo::record_attachment_current(
@@ -213,6 +305,36 @@ impl SnapshotRepo {
 
             // Objects created after the snapshot remain in history but leave the
             // active set through a tracked soft delete.
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "object-label-assignment",
+                "object_label_assignments",
+                "assignment_id",
+                &removed_assignments,
+                &restore_commit_id,
+                &now,
+            )?;
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "object-relation",
+                "object_relations",
+                "relation_id",
+                &removed_relations,
+                &restore_commit_id,
+                &now,
+            )?;
+            soft_delete_for_restore(
+                conn,
+                ctx,
+                "object-label",
+                "object_labels",
+                "label_id",
+                &removed_labels,
+                &restore_commit_id,
+                &now,
+            )?;
             soft_delete_for_restore(
                 conn,
                 ctx,
@@ -246,6 +368,19 @@ impl SnapshotRepo {
 
             for id in &removed_attachments {
                 ObjectVersionRepo::record_attachment_current(conn, &restore_commit_id, id)?;
+            }
+            for id in &removed_relations {
+                ObjectVersionRepo::record_object_relation_current(conn, &restore_commit_id, id)?;
+            }
+            for id in &removed_labels {
+                ObjectVersionRepo::record_object_label_current(conn, &restore_commit_id, id)?;
+            }
+            for id in &removed_assignments {
+                ObjectVersionRepo::record_object_label_assignment_current(
+                    conn,
+                    &restore_commit_id,
+                    id,
+                )?;
             }
             for id in &removed_entries {
                 ObjectVersionRepo::record_entry_current(conn, &restore_commit_id, id)?;
@@ -463,6 +598,92 @@ fn read_all_active_entries(conn: &VaultConnection) -> StorageResult<Vec<Entry>> 
     Ok(entries)
 }
 
+fn read_all_active_object_relations(conn: &VaultConnection) -> StorageResult<Vec<ObjectRelation>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT relation_id, source_object_id, target_object_id, relation_kind,
+                payload_ct, payload_schema_version, object_clock, head_commit_id,
+                deleted, created_at, updated_at, created_by_device_id,
+                updated_by_device_id
+         FROM object_relations WHERE deleted = 0 ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectRelation {
+            relation_id: row.get(0)?,
+            source_object_id: row.get(1)?,
+            target_object_id: row.get(2)?,
+            relation_kind: row.get::<_, String>(3)?.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(StorageError::Validation(error)),
+                )
+            })?,
+            payload_ct: row.get(4)?,
+            payload_schema_version: read_u32(row, 5)?,
+            object_clock: row.get(6)?,
+            head_commit_id: row.get(7)?,
+            deleted: row.get::<_, i32>(8)? != 0,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            created_by_device_id: row.get(11)?,
+            updated_by_device_id: row.get(12)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn read_all_active_object_labels(conn: &VaultConnection) -> StorageResult<Vec<ObjectLabel>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT label_id, collection_id, name_ct, payload_ct, payload_schema_version,
+                object_clock, head_commit_id, deleted, created_at, updated_at,
+                created_by_device_id, updated_by_device_id
+         FROM object_labels WHERE deleted = 0 ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectLabel {
+            label_id: row.get(0)?,
+            collection_id: row.get(1)?,
+            name_ct: row.get(2)?,
+            payload_ct: row.get(3)?,
+            payload_schema_version: read_u32(row, 4)?,
+            object_clock: row.get(5)?,
+            head_commit_id: row.get(6)?,
+            deleted: row.get::<_, i32>(7)? != 0,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+            created_by_device_id: row.get(10)?,
+            updated_by_device_id: row.get(11)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn read_all_active_object_label_assignments(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<ObjectLabelAssignment>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT assignment_id, object_id, label_id, object_clock, head_commit_id,
+                deleted, created_at, updated_at, created_by_device_id,
+                updated_by_device_id
+         FROM object_label_assignments WHERE deleted = 0 ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectLabelAssignment {
+            assignment_id: row.get(0)?,
+            object_id: row.get(1)?,
+            label_id: row.get(2)?,
+            object_clock: row.get(3)?,
+            head_commit_id: row.get(4)?,
+            deleted: row.get::<_, i32>(5)? != 0,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            created_by_device_id: row.get(8)?,
+            updated_by_device_id: row.get(9)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn read_all_active_attachments(conn: &VaultConnection) -> StorageResult<Vec<Attachment>> {
     let mut stmt = conn.inner().prepare(
         "SELECT attachment_id, project_id, entry_id, file_name_ct,
@@ -652,6 +873,134 @@ fn upsert_entry(
     Ok(())
 }
 
+fn upsert_object_relation(
+    conn: &VaultConnection,
+    relation: &ObjectRelation,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
+    conn.inner().execute(
+        "INSERT INTO object_relations
+            (relation_id, source_object_id, target_object_id, relation_kind,
+             payload_ct, payload_schema_version, object_clock, head_commit_id,
+             deleted, created_at, updated_at, created_by_device_id,
+             updated_by_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)
+         ON CONFLICT(relation_id) DO UPDATE SET
+            source_object_id = excluded.source_object_id,
+            target_object_id = excluded.target_object_id,
+            relation_kind = excluded.relation_kind,
+            payload_ct = excluded.payload_ct,
+            payload_schema_version = excluded.payload_schema_version,
+            object_clock = excluded.object_clock,
+            head_commit_id = excluded.head_commit_id,
+            deleted = 0,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
+        params![
+            relation.relation_id,
+            relation.source_object_id,
+            relation.target_object_id,
+            relation.relation_kind.to_string(),
+            relation.payload_ct,
+            relation.payload_schema_version as i64,
+            bump_clock(&relation.object_clock),
+            restore_commit_id,
+            relation.created_at,
+            now,
+            relation.created_by_device_id,
+            device_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_object_label(
+    conn: &VaultConnection,
+    label: &ObjectLabel,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
+    conn.inner().execute(
+        "INSERT INTO object_labels
+            (label_id, collection_id, name_ct, payload_ct, payload_schema_version,
+             object_clock, head_commit_id, deleted, created_at, updated_at,
+             created_by_device_id, updated_by_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11)
+         ON CONFLICT(label_id) DO UPDATE SET
+            collection_id = excluded.collection_id,
+            name_ct = excluded.name_ct,
+            payload_ct = excluded.payload_ct,
+            payload_schema_version = excluded.payload_schema_version,
+            object_clock = excluded.object_clock,
+            head_commit_id = excluded.head_commit_id,
+            deleted = 0,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
+        params![
+            label.label_id,
+            label.collection_id,
+            label.name_ct,
+            label.payload_ct,
+            label.payload_schema_version as i64,
+            bump_clock(&label.object_clock),
+            restore_commit_id,
+            label.created_at,
+            now,
+            label.created_by_device_id,
+            device_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_object_label_assignment(
+    conn: &VaultConnection,
+    assignment: &ObjectLabelAssignment,
+    restore_commit_id: &str,
+    now: &str,
+    device_id: &str,
+) -> StorageResult<()> {
+    conn.inner().execute(
+        "UPDATE object_label_assignments SET deleted = 1
+         WHERE object_id = ?1 AND label_id = ?2 AND assignment_id <> ?3 AND deleted = 0",
+        params![
+            assignment.object_id,
+            assignment.label_id,
+            assignment.assignment_id
+        ],
+    )?;
+    conn.inner().execute(
+        "INSERT INTO object_label_assignments
+            (assignment_id, object_id, label_id, object_clock, head_commit_id,
+             deleted, created_at, updated_at, created_by_device_id,
+             updated_by_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9)
+         ON CONFLICT(assignment_id) DO UPDATE SET
+            object_id = excluded.object_id,
+            label_id = excluded.label_id,
+            object_clock = excluded.object_clock,
+            head_commit_id = excluded.head_commit_id,
+            deleted = 0,
+            updated_at = excluded.updated_at,
+            updated_by_device_id = excluded.updated_by_device_id",
+        params![
+            assignment.assignment_id,
+            assignment.object_id,
+            assignment.label_id,
+            bump_clock(&assignment.object_clock),
+            restore_commit_id,
+            assignment.created_at,
+            now,
+            assignment.created_by_device_id,
+            device_id,
+        ],
+    )?;
+    Ok(())
+}
+
 fn upsert_attachment(
     conn: &VaultConnection,
     a: &Attachment,
@@ -754,6 +1103,27 @@ fn restore_project_tags(
     Ok(())
 }
 
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> StorageResult<Vec<T>> {
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
+
+fn read_u32(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(column)?;
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn active_ids(
     conn: &VaultConnection,
     table: &str,
@@ -850,10 +1220,15 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::entry::EntryRepo;
+    use crate::repo::object_label::{
+        ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+        ObjectLabelRepo,
+    };
+    use crate::repo::object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
     use crate::repo::project::ProjectRepo;
     use crate::search::SearchService;
     use crate::tiga::TigaService;
-    use mdbx_core::model::{EntryType, UnlockMethodType, VaultSession};
+    use mdbx_core::model::{EntryType, RelationKindId, UnlockMethodType, VaultSession};
     use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext) {
@@ -1089,6 +1464,110 @@ mod tests {
             .unwrap();
         assert_eq!(restored.entry_type.as_str(), "com.monica.steam.mafile");
         assert_eq!(restored.payload_schema_version, 5);
+    }
+
+    #[test]
+    fn relation_snapshot_restores_exact_generic_metadata_set() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Generic", None, None).unwrap();
+        let first = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("First"),
+            &serde_json::json!({"body": "first"}),
+        )
+        .unwrap();
+        let second = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("Second"),
+            &serde_json::json!({"body": "second"}),
+        )
+        .unwrap();
+        let relation = ObjectRelationRepo::create(
+            &conn,
+            &ctx,
+            ObjectRelationCreateRequest::new(
+                &first.entry_id,
+                &second.entry_id,
+                RelationKindId::new("com.monica.mail.reply-to").unwrap(),
+                serde_json::json!({"position": 1}),
+            ),
+        )
+        .unwrap();
+        let label = ObjectLabelRepo::create(
+            &conn,
+            &ctx,
+            ObjectLabelCreateRequest::new(
+                &project.project_id,
+                "Important",
+                serde_json::json!({"color": "red"}),
+            ),
+        )
+        .unwrap();
+        let assignment = ObjectLabelAssignmentRepo::create(
+            &conn,
+            &ctx,
+            ObjectLabelAssignmentCreateRequest::new(&first.entry_id, &label.label_id),
+        )
+        .unwrap();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+
+        ObjectLabelAssignmentRepo::soft_delete(&conn, &ctx, &assignment.assignment_id).unwrap();
+        ObjectLabelRepo::soft_delete(&conn, &ctx, &label.label_id).unwrap();
+        ObjectRelationRepo::soft_delete(&conn, &ctx, &relation.relation_id).unwrap();
+        let extra_relation = ObjectRelationRepo::create(
+            &conn,
+            &ctx,
+            ObjectRelationCreateRequest::new(
+                &second.entry_id,
+                &first.entry_id,
+                RelationKindId::new("com.monica.mail.thread-member").unwrap(),
+                serde_json::json!({}),
+            ),
+        )
+        .unwrap();
+
+        SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).unwrap();
+
+        let restored_relation = ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+        let restored_label = ObjectLabelRepo::get_by_id(&conn, &label.label_id)
+            .unwrap()
+            .unwrap();
+        let restored_assignment =
+            ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment.assignment_id)
+                .unwrap()
+                .unwrap();
+        assert!(!restored_relation.deleted);
+        assert!(!restored_label.deleted);
+        assert!(!restored_assignment.deleted);
+        assert!(
+            ObjectRelationRepo::get_by_id(&conn, &extra_relation.relation_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            restored_relation.head_commit_id,
+            restored_label.head_commit_id
+        );
+        assert_eq!(
+            restored_label.head_commit_id,
+            restored_assignment.head_commit_id
+        );
+        assert!(ObjectVersionRepo::get_object_relation(
+            &conn,
+            &relation.relation_id,
+            &restored_relation.head_commit_id,
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]

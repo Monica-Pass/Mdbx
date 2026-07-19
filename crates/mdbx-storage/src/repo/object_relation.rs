@@ -9,6 +9,7 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
+use crate::repo::object_version::ObjectVersionRepo;
 
 #[derive(Debug, Clone)]
 pub struct ObjectRelationCreateRequest {
@@ -98,6 +99,11 @@ impl ObjectRelationRepo {
                     now,
                     ctx.device_id,
                 ],
+            )?;
+            ObjectVersionRepo::record_object_relation_current(
+                conn,
+                &commit_id,
+                &request.relation_id,
             )?;
             Self::get_by_id(conn, &request.relation_id)?
                 .ok_or_else(|| StorageError::NotFound(request.relation_id.clone()))
@@ -213,6 +219,11 @@ impl ObjectRelationRepo {
                     ctx.device_id,
                 ],
             )?;
+            ObjectVersionRepo::record_object_relation_current(
+                conn,
+                &commit_id,
+                &relation.relation_id,
+            )?;
             Self::get_by_id(conn, &relation.relation_id)?
                 .ok_or_else(|| StorageError::NotFound(relation.relation_id.clone()))
         })
@@ -252,6 +263,7 @@ impl ObjectRelationRepo {
                 ],
             )?;
             ctx.create_tombstone(conn, "object-relation", relation_id)?;
+            ObjectVersionRepo::record_object_relation_current(conn, &commit_id, relation_id)?;
             Ok(())
         })
     }

@@ -9,6 +9,7 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
+use crate::repo::object_version::ObjectVersionRepo;
 
 #[derive(Debug, Clone)]
 pub struct ObjectLabelCreateRequest {
@@ -124,6 +125,7 @@ impl ObjectLabelRepo {
                     ctx.device_id,
                 ],
             )?;
+            ObjectVersionRepo::record_object_label_current(conn, &commit_id, &request.label_id)?;
             Self::get_by_id(conn, &request.label_id)?
                 .ok_or_else(|| StorageError::NotFound(request.label_id.clone()))
         })
@@ -220,6 +222,7 @@ impl ObjectLabelRepo {
                     ctx.device_id,
                 ],
             )?;
+            ObjectVersionRepo::record_object_label_current(conn, &commit_id, &label.label_id)?;
             Self::get_by_id(conn, &label.label_id)?
                 .ok_or_else(|| StorageError::NotFound(label.label_id.clone()))
         })
@@ -270,6 +273,7 @@ impl ObjectLabelRepo {
                 ],
             )?;
             ctx.create_tombstone(conn, "object-label", label_id)?;
+            ObjectVersionRepo::record_object_label_current(conn, &commit_id, label_id)?;
             Ok(())
         })
     }
@@ -321,6 +325,11 @@ impl ObjectLabelAssignmentRepo {
                     now,
                     ctx.device_id,
                 ],
+            )?;
+            ObjectVersionRepo::record_object_label_assignment_current(
+                conn,
+                &commit_id,
+                &request.assignment_id,
             )?;
             Self::get_by_id(conn, &request.assignment_id)?
                 .ok_or_else(|| StorageError::NotFound(request.assignment_id.clone()))
@@ -410,6 +419,11 @@ impl ObjectLabelAssignmentRepo {
                 ],
             )?;
             ctx.create_tombstone(conn, "object-label-assignment", assignment_id)?;
+            ObjectVersionRepo::record_object_label_assignment_current(
+                conn,
+                &commit_id,
+                assignment_id,
+            )?;
             Ok(())
         })
     }

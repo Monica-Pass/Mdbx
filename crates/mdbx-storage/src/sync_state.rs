@@ -28,6 +28,12 @@ pub struct SyncStatePayload {
     pub security_audit_events: Option<Vec<SecurityAuditEventRow>>,
     pub projects: Vec<ProjectRow>,
     pub entries: Vec<EntryRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_relations: Option<Vec<ObjectRelationRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_labels: Option<Vec<ObjectLabelRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_label_assignments: Option<Vec<ObjectLabelAssignmentRow>>,
     pub attachments: Vec<AttachmentRow>,
     pub attachment_chunks: Vec<AttachmentChunkRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +180,53 @@ pub struct EntryRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectRelationRow {
+    pub relation_id: String,
+    pub source_object_id: String,
+    pub target_object_id: String,
+    pub relation_kind: String,
+    pub payload_ct: Vec<u8>,
+    pub payload_schema_version: u32,
+    pub object_clock: String,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectLabelRow {
+    pub label_id: String,
+    pub collection_id: String,
+    pub name_ct: Vec<u8>,
+    pub payload_ct: Vec<u8>,
+    pub payload_schema_version: u32,
+    pub object_clock: String,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectLabelAssignmentRow {
+    pub assignment_id: String,
+    pub object_id: String,
+    pub label_id: String,
+    pub object_clock: String,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentRow {
     pub attachment_id: String,
     pub project_id: String,
@@ -229,6 +282,9 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         security_audit_events: Some(load_security_audit_event_rows(conn)?),
         projects: load_project_rows(conn)?,
         entries: load_entry_rows(conn)?,
+        object_relations: Some(load_object_relation_rows(conn)?),
+        object_labels: Some(load_object_label_rows(conn)?),
+        object_label_assignments: Some(load_object_label_assignment_rows(conn)?),
         attachments: load_attachment_rows(conn)?,
         attachment_chunks: load_attachment_chunk_rows(conn)?,
         project_tags: Some(load_project_tag_set_rows(conn)?),
@@ -508,6 +564,86 @@ fn load_entry_rows(conn: &VaultConnection) -> StorageResult<Vec<EntryRow>> {
     Ok(out)
 }
 
+fn load_object_relation_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectRelationRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT relation_id, source_object_id, target_object_id, relation_kind,
+                payload_ct, payload_schema_version, object_clock, head_commit_id,
+                deleted, created_at, updated_at, created_by_device_id,
+                updated_by_device_id
+         FROM object_relations ORDER BY updated_at ASC, relation_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectRelationRow {
+            relation_id: row.get(0)?,
+            source_object_id: row.get(1)?,
+            target_object_id: row.get(2)?,
+            relation_kind: row.get(3)?,
+            payload_ct: row.get(4)?,
+            payload_schema_version: read_u32(row, 5)?,
+            object_clock: row.get(6)?,
+            head_commit_id: row.get(7)?,
+            deleted: row.get::<_, i32>(8)? != 0,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            created_by_device_id: row.get(11)?,
+            updated_by_device_id: row.get(12)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_object_label_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectLabelRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT label_id, collection_id, name_ct, payload_ct, payload_schema_version,
+                object_clock, head_commit_id, deleted, created_at, updated_at,
+                created_by_device_id, updated_by_device_id
+         FROM object_labels ORDER BY updated_at ASC, label_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectLabelRow {
+            label_id: row.get(0)?,
+            collection_id: row.get(1)?,
+            name_ct: row.get(2)?,
+            payload_ct: row.get(3)?,
+            payload_schema_version: read_u32(row, 4)?,
+            object_clock: row.get(5)?,
+            head_commit_id: row.get(6)?,
+            deleted: row.get::<_, i32>(7)? != 0,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+            created_by_device_id: row.get(10)?,
+            updated_by_device_id: row.get(11)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_object_label_assignment_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<ObjectLabelAssignmentRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT assignment_id, object_id, label_id, object_clock, head_commit_id,
+                deleted, created_at, updated_at, created_by_device_id,
+                updated_by_device_id
+         FROM object_label_assignments ORDER BY updated_at ASC, assignment_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ObjectLabelAssignmentRow {
+            assignment_id: row.get(0)?,
+            object_id: row.get(1)?,
+            label_id: row.get(2)?,
+            object_clock: row.get(3)?,
+            head_commit_id: row.get(4)?,
+            deleted: row.get::<_, i32>(5)? != 0,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            created_by_device_id: row.get(8)?,
+            updated_by_device_id: row.get(9)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn load_attachment_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT attachment_id, project_id, entry_id, file_name_ct,
@@ -544,6 +680,17 @@ fn load_attachment_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentR
         out.push(row?);
     }
     Ok(out)
+}
+
+fn read_u32(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(column)?;
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 fn load_attachment_chunk_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentChunkRow>> {
