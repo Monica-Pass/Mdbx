@@ -1,6 +1,6 @@
 use rusqlite::params;
 use rusqlite::OptionalExtension;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use mdbx_core::model::ConflictObjectType;
 use mdbx_core::tiga::{
@@ -13,16 +13,19 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::conflict::ConflictDetector;
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
+use crate::migration::FIELD_KEY_EPOCHS_EXTENSION;
 use crate::repo::{BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
 use crate::sync_state::{
-    decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, ProjectRow,
-    ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
-    TigaPolicyOverrideRow, TigaVaultStateRow,
+    decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
+    KeyEpochState, ProjectRow, ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload,
+    TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
     verify_optional_integrity_tag, SecurityAuditEvent,
 };
+use crate::unlock::UnlockService;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyBatchResult {
@@ -34,16 +37,50 @@ pub struct ApplyBatchResult {
 
 pub struct SyncApplyRepo;
 
+#[derive(Clone, Copy)]
+enum KeyEpochMergeMode {
+    FastForward,
+    Divergent,
+}
+
 impl SyncApplyRepo {
+    /// Applies legacy-compatible sync batches through an immutable connection.
+    /// Key epoch state may be inspected but cannot change through this entry.
     pub fn apply_batch(
         conn: &VaultConnection,
         ctx: &CommitContext,
         batch: &CommitBatch,
     ) -> StorageResult<ApplyBatchResult> {
+        Self::apply_batch_inner(conn, ctx, batch, false)
+    }
+
+    /// Applies sync batches through a mutable connection. Epoch changes require
+    /// verified unlock state and refresh all epoch keyrings before returning.
+    pub fn apply_batch_mut(
+        conn: &mut VaultConnection,
+        ctx: &CommitContext,
+        batch: &CommitBatch,
+    ) -> StorageResult<ApplyBatchResult> {
+        let result = Self::apply_batch_inner(conn, ctx, batch, true)?;
+        if conn.active_key_epoch_id().is_some() {
+            if let Err(error) = UnlockService::refresh_verified_keyring(conn) {
+                conn.clear_session();
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
+
+    fn apply_batch_inner(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        batch: &CommitBatch,
+        allow_key_epoch_changes: bool,
+    ) -> StorageResult<ApplyBatchResult> {
         let mut result = ApplyBatchResult::default();
 
         for serialized in &batch.commits {
-            match Self::apply_commit(conn, ctx, serialized)? {
+            match Self::apply_commit(conn, ctx, serialized, allow_key_epoch_changes)? {
                 ApplyOutcome::Applied => result.applied_commits += 1,
                 ApplyOutcome::Skipped => result.skipped_commits += 1,
                 ApplyOutcome::Conflict => {
@@ -61,6 +98,7 @@ impl SyncApplyRepo {
         conn: &VaultConnection,
         ctx: &CommitContext,
         serialized: &SerializedCommit,
+        allow_key_epoch_changes: bool,
     ) -> StorageResult<ApplyOutcome> {
         if Self::commit_exists(conn, &serialized.commit.commit_id)? {
             if let Some(operation) = &serialized.operation {
@@ -102,7 +140,12 @@ impl SyncApplyRepo {
         let tx_result: StorageResult<ApplyOutcome> = (|| {
             Self::insert_commit(conn, serialized)?;
             if fast_forward {
-                let payload_conflicts = Self::apply_fast_forward_payloads(conn, ctx, serialized)?;
+                let payload_conflicts = Self::apply_fast_forward_payloads(
+                    conn,
+                    ctx,
+                    serialized,
+                    allow_key_epoch_changes,
+                )?;
                 if payload_conflicts == 0 {
                     Self::advance_branch(
                         conn,
@@ -118,8 +161,13 @@ impl SyncApplyRepo {
                     ApplyOutcome::Conflict
                 })
             } else {
-                let payload_conflicts =
-                    Self::apply_divergent_payloads(conn, ctx, serialized, local_head.as_deref())?;
+                let payload_conflicts = Self::apply_divergent_payloads(
+                    conn,
+                    ctx,
+                    serialized,
+                    local_head.as_deref(),
+                    allow_key_epoch_changes,
+                )?;
                 Self::sync_device_head(conn, serialized)?;
                 Ok(if payload_conflicts == 0 {
                     ApplyOutcome::Applied
@@ -273,12 +321,19 @@ impl SyncApplyRepo {
         conn: &VaultConnection,
         ctx: &CommitContext,
         serialized: &SerializedCommit,
+        allow_key_epoch_changes: bool,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for payload in &serialized.object_payloads {
             if let Some(state) = decode_sync_state_payload(payload)? {
-                conflicts +=
-                    Self::apply_sync_state(conn, ctx, &serialized.commit.commit_id, &state)?;
+                conflicts += Self::apply_sync_state(
+                    conn,
+                    ctx,
+                    &serialized.commit.commit_id,
+                    &state,
+                    KeyEpochMergeMode::FastForward,
+                    allow_key_epoch_changes,
+                )?;
             }
         }
         Ok(conflicts)
@@ -289,12 +344,19 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         serialized: &SerializedCommit,
         local_head: Option<&str>,
+        allow_key_epoch_changes: bool,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for payload in &serialized.object_payloads {
             if let Some(state) = decode_sync_state_payload(payload)? {
-                conflicts +=
-                    Self::apply_sync_state(conn, ctx, &serialized.commit.commit_id, &state)?;
+                conflicts += Self::apply_sync_state(
+                    conn,
+                    ctx,
+                    &serialized.commit.commit_id,
+                    &state,
+                    KeyEpochMergeMode::Divergent,
+                    allow_key_epoch_changes,
+                )?;
             } else {
                 conflicts +=
                     Self::record_payload_conflict(conn, ctx, serialized, payload, local_head)?;
@@ -308,8 +370,18 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         incoming_commit_id: &str,
         state: &SyncStatePayload,
+        key_epoch_merge_mode: KeyEpochMergeMode,
+        allow_key_epoch_changes: bool,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
+        if let Some(key_epoch_state) = &state.key_epoch_state {
+            Self::apply_key_epoch_state(
+                conn,
+                key_epoch_state,
+                key_epoch_merge_mode,
+                allow_key_epoch_changes,
+            )?;
+        }
         conflicts += Self::apply_projects(conn, ctx, incoming_commit_id, &state.projects)?;
         conflicts += Self::apply_entries(conn, ctx, incoming_commit_id, &state.entries)?;
         let replace_attachment_chunks =
@@ -337,6 +409,74 @@ impl SyncApplyRepo {
         }
         Self::apply_branches(conn, &state.branches)?;
         Ok(conflicts)
+    }
+
+    fn apply_key_epoch_state(
+        conn: &VaultConnection,
+        incoming: &KeyEpochState,
+        merge_mode: KeyEpochMergeMode,
+        allow_changes: bool,
+    ) -> StorageResult<()> {
+        validate_key_epoch_state(incoming)?;
+        let local = load_key_epoch_state(conn)?;
+        if same_key_epoch_state(&local, incoming) {
+            return Ok(());
+        }
+        if !allow_changes {
+            return Err(StorageError::Validation(
+                "key epoch changes require mutable sync apply".to_string(),
+            ));
+        }
+        if conn.active_key_epoch_id().is_none() {
+            return Err(StorageError::Validation(
+                "vault must be verified-unlocked before applying key epoch changes".to_string(),
+            ));
+        }
+        if incoming
+            .epochs
+            .iter()
+            .any(|row| row.kdf_profile_id == RANDOM_KEY_EPOCH_PROFILE_ID)
+            && incoming.integrity_tag.is_none()
+        {
+            return Err(StorageError::Validation(
+                "random key epoch sync state requires an integrity tag".to_string(),
+            ));
+        }
+        incoming.verify_integrity(conn)?;
+
+        let merged = merge_key_epoch_states(&local, incoming, merge_mode)?;
+        for row in &merged.epochs {
+            conn.inner().execute(
+                "INSERT INTO key_epochs
+                    (key_epoch_id, status, wrapped_epoch_key_ct, kdf_profile_id,
+                     created_at, activated_at, retired_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(key_epoch_id) DO UPDATE SET
+                    status = excluded.status,
+                    retired_at = excluded.retired_at",
+                params![
+                    row.key_epoch_id,
+                    row.status,
+                    row.wrapped_epoch_key_ct,
+                    row.kdf_profile_id,
+                    row.created_at,
+                    row.activated_at,
+                    row.retired_at,
+                ],
+            )?;
+        }
+        conn.inner().execute(
+            "UPDATE vault_meta SET active_key_epoch_id = ?1",
+            params![merged.active_key_epoch_id],
+        )?;
+        if merged
+            .epochs
+            .iter()
+            .any(|row| row.kdf_profile_id == RANDOM_KEY_EPOCH_PROFILE_ID)
+        {
+            conn.ensure_critical_extension(FIELD_KEY_EPOCHS_EXTENSION)?;
+        }
+        UnlockService::verify_key_epoch_state(conn)
     }
 
     fn apply_tiga_vault_state(
@@ -1989,6 +2129,176 @@ fn exists(
     Ok(count > 0)
 }
 
+fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
+    let active_key_epoch_id: String = conn.inner().query_row(
+        "SELECT active_key_epoch_id FROM vault_meta LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.inner().prepare(
+        "SELECT key_epoch_id, status, wrapped_epoch_key_ct, kdf_profile_id,
+                created_at, activated_at, retired_at
+         FROM key_epochs ORDER BY key_epoch_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(KeyEpochRow {
+            key_epoch_id: row.get(0)?,
+            status: row.get(1)?,
+            wrapped_epoch_key_ct: row.get(2)?,
+            kdf_profile_id: row.get(3)?,
+            created_at: row.get(4)?,
+            activated_at: row.get(5)?,
+            retired_at: row.get(6)?,
+        })
+    })?;
+    let mut epochs = Vec::new();
+    for row in rows {
+        epochs.push(row?);
+    }
+    let state = KeyEpochState {
+        active_key_epoch_id,
+        epochs,
+        integrity_tag: None,
+    };
+    validate_key_epoch_state(&state)?;
+    Ok(state)
+}
+
+fn validate_key_epoch_state(state: &KeyEpochState) -> StorageResult<()> {
+    if state.active_key_epoch_id.is_empty() || state.epochs.is_empty() {
+        return Err(StorageError::Validation(
+            "key epoch sync state is empty".to_string(),
+        ));
+    }
+    let mut previous_id: Option<&str> = None;
+    let mut active_count = 0_u32;
+    for row in &state.epochs {
+        if row.key_epoch_id.is_empty() {
+            return Err(StorageError::Validation(
+                "key epoch sync state contains an empty ID".to_string(),
+            ));
+        }
+        if previous_id.is_some_and(|previous| previous >= row.key_epoch_id.as_str()) {
+            return Err(StorageError::Validation(
+                "key epoch sync rows must be uniquely sorted by ID".to_string(),
+            ));
+        }
+        previous_id = Some(&row.key_epoch_id);
+        match row.status.as_str() {
+            "active" => {
+                active_count += 1;
+                if row.key_epoch_id != state.active_key_epoch_id {
+                    return Err(StorageError::Validation(
+                        "active key epoch row does not match the sync state marker".to_string(),
+                    ));
+                }
+            }
+            "retired" => {}
+            other => {
+                return Err(StorageError::Validation(format!(
+                    "unsupported synchronized key epoch status: {other}"
+                )));
+            }
+        }
+    }
+    if active_count != 1 {
+        return Err(StorageError::Validation(format!(
+            "key epoch sync state contains {active_count} active rows"
+        )));
+    }
+    Ok(())
+}
+
+fn same_key_epoch_state(local: &KeyEpochState, incoming: &KeyEpochState) -> bool {
+    local.active_key_epoch_id == incoming.active_key_epoch_id && local.epochs == incoming.epochs
+}
+
+fn merge_key_epoch_states(
+    local: &KeyEpochState,
+    incoming: &KeyEpochState,
+    mode: KeyEpochMergeMode,
+) -> StorageResult<KeyEpochState> {
+    validate_key_epoch_state(local)?;
+    validate_key_epoch_state(incoming)?;
+    let mut epochs = local
+        .epochs
+        .iter()
+        .cloned()
+        .map(|row| (row.key_epoch_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    for incoming_row in &incoming.epochs {
+        if let Some(local_row) = epochs.get_mut(&incoming_row.key_epoch_id) {
+            if local_row.wrapped_epoch_key_ct != incoming_row.wrapped_epoch_key_ct
+                || local_row.kdf_profile_id != incoming_row.kdf_profile_id
+                || local_row.created_at != incoming_row.created_at
+                || local_row.activated_at != incoming_row.activated_at
+            {
+                return Err(StorageError::Validation(format!(
+                    "key epoch {} immutable material was rewritten during sync",
+                    incoming_row.key_epoch_id
+                )));
+            }
+            local_row.retired_at = earliest_present(
+                local_row.retired_at.clone(),
+                incoming_row.retired_at.clone(),
+            );
+        } else {
+            epochs.insert(incoming_row.key_epoch_id.clone(), incoming_row.clone());
+        }
+    }
+
+    let active_key_epoch_id = match mode {
+        KeyEpochMergeMode::FastForward => incoming.active_key_epoch_id.clone(),
+        KeyEpochMergeMode::Divergent => {
+            let local_active = epochs.get(&local.active_key_epoch_id).ok_or_else(|| {
+                StorageError::Validation("local active key epoch row is missing".to_string())
+            })?;
+            let incoming_active = epochs.get(&incoming.active_key_epoch_id).ok_or_else(|| {
+                StorageError::Validation("incoming active key epoch row is missing".to_string())
+            })?;
+            if epoch_activation_rank(incoming_active) > epoch_activation_rank(local_active) {
+                incoming.active_key_epoch_id.clone()
+            } else {
+                local.active_key_epoch_id.clone()
+            }
+        }
+    };
+    let retirement_marker = epochs
+        .get(&active_key_epoch_id)
+        .and_then(|row| row.activated_at.clone())
+        .or_else(|| {
+            epochs
+                .get(&active_key_epoch_id)
+                .map(|row| row.created_at.clone())
+        })
+        .ok_or_else(|| StorageError::Validation("chosen key epoch row is missing".to_string()))?;
+
+    for row in epochs.values_mut() {
+        if row.key_epoch_id == active_key_epoch_id {
+            row.status = "active".to_string();
+            row.retired_at = None;
+        } else {
+            row.status = "retired".to_string();
+            if row.retired_at.is_none() {
+                row.retired_at = Some(retirement_marker.clone());
+            }
+        }
+    }
+    Ok(KeyEpochState {
+        active_key_epoch_id,
+        epochs: epochs.into_values().collect(),
+        integrity_tag: None,
+    })
+}
+
+fn epoch_activation_rank(row: &KeyEpochRow) -> (&str, &str) {
+    (
+        row.activated_at.as_deref().unwrap_or(&row.created_at),
+        &row.key_epoch_id,
+    )
+}
+
 fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, incoming: &T) -> Option<T> {
     if local == incoming || incoming == base {
         Some(local.clone())
@@ -2135,12 +2445,14 @@ mod tests {
     use crate::commit_integrity::compute_commit_integrity_tag;
     use crate::commit_integrity::CommitIntegrityInput;
     use crate::init::{initialize_vault, VaultInitParams};
+    use crate::key_epoch::{KeyEpochRotationResult, KeyEpochService};
     use crate::repo::{
         AttachmentRepo, CommitChange, CommitOperation, EntryRepo, ObjectVersionRepo, ProjectRepo,
     };
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
+    use crate::unlock::UnlockService;
     use mdbx_core::model::{
         ChangeScope, Commit, CommitKind, ConflictResolution, EntryType, UnlockMethodType,
         VaultSession,
@@ -2150,7 +2462,7 @@ mod tests {
     };
     use mdbx_crypto::keyring::Keyring;
     use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit, TombstoneRecord};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     fn setup() -> (VaultConnection, CommitContext) {
@@ -2380,6 +2692,74 @@ mod tests {
 
     fn temp_vault_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mdbx-sync-{}-{}.mdbx", label, Uuid::new_v4()))
+    }
+
+    fn remove_vault_files(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(candidate));
+        }
+    }
+
+    fn rotation_device(device_id: &str) -> DeviceContext {
+        DeviceContext {
+            device_id: Some(device_id.to_string()),
+            assurance: DeviceAssurance::Standard,
+            secure_clipboard_available: true,
+            screen_capture_protection_available: true,
+            secure_temp_files_available: true,
+        }
+    }
+
+    fn rotate_epoch_for_sync(
+        conn: &mut VaultConnection,
+        ctx: &CommitContext,
+        device_id: &str,
+    ) -> KeyEpochRotationResult {
+        let session = conn.active_session().cloned().unwrap();
+        let device = rotation_device(device_id);
+        KeyEpochService::rotate_authorized(
+            conn,
+            ctx,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: session.assurance.authenticated_at_unix_secs + 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn create_key_epoch_sync_pair(label: &str) -> (PathBuf, PathBuf, String) {
+        let source_path = temp_vault_path(&format!("{label}-source"));
+        let target_path = temp_vault_path(&format!("{label}-target"));
+        let base_project_id;
+        {
+            let mut source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some(format!("{label}-vault")),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            UnlockService::setup_password(&mut source, "epoch sync password").unwrap();
+            let base = ProjectRepo::create(
+                &source,
+                &CommitContext::new("device-a".to_string()),
+                "Base",
+                None,
+                None,
+            )
+            .unwrap();
+            base_project_id = base.project_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        (source_path, target_path, base_project_id)
     }
 
     fn checkpoint(conn: &VaultConnection) {
@@ -3729,5 +4109,211 @@ mod tests {
         drop(target);
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn mutable_sync_apply_refreshes_keys_after_sequential_rotation() {
+        let (source_path, target_path, base_project_id) =
+            create_key_epoch_sync_pair("sequential-key-epoch");
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        UnlockService::unlock_with_password(&mut source, "epoch sync password").unwrap();
+        UnlockService::unlock_with_password(&mut target, "epoch sync password").unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        let rotation = rotate_epoch_for_sync(&mut source, &source_ctx, "device-a");
+        let after =
+            ProjectRepo::create(&source, &source_ctx, "After rotation", None, None).unwrap();
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &after.head_commit_id);
+
+        let result = SyncApplyRepo::apply_batch_mut(
+            &mut target,
+            &target_ctx,
+            &CommitBatch::new(commits, 0, true),
+        )
+        .unwrap();
+        assert_eq!(result.conflict_count, 0);
+        assert_eq!(
+            target.active_key_epoch_id(),
+            Some(rotation.active_epoch_id.as_str())
+        );
+        assert!(target
+            .keyring_for_epoch(&rotation.previous_epoch_id)
+            .is_some());
+        assert!(target
+            .keyring_for_epoch(&rotation.active_epoch_id)
+            .is_some());
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &base_project_id)
+                .unwrap()
+                .unwrap()
+                .title_ct,
+            b"Base"
+        );
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &after.project_id)
+                .unwrap()
+                .unwrap()
+                .title_ct,
+            b"After rotation"
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn concurrent_rotations_converge_and_preserve_both_epoch_keys() {
+        let (left_path, right_path, base_project_id) =
+            create_key_epoch_sync_pair("concurrent-key-epoch");
+        let mut left = VaultConnection::open(&left_path).unwrap();
+        let mut right = VaultConnection::open(&right_path).unwrap();
+        UnlockService::unlock_with_password(&mut left, "epoch sync password").unwrap();
+        UnlockService::unlock_with_password(&mut right, "epoch sync password").unwrap();
+        let left_ctx = CommitContext::new("device-a".to_string());
+        let right_ctx = CommitContext::new("device-b".to_string());
+
+        let left_rotation = rotate_epoch_for_sync(&mut left, &left_ctx, "device-a");
+        let left_project = ProjectRepo::create(&left, &left_ctx, "Left epoch", None, None).unwrap();
+        let right_rotation = rotate_epoch_for_sync(&mut right, &right_ctx, "device-b");
+        let right_project =
+            ProjectRepo::create(&right, &right_ctx, "Right epoch", None, None).unwrap();
+
+        let mut left_commits = serialized_commits_from(&left);
+        attach_state_payload_to_commit(&left, &mut left_commits, &left_project.head_commit_id);
+        let mut right_commits = serialized_commits_from(&right);
+        attach_state_payload_to_commit(&right, &mut right_commits, &right_project.head_commit_id);
+
+        SyncApplyRepo::apply_batch_mut(
+            &mut left,
+            &left_ctx,
+            &CommitBatch::new(right_commits, 0, true),
+        )
+        .unwrap();
+        SyncApplyRepo::apply_batch_mut(
+            &mut right,
+            &right_ctx,
+            &CommitBatch::new(left_commits, 0, true),
+        )
+        .unwrap();
+
+        let expected_active = if (
+            right_rotation.rotated_at.as_str(),
+            right_rotation.active_epoch_id.as_str(),
+        ) > (
+            left_rotation.rotated_at.as_str(),
+            left_rotation.active_epoch_id.as_str(),
+        ) {
+            right_rotation.active_epoch_id.as_str()
+        } else {
+            left_rotation.active_epoch_id.as_str()
+        };
+        assert_eq!(left.active_key_epoch_id(), Some(expected_active));
+        assert_eq!(right.active_key_epoch_id(), Some(expected_active));
+        for conn in [&left, &right] {
+            assert!(conn
+                .keyring_for_epoch(&left_rotation.active_epoch_id)
+                .is_some());
+            assert!(conn
+                .keyring_for_epoch(&right_rotation.active_epoch_id)
+                .is_some());
+            let epoch_count: i64 = conn
+                .inner()
+                .query_row("SELECT COUNT(*) FROM key_epochs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(epoch_count, 3);
+            assert_eq!(
+                ProjectRepo::get_by_id(conn, &base_project_id)
+                    .unwrap()
+                    .unwrap()
+                    .title_ct,
+                b"Base"
+            );
+            assert_eq!(
+                ProjectRepo::get_by_id(conn, &left_project.project_id)
+                    .unwrap()
+                    .unwrap()
+                    .title_ct,
+                b"Left epoch"
+            );
+            assert_eq!(
+                ProjectRepo::get_by_id(conn, &right_project.project_id)
+                    .unwrap()
+                    .unwrap()
+                    .title_ct,
+                b"Right epoch"
+            );
+        }
+
+        drop(left);
+        drop(right);
+        remove_vault_files(&left_path);
+        remove_vault_files(&right_path);
+    }
+
+    #[test]
+    fn key_epoch_sync_rejects_immutable_unsigned_and_tampered_changes() {
+        let (source_path, target_path, _) = create_key_epoch_sync_pair("rejected-key-epoch");
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        UnlockService::unlock_with_password(&mut source, "epoch sync password").unwrap();
+        UnlockService::unlock_with_password(&mut target, "epoch sync password").unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        rotate_epoch_for_sync(&mut source, &source_ctx, "device-a");
+        let incoming = collect_sync_state(&source)
+            .unwrap()
+            .key_epoch_state
+            .unwrap();
+        let original_active = target.active_key_epoch_id().unwrap().to_string();
+
+        let immutable_error = SyncApplyRepo::apply_key_epoch_state(
+            &target,
+            &incoming,
+            KeyEpochMergeMode::FastForward,
+            false,
+        )
+        .unwrap_err();
+        assert!(immutable_error.to_string().contains("mutable sync apply"));
+
+        let mut unsigned = incoming.clone();
+        unsigned.integrity_tag = None;
+        let unsigned_error = SyncApplyRepo::apply_key_epoch_state(
+            &target,
+            &unsigned,
+            KeyEpochMergeMode::FastForward,
+            true,
+        )
+        .unwrap_err();
+        assert!(unsigned_error.to_string().contains("integrity tag"));
+
+        let mut tampered = incoming;
+        tampered.integrity_tag.as_mut().unwrap()[0] ^= 1;
+        let tampered_error = SyncApplyRepo::apply_key_epoch_state(
+            &target,
+            &tampered,
+            KeyEpochMergeMode::FastForward,
+            true,
+        )
+        .unwrap_err();
+        assert!(tampered_error
+            .to_string()
+            .contains("integrity tag mismatch"));
+        assert_eq!(target.active_key_epoch_id(), Some(original_active.as_str()));
+        let database_active: String = target
+            .inner()
+            .query_row("SELECT active_key_epoch_id FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(database_active, original_active);
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
     }
 }

@@ -1271,7 +1271,7 @@ fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, S
 }
 
 fn apply_sync_bundle(
-    conn: &VaultConnection,
+    conn: &mut VaultConnection,
     bundle: &mdbx_sync::SyncBundle,
 ) -> Result<ApplyBatchResult, String> {
     let local_vault_id = vault_id(conn)?;
@@ -1283,7 +1283,7 @@ fn apply_sync_bundle(
     }
 
     let device_id = latest_device_id(conn)?.unwrap_or_else(|| "mdbx-cli-sync".to_string());
-    SyncApplyRepo::apply_batch(
+    SyncApplyRepo::apply_batch_mut(
         conn,
         &CommitContext::new(device_id),
         &CommitBatch::new(bundle.commits.clone(), 0, true),

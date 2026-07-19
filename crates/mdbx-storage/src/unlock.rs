@@ -980,6 +980,19 @@ impl UnlockService {
         Self::attach_verified_keyring(conn, vault_key.as_slice())
     }
 
+    pub(crate) fn verify_key_epoch_state(conn: &VaultConnection) -> StorageResult<()> {
+        let vault_key = Zeroizing::new(
+            conn.keyring()
+                .map(|keyring| keyring.vault_key.clone())
+                .ok_or_else(|| {
+                    StorageError::Validation(
+                        "vault must be unlocked before verifying key epochs".to_string(),
+                    )
+                })?,
+        );
+        Self::build_keyring(conn, vault_key.as_slice()).map(|_| ())
+    }
+
     fn load_epoch_keyrings(
         conn: &VaultConnection,
         vault_key: &[u8],
