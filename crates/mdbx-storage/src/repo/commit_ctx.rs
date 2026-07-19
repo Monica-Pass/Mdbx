@@ -115,33 +115,53 @@ impl CommitContext {
             ));
         }
 
-        if let Some((commit_id, operation_kind, branch_name)) = conn
+        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let existing = conn
             .inner()
             .query_row(
-                "SELECT commit_id, operation_kind, branch_name
-                 FROM commit_operations WHERE operation_id = ?1",
+                "SELECT o.commit_id, o.operation_kind, o.branch_name,
+                        c.commit_kind, c.change_scope
+                 FROM commit_operations o
+                 JOIN commits c ON c.commit_id = o.commit_id
+                 WHERE o.operation_id = ?1",
                 params![operation.operation_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
-            .optional()
-            .map_err(StorageError::Database)?
+            .optional();
+        let existing = match existing {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = conn.inner().execute_batch("ROLLBACK;");
+                return Err(StorageError::Database(error));
+            }
+        };
+        if let Some((commit_id, operation_kind, branch_name, commit_kind, change_scope)) = existing
         {
-            if operation_kind != operation.operation_kind || branch_name != operation.branch_name {
+            let compatible_scope =
+                change_scope == operation.change_scope || change_scope == "multi";
+            if operation_kind != operation.operation_kind
+                || branch_name != operation.branch_name
+                || commit_kind != operation.commit_kind
+                || !compatible_scope
+            {
+                let _ = conn.inner().execute_batch("ROLLBACK;");
                 return Err(StorageError::Validation(format!(
                     "operation {} was reused for a different operation",
                     operation.operation_id
                 )));
             }
+            conn.inner().execute_batch("ROLLBACK;")?;
             return Ok(OperationExecution::AlreadyCommitted { commit_id });
         }
 
-        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
         let scoped = CommitContext {
             device_id: self.device_id.clone(),
             active_operation: RefCell::new(Some(ActiveOperation {
@@ -182,7 +202,10 @@ impl CommitContext {
             .query_row(
                 "INSERT INTO commit_device_sequences (device_id, last_local_seq)
                  VALUES (?1, COALESCE((SELECT MAX(local_seq) + 1 FROM commits WHERE device_id = ?1), 1))
-                 ON CONFLICT(device_id) DO UPDATE SET last_local_seq = last_local_seq + 1
+                 ON CONFLICT(device_id) DO UPDATE SET last_local_seq = MAX(
+                     last_local_seq + 1,
+                     COALESCE((SELECT MAX(local_seq) + 1 FROM commits WHERE device_id = ?1), 1)
+                 )
                  RETURNING last_local_seq",
                 params![self.device_id],
                 |row| row.get::<_, i64>(0),
@@ -435,44 +458,45 @@ impl CommitContext {
             .borrow_mut()
             .take()
             .ok_or_else(|| StorageError::Validation("missing active operation".to_string()))?;
-
-        if active.operation.commit_kind != commit_kind {
-            return Err(StorageError::Validation(format!(
-                "operation commit kind {} cannot contain {}",
-                active.operation.commit_kind, commit_kind
-            )));
-        }
-        if active.operation.change_scope != change_scope {
-            active.operation.change_scope = "multi".to_string();
-        }
-        for parent in parents {
-            if !active.operation.parents.contains(parent) {
-                active.operation.parents.push(parent.clone());
+        let result = (|| -> StorageResult<String> {
+            if active.operation.commit_kind != commit_kind {
+                return Err(StorageError::Validation(format!(
+                    "operation commit kind {} cannot contain {}",
+                    active.operation.commit_kind, commit_kind
+                )));
             }
-        }
-        for object_id in changed_object_ids {
-            merge_change(
-                &mut active.operation.changed_objects,
-                CommitChange {
-                    object_type: change_scope.to_string(),
-                    object_id: object_id.clone(),
-                    action: "change".to_string(),
-                    fields: Vec::new(),
-                },
-            );
-        }
+            if active.operation.change_scope != change_scope {
+                active.operation.change_scope = "multi".to_string();
+            }
+            for parent in parents {
+                if !active.operation.parents.contains(parent) {
+                    active.operation.parents.push(parent.clone());
+                }
+            }
+            for object_id in changed_object_ids {
+                merge_change(
+                    &mut active.operation.changed_objects,
+                    CommitChange {
+                        object_type: change_scope.to_string(),
+                        object_id: object_id.clone(),
+                        action: "change".to_string(),
+                        fields: Vec::new(),
+                    },
+                );
+            }
 
-        let result = if let Some(commit_id) = active.commit_id.clone() {
-            self.rewrite_active_commit(conn, &mut active)?;
-            commit_id
-        } else {
-            let commit_id = self.create_operation_commit_inner(conn, &active.operation)?;
-            active.commit_id = Some(commit_id.clone());
-            active.operation.parents = self.parents_for_commit(conn, &commit_id)?;
-            commit_id
-        };
+            if let Some(commit_id) = active.commit_id.clone() {
+                self.rewrite_active_commit(conn, &mut active)?;
+                Ok(commit_id)
+            } else {
+                let commit_id = self.create_operation_commit_inner(conn, &active.operation)?;
+                active.commit_id = Some(commit_id.clone());
+                active.operation.parents = self.parents_for_commit(conn, &commit_id)?;
+                Ok(commit_id)
+            }
+        })();
         self.active_operation.replace(Some(active));
-        Ok(result)
+        result
     }
 
     fn parents_for_commit(
@@ -837,6 +861,7 @@ mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::ProjectRepo;
+    use std::sync::{Arc, Barrier};
 
     fn initialized() -> (VaultConnection, CommitContext) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -1162,5 +1187,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version_count, 1);
+    }
+
+    #[test]
+    fn concurrent_retry_executes_one_operation_only_once() {
+        let path =
+            std::env::temp_dir().join(format!("mdbx-operation-race-{}.mdbx", Uuid::new_v4()));
+        {
+            let conn = VaultConnection::create(&path).unwrap();
+            initialize_vault(
+                &conn,
+                &VaultInitParams {
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let operation = CommitOperation::new(
+            "operation-race",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let handles = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                let operation = operation.clone();
+                std::thread::spawn(move || {
+                    let conn = VaultConnection::open(&path).unwrap();
+                    let ctx = CommitContext::new("device-a".to_string());
+                    barrier.wait();
+                    ctx.run_operation(&conn, operation, |scoped| {
+                        ProjectRepo::create(&conn, scoped, "once", None, None)
+                    })
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        let conn = VaultConnection::open(&path).unwrap();
+        let project_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(project_count, 1);
+        assert!(results
+            .iter()
+            .any(|result| matches!(result, OperationExecution::Applied { .. })));
+        assert!(results
+            .iter()
+            .any(|result| matches!(result, OperationExecution::AlreadyCommitted { .. })));
+
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    #[test]
+    fn caught_nested_error_does_not_disable_coalescing() {
+        let (conn, ctx) = initialized();
+        let before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let operation = CommitOperation::new(
+            "operation-after-error",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+
+        let result = ctx
+            .run_operation(&conn, operation, |scoped| {
+                let error = scoped
+                    .create_commit(&conn, "merge", "project", &["invalid".to_string()], &[])
+                    .unwrap_err();
+                assert!(error.to_string().contains("cannot contain merge"));
+                ProjectRepo::create(&conn, scoped, "Still coalesced", None, None)
+            })
+            .unwrap();
+        let commit_id = match result {
+            OperationExecution::Applied { commit_id, .. } => commit_id,
+            OperationExecution::AlreadyCommitted { .. } => panic!("first call must execute"),
+        };
+
+        let after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before + 1);
+        let operation_commit: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_id FROM commit_operations WHERE operation_id = ?1",
+                params!["operation-after-error"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_commit, commit_id);
     }
 }

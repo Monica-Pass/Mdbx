@@ -171,6 +171,14 @@ impl SyncApplyRepo {
             ],
         )?;
 
+        conn.inner().execute(
+            "INSERT INTO commit_device_sequences (device_id, last_local_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(device_id) DO UPDATE SET
+                last_local_seq = MAX(last_local_seq, excluded.last_local_seq)",
+            params![commit.device_id, commit.local_seq as i64],
+        )?;
+
         for parent_id in &serialized.parent_ids {
             conn.inner().execute(
                 "INSERT OR IGNORE INTO commit_parents (commit_id, parent_commit_id) VALUES (?1, ?2)",
@@ -2716,6 +2724,49 @@ mod tests {
         let result = SyncApplyRepo::apply_batch(&conn, &ctx, &batch).unwrap();
         assert_eq!(result.applied_commits, 1);
         assert_eq!(result.conflict_count, 0);
+    }
+
+    #[test]
+    fn incoming_commit_advances_the_device_sequence_floor() {
+        let (conn, ctx) = setup();
+        let main_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let incoming = make_commit(
+            "remote-seq-50",
+            "device-a",
+            50,
+            vec![main_head],
+            Vec::new(),
+            "unused",
+            "project",
+        );
+        SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![incoming], 0, true))
+            .unwrap();
+
+        let operation = CommitOperation::new(
+            "local-after-sync",
+            "change",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let local_seq: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT local_seq FROM commits WHERE commit_id = ?1",
+                params![commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_seq, 51);
     }
 
     #[test]
