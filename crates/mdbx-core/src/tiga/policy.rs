@@ -985,6 +985,8 @@ pub enum TigaOperation {
     ChangeRecoveryMethods,
     RotateKeyEpoch,
     DeleteAuditRecords,
+    ManageDeletedObjectRetention,
+    PurgeDeletedObject,
     BackgroundAccess,
     SyncCiphertext,
     CreatePlaintextCache,
@@ -1161,7 +1163,9 @@ impl TigaPolicy {
             | TigaOperation::ChangeSecurityPolicy
             | TigaOperation::ChangeRecoveryMethods
             | TigaOperation::RotateKeyEpoch
-            | TigaOperation::DeleteAuditRecords => {
+            | TigaOperation::DeleteAuditRecords
+            | TigaOperation::ManageDeletedObjectRetention
+            | TigaOperation::PurgeDeletedObject => {
                 if operation == TigaOperation::DeleteAuditRecords
                     && !self.administration.audit_deletion_allowed
                 {
@@ -1251,6 +1255,8 @@ impl TigaPolicy {
                     | TigaOperation::ChangeRecoveryMethods
                     | TigaOperation::RotateKeyEpoch
                     | TigaOperation::DeleteAuditRecords
+                    | TigaOperation::ManageDeletedObjectRetention
+                    | TigaOperation::PurgeDeletedObject
             ),
         }
     }

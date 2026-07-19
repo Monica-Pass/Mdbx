@@ -25,4 +25,6 @@ pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
 pub use object_version::ObjectVersionRepo;
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
-pub use tombstone::{TombstonePurgeBlocker, TombstonePurgeEligibility, TombstoneRepo};
+pub use tombstone::{
+    TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
+};

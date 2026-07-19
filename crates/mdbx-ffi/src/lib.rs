@@ -27,7 +27,8 @@ use mdbx_storage::repo::{
     CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
     ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
-    ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility, TombstoneRepo,
+    ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult,
+    TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -207,6 +208,23 @@ impl From<TombstonePurgeEligibility> for MdbxTombstonePurgeEligibility {
             tombstone_id: value.tombstone_id,
             eligible: value.eligible,
             blockers: value.blockers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxTombstonePurgeScheduleResult {
+    pub tombstone_id: String,
+    pub purge_eligible_at: String,
+    pub commit_id: String,
+}
+
+impl From<TombstonePurgeScheduleResult> for MdbxTombstonePurgeScheduleResult {
+    fn from(value: TombstonePurgeScheduleResult) -> Self {
+        Self {
+            tombstone_id: value.tombstone_id,
+            purge_eligible_at: value.purge_eligible_at,
+            commit_id: value.commit_id,
         }
     }
 }
@@ -526,6 +544,8 @@ pub enum MdbxTigaOperation {
     ChangeRecoveryMethods,
     RotateKeyEpoch,
     DeleteAuditRecords,
+    ManageDeletedObjectRetention,
+    PurgeDeletedObject,
     BackgroundAccess,
     SyncCiphertext,
     CreatePlaintextCache,
@@ -545,6 +565,8 @@ impl From<MdbxTigaOperation> for TigaOperation {
             MdbxTigaOperation::ChangeRecoveryMethods => Self::ChangeRecoveryMethods,
             MdbxTigaOperation::RotateKeyEpoch => Self::RotateKeyEpoch,
             MdbxTigaOperation::DeleteAuditRecords => Self::DeleteAuditRecords,
+            MdbxTigaOperation::ManageDeletedObjectRetention => Self::ManageDeletedObjectRetention,
+            MdbxTigaOperation::PurgeDeletedObject => Self::PurgeDeletedObject,
             MdbxTigaOperation::BackgroundAccess => Self::BackgroundAccess,
             MdbxTigaOperation::SyncCiphertext => Self::SyncCiphertext,
             MdbxTigaOperation::CreatePlaintextCache => Self::CreatePlaintextCache,
@@ -566,6 +588,8 @@ impl From<TigaOperation> for MdbxTigaOperation {
             TigaOperation::ChangeRecoveryMethods => Self::ChangeRecoveryMethods,
             TigaOperation::RotateKeyEpoch => Self::RotateKeyEpoch,
             TigaOperation::DeleteAuditRecords => Self::DeleteAuditRecords,
+            TigaOperation::ManageDeletedObjectRetention => Self::ManageDeletedObjectRetention,
+            TigaOperation::PurgeDeletedObject => Self::PurgeDeletedObject,
             TigaOperation::BackgroundAccess => Self::BackgroundAccess,
             TigaOperation::SyncCiphertext => Self::SyncCiphertext,
             TigaOperation::CreatePlaintextCache => Self::CreatePlaintextCache,
@@ -1001,6 +1025,30 @@ impl MdbxVault {
     ) -> Result<MdbxTombstonePurgeEligibility, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(TombstoneRepo::evaluate_purge_eligibility(&conn, &tombstone_id, &now)?.into())
+    }
+
+    pub fn schedule_tombstone_purge(
+        &self,
+        tombstone_id: String,
+        purge_eligible_at: String,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxTombstonePurgeScheduleResult, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let session = conn.active_session().cloned();
+        let device = device.into_core(&self.device_id);
+        let ctx = CommitContext::new(self.device_id.clone());
+        let (result, _) = TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone_id,
+            &purge_eligible_at,
+            TigaAuthorizationContext {
+                session: session.as_ref(),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?;
+        Ok(result.into())
     }
 
     pub fn resolve_tiga_policy(

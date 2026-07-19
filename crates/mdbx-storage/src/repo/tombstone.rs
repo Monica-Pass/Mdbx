@@ -3,12 +3,17 @@ use std::collections::HashSet;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use mdbx_core::model::Tombstone;
 use mdbx_core::model::TombstoneTargetType;
+use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::repo::{CommitChange, CommitContext, CommitOperation};
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 /// 墓碑查询仓库。
 ///
@@ -36,6 +41,13 @@ pub struct TombstonePurgeEligibility {
     pub tombstone_id: String,
     pub eligible: bool,
     pub blockers: Vec<TombstonePurgeBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstonePurgeScheduleResult {
+    pub tombstone_id: String,
+    pub purge_eligible_at: String,
+    pub commit_id: String,
 }
 
 impl TombstoneRepo {
@@ -235,6 +247,74 @@ impl TombstoneRepo {
         })
     }
 
+    /// 在 TIGA 管理授权后安排墓碑的最早清理时间。
+    pub fn schedule_purge_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        tombstone_id: &str,
+        purge_eligible_at: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(TombstonePurgeScheduleResult, AuthorizationDecision)> {
+        let eligible_at =
+            chrono::DateTime::parse_from_rfc3339(purge_eligible_at).map_err(|error| {
+                StorageError::Validation(format!("invalid purge schedule: {error}"))
+            })?;
+        let tombstone = Self::find_by_id(conn, tombstone_id)?
+            .ok_or_else(|| StorageError::NotFound(tombstone_id.to_string()))?;
+        let deleted_at =
+            chrono::DateTime::parse_from_rfc3339(&tombstone.deleted_at).map_err(|error| {
+                StorageError::Validation(format!(
+                    "tombstone {} has invalid deleted_at: {error}",
+                    tombstone.tombstone_id
+                ))
+            })?;
+        if eligible_at < deleted_at {
+            return Err(StorageError::Validation(
+                "purge schedule cannot precede the deletion time".to_string(),
+            ));
+        }
+
+        let (result, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ManageDeletedObjectRetention,
+            context,
+            || {
+                let operation = CommitOperation::new(
+                    schedule_operation_id(tombstone_id, purge_eligible_at),
+                    "schedule-deleted-object-purge",
+                    "main",
+                    "change",
+                    tombstone.target_object_type.to_string(),
+                    vec![CommitChange {
+                        object_type: tombstone.target_object_type.to_string(),
+                        object_id: tombstone.target_object_id.clone(),
+                        action: "schedule-purge".to_string(),
+                        fields: vec!["purge_eligible_at".to_string()],
+                    }],
+                );
+                let commit_id = ctx.create_operation_commit(conn, &operation)?;
+                let affected = conn.inner().execute(
+                    "UPDATE tombstones SET purge_eligible_at = ?1
+                     WHERE tombstone_id = ?2",
+                    params![purge_eligible_at, tombstone_id],
+                )?;
+                if affected != 1 {
+                    return Err(StorageError::NotFound(tombstone_id.to_string()));
+                }
+                Ok((
+                    TombstonePurgeScheduleResult {
+                        tombstone_id: tombstone_id.to_string(),
+                        purge_eligible_at: purge_eligible_at.to_string(),
+                        commit_id: commit_id.clone(),
+                    },
+                    commit_id,
+                ))
+            },
+        )?;
+        Ok((result, decision))
+    }
+
     fn list_where(
         conn: &VaultConnection,
         where_clause: &str,
@@ -348,6 +428,16 @@ impl TombstoneRepo {
     }
 }
 
+fn schedule_operation_id(tombstone_id: &str, purge_eligible_at: &str) -> String {
+    let digest =
+        Sha256::digest([tombstone_id.as_bytes(), b"\0", purge_eligible_at.as_bytes()].concat());
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("tombstone-purge-schedule-{encoded}")
+}
+
 fn read_target_type(
     row: &rusqlite::Row<'_>,
     column: usize,
@@ -374,6 +464,8 @@ mod tests {
     use crate::repo::commit_ctx::CommitContext;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
+    use mdbx_core::model::{UnlockMethodType, VaultSession};
+    use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext, String) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -385,6 +477,27 @@ mod tests {
         let ctx = CommitContext::new("test-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Tombstone Project", None, None).unwrap();
         (conn, ctx, project.project_id)
+    }
+
+    fn administrative_session(now: i64) -> VaultSession {
+        VaultSession {
+            session_id: "purge-admin-session".to_string(),
+            unlock_method: UnlockMethodType::Password,
+            created_at: chrono::DateTime::from_timestamp(now, 0)
+                .unwrap()
+                .to_rfc3339(),
+            assurance: SessionAssurance::from_unlock_method(UnlockMethodType::Password, now),
+        }
+    }
+
+    fn administrative_device() -> DeviceContext {
+        DeviceContext {
+            device_id: Some("test-device".to_string()),
+            assurance: DeviceAssurance::Standard,
+            secure_clipboard_available: false,
+            screen_capture_protection_available: false,
+            secure_temp_files_available: true,
+        }
     }
 
     #[test]
@@ -584,6 +697,99 @@ mod tests {
             eligibility.blockers,
             vec![TombstonePurgeBlocker::RetentionNotScheduled]
         );
+    }
+
+    #[test]
+    fn tombstone_purge_schedule_is_authorized_audited_and_idempotent() {
+        let (conn, ctx, project_id) = setup();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        let session = administrative_session(1_000);
+        let device = administrative_device();
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: 1_010,
+        };
+
+        let (first, decision) = TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            context,
+        )
+        .unwrap();
+        assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
+        let commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        let (retry, _) = TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            context,
+        )
+        .unwrap();
+        assert_eq!(retry.commit_id, first.commit_id);
+        let retry_commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retry_commit_count, commit_count);
+
+        let stored: String = conn
+            .inner()
+            .query_row(
+                "SELECT purge_eligible_at FROM tombstones WHERE tombstone_id = ?1",
+                params![tombstone.tombstone_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "2030-01-01T00:00:00Z");
+        let events = TigaService::list_security_audit_events(&conn, 10).unwrap();
+        assert!(events.iter().all(|event| {
+            event.operation == TigaOperation::ManageDeletedObjectRetention
+                && event.commit_id.as_deref() == Some(first.commit_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn tombstone_purge_schedule_denial_preserves_state() {
+        let (conn, ctx, project_id) = setup();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        let device = administrative_device();
+
+        let error = TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            TigaAuthorizationContext {
+                session: None,
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+        let stored: Option<String> = conn
+            .inner()
+            .query_row(
+                "SELECT purge_eligible_at FROM tombstones WHERE tombstone_id = ?1",
+                params![tombstone.tombstone_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.is_none());
     }
 
     #[test]
