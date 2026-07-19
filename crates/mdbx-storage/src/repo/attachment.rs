@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+
 use rusqlite::params;
 use rusqlite::types::Type;
 use rusqlite::OptionalExtension;
@@ -528,48 +530,146 @@ impl AttachmentRepo {
     /// 从 attachment_chunks 读取 chunk_index=0 的内容，计算 hash 并与
     /// attachments.content_hash 对比。不匹配则返回错误。
     pub fn read_content(conn: &VaultConnection, attachment_id: &str) -> StorageResult<Vec<u8>> {
+        let mut data = Vec::new();
+        Self::read_content_to_writer(conn, attachment_id, &mut data)?;
+        Ok(data)
+    }
+
+    /// 将附件明文流式写入目标，并验证结构、分块和整体内容完整性。
+    ///
+    /// 内存占用与单个已加密分块大小相关，不随附件总大小增长。返回写入的明文字节数。
+    pub fn read_content_to_writer(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        writer: &mut dyn Write,
+    ) -> StorageResult<u64> {
+        Self::read_content_to_writer_inner(conn, attachment_id, writer, true)
+    }
+
+    fn read_content_to_writer_inner(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        writer: &mut dyn Write,
+        reject_deleted: bool,
+    ) -> StorageResult<u64> {
         let att = AttachmentRepo::get_by_id(conn, attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
 
-        if att.deleted {
+        if reject_deleted && att.deleted {
             return Err(StorageError::ConstraintViolation(
                 "attachment is deleted".to_string(),
             ));
         }
 
-        if att.chunk_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        let data = read_all_chunks(conn, attachment_id, att.chunk_count)?;
-
-        // 整体完整性校验
-        let computed = compute_sha256_hex(&data);
-        if computed != att.content_hash {
+        let (actual_count, declared_size, min_index, max_index): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = conn.inner().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(stored_size), 0),
+                    MIN(chunk_index), MAX(chunk_index)
+             FROM attachment_chunks WHERE attachment_id = ?1",
+            params![attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if actual_count != i64::from(att.chunk_count) {
             return Err(StorageError::ConstraintViolation(format!(
-                "content hash mismatch: expected {}, got {}",
-                att.content_hash, computed
+                "attachment chunk count mismatch: expected {}, got {}",
+                att.chunk_count, actual_count
+            )));
+        }
+        if actual_count == 0 {
+            return Ok(0);
+        }
+        if min_index != Some(0) || max_index != Some(actual_count - 1) {
+            return Err(StorageError::ConstraintViolation(
+                "attachment chunk indices are not contiguous".to_string(),
+            ));
+        }
+        if declared_size < 0 || declared_size as u64 != att.stored_size {
+            return Err(StorageError::ConstraintViolation(format!(
+                "attachment stored size mismatch: expected {}, got {}",
+                att.stored_size, declared_size
             )));
         }
 
-        Ok(data)
+        let mut stmt = conn.inner().prepare(
+            "SELECT chunk_index, chunk_hash, chunk_ct, stored_size
+             FROM attachment_chunks
+             WHERE attachment_id = ?1
+             ORDER BY chunk_index",
+        )?;
+        let rows = stmt.query_map(params![attachment_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut overall_hasher = Sha256::new();
+        let mut total_size = 0u64;
+        for (expected_index, row) in rows.enumerate() {
+            let (chunk_index, expected_hash, encrypted, stored_size) = row?;
+            if chunk_index != expected_index as i64 {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "attachment chunk index mismatch: expected {}, got {}",
+                    expected_index, chunk_index
+                )));
+            }
+            let plaintext =
+                Self::decrypt_attachment_field(conn, attachment_id, "chunk", &encrypted)?;
+            if stored_size < 0 || stored_size as usize != plaintext.len() {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "attachment chunk {} size mismatch",
+                    chunk_index
+                )));
+            }
+            let computed_hash = compute_sha256_hex(&plaintext);
+            if computed_hash != expected_hash {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "attachment chunk {} hash mismatch",
+                    chunk_index
+                )));
+            }
+
+            writer.write_all(&plaintext)?;
+            overall_hasher.update(&plaintext);
+            total_size = total_size
+                .checked_add(plaintext.len() as u64)
+                .ok_or_else(|| {
+                    StorageError::Validation("attachment content size overflow".to_string())
+                })?;
+        }
+
+        let computed_hash = format!("{:x}", overall_hasher.finalize());
+        if computed_hash != att.content_hash {
+            return Err(StorageError::ConstraintViolation(format!(
+                "content hash mismatch: expected {}, got {}",
+                att.content_hash, computed_hash
+            )));
+        }
+        if total_size != att.stored_size {
+            return Err(StorageError::ConstraintViolation(format!(
+                "attachment plaintext size mismatch: expected {}, got {}",
+                att.stored_size, total_size
+            )));
+        }
+
+        Ok(total_size)
     }
 
     /// 校验附件完整性，不返回内容。
     pub fn verify_integrity(conn: &VaultConnection, attachment_id: &str) -> StorageResult<bool> {
         let att = AttachmentRepo::get_by_id(conn, attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
-
         if att.chunk_count == 0 {
             return Ok(true);
         }
-
-        let data = match read_all_chunks(conn, attachment_id, att.chunk_count) {
-            Ok(d) => d,
-            Err(_) => return Ok(false),
-        };
-
-        Ok(compute_sha256_hex(&data) == att.content_hash)
+        let mut sink = std::io::sink();
+        Ok(Self::read_content_to_writer_inner(conn, attachment_id, &mut sink, false).is_ok())
     }
 
     // -----------------------------------------------------------------------
@@ -588,6 +688,50 @@ impl AttachmentRepo {
         data: &[u8],
         chunk_size: usize,
     ) -> StorageResult<String> {
+        let mut reader = std::io::Cursor::new(data);
+        Self::write_content_from_reader_inner(
+            conn,
+            ctx,
+            attachment_id,
+            &mut reader,
+            chunk_size,
+            true,
+        )
+    }
+
+    /// 从 reader 分块读取、加密并写入附件内容。
+    ///
+    /// 所有分块、提交和附件元数据位于同一个事务中。reader 失败时原有内容保持不变。
+    /// 当内容只有一个分块时使用内嵌模式，多个分块时使用分块模式。
+    pub fn write_content_from_reader(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        reader: &mut dyn Read,
+        chunk_size: usize,
+    ) -> StorageResult<String> {
+        Self::write_content_from_reader_inner(conn, ctx, attachment_id, reader, chunk_size, false)
+    }
+
+    fn write_content_from_reader_inner(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        reader: &mut dyn Read,
+        chunk_size: usize,
+        force_chunked_mode: bool,
+    ) -> StorageResult<String> {
+        if chunk_size == 0 {
+            return Err(StorageError::Validation(
+                "chunk_size must be greater than zero".to_string(),
+            ));
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(chunk_size).map_err(|error| {
+            StorageError::Validation(format!("cannot allocate attachment chunk buffer: {error}"))
+        })?;
+        buffer.resize(chunk_size, 0);
+
         conn.with_immediate_transaction(|| {
             let att = AttachmentRepo::get_by_id(conn, attachment_id)?
                 .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
@@ -598,13 +742,7 @@ impl AttachmentRepo {
                 ));
             }
 
-            assert!(chunk_size > 0, "chunk_size must be > 0");
-
-            let content_hash = compute_sha256_hex(data);
             let now = chrono::Utc::now().to_rfc3339();
-            let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
-            let chunk_count = chunks.len() as u32;
-
             let commit_id = ctx.commit_object_change(
                 conn,
                 "attachments",
@@ -619,8 +757,15 @@ impl AttachmentRepo {
                 params![attachment_id],
             )?;
 
-            // 逐 chunk 写入
-            for (i, chunk) in chunks.iter().enumerate() {
+            let mut content_hasher = Sha256::new();
+            let mut chunk_count = 0u32;
+            let mut total_size = 0u64;
+            loop {
+                let bytes_read = read_chunk(reader, &mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                let chunk = &buffer[..bytes_read];
                 let chunk_hash = compute_sha256_hex(chunk);
                 let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", chunk)?;
                 conn.inner().execute(
@@ -629,27 +774,47 @@ impl AttachmentRepo {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         attachment_id,
-                        i as i64,
+                        i64::from(chunk_count),
                         chunk_hash,
                         chunk_ct,
                         chunk.len() as i64,
                         now,
                     ],
                 )?;
+                content_hasher.update(chunk);
+                total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    StorageError::Validation("attachment content size overflow".to_string())
+                })?;
+                if total_size > i64::MAX as u64 {
+                    return Err(StorageError::Validation(
+                        "attachment content exceeds SQLite integer range".to_string(),
+                    ));
+                }
+                chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
+                    StorageError::Validation("attachment chunk count overflow".to_string())
+                })?;
             }
+
+            let content_hash = format!("{:x}", content_hasher.finalize());
+            let storage_mode = if force_chunked_mode || chunk_count > 1 {
+                "embedded-chunked"
+            } else {
+                "embedded-inline"
+            };
 
             // 更新 attachments 元数据
             conn.inner().execute(
                 "UPDATE attachments SET
                 content_hash = ?2, stored_size = ?3, chunk_count = ?4,
-                storage_mode = 'embedded-chunked',
-                head_commit_id = ?5, updated_at = ?6, updated_by_device_id = ?7
+                storage_mode = ?5,
+                head_commit_id = ?6, updated_at = ?7, updated_by_device_id = ?8
              WHERE attachment_id = ?1",
                 params![
                     attachment_id,
                     content_hash,
-                    data.len() as i64,
+                    total_size as i64,
                     chunk_count,
+                    storage_mode,
                     commit_id,
                     now,
                     ctx.device_id,
@@ -741,36 +906,17 @@ impl AttachmentRepo {
     }
 }
 
-/// 按 chunk_index 顺序读取所有 chunk 并拼接，解密每个 chunk。
-fn read_all_chunks(
-    conn: &VaultConnection,
-    attachment_id: &str,
-    chunk_count: u32,
-) -> StorageResult<Vec<u8>> {
-    let mut stmt = conn.inner().prepare(
-        "SELECT chunk_ct FROM attachment_chunks
-         WHERE attachment_id = ?1
-         ORDER BY chunk_index",
-    )?;
-
-    let rows = stmt.query_map(params![attachment_id], |row| row.get::<_, Vec<u8>>(0))?;
-
-    let mut data = Vec::new();
-    for row in rows {
-        let encrypted = row?;
-        let plaintext =
-            AttachmentRepo::decrypt_attachment_field(conn, attachment_id, "chunk", &encrypted)?;
-        data.extend_from_slice(&plaintext);
+fn read_chunk(reader: &mut dyn Read, buffer: &mut [u8]) -> StorageResult<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(StorageError::Io(error)),
+        }
     }
-
-    // 验证 chunk 数量与声明的匹配
-    if data.is_empty() && chunk_count > 0 {
-        return Err(StorageError::ConstraintViolation(
-            "attachment has chunk_count > 0 but no chunk data found".to_string(),
-        ));
-    }
-
-    Ok(data)
+    Ok(filled)
 }
 
 /// 计算 SHA-256 并返回 hex 字符串。
@@ -787,6 +933,8 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, ErrorKind};
+
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
@@ -1265,6 +1413,21 @@ mod tests {
     }
 
     #[test]
+    fn test_integrity_verification_preserves_legacy_deleted_and_missing_behavior() {
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "deleted.bin", None, "", 4)
+            .unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"data").unwrap();
+        AttachmentRepo::soft_delete(&conn, &ctx, &att.attachment_id).unwrap();
+
+        assert!(AttachmentRepo::verify_integrity(&conn, &att.attachment_id).unwrap());
+        assert!(matches!(
+            AttachmentRepo::verify_integrity(&conn, "missing-attachment"),
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test]
     fn test_integrity_verification_fails_on_tamper() {
         let (conn, ctx, project_id) = setup();
         let att =
@@ -1396,6 +1559,256 @@ mod tests {
         assert_eq!(refreshed.stored_size, 1024);
         assert_eq!(refreshed.chunk_count, 4);
         assert_eq!(refreshed.storage_mode, StorageMode::EmbeddedChunked);
+    }
+
+    #[test]
+    fn test_streaming_content_roundtrip_uses_bounded_reads() {
+        struct TrackingReader {
+            inner: Cursor<Vec<u8>>,
+            max_requested: usize,
+        }
+
+        impl Read for TrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.max_requested = self.max_requested.max(buffer.len());
+                self.inner.read(buffer)
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "stream.bin",
+            Some("application/octet-stream"),
+            "",
+            1025,
+        )
+        .unwrap();
+        let data: Vec<u8> = (0..1025).map(|index| (index % 251) as u8).collect();
+        let mut reader = TrackingReader {
+            inner: Cursor::new(data.clone()),
+            max_requested: 0,
+        };
+
+        let hash = AttachmentRepo::write_content_from_reader(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            128,
+        )
+        .unwrap();
+        assert!(reader.max_requested <= 128);
+
+        let mut output = Vec::new();
+        let written =
+            AttachmentRepo::read_content_to_writer(&conn, &att.attachment_id, &mut output).unwrap();
+        assert_eq!(written, data.len() as u64);
+        assert_eq!(output, data);
+        assert_eq!(hash, compute_sha256_hex(&output));
+
+        let refreshed = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.chunk_count, 9);
+        assert_eq!(refreshed.storage_mode, StorageMode::EmbeddedChunked);
+    }
+
+    #[test]
+    fn test_streaming_single_chunk_uses_inline_mode() {
+        let (conn, ctx, project_id) = setup();
+        let att =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "small.bin", None, "", 5).unwrap();
+        let mut reader = Cursor::new(b"small".to_vec());
+
+        AttachmentRepo::write_content_from_reader(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            128,
+        )
+        .unwrap();
+
+        let refreshed = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.chunk_count, 1);
+        assert_eq!(refreshed.storage_mode, StorageMode::EmbeddedInline);
+    }
+
+    #[test]
+    fn test_streaming_empty_content_roundtrip() {
+        let (conn, ctx, project_id) = setup();
+        let att =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "empty.bin", None, "", 0).unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+
+        let hash = AttachmentRepo::write_content_from_reader(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            128,
+        )
+        .unwrap();
+
+        assert_eq!(hash, compute_sha256_hex(&[]));
+        assert!(AttachmentRepo::read_content(&conn, &att.attachment_id)
+            .unwrap()
+            .is_empty());
+        assert!(AttachmentRepo::verify_integrity(&conn, &att.attachment_id).unwrap());
+    }
+
+    #[test]
+    fn test_streaming_zero_chunk_size_is_validation_error() {
+        let (conn, ctx, project_id) = setup();
+        let att =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "zero.bin", None, "", 0).unwrap();
+        let mut reader = Cursor::new(b"data".to_vec());
+
+        let error = AttachmentRepo::write_content_from_reader(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn test_streaming_reader_failure_rolls_back_content_and_commit() {
+        struct FailingReader {
+            data: Vec<u8>,
+            position: usize,
+            fail_after: usize,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.position >= self.fail_after {
+                    return Err(std::io::Error::new(ErrorKind::Other, "reader failed"));
+                }
+                let available = self
+                    .data
+                    .len()
+                    .min(self.fail_after)
+                    .saturating_sub(self.position);
+                if available == 0 {
+                    return Ok(0);
+                }
+                let read = available.min(buffer.len());
+                buffer[..read].copy_from_slice(&self.data[self.position..self.position + read]);
+                self.position += read;
+                Ok(read)
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "rollback.bin", None, "", 8)
+            .unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"original").unwrap();
+        let before = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut reader = FailingReader {
+            data: vec![7; 512],
+            position: 0,
+            fail_after: 150,
+        };
+
+        let error = AttachmentRepo::write_content_from_reader(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            64,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Io(ref io) if io.kind() == ErrorKind::Other));
+
+        let after = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.chunk_count, before.chunk_count);
+        assert_eq!(after.head_commit_id, before.head_commit_id);
+        assert_eq!(commit_count_after, commit_count_before);
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_failure_preserves_io_error_kind() {
+        struct FailingWriter {
+            written: usize,
+            fail_after: usize,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if self.written >= self.fail_after {
+                    return Err(std::io::Error::new(ErrorKind::BrokenPipe, "writer failed"));
+                }
+                let written = buffer.len().min(self.fail_after - self.written);
+                self.written += written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "writer.bin", None, "", 256)
+            .unwrap();
+        AttachmentRepo::write_chunked_content(&conn, &ctx, &att.attachment_id, &[9; 256], 64)
+            .unwrap();
+        let mut writer = FailingWriter {
+            written: 0,
+            fail_after: 100,
+        };
+
+        let error = AttachmentRepo::read_content_to_writer(&conn, &att.attachment_id, &mut writer)
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Io(ref io) if io.kind() == ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn test_streaming_read_detects_chunk_hash_tamper() {
+        let (conn, ctx, project_id) = setup();
+        let att =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "hash.bin", None, "", 128).unwrap();
+        AttachmentRepo::write_chunked_content(&conn, &ctx, &att.attachment_id, &[3; 128], 32)
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE attachment_chunks SET chunk_hash = ?1
+                 WHERE attachment_id = ?2 AND chunk_index = 1",
+                params!["0".repeat(64), att.attachment_id],
+            )
+            .unwrap();
+
+        let mut output = Vec::new();
+        let error = AttachmentRepo::read_content_to_writer(&conn, &att.attachment_id, &mut output)
+            .unwrap_err();
+        assert!(matches!(error, StorageError::ConstraintViolation(_)));
     }
 
     #[test]

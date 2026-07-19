@@ -7,6 +7,7 @@ use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
 use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
+use mdbx_storage::error::StorageError;
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 use mdbx_storage::import::KdbxEntry;
 #[cfg(feature = "kdbx-export")]
@@ -15,8 +16,8 @@ use mdbx_storage::import::KdbxExporter;
 use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
-use mdbx_storage::repo::CommitContext;
 use mdbx_storage::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
+use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
 #[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
 use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
@@ -415,6 +416,8 @@ fn open_or_create_vault(
 fn ctx() -> CommitContext {
     CommitContext::new("cli-device".to_string())
 }
+
+const ATTACHMENT_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 fn cli_device_context() -> DeviceContext {
     DeviceContext {
@@ -882,52 +885,86 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
             entry_id,
             file,
         } => {
-            let data = std::fs::read(&file).map_err(|e| format!("cannot read file: {}", e))?;
+            let mut input =
+                std::fs::File::open(&file).map_err(|e| format!("cannot open file: {}", e))?;
+            let original_size = input
+                .metadata()
+                .map_err(|e| format!("cannot read file metadata: {}", e))?
+                .len();
             let file_name = file
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unnamed");
+                .unwrap_or("unnamed")
+                .to_string();
             let media_type = mime_guess_for_path(&file);
 
-            // 先基于大小计算 hash，创建元数据
-            use sha2::{Digest, Sha256};
-            let content_hash = {
-                let mut h = Sha256::new();
-                h.update(&data);
-                format!("{:x}", h.finalize())
-            };
-
-            let att = AttachmentRepo::add(
-                conn,
-                &ctx,
-                &project_id,
-                entry_id.as_deref(),
-                file_name,
-                media_type.as_deref(),
-                &content_hash,
-                data.len() as u64,
-            )
-            .map_err(|e| format!("{}", e))?;
-
-            AttachmentRepo::write_inline_content(conn, &ctx, &att.attachment_id, &data)
+            let operation = CommitOperation::new(
+                uuid::Uuid::new_v4().to_string(),
+                "attachment-add",
+                "main",
+                "change",
+                "attachment",
+                Vec::new(),
+            );
+            let result = ctx
+                .run_operation(conn, operation, |scoped| {
+                    let att = AttachmentRepo::add(
+                        conn,
+                        scoped,
+                        &project_id,
+                        entry_id.as_deref(),
+                        &file_name,
+                        media_type.as_deref(),
+                        "",
+                        original_size,
+                    )?;
+                    AttachmentRepo::write_content_from_reader(
+                        conn,
+                        scoped,
+                        &att.attachment_id,
+                        &mut input,
+                        ATTACHMENT_STREAM_CHUNK_SIZE,
+                    )?;
+                    let stored = AttachmentRepo::get_by_id(conn, &att.attachment_id)?
+                        .ok_or_else(|| StorageError::NotFound(att.attachment_id.clone()))?;
+                    if stored.stored_size != original_size {
+                        return Err(StorageError::Validation(format!(
+                            "source file size changed during import: expected {}, read {}",
+                            original_size, stored.stored_size
+                        )));
+                    }
+                    Ok(att)
+                })
                 .map_err(|e| format!("{}", e))?;
+            let att = match result {
+                OperationExecution::Applied { value, .. } => value,
+                OperationExecution::AlreadyCommitted { commit_id } => {
+                    return Err(format!(
+                        "attachment add operation was already committed as {}",
+                        commit_id
+                    ));
+                }
+            };
 
             println!(
                 "Added attachment {} ({} bytes)",
-                att.attachment_id,
-                data.len()
+                att.attachment_id, original_size
             );
         }
         AttachAction::Get {
             attachment_id,
             output,
         } => {
-            let data =
-                AttachmentRepo::read_content(conn, &attachment_id).map_err(|e| format!("{}", e))?;
             if let Some(path) = output {
-                std::fs::write(&path, &data).map_err(|e| format!("{}", e))?;
-                println!("Wrote {} bytes to {}", data.len(), path.display());
+                let mut output_file = std::fs::File::create(&path).map_err(|e| format!("{}", e))?;
+                let written =
+                    AttachmentRepo::read_content_to_writer(conn, &attachment_id, &mut output_file)
+                        .map_err(|e| format!("{}", e))?;
+                output_file.sync_all().map_err(|e| format!("{}", e))?;
+                println!("Wrote {} bytes to {}", written, path.display());
             } else {
+                let data = AttachmentRepo::read_content(conn, &attachment_id)
+                    .map_err(|e| format!("{}", e))?;
                 // stdout — only if looks like text
                 match std::str::from_utf8(&data) {
                     Ok(s) => println!("{}", s),
@@ -1879,6 +1916,10 @@ mod tests {
 
         let conn = open_unlocked(&path);
         let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let commit_count_before_attachment: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
         drop(conn);
 
         let input =
@@ -1903,6 +1944,14 @@ mod tests {
         let attachment = AttachmentRepo::list_by_project(&conn, &project_id)
             .unwrap()
             .remove(0);
+        let commit_count_after_attachment: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            commit_count_after_attachment,
+            commit_count_before_attachment + 1
+        );
         assert_eq!(
             String::from_utf8(attachment.file_name_ct.clone()).unwrap(),
             input.file_name().unwrap().to_string_lossy()
@@ -2013,6 +2062,83 @@ mod tests {
             },
         ))
         .unwrap();
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn cli_streams_large_attachment_in_single_commit() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Large Attachments".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-large-{}.bin", uuid::Uuid::new_v4()));
+        let output =
+            std::env::temp_dir().join(format!("mdbx-cli-large-out-{}.bin", uuid::Uuid::new_v4()));
+        let data: Vec<u8> = (0..ATTACHMENT_STREAM_CHUNK_SIZE + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&input, &data).unwrap();
+
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id: project_id.clone(),
+                    entry_id: None,
+                    file: input.clone(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let attachment = AttachmentRepo::list_by_project(&conn, &project_id)
+            .unwrap()
+            .remove(0);
+        let commit_count_after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(commit_count_after, commit_count_before + 1);
+        assert_eq!(attachment.chunk_count, 2);
+        assert_eq!(
+            attachment.storage_mode,
+            mdbx_core::model::attachment::StorageMode::EmbeddedChunked
+        );
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Get {
+                    attachment_id: attachment.attachment_id,
+                    output: Some(output.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), data);
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
