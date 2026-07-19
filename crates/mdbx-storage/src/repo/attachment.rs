@@ -21,6 +21,35 @@ use crate::repo::object_version::ObjectVersionRepo;
 /// 改名只改元数据，不改变 content_hash。
 pub struct AttachmentRepo;
 
+/// 流式附件写入的资源约束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentWriteOptions {
+    /// 单个明文分块的最大字节数。
+    pub chunk_size: usize,
+    /// 此次操作允许读取的明文总字节数。
+    pub max_plaintext_size: u64,
+    /// 可选的精确明文大小，用于检测源文件在读取期间发生变化。
+    pub expected_plaintext_size: Option<u64>,
+}
+
+impl AttachmentWriteOptions {
+    pub fn new(chunk_size: usize, max_plaintext_size: u64) -> Self {
+        Self {
+            chunk_size,
+            max_plaintext_size,
+            expected_plaintext_size: None,
+        }
+    }
+
+    pub fn exact(chunk_size: usize, plaintext_size: u64) -> Self {
+        Self {
+            chunk_size,
+            max_plaintext_size: plaintext_size,
+            expected_plaintext_size: Some(plaintext_size),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AttachmentCreateRequest<'a> {
     pub project_id: &'a str,
@@ -694,7 +723,7 @@ impl AttachmentRepo {
             ctx,
             attachment_id,
             &mut reader,
-            chunk_size,
+            AttachmentWriteOptions::exact(chunk_size, data.len() as u64),
             true,
         )
     }
@@ -710,7 +739,24 @@ impl AttachmentRepo {
         reader: &mut dyn Read,
         chunk_size: usize,
     ) -> StorageResult<String> {
-        Self::write_content_from_reader_inner(conn, ctx, attachment_id, reader, chunk_size, false)
+        Self::write_content_from_reader_with_options(
+            conn,
+            ctx,
+            attachment_id,
+            reader,
+            AttachmentWriteOptions::new(chunk_size, i64::MAX as u64),
+        )
+    }
+
+    /// 从 reader 写入受总量和可选精确大小约束的附件内容。
+    pub fn write_content_from_reader_with_options(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        reader: &mut dyn Read,
+        options: AttachmentWriteOptions,
+    ) -> StorageResult<String> {
+        Self::write_content_from_reader_inner(conn, ctx, attachment_id, reader, options, false)
     }
 
     fn write_content_from_reader_inner(
@@ -718,19 +764,18 @@ impl AttachmentRepo {
         ctx: &CommitContext,
         attachment_id: &str,
         reader: &mut dyn Read,
-        chunk_size: usize,
+        options: AttachmentWriteOptions,
         force_chunked_mode: bool,
     ) -> StorageResult<String> {
-        if chunk_size == 0 {
-            return Err(StorageError::Validation(
-                "chunk_size must be greater than zero".to_string(),
-            ));
-        }
+        Self::validate_write_options(options)?;
+        let maximum_buffer_size = usize::try_from(options.max_plaintext_size.saturating_add(1))
+            .unwrap_or(options.chunk_size);
+        let buffer_size = options.chunk_size.min(maximum_buffer_size.max(1));
         let mut buffer = Vec::new();
-        buffer.try_reserve_exact(chunk_size).map_err(|error| {
+        buffer.try_reserve_exact(buffer_size).map_err(|error| {
             StorageError::Validation(format!("cannot allocate attachment chunk buffer: {error}"))
         })?;
-        buffer.resize(chunk_size, 0);
+        buffer.resize(buffer_size, 0);
 
         conn.with_immediate_transaction(|| {
             let att = AttachmentRepo::get_by_id(conn, attachment_id)?
@@ -761,9 +806,23 @@ impl AttachmentRepo {
             let mut chunk_count = 0u32;
             let mut total_size = 0u64;
             loop {
-                let bytes_read = read_chunk(reader, &mut buffer)?;
+                let read_limit = next_attachment_read_limit(
+                    buffer.len(),
+                    total_size,
+                    options.max_plaintext_size,
+                );
+                let bytes_read = read_chunk(reader, &mut buffer[..read_limit])?;
                 if bytes_read == 0 {
                     break;
+                }
+                let next_total = total_size.checked_add(bytes_read as u64).ok_or_else(|| {
+                    StorageError::Validation("attachment content size overflow".to_string())
+                })?;
+                if next_total > options.max_plaintext_size {
+                    return Err(StorageError::Validation(format!(
+                        "attachment content exceeds configured limit of {} bytes",
+                        options.max_plaintext_size
+                    )));
                 }
                 let chunk = &buffer[..bytes_read];
                 let chunk_hash = compute_sha256_hex(chunk);
@@ -782,17 +841,19 @@ impl AttachmentRepo {
                     ],
                 )?;
                 content_hasher.update(chunk);
-                total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
-                    StorageError::Validation("attachment content size overflow".to_string())
-                })?;
-                if total_size > i64::MAX as u64 {
-                    return Err(StorageError::Validation(
-                        "attachment content exceeds SQLite integer range".to_string(),
-                    ));
-                }
+                total_size = next_total;
                 chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
                     StorageError::Validation("attachment chunk count overflow".to_string())
                 })?;
+            }
+
+            if let Some(expected_size) = options.expected_plaintext_size {
+                if total_size != expected_size {
+                    return Err(StorageError::Validation(format!(
+                        "attachment content size changed: expected {}, read {}",
+                        expected_size, total_size
+                    )));
+                }
             }
 
             let content_hash = format!("{:x}", content_hasher.finalize());
@@ -824,6 +885,28 @@ impl AttachmentRepo {
 
             Ok(content_hash)
         })
+    }
+
+    fn validate_write_options(options: AttachmentWriteOptions) -> StorageResult<()> {
+        if options.chunk_size == 0 {
+            return Err(StorageError::Validation(
+                "chunk_size must be greater than zero".to_string(),
+            ));
+        }
+        if options.max_plaintext_size > i64::MAX as u64 {
+            return Err(StorageError::Validation(
+                "max_plaintext_size exceeds SQLite integer range".to_string(),
+            ));
+        }
+        if options
+            .expected_plaintext_size
+            .is_some_and(|expected| expected > options.max_plaintext_size)
+        {
+            return Err(StorageError::Validation(
+                "expected_plaintext_size exceeds max_plaintext_size".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// 校验每个 chunk 的独立 hash。
@@ -917,6 +1000,15 @@ fn read_chunk(reader: &mut dyn Read, buffer: &mut [u8]) -> StorageResult<usize> 
         }
     }
     Ok(filled)
+}
+
+fn next_attachment_read_limit(buffer_size: usize, total_size: u64, max_size: u64) -> usize {
+    let remaining = max_size.saturating_sub(total_size);
+    if remaining >= buffer_size as u64 {
+        buffer_size
+    } else {
+        (remaining as usize).saturating_add(1).min(buffer_size)
+    }
 }
 
 /// 计算 SHA-256 并返回 hex 字符串。
@@ -1679,6 +1771,154 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn test_bounded_streaming_reads_only_one_byte_beyond_limit_and_rolls_back() {
+        struct CountingReader {
+            inner: Cursor<Vec<u8>>,
+            total_read: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buffer)?;
+                self.total_read += read;
+                Ok(read)
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "bounded.bin", None, "", 8)
+            .unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"original").unwrap();
+        let before = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut reader = CountingReader {
+            inner: Cursor::new(vec![5; 100]),
+            total_read: 0,
+        };
+
+        let error = AttachmentRepo::write_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::new(16, 50),
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Validation(_)));
+        assert_eq!(reader.total_read, 51);
+
+        let after = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.head_commit_id, before.head_commit_id);
+        assert_eq!(commit_count_after, commit_count_before);
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn test_exact_streaming_size_rejects_short_source_and_rolls_back() {
+        let (conn, ctx, project_id) = setup();
+        let att =
+            AttachmentRepo::add(&conn, &ctx, &project_id, None, "exact.bin", None, "", 8).unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"original").unwrap();
+        let before = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let mut reader = Cursor::new(vec![1; 49]);
+
+        let error = AttachmentRepo::write_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(16, 50),
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Validation(_)));
+
+        let after = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.head_commit_id, before.head_commit_id);
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn test_invalid_streaming_limits_are_rejected_before_reading() {
+        struct PanicReader;
+
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("invalid options must be rejected before reading")
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "invalid.bin", None, "", 0)
+            .unwrap();
+        let mut reader = PanicReader;
+
+        let error = AttachmentRepo::write_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions {
+                chunk_size: 16,
+                max_plaintext_size: 10,
+                expected_plaintext_size: Some(11),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn test_small_total_limit_caps_chunk_buffer_allocation() {
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "empty-limit.bin",
+            None,
+            "",
+            0,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(Vec::<u8>::new());
+
+        let hash = AttachmentRepo::write_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(usize::MAX, 0),
+        )
+        .unwrap();
+
+        assert_eq!(hash, compute_sha256_hex(&[]));
     }
 
     #[test]

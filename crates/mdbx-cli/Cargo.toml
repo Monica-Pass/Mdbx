@@ -28,3 +28,4 @@ rpassword = "=7.4.0"
 sha2 = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"

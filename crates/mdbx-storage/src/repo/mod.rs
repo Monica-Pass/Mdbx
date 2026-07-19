@@ -11,7 +11,7 @@ pub mod project;
 pub mod snapshot;
 pub mod tombstone;
 
-pub use attachment::{AttachmentCreateRequest, AttachmentRepo};
+pub use attachment::{AttachmentCreateRequest, AttachmentRepo, AttachmentWriteOptions};
 pub use branch::BranchRepo;
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
@@ -7,7 +7,6 @@ use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
 use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
-use mdbx_storage::error::StorageError;
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 use mdbx_storage::import::KdbxEntry;
 #[cfg(feature = "kdbx-export")]
@@ -16,7 +15,9 @@ use mdbx_storage::import::KdbxExporter;
 use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
-use mdbx_storage::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
+use mdbx_storage::repo::{
+    AttachmentRepo, AttachmentWriteOptions, EntryRepo, ProjectRepo, SnapshotRepo,
+};
 use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
 #[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
@@ -418,6 +419,32 @@ fn ctx() -> CommitContext {
 }
 
 const ATTACHMENT_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+
+fn export_attachment_to_path(
+    conn: &VaultConnection,
+    attachment_id: &str,
+    output: &Path,
+) -> Result<u64, String> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mdbx-attachment-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("cannot create temporary output file: {error}"))?;
+    let written =
+        AttachmentRepo::read_content_to_writer(conn, attachment_id, temporary.as_file_mut())
+            .map_err(|error| format!("{error}"))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("cannot synchronize temporary output file: {error}"))?;
+    temporary
+        .persist(output)
+        .map_err(|error| format!("cannot replace output file: {}", error.error))?;
+    Ok(written)
+}
 
 fn cli_device_context() -> DeviceContext {
     DeviceContext {
@@ -918,21 +945,13 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
                         "",
                         original_size,
                     )?;
-                    AttachmentRepo::write_content_from_reader(
+                    AttachmentRepo::write_content_from_reader_with_options(
                         conn,
                         scoped,
                         &att.attachment_id,
                         &mut input,
-                        ATTACHMENT_STREAM_CHUNK_SIZE,
+                        AttachmentWriteOptions::exact(ATTACHMENT_STREAM_CHUNK_SIZE, original_size),
                     )?;
-                    let stored = AttachmentRepo::get_by_id(conn, &att.attachment_id)?
-                        .ok_or_else(|| StorageError::NotFound(att.attachment_id.clone()))?;
-                    if stored.stored_size != original_size {
-                        return Err(StorageError::Validation(format!(
-                            "source file size changed during import: expected {}, read {}",
-                            original_size, stored.stored_size
-                        )));
-                    }
                     Ok(att)
                 })
                 .map_err(|e| format!("{}", e))?;
@@ -956,11 +975,7 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
             output,
         } => {
             if let Some(path) = output {
-                let mut output_file = std::fs::File::create(&path).map_err(|e| format!("{}", e))?;
-                let written =
-                    AttachmentRepo::read_content_to_writer(conn, &attachment_id, &mut output_file)
-                        .map_err(|e| format!("{}", e))?;
-                output_file.sync_all().map_err(|e| format!("{}", e))?;
+                let written = export_attachment_to_path(conn, &attachment_id, &path)?;
                 println!("Wrote {} bytes to {}", written, path.display());
             } else {
                 let data = AttachmentRepo::read_content(conn, &attachment_id)
@@ -1967,6 +1982,7 @@ mod tests {
             },
         ))
         .unwrap();
+        std::fs::write(&output, b"stale output").unwrap();
         run(cli(
             &path,
             Commands::Attach {
@@ -2065,6 +2081,77 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn cli_attachment_export_failure_preserves_existing_target() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Protected Export".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        drop(conn);
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-corrupt-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&input, b"authenticated attachment content").unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id: project_id.clone(),
+                    entry_id: None,
+                    file: input.clone(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let attachment = AttachmentRepo::list_by_project(&conn, &project_id)
+            .unwrap()
+            .remove(0);
+        conn.inner()
+            .execute(
+                "UPDATE attachments SET content_hash = ?1 WHERE attachment_id = ?2",
+                params!["0".repeat(64), attachment.attachment_id],
+            )
+            .unwrap();
+        drop(conn);
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = output_dir.path().join("existing.bin");
+        std::fs::write(&output, b"keep this target").unwrap();
+        let error = run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Get {
+                    attachment_id: attachment.attachment_id,
+                    output: Some(output.clone()),
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("content hash mismatch"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep this target");
+        let remaining_files: Vec<_> = std::fs::read_dir(output_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining_files, vec![output.file_name().unwrap()]);
+
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]
