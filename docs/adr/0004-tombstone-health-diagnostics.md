@@ -21,8 +21,10 @@ For each exact object type and identity:
 
 Unknown tombstone types remain untouched for extension compatibility. Branch tombstones remain outside row-state validation because branches do not expose a deleted column. Tombstones whose object row is absent may represent retained deletion history and are preserved.
 
+`TombstoneTargetType` is a closed physical-family selector, distinct from extensible business `ObjectTypeId` values stored in Entry rows. TombstoneRepo parses every stored family explicitly. Unknown values return a conversion error and never fall back to Project. A future physical family therefore requires a critical storage extension and reader implementation before typed access.
+
 All violations use the `tombstones` category and Error severity, making the overall report unhealthy. UniFFI exposes additive health result, issue, and severity types through `MdbxVault::health_check`; the CLI continues to render the same storage report.
 
 ## Consequences
 
-Operators and native applications can distinguish physical database integrity from semantic deletion-state integrity. Missing markers, stale markers, and duplicate markers become visible before they cause resurrection or inconsistent synchronization. Valid unresolved deletion conflicts continue to pass health checks. The diagnostic remains read-only and therefore cannot silently rewrite history or choose a conflict result.
+Operators and native applications can distinguish physical database integrity from semantic deletion-state integrity. Missing markers, stale markers, duplicate markers, and unsupported physical families become visible before they cause resurrection, misclassification, or inconsistent synchronization. Valid unresolved deletion conflicts continue to pass health checks. The diagnostic remains read-only and therefore cannot silently rewrite history or choose a conflict result.

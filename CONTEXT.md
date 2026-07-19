@@ -82,6 +82,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 12. Custom conflict state preserves stable object identity and structural ownership. Plaintext custom metadata is authenticated and encrypted by the core inside the resolution transaction.
 13. After successful conflict resolution or conflict-free fast-forward synchronization, every deleted object has an exact typed tombstone and every active object has no current typed tombstone. An unresolved delete-versus-modify conflict may temporarily preserve both the active local row and the incoming delete marker until resolution.
 14. Health diagnostics must cover generic objects and legacy compatibility objects through the same severity and category model. A healthy report contains no Error or Critical issue.
+15. TombstoneTargetType identifies a physical core object family. Unknown stored values require declared reader support and produce an explicit error; they must never be converted to Project or another known family.
 
 ## Module Architecture
 
@@ -105,7 +106,7 @@ The synchronization state carries an optional complete TombstoneState. New produ
 
 ### Recovery and Health Module
 
-The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, and typed tombstones. It reports missing markers for deleted rows, unexplained markers for active rows, and duplicate markers as errors. Unknown extension tombstone types remain preserved. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
+The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, and typed tombstones. It reports missing markers for deleted rows, unexplained markers for active rows, and duplicate markers as errors. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
 
 ### Capability Features
 

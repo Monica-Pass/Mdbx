@@ -46,10 +46,7 @@ impl TombstoneRepo {
         stmt.query_row(params![target_object_id], |row| {
             Ok(Tombstone {
                 tombstone_id: row.get(0)?,
-                target_object_type: {
-                    let s: String = row.get(1)?;
-                    s.parse().unwrap_or(TombstoneTargetType::Project)
-                },
+                target_object_type: read_target_type(row, 1)?,
                 target_object_id: row.get(2)?,
                 delete_clock: row.get(3)?,
                 deleted_by_device_id: row.get(4)?,
@@ -118,10 +115,7 @@ impl TombstoneRepo {
         let rows = stmt.query_map(params, |row| {
             Ok(Tombstone {
                 tombstone_id: row.get(0)?,
-                target_object_type: {
-                    let s: String = row.get(1)?;
-                    s.parse().unwrap_or(TombstoneTargetType::Project)
-                },
+                target_object_type: read_target_type(row, 1)?,
                 target_object_id: row.get(2)?,
                 delete_clock: row.get(3)?,
                 deleted_by_device_id: row.get(4)?,
@@ -136,6 +130,20 @@ impl TombstoneRepo {
         }
         Ok(tombstones)
     }
+}
+
+fn read_target_type(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<TombstoneTargetType> {
+    let value = row.get::<_, String>(column)?;
+    value.parse().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +223,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ts.target_object_type, TombstoneTargetType::Attachment);
+    }
+
+    #[test]
+    fn tombstone_target_type_known_generic_roundtrips() {
+        let (conn, ctx, _project_id) = setup();
+        let target_id = uuid::Uuid::new_v4().to_string();
+        ctx.create_tombstone(&conn, "object-label", &target_id)
+            .unwrap();
+
+        let tombstone = TombstoneRepo::find_by_target(&conn, &target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tombstone.target_object_type,
+            TombstoneTargetType::ObjectLabel
+        );
+    }
+
+    #[test]
+    fn tombstone_target_type_unknown_is_rejected_without_project_fallback() {
+        let (conn, ctx, _project_id) = setup();
+        let target_id = uuid::Uuid::new_v4().to_string();
+        ctx.create_tombstone(&conn, "com.example.future-family", &target_id)
+            .unwrap();
+
+        let find_error = TombstoneRepo::find_by_target(&conn, &target_id).unwrap_err();
+        assert!(find_error
+            .to_string()
+            .contains("unknown TombstoneTargetType"));
+        let list_error = TombstoneRepo::list_all(&conn).unwrap_err();
+        assert!(list_error
+            .to_string()
+            .contains("unknown TombstoneTargetType"));
+        assert_eq!(
+            TombstoneRepo::count_by_type(&conn, TombstoneTargetType::Project).unwrap(),
+            0
+        );
     }
 
     #[test]
