@@ -14,6 +14,12 @@ Inside the `.mdbx` file, the preferred engine is:
 
 `LMDB` MAY be explored later, but SQLite is the preferred baseline because of tooling maturity, portability, recovery tooling, and schema evolution support.
 
+### Vault Creation Lifecycle
+
+Vault creation MUST atomically reserve a path that does not exist. An existing regular file, SQLite database, MDBX vault, or same-name SQLite WAL/SHM sidecar MUST be rejected without changing its contents. A client-side existence check may improve the error message, but the storage reservation remains authoritative.
+
+Creation remains pending until schema creation, vault metadata, the genesis commit, the initial branch, the device head, the initial key epoch, and the first unlock method have all succeeded. Failure before that point MUST close the SQLite connection and remove the main database plus any WAL and SHM sidecars created by the same attempt. Opening or upgrading an established vault uses the open and migration interfaces, never the create interface.
+
 ## 2. Internal Storage Goals
 
 The internal layout MUST support all of the following:

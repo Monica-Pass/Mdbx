@@ -34,8 +34,8 @@ impl TempVaultPath {
 impl Drop for TempVaultPath {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_file(self.path.with_extension("mdbx-shm"));
-        let _ = fs::remove_file(self.path.with_extension("mdbx-wal"));
+        let _ = fs::remove_file(sqlite_sidecar_path(&self.path, "-shm"));
+        let _ = fs::remove_file(sqlite_sidecar_path(&self.path, "-wal"));
     }
 }
 
@@ -74,6 +74,66 @@ fn count_rows(path: &Path, table: &str) -> i64 {
         row.get(0)
     })
     .unwrap()
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+#[test]
+fn create_failure_removes_database_and_sidecars() {
+    let vault_path = temp_vault_path("create-failure-cleanup");
+
+    let result = create_vault(
+        vault_path.as_path_string(),
+        String::new(),
+        "ffi-create-failure-device".to_string(),
+    );
+
+    assert!(result.is_err());
+    assert!(!vault_path.path().exists());
+    assert!(!sqlite_sidecar_path(vault_path.path(), "-wal").exists());
+    assert!(!sqlite_sidecar_path(vault_path.path(), "-shm").exists());
+}
+
+#[test]
+fn create_rejects_existing_vault_and_preserves_contents() {
+    let vault_path = temp_vault_path("create-existing-preserved");
+    let path = vault_path.as_path_string();
+    let password = "existing vault password 12345!";
+    let vault = create_vault(
+        path.clone(),
+        password.to_string(),
+        "ffi-existing-device".to_string(),
+    )
+    .unwrap();
+    let project = vault.create_project("Preserved".to_string()).unwrap();
+    drop(vault);
+
+    assert!(create_vault(
+        path.clone(),
+        "replacement password 12345!".to_string(),
+        "ffi-replacement-device".to_string(),
+    )
+    .is_err());
+    let reopened = open_vault(
+        path,
+        password.to_string(),
+        "ffi-existing-device".to_string(),
+    )
+    .unwrap();
+    let entry = reopened
+        .create_entry(
+            project.project_id.clone(),
+            "note".to_string(),
+            "Preservation Check".to_string(),
+            r#"{"body":"original vault remains writable"}"#.to_string(),
+        )
+        .unwrap();
+
+    assert_eq!(entry.project_id, project.project_id);
 }
 
 #[test]

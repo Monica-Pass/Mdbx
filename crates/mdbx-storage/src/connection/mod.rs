@@ -1,5 +1,6 @@
 use rusqlite::Connection;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use mdbx_core::model::VaultSession;
 use mdbx_crypto::keyring::Keyring;
@@ -22,6 +23,55 @@ pub struct VaultConnection {
     pub(crate) active_session: Option<VaultSession>,
 }
 
+/// A newly reserved vault file that is removed unless creation is committed.
+///
+/// Production callers keep this guard alive while initializing metadata and
+/// configuring the first unlock method. Any early return drops the connection
+/// before removing the database and its SQLite sidecars.
+pub struct PendingVaultCreation {
+    path: PathBuf,
+    connection: Option<VaultConnection>,
+    committed: bool,
+}
+
+impl PendingVaultCreation {
+    pub fn begin(path: &Path) -> StorageResult<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection: Some(VaultConnection::create(path)?),
+            committed: false,
+        })
+    }
+
+    pub fn connection(&self) -> &VaultConnection {
+        self.connection
+            .as_ref()
+            .expect("pending vault connection must exist before commit")
+    }
+
+    pub fn connection_mut(&mut self) -> &mut VaultConnection {
+        self.connection
+            .as_mut()
+            .expect("pending vault connection must exist before commit")
+    }
+
+    pub fn commit(mut self) -> VaultConnection {
+        self.committed = true;
+        self.connection
+            .take()
+            .expect("pending vault connection must exist before commit")
+    }
+}
+
+impl Drop for PendingVaultCreation {
+    fn drop(&mut self) {
+        self.connection.take();
+        if !self.committed {
+            remove_vault_files(&self.path);
+        }
+    }
+}
+
 impl VaultConnection {
     /// 打开已有的 `.mdbx` 文件。
     pub fn open(path: &Path) -> StorageResult<Self> {
@@ -37,16 +87,28 @@ impl VaultConnection {
     }
 
     /// 创建新的 `.mdbx` 文件。
+    ///
+    /// 文件路径必须尚不存在。生产入口应通过 `PendingVaultCreation`
+    /// 完成初始化与首个解锁方法配置，使后续步骤失败时可以清理新文件。
     pub fn create(path: &Path) -> StorageResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::apply_pragmas(&conn)?;
-        schema::create_all_tables(&conn)?;
-        Self::cleanup_legacy_persistent_fts(&conn)?;
-        Ok(Self {
-            conn,
-            keyring: None,
-            active_session: None,
-        })
+        ensure_sidecars_absent(path)?;
+        OpenOptions::new().write(true).create_new(true).open(path)?;
+
+        let result = (|| {
+            let conn = Connection::open(path)?;
+            Self::apply_pragmas(&conn)?;
+            schema::create_all_tables(&conn)?;
+            Self::cleanup_legacy_persistent_fts(&conn)?;
+            Ok(Self {
+                conn,
+                keyring: None,
+                active_session: None,
+            })
+        })();
+        if result.is_err() {
+            remove_vault_files(path);
+        }
+        result
     }
 
     /// 打开内存数据库（用于测试）。
@@ -179,9 +241,39 @@ impl VaultConnection {
     }
 }
 
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn ensure_sidecars_absent(path: &Path) -> StorageResult<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("SQLite sidecar already exists: {}", sidecar.display()),
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn remove_vault_files(path: &Path) {
+    let _ = fs::remove_file(sqlite_sidecar_path(path, "-wal"));
+    let _ = fs::remove_file(sqlite_sidecar_path(path, "-shm"));
+    let _ = fs::remove_file(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::{initialize_vault, VaultInitParams};
     use uuid::Uuid;
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
@@ -226,12 +318,15 @@ mod tests {
     }
 
     #[test]
-    fn create_removes_legacy_persistent_fts_from_existing_file() {
+    fn create_rejects_existing_legacy_fts_database_without_modifying_it() {
         let path = temp_db_path("create-legacy-fts");
         create_legacy_fts_db(&path);
 
-        let conn = VaultConnection::create(&path).unwrap();
-        assert!(!persistent_fts_exists(conn.inner()));
+        let error = VaultConnection::create(&path).err().unwrap();
+        let existing = Connection::open(&path).unwrap();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        assert!(persistent_fts_exists(&existing));
 
         let _ = std::fs::remove_file(path);
     }
@@ -240,5 +335,75 @@ mod tests {
     fn open_in_memory_does_not_create_persistent_fts() {
         let conn = VaultConnection::open_in_memory().unwrap();
         assert!(!persistent_fts_exists(conn.inner()));
+    }
+
+    #[test]
+    fn create_rejects_existing_file_without_modifying_it() {
+        let path = temp_db_path("existing-file");
+        let original = b"existing non-mdbx data";
+        fs::write(&path, original).unwrap();
+
+        let error = VaultConnection::create(&path).err().unwrap();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_rejects_preexisting_sidecars_without_modifying_them() {
+        let path = temp_db_path("existing-sidecars");
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        let shm = sqlite_sidecar_path(&path, "-shm");
+        fs::write(&wal, b"existing wal data").unwrap();
+        fs::write(&shm, b"existing shm data").unwrap();
+
+        let error = VaultConnection::create(&path).err().unwrap();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        assert!(!path.exists());
+        assert_eq!(fs::read(&wal).unwrap(), b"existing wal data");
+        assert_eq!(fs::read(&shm).unwrap(), b"existing shm data");
+        let _ = fs::remove_file(wal);
+        let _ = fs::remove_file(shm);
+    }
+
+    #[test]
+    fn abandoned_pending_creation_removes_database_and_sidecars() {
+        let path = temp_db_path("abandoned-creation");
+        {
+            let creation = PendingVaultCreation::begin(&path).unwrap();
+            initialize_vault(creation.connection(), &VaultInitParams::default()).unwrap();
+            assert!(path.exists());
+        }
+
+        assert!(!path.exists());
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+    }
+
+    #[test]
+    fn committed_pending_creation_remains_reopenable() {
+        let path = temp_db_path("committed-creation");
+        let mut creation = PendingVaultCreation::begin(&path).unwrap();
+        let initialized =
+            initialize_vault(creation.connection(), &VaultInitParams::default()).unwrap();
+        creation
+            .connection_mut()
+            .inner()
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .unwrap();
+        let connection = creation.commit();
+        drop(connection);
+
+        let reopened = VaultConnection::open(&path).unwrap();
+        let vault_id: String = reopened
+            .inner()
+            .query_row("SELECT vault_id FROM vault_meta", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(vault_id, initialized.vault_id);
+        drop(reopened);
+        remove_vault_files(&path);
     }
 }

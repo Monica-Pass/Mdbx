@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::benchmark::BenchmarkRunner;
-use mdbx_storage::connection::VaultConnection;
+use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::import::{KdbxEntry, KdbxExporter, KdbxImporter};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
@@ -462,8 +462,8 @@ fn cmd_init(
         tiga_mode
     );
 
-    let mut conn =
-        VaultConnection::create(path).map_err(|e| format!("failed to create vault: {}", e))?;
+    let mut creation =
+        PendingVaultCreation::begin(path).map_err(|e| format!("failed to create vault: {}", e))?;
 
     let device_id = format!(
         "cli-{}",
@@ -478,17 +478,20 @@ fn cmd_init(
         device_id,
         ..VaultInitParams::default()
     };
-    initialize_vault(&conn, &params).map_err(|e| format!("init failed: {}", e))?;
+    initialize_vault(creation.connection(), &params).map_err(|e| format!("init failed: {}", e))?;
 
     if let Some(pw) = password {
-        UnlockService::setup_password_with_mode(&mut conn, pw, tiga_mode)
+        UnlockService::setup_password_with_mode(creation.connection_mut(), pw, tiga_mode)
             .map_err(|e| format!("setup failed: {}", e))?;
+        drop(creation.commit());
         println!("Vault initialized successfully at '{}'", path.display());
         return Ok(());
     }
 
     if let Some(pin) = pin {
-        UnlockService::setup_pin(&mut conn, pin).map_err(|e| format!("setup failed: {}", e))?;
+        UnlockService::setup_pin(creation.connection_mut(), pin)
+            .map_err(|e| format!("setup failed: {}", e))?;
+        drop(creation.commit());
         println!("Vault initialized successfully at '{}'", path.display());
         return Ok(());
     }
@@ -507,7 +510,7 @@ fn cmd_init(
             if pw != confirm {
                 return Err("passwords do not match".to_string());
             }
-            UnlockService::setup_password_with_mode(&mut conn, &pw, tiga_mode)
+            UnlockService::setup_password_with_mode(creation.connection_mut(), &pw, tiga_mode)
                 .map_err(|e| format!("setup failed: {}", e))?;
         }
         "2" => {
@@ -516,12 +519,13 @@ fn cmd_init(
             if pin != confirm {
                 return Err("PINs do not match".to_string());
             }
-            UnlockService::setup_pin(&mut conn, &pin)
+            UnlockService::setup_pin(creation.connection_mut(), &pin)
                 .map_err(|e| format!("setup failed: {}", e))?;
         }
         _ => return Err("invalid choice".to_string()),
     }
 
+    drop(creation.commit());
     println!("Vault initialized successfully at '{}'", path.display());
     Ok(())
 }
@@ -1614,6 +1618,29 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn init_failure_removes_new_vault_and_sidecars() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        let command = Commands::Init {
+            tiga: "sky".to_string(),
+            password: None,
+            pin: Some("12".to_string()),
+        };
+
+        let result = run(Cli {
+            vault: path.clone(),
+            unlock_password: None,
+            unlock_pin: None,
+            command,
+        });
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
     }
 
     #[test]

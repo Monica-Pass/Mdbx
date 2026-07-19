@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("schema creation failed: {0}")]
     SchemaCreation(String),
 

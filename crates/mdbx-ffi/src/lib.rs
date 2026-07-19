@@ -12,7 +12,7 @@ use mdbx_core::tiga::{
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, PolicyException,
     ResolvedTigaPolicy, TigaMode, TigaOperation, TigaPolicyOverride, TigaScope,
 };
-use mdbx_storage::connection::VaultConnection;
+use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
@@ -1328,10 +1328,10 @@ pub fn create_vault_with_tiga_mode(
     device_id: String,
     mode: MdbxTigaMode,
 ) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    let mut conn = VaultConnection::create(Path::new(&path))?;
+    let mut creation = PendingVaultCreation::begin(Path::new(&path))?;
     let mode: TigaMode = mode.into();
     let init = initialize_vault(
-        &conn,
+        creation.connection(),
         &VaultInitParams {
             default_tiga_mode: mode.to_string(),
             device_id: device_id.clone(),
@@ -1339,7 +1339,8 @@ pub fn create_vault_with_tiga_mode(
         },
     )?;
     let password = Zeroizing::new(password);
-    UnlockService::setup_password_with_mode(&mut conn, password.as_str(), mode)?;
+    UnlockService::setup_password_with_mode(creation.connection_mut(), password.as_str(), mode)?;
+    let conn = creation.commit();
     Ok(Arc::new(MdbxVault {
         conn: Mutex::new(conn),
         device_id,
