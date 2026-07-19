@@ -409,8 +409,6 @@ impl AttachmentRepo {
 
             let now = chrono::Utc::now().to_rfc3339();
 
-            ctx.create_tombstone(conn, "attachment", attachment_id)?;
-
             let commit_id = ctx.commit_object_change(
                 conn,
                 "attachments",
@@ -418,6 +416,7 @@ impl AttachmentRepo {
                 "change",
                 "attachment",
             )?;
+            ctx.create_tombstone_for_commit(conn, "attachment", attachment_id, &commit_id)?;
 
             conn.inner().execute(
                 "UPDATE attachments SET deleted = 1,

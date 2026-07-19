@@ -62,6 +62,10 @@ A `ConflictResolutionOperation` selects local state, incoming state, or a valida
 
 `TombstoneState` is the complete current deletion-marker collection projected into synchronization state. Per-commit tombstones remain compatible delete-event records. A present complete collection, including an empty collection, is authoritative only during conflict-free fast-forward application and therefore communicates both deletion and revival without discarding divergent local deletion state.
 
+### TombstoneAcknowledgement
+
+A `TombstoneAcknowledgement` records that one registered device observed a deletion commit. It is separate from `DeviceHead`, because receiving a commit does not require the device to author a later commit. A tombstone can enter the authorized cleanup stage only after every non-revoked device has a causally valid acknowledgement.
+
 ### HealthReport
 
 A `HealthReport` is a read-only structured diagnosis of vault integrity. Each issue has a stable severity, category, and description suitable for CLI output and native client presentation. Tombstone diagnostics compare exact typed markers with the current deletion state of every synchronized object family while recognizing unresolved delete-versus-modify conflicts as a temporary valid state.
@@ -83,6 +87,8 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 13. After successful conflict resolution or conflict-free fast-forward synchronization, every deleted object has an exact typed tombstone and every active object has no current typed tombstone. An unresolved delete-versus-modify conflict may temporarily preserve both the active local row and the incoming delete marker until resolution.
 14. Health diagnostics must cover generic objects and legacy compatibility objects through the same severity and category model. A healthy report contains no Error or Critical issue.
 15. TombstoneTargetType identifies a physical core object family. Unknown stored values require declared reader support and produce an explicit error; they must never be converted to Project or another known family.
+16. A tombstone is not eligible for physical cleanup until retention has expired, the object remains deleted, conflicts are resolved, the delete commit exists, and every non-revoked device has causally acknowledged that commit.
+17. Device revocation is monotonic security state. Synchronization may advance a revoked device's recorded head but cannot reactivate it.
 
 ## Module Architecture
 
@@ -103,6 +109,8 @@ Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payloa
 The Conflict Resolution Module loads authenticated local and incoming ObjectVersions, validates identity and ownership constraints, and applies LocalWins, IncomingWins, or Custom state through one transaction. ObjectRelations, ObjectLabels, and ObjectLabelAssignments use the same merge-commit and tombstone rules as legacy projects, entries, and attachments. Duplicate assignment UUIDs for the same logical object-label membership are mapped to the local logical identity before resolution.
 
 The synchronization state carries an optional complete TombstoneState. New producers always emit it. Legacy payloads omit it and retain their existing per-commit delete-event behavior. Receivers replace the complete collection only for conflict-free fast-forward commits; divergent commits continue to preserve local markers until a merge resolution becomes authoritative.
+
+Tombstone acknowledgements are monotonic synchronized metadata. Per-commit tombstones acknowledge the deleting and receiving devices; complete state transfers accumulated acknowledgements. `device_heads` supplies the active-device set but is not treated as proof that a device observed a deletion.
 
 ### Recovery and Health Module
 

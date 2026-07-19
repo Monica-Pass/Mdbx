@@ -6,18 +6,19 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v2, v7};
+use crate::schema::{v2, v7, v8};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
 pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlation-v1";
 pub const MIGRATION_STABLE_BRANCH_ID: &str = "mdbx-2-stable-branch-id-v1";
 pub const MIGRATION_GENERIC_METADATA: &str = "mdbx-2-generic-metadata-v1";
+pub const MIGRATION_TOMBSTONE_DELETE_PROOF: &str = "mdbx-2-tombstone-delete-proof-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -246,6 +247,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
             .map_err(StorageError::Database)?;
         v2::create_extensions(conn)?;
         v7::create_extensions(conn)?;
+        v8::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -309,6 +311,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
     let result = (|| -> StorageResult<()> {
         v2::create_extensions(conn)?;
         v7::create_extensions(conn)?;
+        v8::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
@@ -340,6 +343,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_GENERIC_METADATA, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_TOMBSTONE_DELETE_PROOF, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -521,6 +530,11 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
             "MDBX-2 vault is missing required commit_operations column branch_id".to_string(),
         ));
     }
+    if !v2::column_exists(conn, "tombstones", "delete_commit_id")? {
+        return Err(StorageError::Validation(
+            "MDBX-2 vault is missing required tombstones column delete_commit_id".to_string(),
+        ));
+    }
     if !table_exists(conn, "schema_migrations")? {
         return Err(StorageError::Validation(
             "MDBX-2 vault is missing schema_migrations".to_string(),
@@ -535,6 +549,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "object_relations",
         "object_labels",
         "object_label_assignments",
+        "tombstone_acknowledgements",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -709,6 +724,65 @@ mod tests {
             .unwrap();
         assert_eq!(policy_state.0, i64::from(TIGA_POLICY_VERSION));
         assert_eq!(policy_state.1, "remediation-required");
+    }
+
+    #[test]
+    fn v1_upgrade_backfills_tombstone_delete_proof_and_deleting_device_ack() {
+        let conn = v1_database();
+        conn.execute(
+            "INSERT INTO commits
+                (commit_id, device_id, local_seq, commit_kind, change_scope,
+                 changed_object_ids_ct, vector_clock, message_ct, created_at, integrity_tag)
+             VALUES ('delete-commit', 'legacy-device', 1, 'change', 'project',
+                     X'01', '{\"legacy-device\":1}', NULL,
+                     '2026-01-02T00:00:00Z', X'02')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects
+                (project_id, title_ct, summary_ct, group_id, icon_ref, favorite,
+                 archived, deleted, tiga_mode_override, object_clock, head_commit_id,
+                 attachment_count, created_at, updated_at, created_by_device_id,
+                 updated_by_device_id)
+             VALUES ('deleted-project', X'01', NULL, NULL, NULL, 0, 0, 1, NULL,
+                     '{\"counter\":2}', 'delete-commit', 0,
+                     '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z',
+                     'legacy-device', 'legacy-device')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tombstones
+                (tombstone_id, target_object_type, target_object_id, delete_clock,
+                 deleted_by_device_id, deleted_at, purge_eligible_at)
+             VALUES ('legacy-tombstone', 'project', 'deleted-project', '{}',
+                     'legacy-device', '2026-01-02T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+
+        upgrade_to_latest(&conn).unwrap();
+
+        let proof: Option<String> = conn
+            .query_row(
+                "SELECT delete_commit_id FROM tombstones WHERE tombstone_id = 'legacy-tombstone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof.as_deref(), Some("delete-commit"));
+        let acknowledgement: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tombstone_acknowledgements
+                 WHERE tombstone_id = 'legacy-tombstone'
+                   AND device_id = 'legacy-device'
+                   AND observed_commit_id = 'delete-commit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledgement, 1);
     }
 
     #[test]

@@ -272,7 +272,7 @@ impl ObjectLabelRepo {
                     ctx.device_id,
                 ],
             )?;
-            ctx.create_tombstone(conn, "object-label", label_id)?;
+            ctx.create_tombstone_for_commit(conn, "object-label", label_id, &commit_id)?;
             ObjectVersionRepo::record_object_label_current(conn, &commit_id, label_id)?;
             Ok(())
         })
@@ -418,7 +418,12 @@ impl ObjectLabelAssignmentRepo {
                     ctx.device_id,
                 ],
             )?;
-            ctx.create_tombstone(conn, "object-label-assignment", assignment_id)?;
+            ctx.create_tombstone_for_commit(
+                conn,
+                "object-label-assignment",
+                assignment_id,
+                &commit_id,
+            )?;
             ObjectVersionRepo::record_object_label_assignment_current(
                 conn,
                 &commit_id,

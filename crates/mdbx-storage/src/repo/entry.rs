@@ -561,10 +561,9 @@ impl EntryRepo {
 
             let now = chrono::Utc::now().to_rfc3339();
 
-            ctx.create_tombstone(conn, "entry", entry_id)?;
-
             let commit_id =
                 ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
+            ctx.create_tombstone_for_commit(conn, "entry", entry_id, &commit_id)?;
 
             let object_clock = bump_clock(&entry.object_clock);
 

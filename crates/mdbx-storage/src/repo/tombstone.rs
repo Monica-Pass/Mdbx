@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 
 use mdbx_core::model::Tombstone;
 use mdbx_core::model::TombstoneTargetType;
@@ -12,6 +15,28 @@ use crate::error::{StorageError, StorageResult};
 /// 墓碑记录由 CommitContext::create_tombstone 写入，
 /// 本仓库只负责查询和批量操作。
 pub struct TombstoneRepo;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TombstonePurgeBlocker {
+    RetentionNotScheduled,
+    RetentionPeriodActive { eligible_at: String },
+    InvalidRetentionTimestamp { value: String },
+    MissingDeleteCommit,
+    DeleteCommitMissing { commit_id: String },
+    TargetMissing,
+    TargetNotDeleted,
+    UnresolvedConflict,
+    DeviceHasNotAcknowledgedDelete { device_id: String },
+    UnsupportedTargetType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstonePurgeEligibility {
+    pub tombstone_id: String,
+    pub eligible: bool,
+    pub blockers: Vec<TombstonePurgeBlocker>,
+}
 
 impl TombstoneRepo {
     /// 按类型列出所有墓碑。
@@ -38,7 +63,8 @@ impl TombstoneRepo {
     ) -> StorageResult<Option<Tombstone>> {
         let mut stmt = conn.inner().prepare(
             "SELECT tombstone_id, target_object_type, target_object_id,
-                    delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at
+                    delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at,
+                    delete_commit_id
              FROM tombstones WHERE target_object_id = ?1
              ORDER BY deleted_at DESC LIMIT 1",
         )?;
@@ -52,6 +78,7 @@ impl TombstoneRepo {
                 deleted_by_device_id: row.get(4)?,
                 deleted_at: row.get(5)?,
                 purge_eligible_at: row.get(6)?,
+                delete_commit_id: row.get(7)?,
             })
         })
         .optional()
@@ -87,16 +114,125 @@ impl TombstoneRepo {
         Ok(count as u32)
     }
 
-    /// 清除指定墓碑（物理清理）。
+    /// MDBX1 兼容符号。MDBX2 禁止绕过资格评估进行物理清理。
     pub fn purge(conn: &VaultConnection, tombstone_id: &str) -> StorageResult<()> {
-        let affected = conn.inner().execute(
-            "DELETE FROM tombstones WHERE tombstone_id = ?1",
+        let exists: bool = conn.inner().query_row(
+            "SELECT EXISTS(SELECT 1 FROM tombstones WHERE tombstone_id = ?1)",
             params![tombstone_id],
+            |row| row.get(0),
         )?;
-        if affected == 0 {
+        if !exists {
             return Err(StorageError::NotFound(tombstone_id.to_string()));
         }
-        Ok(())
+        Err(StorageError::ConstraintViolation(
+            "legacy tombstone purge is disabled; use MDBX2 authorized purge after eligibility evaluation"
+                .to_string(),
+        ))
+    }
+
+    /// 评估墓碑是否具备进入授权清理阶段的条件。
+    pub fn evaluate_purge_eligibility(
+        conn: &VaultConnection,
+        tombstone_id: &str,
+        now: &str,
+    ) -> StorageResult<TombstonePurgeEligibility> {
+        let now = chrono::DateTime::parse_from_rfc3339(now).map_err(|error| {
+            StorageError::Validation(format!("invalid eligibility evaluation time: {error}"))
+        })?;
+        let tombstone = Self::find_by_id(conn, tombstone_id)?
+            .ok_or_else(|| StorageError::NotFound(tombstone_id.to_string()))?;
+        let mut blockers = Vec::new();
+
+        match tombstone.purge_eligible_at.as_deref() {
+            None => blockers.push(TombstonePurgeBlocker::RetentionNotScheduled),
+            Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
+                Ok(eligible_at) if eligible_at > now => {
+                    blockers.push(TombstonePurgeBlocker::RetentionPeriodActive {
+                        eligible_at: value.to_string(),
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => blockers.push(TombstonePurgeBlocker::InvalidRetentionTimestamp {
+                    value: value.to_string(),
+                }),
+            },
+        }
+
+        match Self::target_deleted_state(conn, &tombstone)? {
+            Some(true) => {}
+            Some(false) => blockers.push(TombstonePurgeBlocker::TargetNotDeleted),
+            None if tombstone.target_object_type == TombstoneTargetType::Branch => {
+                blockers.push(TombstonePurgeBlocker::UnsupportedTargetType);
+            }
+            None => blockers.push(TombstonePurgeBlocker::TargetMissing),
+        }
+
+        let unresolved_conflicts: i64 = conn.inner().query_row(
+            "SELECT COUNT(*) FROM conflicts
+             WHERE object_type = ?1 AND object_id = ?2 AND resolution = 'unresolved'",
+            params![
+                tombstone.target_object_type.to_string(),
+                tombstone.target_object_id
+            ],
+            |row| row.get(0),
+        )?;
+        if unresolved_conflicts > 0 {
+            blockers.push(TombstonePurgeBlocker::UnresolvedConflict);
+        }
+
+        match tombstone.delete_commit_id.as_deref() {
+            None => blockers.push(TombstonePurgeBlocker::MissingDeleteCommit),
+            Some(delete_commit_id) => {
+                let commit_exists: bool = conn.inner().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commits WHERE commit_id = ?1)",
+                    params![delete_commit_id],
+                    |row| row.get(0),
+                )?;
+                if !commit_exists {
+                    blockers.push(TombstonePurgeBlocker::DeleteCommitMissing {
+                        commit_id: delete_commit_id.to_string(),
+                    });
+                } else {
+                    let mut stmt = conn.inner().prepare(
+                        "SELECT device_id FROM device_heads
+                         WHERE revoked = 0 ORDER BY device_id",
+                    )?;
+                    let devices = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    for device_id in devices {
+                        let device_id = device_id?;
+                        let observed_commit_id = conn
+                            .inner()
+                            .query_row(
+                                "SELECT observed_commit_id
+                                 FROM tombstone_acknowledgements
+                                 WHERE tombstone_id = ?1 AND device_id = ?2",
+                                params![tombstone.tombstone_id, device_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?;
+                        let acknowledged = match observed_commit_id {
+                            Some(observed_commit_id) => Self::is_ancestor_commit(
+                                conn,
+                                delete_commit_id,
+                                &observed_commit_id,
+                            )?,
+                            None => false,
+                        };
+                        if !acknowledged {
+                            blockers.push(TombstonePurgeBlocker::DeviceHasNotAcknowledgedDelete {
+                                device_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(TombstonePurgeEligibility {
+            tombstone_id: tombstone.tombstone_id,
+            eligible: blockers.is_empty(),
+            blockers,
+        })
     }
 
     fn list_where(
@@ -106,7 +242,8 @@ impl TombstoneRepo {
     ) -> StorageResult<Vec<Tombstone>> {
         let sql = format!(
             "SELECT tombstone_id, target_object_type, target_object_id,
-                    delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at
+                    delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at,
+                    delete_commit_id
              FROM tombstones WHERE {} ORDER BY deleted_at DESC",
             where_clause
         );
@@ -121,6 +258,7 @@ impl TombstoneRepo {
                 deleted_by_device_id: row.get(4)?,
                 deleted_at: row.get(5)?,
                 purge_eligible_at: row.get(6)?,
+                delete_commit_id: row.get(7)?,
             })
         })?;
 
@@ -129,6 +267,84 @@ impl TombstoneRepo {
             tombstones.push(row?);
         }
         Ok(tombstones)
+    }
+
+    fn find_by_id(conn: &VaultConnection, tombstone_id: &str) -> StorageResult<Option<Tombstone>> {
+        conn.inner()
+            .query_row(
+                "SELECT tombstone_id, target_object_type, target_object_id,
+                        delete_clock, deleted_by_device_id, deleted_at,
+                        purge_eligible_at, delete_commit_id
+                 FROM tombstones WHERE tombstone_id = ?1",
+                params![tombstone_id],
+                |row| {
+                    Ok(Tombstone {
+                        tombstone_id: row.get(0)?,
+                        target_object_type: read_target_type(row, 1)?,
+                        target_object_id: row.get(2)?,
+                        delete_clock: row.get(3)?,
+                        deleted_by_device_id: row.get(4)?,
+                        deleted_at: row.get(5)?,
+                        purge_eligible_at: row.get(6)?,
+                        delete_commit_id: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    fn target_deleted_state(
+        conn: &VaultConnection,
+        tombstone: &Tombstone,
+    ) -> StorageResult<Option<bool>> {
+        let (table, id_column) = match tombstone.target_object_type {
+            TombstoneTargetType::Project => ("projects", "project_id"),
+            TombstoneTargetType::Entry => ("entries", "entry_id"),
+            TombstoneTargetType::Attachment => ("attachments", "attachment_id"),
+            TombstoneTargetType::ObjectRelation => ("object_relations", "relation_id"),
+            TombstoneTargetType::ObjectLabel => ("object_labels", "label_id"),
+            TombstoneTargetType::ObjectLabelAssignment => {
+                ("object_label_assignments", "assignment_id")
+            }
+            TombstoneTargetType::Branch => return Ok(None),
+        };
+        let sql = format!("SELECT deleted FROM {table} WHERE {id_column} = ?1");
+        conn.inner()
+            .query_row(&sql, params![tombstone.target_object_id], |row| {
+                row.get::<_, bool>(0)
+            })
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    fn is_ancestor_commit(
+        conn: &VaultConnection,
+        ancestor: &str,
+        descendant: &str,
+    ) -> StorageResult<bool> {
+        if ancestor == descendant {
+            return Ok(true);
+        }
+        let mut stack = vec![descendant.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(commit_id) = stack.pop() {
+            if !seen.insert(commit_id.clone()) {
+                continue;
+            }
+            let mut stmt = conn
+                .inner()
+                .prepare("SELECT parent_commit_id FROM commit_parents WHERE commit_id = ?1")?;
+            let parents = stmt.query_map(params![commit_id], |row| row.get::<_, String>(0))?;
+            for parent in parents {
+                let parent = parent?;
+                if parent == ancestor {
+                    return Ok(true);
+                }
+                stack.push(parent);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -161,7 +377,10 @@ mod tests {
 
     fn setup() -> (VaultConnection, CommitContext, String) {
         let conn = VaultConnection::open_in_memory().unwrap();
-        let params = VaultInitParams::default();
+        let params = VaultInitParams {
+            device_id: "test-device".to_string(),
+            ..VaultInitParams::default()
+        };
         initialize_vault(&conn, &params).unwrap();
         let ctx = CommitContext::new("test-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Tombstone Project", None, None).unwrap();
@@ -180,6 +399,7 @@ mod tests {
         assert_eq!(ts.target_object_id, project_id);
         assert_eq!(ts.deleted_by_device_id, "test-device");
         assert!(!ts.tombstone_id.is_empty());
+        assert!(ts.delete_commit_id.is_some());
     }
 
     #[test]
@@ -328,18 +548,101 @@ mod tests {
     }
 
     #[test]
-    fn test_purge() {
+    fn legacy_purge_is_disabled_and_preserves_tombstone() {
         let (conn, ctx, project_id) = setup();
         ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
 
         let ts = TombstoneRepo::find_by_target(&conn, &project_id)
             .unwrap()
             .unwrap();
-        TombstoneRepo::purge(&conn, &ts.tombstone_id).unwrap();
+        let error = TombstoneRepo::purge(&conn, &ts.tombstone_id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy tombstone purge is disabled"));
 
         assert!(TombstoneRepo::find_by_target(&conn, &project_id)
             .unwrap()
-            .is_none());
+            .is_some());
+    }
+
+    #[test]
+    fn purge_eligibility_requires_retention_schedule() {
+        let (conn, ctx, project_id) = setup();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+
+        let eligibility = TombstoneRepo::evaluate_purge_eligibility(
+            &conn,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(!eligibility.eligible);
+        assert_eq!(
+            eligibility.blockers,
+            vec![TombstonePurgeBlocker::RetentionNotScheduled]
+        );
+    }
+
+    #[test]
+    fn purge_eligibility_requires_every_active_device_to_acknowledge_delete() {
+        let (conn, ctx, project_id) = setup();
+        let pre_delete_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM device_heads WHERE device_id = ?1",
+                params![ctx.device_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE tombstones SET purge_eligible_at = '2029-01-01T00:00:00Z'
+                 WHERE tombstone_id = ?1",
+                params![tombstone.tombstone_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
+                 VALUES ('stale-device', ?1, '2029-01-01T00:00:00Z', 0)",
+                params![pre_delete_head],
+            )
+            .unwrap();
+
+        let blocked = TombstoneRepo::evaluate_purge_eligibility(
+            &conn,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.blockers,
+            vec![TombstonePurgeBlocker::DeviceHasNotAcknowledgedDelete {
+                device_id: "stale-device".to_string(),
+            }]
+        );
+
+        conn.inner()
+            .execute(
+                "UPDATE device_heads SET revoked = 1 WHERE device_id = 'stale-device'",
+                [],
+            )
+            .unwrap();
+        let eligible = TombstoneRepo::evaluate_purge_eligibility(
+            &conn,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(eligible.eligible);
+        assert!(eligible.blockers.is_empty());
     }
 
     #[test]

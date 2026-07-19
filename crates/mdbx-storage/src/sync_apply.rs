@@ -20,7 +20,7 @@ use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
     KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow,
     ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
-    TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneRow,
+    TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneAcknowledgementRow, TombstoneRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -140,6 +140,7 @@ impl SyncApplyRepo {
         conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
         let tx_result: StorageResult<ApplyOutcome> = (|| {
             Self::insert_commit(conn, serialized)?;
+            Self::acknowledge_received_tombstones(conn, ctx, serialized)?;
             if fast_forward {
                 let payload_conflicts = Self::apply_fast_forward_payloads(
                     conn,
@@ -257,9 +258,17 @@ impl SyncApplyRepo {
 
         for tombstone in &serialized.tombstones {
             conn.inner().execute(
-                "INSERT OR REPLACE INTO tombstones (tombstone_id, target_object_type, target_object_id,
-                 delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                "INSERT INTO tombstones (tombstone_id, target_object_type, target_object_id,
+                 delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at,
+                 delete_commit_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+                 ON CONFLICT(tombstone_id) DO UPDATE SET
+                    target_object_type = excluded.target_object_type,
+                    target_object_id = excluded.target_object_id,
+                    delete_clock = excluded.delete_clock,
+                    deleted_by_device_id = excluded.deleted_by_device_id,
+                    deleted_at = excluded.deleted_at,
+                    delete_commit_id = excluded.delete_commit_id",
                 params![
                     tombstone.tombstone_id,
                     tombstone.target_object_type,
@@ -267,10 +276,49 @@ impl SyncApplyRepo {
                     tombstone.delete_clock,
                     tombstone.deleted_by_device_id,
                     tombstone.deleted_at,
+                    serialized.commit.commit_id,
+                ],
+            )?;
+            conn.inner().execute(
+                "INSERT INTO tombstone_acknowledgements
+                    (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
+                    observed_commit_id = excluded.observed_commit_id,
+                    acknowledged_at = excluded.acknowledged_at",
+                params![
+                    tombstone.tombstone_id,
+                    tombstone.deleted_by_device_id,
+                    serialized.commit.commit_id,
+                    tombstone.deleted_at,
                 ],
             )?;
         }
 
+        Ok(())
+    }
+
+    fn acknowledge_received_tombstones(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        serialized: &SerializedCommit,
+    ) -> StorageResult<()> {
+        for tombstone in &serialized.tombstones {
+            conn.inner().execute(
+                "INSERT INTO tombstone_acknowledgements
+                    (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
+                    observed_commit_id = excluded.observed_commit_id,
+                    acknowledged_at = excluded.acknowledged_at",
+                params![
+                    tombstone.tombstone_id,
+                    ctx.device_id,
+                    serialized.commit.commit_id,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -422,6 +470,9 @@ impl SyncApplyRepo {
             if let Some(tombstones) = &state.tombstones {
                 Self::apply_complete_tombstone_state(conn, tombstones)?;
             }
+        }
+        if let Some(acknowledgements) = &state.tombstone_acknowledgements {
+            Self::apply_tombstone_acknowledgements(conn, acknowledgements)?;
         }
         Ok(conflicts)
     }
@@ -1495,11 +1546,15 @@ impl SyncApplyRepo {
     ) -> StorageResult<()> {
         conn.inner().execute("DELETE FROM tombstones", [])?;
         for row in tombstones {
+            let delete_commit_id = match row.delete_commit_id.as_deref() {
+                Some(commit_id) if Self::commit_exists(conn, commit_id)? => Some(commit_id),
+                _ => None,
+            };
             conn.inner().execute(
                 "INSERT INTO tombstones
                     (tombstone_id, target_object_type, target_object_id, delete_clock,
-                     deleted_by_device_id, deleted_at, purge_eligible_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     row.tombstone_id,
                     row.target_object_type,
@@ -1508,6 +1563,41 @@ impl SyncApplyRepo {
                     row.deleted_by_device_id,
                     row.deleted_at,
                     row.purge_eligible_at,
+                    delete_commit_id,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_tombstone_acknowledgements(
+        conn: &VaultConnection,
+        acknowledgements: &[TombstoneAcknowledgementRow],
+    ) -> StorageResult<()> {
+        for row in acknowledgements {
+            let references_exist: bool = conn.inner().query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tombstones t, commits c
+                    WHERE t.tombstone_id = ?1 AND c.commit_id = ?2
+                 )",
+                params![row.tombstone_id, row.observed_commit_id],
+                |sql_row| sql_row.get(0),
+            )?;
+            if !references_exist {
+                continue;
+            }
+            conn.inner().execute(
+                "INSERT INTO tombstone_acknowledgements
+                    (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
+                    observed_commit_id = excluded.observed_commit_id,
+                    acknowledged_at = excluded.acknowledged_at",
+                params![
+                    row.tombstone_id,
+                    row.device_id,
+                    row.observed_commit_id,
+                    row.acknowledged_at,
                 ],
             )?;
         }
@@ -3133,6 +3223,45 @@ mod tests {
             .unwrap();
         assert_eq!(stored.0, second.commit.commit_id);
         assert_eq!(stored.1, 1);
+    }
+
+    #[test]
+    fn receiving_tombstone_records_local_and_deleting_device_acknowledgements() {
+        let (conn, ctx) = setup();
+        let serialized = make_commit(
+            "remote-delete",
+            "remote-device",
+            1,
+            Vec::new(),
+            vec!["project-1".to_string()],
+            "project-1",
+            "project",
+        );
+
+        SyncApplyRepo::insert_commit(&conn, &serialized).unwrap();
+        SyncApplyRepo::acknowledge_received_tombstones(&conn, &ctx, &serialized).unwrap();
+
+        let mut stmt = conn
+            .inner()
+            .prepare(
+                "SELECT device_id, observed_commit_id FROM tombstone_acknowledgements
+                 WHERE tombstone_id = 't-remote-delete' ORDER BY device_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                ("device-a".to_string(), "remote-delete".to_string()),
+                ("remote-device".to_string(), "remote-delete".to_string()),
+            ]
+        );
     }
 
     fn temp_vault_path(label: &str) -> PathBuf {

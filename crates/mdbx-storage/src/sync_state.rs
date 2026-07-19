@@ -40,6 +40,8 @@ pub struct SyncStatePayload {
     pub project_tags: Option<Vec<ProjectTagSetRow>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstones: Option<Vec<TombstoneRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_acknowledgements: Option<Vec<TombstoneAcknowledgementRow>>,
     pub branches: Vec<BranchRow>,
 }
 
@@ -274,6 +276,16 @@ pub struct TombstoneRow {
     pub deleted_by_device_id: String,
     pub deleted_at: String,
     pub purge_eligible_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TombstoneAcknowledgementRow {
+    pub tombstone_id: String,
+    pub device_id: String,
+    pub observed_commit_id: String,
+    pub acknowledged_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +314,7 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         attachment_chunks: load_attachment_chunk_rows(conn)?,
         project_tags: Some(load_project_tag_set_rows(conn)?),
         tombstones: Some(load_tombstone_rows(conn)?),
+        tombstone_acknowledgements: Some(load_tombstone_acknowledgement_rows(conn)?),
         branches: load_branch_rows(conn)?,
     })
 }
@@ -764,7 +777,7 @@ fn load_project_tag_set_rows(conn: &VaultConnection) -> StorageResult<Vec<Projec
 fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT tombstone_id, target_object_type, target_object_id, delete_clock,
-                deleted_by_device_id, deleted_at, purge_eligible_at
+                deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id
          FROM tombstones
          ORDER BY target_object_type ASC, target_object_id ASC, tombstone_id ASC",
     )?;
@@ -777,6 +790,26 @@ fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow
             deleted_by_device_id: row.get(4)?,
             deleted_at: row.get(5)?,
             purge_eligible_at: row.get(6)?,
+            delete_commit_id: row.get(7)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn load_tombstone_acknowledgement_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<TombstoneAcknowledgementRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT tombstone_id, device_id, observed_commit_id, acknowledged_at
+         FROM tombstone_acknowledgements
+         ORDER BY tombstone_id ASC, device_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TombstoneAcknowledgementRow {
+            tombstone_id: row.get(0)?,
+            device_id: row.get(1)?,
+            observed_commit_id: row.get(2)?,
+            acknowledged_at: row.get(3)?,
         })
     })?;
     collect_rows(rows)
@@ -879,5 +912,6 @@ mod tests {
         let decoded = decode_sync_state_payload(&payload).unwrap().unwrap();
         assert!(decoded.key_epoch_state.is_none());
         assert!(decoded.tombstones.is_none());
+        assert!(decoded.tombstone_acknowledgements.is_none());
     }
 }

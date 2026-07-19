@@ -262,7 +262,7 @@ impl ObjectRelationRepo {
                     ctx.device_id,
                 ],
             )?;
-            ctx.create_tombstone(conn, "object-relation", relation_id)?;
+            ctx.create_tombstone_for_commit(conn, "object-relation", relation_id, &commit_id)?;
             ObjectVersionRepo::record_object_relation_current(conn, &commit_id, relation_id)?;
             Ok(())
         })

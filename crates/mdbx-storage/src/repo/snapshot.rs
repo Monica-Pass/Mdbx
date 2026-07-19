@@ -1162,7 +1162,7 @@ fn soft_delete_for_restore(
     now: &str,
 ) -> StorageResult<()> {
     for object_id in object_ids {
-        ctx.create_tombstone(conn, object_type, object_id)?;
+        ctx.create_tombstone_for_commit(conn, object_type, object_id, restore_commit_id)?;
         if table == "attachments" {
             conn.inner().execute(
                 &format!(

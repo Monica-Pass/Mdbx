@@ -302,12 +302,10 @@ impl ProjectRepo {
 
             let now = chrono::Utc::now().to_rfc3339();
 
-            // tombstone
-            ctx.create_tombstone(conn, "project", project_id)?;
-
             // commit
             let commit_id =
                 ctx.commit_object_change(conn, "projects", project_id, "change", "project")?;
+            ctx.create_tombstone_for_commit(conn, "project", project_id, &commit_id)?;
 
             let object_clock = bump_clock(&project.object_clock);
 

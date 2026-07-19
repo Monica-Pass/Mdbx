@@ -731,6 +731,50 @@ impl CommitContext {
                 now,
             ],
         )?;
+        Ok(tombstone_id)
+    }
+
+    /// 写入带有因果 commit 证明的 MDBX2 tombstone。
+    pub fn create_tombstone_for_commit(
+        &self,
+        conn: &VaultConnection,
+        target_object_type: &str,
+        target_object_id: &str,
+        delete_commit_id: &str,
+    ) -> StorageResult<String> {
+        let delete_clock: String = conn
+            .inner()
+            .query_row(
+                "SELECT vector_clock FROM commits WHERE commit_id = ?1",
+                params![delete_commit_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(delete_commit_id.to_string()))?;
+        let tombstone_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.inner().execute(
+            "INSERT INTO tombstones (tombstone_id, target_object_type, target_object_id,
+             delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at,
+             delete_commit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+            params![
+                tombstone_id,
+                target_object_type,
+                target_object_id,
+                delete_clock,
+                self.device_id,
+                now,
+                delete_commit_id,
+            ],
+        )?;
+        conn.inner().execute(
+            "INSERT INTO tombstone_acknowledgements
+                (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![tombstone_id, self.device_id, delete_commit_id, now],
+        )?;
 
         Ok(tombstone_id)
     }

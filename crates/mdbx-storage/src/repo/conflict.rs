@@ -796,6 +796,7 @@ impl ConflictRepo {
             ctx,
             "entry",
             &conflict.object_id,
+            &commit_id,
             current.deleted,
         )?;
         ObjectVersionRepo::record_entry_current(conn, &commit_id, &conflict.object_id)?;
@@ -862,7 +863,14 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
-        Self::reconcile_resolution_tombstone(conn, ctx, "entry", &conflict.object_id, false)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "entry",
+            &conflict.object_id,
+            &commit_id,
+            false,
+        )?;
         ObjectVersionRepo::record_entry_current(conn, &commit_id, &conflict.object_id)?;
         Ok(())
     }
@@ -893,6 +901,7 @@ impl ConflictRepo {
             ctx,
             "project",
             &conflict.object_id,
+            &commit_id,
             current.deleted,
         )?;
         ObjectVersionRepo::record_project_current(conn, &commit_id, &conflict.object_id)?;
@@ -969,6 +978,7 @@ impl ConflictRepo {
             ctx,
             "attachment",
             &conflict.object_id,
+            &commit_id,
             current.deleted,
         )?;
         ObjectVersionRepo::record_attachment_current(conn, &commit_id, &conflict.object_id)?;
@@ -1079,6 +1089,7 @@ impl ConflictRepo {
             ctx,
             "object-relation",
             &conflict.object_id,
+            &commit_id,
             selected.deleted,
         )?;
         ObjectVersionRepo::record_object_relation_current(conn, &commit_id, &conflict.object_id)
@@ -1146,6 +1157,7 @@ impl ConflictRepo {
             ctx,
             "object-label",
             &conflict.object_id,
+            &commit_id,
             selected.deleted,
         )?;
         ObjectVersionRepo::record_object_label_current(conn, &commit_id, &conflict.object_id)
@@ -1211,6 +1223,7 @@ impl ConflictRepo {
             ctx,
             "object-label-assignment",
             &conflict.object_id,
+            &commit_id,
             selected.deleted,
         )?;
         ObjectVersionRepo::record_object_label_assignment_current(
@@ -1427,6 +1440,7 @@ impl ConflictRepo {
         ctx: &CommitContext,
         object_type: &str,
         object_id: &str,
+        delete_commit_id: &str,
         deleted: bool,
     ) -> StorageResult<()> {
         if deleted {
@@ -1437,7 +1451,30 @@ impl ConflictRepo {
                 |row| row.get(0),
             )?;
             if existing == 0 {
-                ctx.create_tombstone(conn, object_type, object_id)?;
+                ctx.create_tombstone_for_commit(conn, object_type, object_id, delete_commit_id)?;
+            } else {
+                conn.inner().execute(
+                    "UPDATE tombstones SET delete_commit_id = ?3,
+                     delete_clock = (SELECT vector_clock FROM commits WHERE commit_id = ?3)
+                     WHERE target_object_type = ?1 AND target_object_id = ?2",
+                    params![object_type, object_id, delete_commit_id],
+                )?;
+                conn.inner().execute(
+                    "INSERT INTO tombstone_acknowledgements
+                        (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+                     SELECT tombstone_id, ?3, ?4, ?5 FROM tombstones
+                     WHERE target_object_type = ?1 AND target_object_id = ?2
+                     ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
+                        observed_commit_id = excluded.observed_commit_id,
+                        acknowledged_at = excluded.acknowledged_at",
+                    params![
+                        object_type,
+                        object_id,
+                        ctx.device_id,
+                        delete_commit_id,
+                        chrono::Utc::now().to_rfc3339(),
+                    ],
+                )?;
             }
         } else {
             conn.inner().execute(
@@ -1536,7 +1573,14 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
-        Self::reconcile_resolution_tombstone(conn, ctx, "entry", &row.entry_id, row.deleted)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "entry",
+            &row.entry_id,
+            commit_id,
+            row.deleted,
+        )?;
         Ok(())
     }
 
@@ -1571,7 +1615,14 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
-        Self::reconcile_resolution_tombstone(conn, ctx, "project", &row.project_id, row.deleted)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "project",
+            &row.project_id,
+            commit_id,
+            row.deleted,
+        )?;
         Ok(())
     }
 
@@ -1611,6 +1662,7 @@ impl ConflictRepo {
             ctx,
             "attachment",
             &row.attachment_id,
+            commit_id,
             row.deleted,
         )?;
         Ok(())

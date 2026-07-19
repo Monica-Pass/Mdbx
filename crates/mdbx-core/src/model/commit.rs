@@ -118,6 +118,9 @@ pub struct Tombstone {
     pub delete_clock: ObjectClock,
     pub deleted_by_device_id: DeviceId,
     pub deleted_at: String,
+    /// 证明目标对象处于删除状态的 commit。旧墓碑可能缺失此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_commit_id: Option<CommitId>,
     /// 可安全物理清理的时间
     pub purge_eligible_at: Option<String>,
 }

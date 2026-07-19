@@ -27,7 +27,7 @@ use mdbx_storage::repo::{
     CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
     ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
-    ProjectRepo,
+    ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility, TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -142,6 +142,71 @@ impl From<HealthCheckResult> for MdbxHealthCheckResult {
         Self {
             healthy: value.healthy,
             issues: value.issues.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxTombstonePurgeBlocker {
+    pub code: String,
+    pub device_id: Option<String>,
+    pub commit_id: Option<String>,
+    pub timestamp: Option<String>,
+}
+
+impl From<TombstonePurgeBlocker> for MdbxTombstonePurgeBlocker {
+    fn from(value: TombstonePurgeBlocker) -> Self {
+        match value {
+            TombstonePurgeBlocker::RetentionNotScheduled => Self::new("retention-not-scheduled"),
+            TombstonePurgeBlocker::RetentionPeriodActive { eligible_at } => Self {
+                timestamp: Some(eligible_at),
+                ..Self::new("retention-period-active")
+            },
+            TombstonePurgeBlocker::InvalidRetentionTimestamp { value } => Self {
+                timestamp: Some(value),
+                ..Self::new("invalid-retention-timestamp")
+            },
+            TombstonePurgeBlocker::MissingDeleteCommit => Self::new("missing-delete-commit"),
+            TombstonePurgeBlocker::DeleteCommitMissing { commit_id } => Self {
+                commit_id: Some(commit_id),
+                ..Self::new("delete-commit-missing")
+            },
+            TombstonePurgeBlocker::TargetMissing => Self::new("target-missing"),
+            TombstonePurgeBlocker::TargetNotDeleted => Self::new("target-not-deleted"),
+            TombstonePurgeBlocker::UnresolvedConflict => Self::new("unresolved-conflict"),
+            TombstonePurgeBlocker::DeviceHasNotAcknowledgedDelete { device_id } => Self {
+                device_id: Some(device_id),
+                ..Self::new("device-has-not-acknowledged-delete")
+            },
+            TombstonePurgeBlocker::UnsupportedTargetType => Self::new("unsupported-target-type"),
+        }
+    }
+}
+
+impl MdbxTombstonePurgeBlocker {
+    fn new(code: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            device_id: None,
+            commit_id: None,
+            timestamp: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxTombstonePurgeEligibility {
+    pub tombstone_id: String,
+    pub eligible: bool,
+    pub blockers: Vec<MdbxTombstonePurgeBlocker>,
+}
+
+impl From<TombstonePurgeEligibility> for MdbxTombstonePurgeEligibility {
+    fn from(value: TombstonePurgeEligibility) -> Self {
+        Self {
+            tombstone_id: value.tombstone_id,
+            eligible: value.eligible,
+            blockers: value.blockers.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -927,6 +992,15 @@ impl MdbxVault {
     pub fn health_check(&self) -> Result<MdbxHealthCheckResult, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(RecoveryVerifier::full_health_check(&conn)?.into())
+    }
+
+    pub fn evaluate_tombstone_purge_eligibility(
+        &self,
+        tombstone_id: String,
+        now: String,
+    ) -> Result<MdbxTombstonePurgeEligibility, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(TombstoneRepo::evaluate_purge_eligibility(&conn, &tombstone_id, &now)?.into())
     }
 
     pub fn resolve_tiga_policy(
@@ -2659,6 +2733,40 @@ mod tests {
                 && issue.description.contains(&project.project_id)
                 && issue.description.contains("deleted without")
         }));
+    }
+
+    #[test]
+    fn tombstone_purge_eligibility_is_available_to_native_clients() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(
+            &conn,
+            &VaultInitParams {
+                device_id: "ffi-purge-device".to_string(),
+                ..VaultInitParams::default()
+            },
+        )
+        .unwrap();
+        let ctx = CommitContext::new("ffi-purge-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Purge", None, None).unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &project.project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project.project_id)
+            .unwrap()
+            .unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-purge-device".to_string(),
+            vault_id: "ffi-purge-vault".to_string(),
+        };
+
+        let result = vault
+            .evaluate_tombstone_purge_eligibility(
+                tombstone.tombstone_id,
+                "2030-01-01T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        assert!(!result.eligible);
+        assert_eq!(result.blockers.len(), 1);
+        assert_eq!(result.blockers[0].code, "retention-not-scheduled");
     }
 
     #[test]
