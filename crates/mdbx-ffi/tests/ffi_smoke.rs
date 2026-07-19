@@ -673,6 +673,111 @@ fn namespaced_objects_roundtrip_through_the_generic_client_api() {
 }
 
 #[test]
+fn generic_relation_and_label_client_apis_preserve_encrypted_metadata() {
+    let vault_path = temp_vault_path("generic-metadata-api");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "generic metadata password 12345!".to_string(),
+        "ffi-generic-metadata-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let first = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "First".to_string(),
+            r#"{"body":"first"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let second = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Second".to_string(),
+            r#"{"body":"second"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+
+    let relation = vault
+        .create_object_relation(
+            first.object_id.clone(),
+            second.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":1}"#.to_string(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(relation.payload_schema_version, 2);
+    assert_eq!(
+        vault
+            .list_object_relations_from(
+                first.object_id.clone(),
+                Some("com.monica.mail.reply-to".to_string()),
+            )
+            .unwrap(),
+        vec![relation.clone()]
+    );
+    let relation = vault
+        .update_object_relation(
+            relation.relation_id.clone(),
+            relation.relation_kind.clone(),
+            r#"{"position":2}"#.to_string(),
+            3,
+        )
+        .unwrap();
+    assert_eq!(relation.payload_schema_version, 3);
+
+    let label = vault
+        .create_object_label(
+            collection.project_id,
+            "Important".to_string(),
+            r#"{"color":"red"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let assignment = vault
+        .assign_object_label(first.object_id.clone(), label.label_id.clone())
+        .unwrap();
+    assert_eq!(
+        vault
+            .list_object_label_assignments(first.object_id.clone())
+            .unwrap(),
+        vec![assignment.clone()]
+    );
+    let label = vault
+        .update_object_label(
+            label.label_id,
+            "Priority".to_string(),
+            r#"{"color":"orange"}"#.to_string(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(label.name, "Priority");
+    assert_eq!(label.payload_schema_version, 2);
+
+    vault
+        .remove_object_label_assignment(assignment.assignment_id)
+        .unwrap();
+    vault.delete_object_label(label.label_id).unwrap();
+    vault.delete_object_relation(relation.relation_id).unwrap();
+
+    let invalid_kind = vault.create_object_relation(
+        first.object_id,
+        second.object_id,
+        "reply-to".to_string(),
+        "{}".to_string(),
+        1,
+    );
+    assert!(matches!(
+        invalid_kind,
+        Err(MdbxFfiError::InvalidRelationKind { .. })
+    ));
+}
+
+#[test]
 fn opens_with_security_key_material() {
     let vault_path = temp_vault_path("security-key");
     let path = vault_path.as_path_string();
@@ -788,7 +893,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(6));
+    assert_eq!(upgraded.schema_version, Some(7));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())

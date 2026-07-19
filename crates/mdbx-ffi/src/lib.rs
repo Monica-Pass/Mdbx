@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use mdbx_core::model::{EntryType, ObjectTypeId, UnlockMethodType};
+use mdbx_core::model::{EntryType, ObjectTypeId, RelationKindId, UnlockMethodType};
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, PolicyException,
@@ -20,7 +20,9 @@ use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::repo::{
     BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
-    CommitHistoryRepo, CommitOperation, EntryRepo, OperationExecution, ProjectRepo,
+    CommitHistoryRepo, CommitOperation, EntryRepo, ObjectLabelAssignmentCreateRequest,
+    ObjectLabelAssignmentRepo, ObjectLabelCreateRequest, ObjectLabelRepo,
+    ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution, ProjectRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -41,6 +43,8 @@ pub enum MdbxFfiError {
     InvalidEntryType { entry_type: String },
     #[error("invalid object type ID: {object_type_id}")]
     InvalidObjectTypeId { object_type_id: String },
+    #[error("invalid relation kind: {relation_kind}")]
+    InvalidRelationKind { relation_kind: String },
     #[error("vault lock poisoned")]
     LockPoisoned,
 }
@@ -139,6 +143,35 @@ pub struct MdbxObjectRecord {
     pub title: String,
     pub payload_json: String,
     pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRelationRecord {
+    pub relation_id: String,
+    pub source_object_id: String,
+    pub target_object_id: String,
+    pub relation_kind: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelRecord {
+    pub label_id: String,
+    pub collection_id: String,
+    pub name: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelAssignmentRecord {
+    pub assignment_id: String,
+    pub object_id: String,
+    pub label_id: String,
     pub deleted: bool,
 }
 
@@ -1169,6 +1202,199 @@ impl MdbxVault {
         object_record_from_entry(&updated)
     }
 
+    pub fn create_object_relation(
+        &self,
+        source_object_id: String,
+        target_object_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectRelationRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let relation = ObjectRelationRepo::create(
+            &conn,
+            &ctx,
+            ObjectRelationCreateRequest::new(
+                source_object_id,
+                target_object_id,
+                parse_relation_kind(&relation_kind)?,
+                parse_payload_json(&payload_json)?,
+            )
+            .with_payload_schema_version(payload_schema_version),
+        )?;
+        object_relation_record(&relation)
+    }
+
+    pub fn get_object_relation(
+        &self,
+        relation_id: String,
+    ) -> Result<Option<MdbxObjectRelationRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectRelationRepo::get_by_id(&conn, &relation_id)?
+            .as_ref()
+            .map(object_relation_record)
+            .transpose()
+    }
+
+    pub fn list_object_relations_from(
+        &self,
+        source_object_id: String,
+        relation_kind: Option<String>,
+    ) -> Result<Vec<MdbxObjectRelationRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let kind = relation_kind
+            .as_deref()
+            .map(parse_relation_kind)
+            .transpose()?;
+        ObjectRelationRepo::list_from_object(&conn, &source_object_id, kind.as_ref())?
+            .iter()
+            .map(object_relation_record)
+            .collect()
+    }
+
+    pub fn list_object_relations_to(
+        &self,
+        target_object_id: String,
+        relation_kind: Option<String>,
+    ) -> Result<Vec<MdbxObjectRelationRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let kind = relation_kind
+            .as_deref()
+            .map(parse_relation_kind)
+            .transpose()?;
+        ObjectRelationRepo::list_to_object(&conn, &target_object_id, kind.as_ref())?
+            .iter()
+            .map(object_relation_record)
+            .collect()
+    }
+
+    pub fn update_object_relation(
+        &self,
+        relation_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectRelationRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let mut relation = ObjectRelationRepo::get_by_id(&conn, &relation_id)?
+            .ok_or_else(|| StorageError::NotFound(relation_id.clone()))?;
+        relation.relation_kind = parse_relation_kind(&relation_kind)?;
+        relation.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
+        relation.payload_schema_version = payload_schema_version;
+        let ctx = CommitContext::new(self.device_id.clone());
+        object_relation_record(&ObjectRelationRepo::update(&conn, &ctx, &relation)?)
+    }
+
+    pub fn delete_object_relation(&self, relation_id: String) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectRelationRepo::soft_delete(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &relation_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn create_object_label(
+        &self,
+        collection_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectLabelRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let label = ObjectLabelRepo::create(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            ObjectLabelCreateRequest::new(collection_id, name, parse_payload_json(&payload_json)?)
+                .with_payload_schema_version(payload_schema_version),
+        )?;
+        object_label_record(&label)
+    }
+
+    pub fn list_object_labels(
+        &self,
+        collection_id: String,
+    ) -> Result<Vec<MdbxObjectLabelRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectLabelRepo::list_by_collection(&conn, &collection_id)?
+            .iter()
+            .map(object_label_record)
+            .collect()
+    }
+
+    pub fn update_object_label(
+        &self,
+        label_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectLabelRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let mut label = ObjectLabelRepo::get_by_id(&conn, &label_id)?
+            .ok_or_else(|| StorageError::NotFound(label_id.clone()))?;
+        label.name_ct = name.into_bytes();
+        label.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
+        label.payload_schema_version = payload_schema_version;
+        object_label_record(&ObjectLabelRepo::update(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &label,
+        )?)
+    }
+
+    pub fn delete_object_label(&self, label_id: String) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectLabelRepo::soft_delete(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &label_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn assign_object_label(
+        &self,
+        object_id: String,
+        label_id: String,
+    ) -> Result<MdbxObjectLabelAssignmentRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(object_label_assignment_record(
+            &ObjectLabelAssignmentRepo::create(
+                &conn,
+                &CommitContext::new(self.device_id.clone()),
+                ObjectLabelAssignmentCreateRequest::new(object_id, label_id),
+            )?,
+        ))
+    }
+
+    pub fn list_object_label_assignments(
+        &self,
+        object_id: String,
+    ) -> Result<Vec<MdbxObjectLabelAssignmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(
+            ObjectLabelAssignmentRepo::list_by_object(&conn, &object_id)?
+                .iter()
+                .map(object_label_assignment_record)
+                .collect(),
+        )
+    }
+
+    pub fn remove_object_label_assignment(
+        &self,
+        assignment_id: String,
+    ) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectLabelAssignmentRepo::soft_delete(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &assignment_id,
+        )?;
+        Ok(())
+    }
+
     pub fn list_entries(
         &self,
         project_id: String,
@@ -1967,6 +2193,14 @@ fn parse_optional_object_type_id(
         .transpose()
 }
 
+fn parse_relation_kind(relation_kind: &str) -> Result<RelationKindId, MdbxFfiError> {
+    relation_kind
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidRelationKind {
+            relation_kind: relation_kind.to_string(),
+        })
+}
+
 fn parse_payload_json(payload_json: &str) -> Result<serde_json::Value, MdbxFfiError> {
     serde_json::from_str(payload_json).map_err(MdbxFfiError::from)
 }
@@ -2006,6 +2240,50 @@ fn object_record_from_entry(
         payload_schema_version: entry.payload_schema_version,
         deleted: entry.deleted,
     })
+}
+
+fn object_relation_record(
+    relation: &mdbx_core::model::ObjectRelation,
+) -> Result<MdbxObjectRelationRecord, MdbxFfiError> {
+    let payload: serde_json::Value = serde_json::from_slice(&relation.payload_ct)?;
+    Ok(MdbxObjectRelationRecord {
+        relation_id: relation.relation_id.clone(),
+        source_object_id: relation.source_object_id.clone(),
+        target_object_id: relation.target_object_id.clone(),
+        relation_kind: relation.relation_kind.to_string(),
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: relation.payload_schema_version,
+        deleted: relation.deleted,
+    })
+}
+
+fn object_label_record(
+    label: &mdbx_core::model::ObjectLabel,
+) -> Result<MdbxObjectLabelRecord, MdbxFfiError> {
+    let name =
+        String::from_utf8(label.name_ct.clone()).map_err(|error| MdbxFfiError::Serialization {
+            message: error.to_string(),
+        })?;
+    let payload: serde_json::Value = serde_json::from_slice(&label.payload_ct)?;
+    Ok(MdbxObjectLabelRecord {
+        label_id: label.label_id.clone(),
+        collection_id: label.collection_id.clone(),
+        name,
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: label.payload_schema_version,
+        deleted: label.deleted,
+    })
+}
+
+fn object_label_assignment_record(
+    assignment: &mdbx_core::model::ObjectLabelAssignment,
+) -> MdbxObjectLabelAssignmentRecord {
+    MdbxObjectLabelAssignmentRecord {
+        assignment_id: assignment.assignment_id.clone(),
+        object_id: assignment.object_id.clone(),
+        label_id: assignment.label_id.clone(),
+        deleted: assignment.deleted,
+    }
 }
 
 #[cfg(test)]
