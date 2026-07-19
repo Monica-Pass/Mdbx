@@ -3,12 +3,13 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
 use crate::error::{SyncError, SyncResult};
-use crate::message::SerializedCommit;
+use crate::message::{ObjectPayload, SerializedCommit, TombstoneRecord};
 
 /// 文件格式魔数：`MDBXSYNC`
 const BUNDLE_MAGIC: &[u8; 8] = b"MDBXSYNC";
 /// 当前格式版本
-const BUNDLE_VERSION: u32 = 1;
+const BUNDLE_VERSION: u32 = 2;
+const LEGACY_BUNDLE_VERSION: u32 = 1;
 
 /// 离线同步包。
 ///
@@ -18,7 +19,7 @@ const BUNDLE_VERSION: u32 = 1;
 /// ```text
 /// ┌──────────────────────────────────────┐
 /// │ magic:    [u8; 8]  = b"MDBXSYNC"   │
-/// │ version:  u32 (LE)  = 1             │
+/// │ version:  u32 (LE)  = 2             │
 /// │ reserved: [u8; 20]  (zero)          │
 /// │ payload:  <bincode 2 serde>         │
 /// │ hash:     [u8; 32]  SHA-256(body)   │
@@ -34,6 +35,43 @@ pub struct SyncBundle {
     pub vault_id: String,
     /// 包含的 commits 列表
     pub commits: Vec<SerializedCommit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySyncBundleV1 {
+    exported_at: String,
+    source_device_id: String,
+    vault_id: String,
+    commits: Vec<LegacySerializedCommitV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySerializedCommitV1 {
+    commit: mdbx_core::model::Commit,
+    parent_ids: Vec<String>,
+    tombstones: Vec<TombstoneRecord>,
+    object_payloads: Vec<ObjectPayload>,
+}
+
+impl From<LegacySyncBundleV1> for SyncBundle {
+    fn from(legacy: LegacySyncBundleV1) -> Self {
+        Self {
+            exported_at: legacy.exported_at,
+            source_device_id: legacy.source_device_id,
+            vault_id: legacy.vault_id,
+            commits: legacy
+                .commits
+                .into_iter()
+                .map(|commit| SerializedCommit {
+                    commit: commit.commit,
+                    operation: None,
+                    parent_ids: commit.parent_ids,
+                    tombstones: commit.tombstones,
+                    object_payloads: commit.object_payloads,
+                })
+                .collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,10 +142,9 @@ pub fn read_bundle(reader: &mut impl Read) -> SyncResult<SyncBundle> {
     let mut version_buf = [0u8; 4];
     reader.read_exact(&mut version_buf)?;
     let version = u32::from_le_bytes(version_buf);
-    if version != BUNDLE_VERSION {
+    if version != BUNDLE_VERSION && version != LEGACY_BUNDLE_VERSION {
         return Err(SyncError::BundleFormat(format!(
-            "unsupported version: {}, expected {}",
-            version, BUNDLE_VERSION
+            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION} and {BUNDLE_VERSION}"
         )));
     }
 
@@ -143,10 +180,17 @@ pub fn read_bundle(reader: &mut impl Read) -> SyncResult<SyncBundle> {
     }
 
     // 反序列化
-    let (bundle, bytes_read): (SyncBundle, usize) =
+    let (bundle, bytes_read) = if version == LEGACY_BUNDLE_VERSION {
+        let (legacy, bytes_read): (LegacySyncBundleV1, usize) =
+            bincode::serde::decode_from_slice(payload_data, bincode::config::standard()).map_err(
+                |e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )?;
+        (legacy.into(), bytes_read)
+    } else {
         bincode::serde::decode_from_slice(payload_data, bincode::config::standard()).map_err(
             |e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )?;
+        )?
+    };
     if bytes_read != payload_data.len() {
         return Err(SyncError::BundleFormat(format!(
             "trailing payload bytes: {}",
@@ -191,6 +235,7 @@ mod tests {
                     created_at: "2026-05-21T00:00:00Z".to_string(),
                     integrity_tag: vec![],
                 },
+                operation: None,
                 parent_ids: vec!["genesis".to_string()],
                 tombstones: vec![],
                 object_payloads: vec![ObjectPayload {
@@ -203,6 +248,34 @@ mod tests {
         }
     }
 
+    fn legacy_bundle_bytes() -> Vec<u8> {
+        let current = sample_bundle();
+        let legacy = LegacySyncBundleV1 {
+            exported_at: current.exported_at,
+            source_device_id: current.source_device_id,
+            vault_id: current.vault_id,
+            commits: current
+                .commits
+                .into_iter()
+                .map(|commit| LegacySerializedCommitV1 {
+                    commit: commit.commit,
+                    parent_ids: commit.parent_ids,
+                    tombstones: commit.tombstones,
+                    object_payloads: commit.object_payloads,
+                })
+                .collect(),
+        };
+        let payload = bincode::serde::encode_to_vec(legacy, bincode::config::standard()).unwrap();
+        let hash = Sha256::digest(&payload);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BUNDLE_MAGIC);
+        bytes.extend_from_slice(&LEGACY_BUNDLE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; 20]);
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&hash);
+        bytes
+    }
+
     #[test]
     fn test_bundle_roundtrip() {
         let bundle = sample_bundle();
@@ -213,6 +286,14 @@ mod tests {
         assert_eq!(restored.vault_id, bundle.vault_id);
         assert_eq!(restored.source_device_id, bundle.source_device_id);
         assert_eq!(restored.commits.len(), 1);
+        assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+    }
+
+    #[test]
+    fn test_legacy_v1_bundle_is_upgraded_without_operation_metadata() {
+        let restored = bundle_from_bytes(&legacy_bundle_bytes()).unwrap();
+        assert_eq!(restored.commits.len(), 1);
+        assert!(restored.commits[0].operation.is_none());
         assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
     }
 
@@ -271,6 +352,7 @@ mod tests {
                     created_at: "2026-05-21T00:00:00Z".to_string(),
                     integrity_tag: vec![],
                 },
+                operation: None,
                 parent_ids: vec![],
                 tombstones: vec![],
                 object_payloads: vec![],

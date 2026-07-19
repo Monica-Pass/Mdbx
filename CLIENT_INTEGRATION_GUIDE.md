@@ -172,6 +172,16 @@ These operations may become multiple commits:
 - a long transaction is interrupted and resumed
 - the client must split work for memory reasons and the UI clearly presents multiple batches
 
+MDBX2 writing clients SHOULD generate a stable `operation_id` when a user action starts and submit
+it through `CommitOperation` / `CommitContext::create_operation_commit`. A retry after a timeout or
+process restart must reuse that ID; storage returns the original commit idempotently. The same ID
+must never be reused for different request content.
+
+`CommitOperation` also carries the `operation_kind`, target `branch_name`, object types, actions,
+and field summaries. Storage atomically allocates the device `local_seq`, merges parent vector
+clocks, writes the legacy `commits` compatibility projection, and advances device and selected
+branch heads. Clients must not calculate `MAX(local_seq)+1` themselves.
+
 ### 4.2 Deletion Must Use Tombstones
 
 Deleting an object must:

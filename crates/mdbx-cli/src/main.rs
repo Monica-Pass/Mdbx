@@ -16,7 +16,8 @@ use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_st
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
-    build_bundle, read_bundle, write_bundle, CommitBatch, SerializedCommit, TombstoneRecord,
+    build_bundle, read_bundle, write_bundle, CommitBatch, CommitOperationMetadata,
+    SerializedCommit, TombstoneRecord,
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -1298,6 +1299,7 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
     let rows = stmt
         .query_map([], |row| {
             let commit_id: String = row.get(0)?;
+            let operation = operation_for_commit(conn, &commit_id)?;
             Ok(SerializedCommit {
                 parent_ids: parent_ids_for_commit(conn, &commit_id).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -1320,6 +1322,7 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
                     created_at: row.get(8)?,
                     integrity_tag: row.get(9)?,
                 },
+                operation,
             })
         })
         .map_err(|e| format!("failed to map commits: {}", e))?;
@@ -1334,6 +1337,30 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
         first.tombstones = tombstones;
     }
     Ok(commits)
+}
+
+fn operation_for_commit(
+    conn: &VaultConnection,
+    commit_id: &str,
+) -> rusqlite::Result<Option<CommitOperationMetadata>> {
+    conn.inner()
+        .query_row(
+            "SELECT operation_id, operation_kind, branch_name, change_summary_ct,
+                    request_hash, integrity_tag
+             FROM commit_operations WHERE commit_id = ?1",
+            params![commit_id],
+            |row| {
+                Ok(CommitOperationMetadata {
+                    operation_id: row.get(0)?,
+                    operation_kind: row.get(1)?,
+                    branch_name: row.get(2)?,
+                    change_summary_ct: row.get(3)?,
+                    request_hash: row.get(4)?,
+                    integrity_tag: row.get(5)?,
+                })
+            },
+        )
+        .optional()
 }
 
 fn parent_ids_for_commit(conn: &VaultConnection, commit_id: &str) -> Result<Vec<String>, String> {

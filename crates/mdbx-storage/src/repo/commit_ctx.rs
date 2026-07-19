@@ -5,6 +5,8 @@ use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use mdbx_core::model::Commit;
+
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
@@ -489,6 +491,42 @@ impl CommitContext {
                 Ok(hasher.finalize().to_vec())
             }
         }
+    }
+
+    pub(crate) fn verify_operation_integrity(
+        conn: &VaultConnection,
+        commit: &Commit,
+        operation: &mdbx_sync::CommitOperationMetadata,
+    ) -> StorageResult<()> {
+        let parts = [
+            b"mdbx-operation-integrity-v1".as_slice(),
+            operation.operation_id.as_bytes(),
+            commit.commit_id.as_bytes(),
+            operation.operation_kind.as_bytes(),
+            operation.branch_name.as_bytes(),
+            operation.change_summary_ct.as_slice(),
+            operation.request_hash.as_slice(),
+            commit.created_at.as_bytes(),
+        ];
+        let expected = match conn.keyring() {
+            Some(keyring) => mdbx_crypto::integrity::hmac_sha256(&keyring.integrity_subkey, &parts)
+                .map_err(StorageError::Crypto)?,
+            None => {
+                let mut hasher = Sha256::new();
+                for part in parts {
+                    hasher.update((part.len() as u64).to_le_bytes());
+                    hasher.update(part);
+                }
+                hasher.finalize().to_vec()
+            }
+        };
+        if expected != operation.integrity_tag {
+            return Err(StorageError::Validation(format!(
+                "incoming operation {} integrity mismatch",
+                operation.operation_id
+            )));
+        }
+        Ok(())
     }
 }
 

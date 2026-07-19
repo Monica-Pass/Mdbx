@@ -172,6 +172,15 @@ MAY 拆成多个 commit 的操作：
 - 长事务被用户中断后继续
 - 客户端为了内存限制分批提交，并且 UI 明确显示为多批操作
 
+MDBX2 写入客户端 SHOULD 在用户动作开始时生成稳定的 `operation_id`，并通过
+`CommitOperation` / `CommitContext::create_operation_commit` 提交。网络超时或进程恢复后
+必须复用同一个 `operation_id`；storage core 会幂等返回原 commit。不得对内容不同的请求
+复用同一个 ID。
+
+`CommitOperation` 还应明确提供 `operation_kind`、目标 `branch_name`、对象类型、动作和字段
+摘要。storage core 负责原子分配设备 `local_seq`、合并 parent 向量时钟、写入旧 `commits`
+兼容投影，并同步更新 device head 和指定 branch head。客户端不得自行计算 `MAX(local_seq)+1`。
+
 ### 4.2 删除必须走 tombstone
 
 删除对象时 MUST：

@@ -7,7 +7,7 @@ use mdbx_core::tiga::{
     AuthorizationConstraint, AuthorizationReason, PolicyException, TigaMode, TigaPolicyOverride,
     TigaScope,
 };
-use mdbx_sync::{CommitBatch, ObjectPayload, SerializedCommit};
+use mdbx_sync::{CommitBatch, CommitOperationMetadata, ObjectPayload, SerializedCommit};
 
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::conflict::ConflictDetector;
@@ -62,6 +62,17 @@ impl SyncApplyRepo {
         serialized: &SerializedCommit,
     ) -> StorageResult<ApplyOutcome> {
         if Self::commit_exists(conn, &serialized.commit.commit_id)? {
+            if let Some(operation) = &serialized.operation {
+                CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
+                conn.with_immediate_transaction(|| {
+                    Self::insert_operation(
+                        conn,
+                        &serialized.commit.commit_id,
+                        &serialized.commit.created_at,
+                        operation,
+                    )
+                })?;
+            }
             return Ok(ApplyOutcome::Skipped);
         }
 
@@ -71,7 +82,12 @@ impl SyncApplyRepo {
             }
         }
 
-        let local_head = Self::current_branch_head(conn, "main")?;
+        let branch_name = serialized
+            .operation
+            .as_ref()
+            .map(|operation| operation.branch_name.as_str())
+            .unwrap_or("main");
+        let local_head = Self::current_branch_head(conn, branch_name)?;
         let fast_forward = local_head
             .as_deref()
             .map(|head| serialized.parent_ids.iter().any(|parent| parent == head))
@@ -83,7 +99,7 @@ impl SyncApplyRepo {
             if fast_forward {
                 let payload_conflicts = Self::apply_fast_forward_payloads(conn, ctx, serialized)?;
                 if payload_conflicts == 0 {
-                    Self::advance_main_branch(conn, &serialized.commit.commit_id)?;
+                    Self::advance_branch(conn, branch_name, &serialized.commit.commit_id)?;
                 }
                 Self::sync_device_head(conn, serialized)?;
                 Ok(if payload_conflicts == 0 {
@@ -162,6 +178,16 @@ impl SyncApplyRepo {
             )?;
         }
 
+        if let Some(operation) = &serialized.operation {
+            CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
+            Self::insert_operation(
+                conn,
+                &serialized.commit.commit_id,
+                &serialized.commit.created_at,
+                operation,
+            )?;
+        }
+
         for tombstone in &serialized.tombstones {
             conn.inner().execute(
                 "INSERT OR REPLACE INTO tombstones (tombstone_id, target_object_type, target_object_id,
@@ -178,6 +204,49 @@ impl SyncApplyRepo {
             )?;
         }
 
+        Ok(())
+    }
+
+    fn insert_operation(
+        conn: &VaultConnection,
+        commit_id: &str,
+        created_at: &str,
+        operation: &CommitOperationMetadata,
+    ) -> StorageResult<()> {
+        let existing: Option<(String, Vec<u8>)> = conn
+            .inner()
+            .query_row(
+                "SELECT commit_id, request_hash FROM commit_operations WHERE operation_id = ?1",
+                params![operation.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_commit_id, request_hash)) = existing {
+            if existing_commit_id != commit_id || request_hash != operation.request_hash {
+                return Err(StorageError::Validation(format!(
+                    "incoming operation {} conflicts with existing metadata",
+                    operation.operation_id
+                )));
+            }
+            return Ok(());
+        }
+
+        conn.inner().execute(
+            "INSERT INTO commit_operations
+             (operation_id, commit_id, operation_kind, branch_name, change_summary_ct,
+              request_hash, created_at, integrity_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                operation.operation_id,
+                commit_id,
+                operation.operation_kind,
+                operation.branch_name,
+                operation.change_summary_ct,
+                operation.request_hash,
+                created_at,
+                operation.integrity_tag,
+            ],
+        )?;
         Ok(())
     }
 
@@ -1780,12 +1849,21 @@ impl SyncApplyRepo {
             .map_err(StorageError::Database)
     }
 
-    fn advance_main_branch(conn: &VaultConnection, commit_id: &str) -> StorageResult<()> {
+    fn advance_branch(
+        conn: &VaultConnection,
+        branch_name: &str,
+        commit_id: &str,
+    ) -> StorageResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        conn.inner().execute(
-            "UPDATE branches SET head_commit_id = ?1, updated_at = ?2 WHERE branch_name = 'main'",
-            params![commit_id, now],
+        let updated = conn.inner().execute(
+            "UPDATE branches SET head_commit_id = ?1, updated_at = ?2 WHERE branch_name = ?3",
+            params![commit_id, now, branch_name],
         )?;
+        if updated == 0 {
+            return Err(StorageError::NotFound(format!(
+                "branch {branch_name} not found"
+            )));
+        }
         Ok(())
     }
 }
@@ -1980,7 +2058,9 @@ mod tests {
     use crate::commit_integrity::compute_commit_integrity_tag;
     use crate::commit_integrity::CommitIntegrityInput;
     use crate::init::{initialize_vault, VaultInitParams};
-    use crate::repo::{AttachmentRepo, EntryRepo, ObjectVersionRepo, ProjectRepo};
+    use crate::repo::{
+        AttachmentRepo, CommitChange, CommitOperation, EntryRepo, ObjectVersionRepo, ProjectRepo,
+    };
     use crate::sync_state::collect_sync_state_payload;
     use mdbx_core::model::{ChangeScope, Commit, CommitKind, ConflictResolution, EntryType};
     use mdbx_core::tiga::TIGA_POLICY_VERSION;
@@ -2191,6 +2271,7 @@ mod tests {
                 integrity_tag: tag,
                 ..commit
             },
+            operation: None,
             parent_ids: parents,
             tombstones: vec![TombstoneRecord {
                 tombstone_id: format!("t-{}", commit_id),
@@ -2237,6 +2318,7 @@ mod tests {
                     parent_ids: SyncApplyRepo::parent_ids_for_commit(conn, &commit_id).unwrap(),
                     tombstones: vec![],
                     object_payloads: vec![],
+                    operation: operation_for_commit(conn, &commit_id).unwrap(),
                     commit: Commit {
                         commit_id,
                         device_id: row.get(1)?,
@@ -2274,6 +2356,30 @@ mod tests {
             "key-epoch" => ChangeScope::KeyEpoch,
             _ => ChangeScope::Multi,
         }
+    }
+
+    fn operation_for_commit(
+        conn: &VaultConnection,
+        commit_id: &str,
+    ) -> rusqlite::Result<Option<CommitOperationMetadata>> {
+        conn.inner()
+            .query_row(
+                "SELECT operation_id, operation_kind, branch_name, change_summary_ct,
+                        request_hash, integrity_tag
+                 FROM commit_operations WHERE commit_id = ?1",
+                params![commit_id],
+                |row| {
+                    Ok(CommitOperationMetadata {
+                        operation_id: row.get(0)?,
+                        operation_kind: row.get(1)?,
+                        branch_name: row.get(2)?,
+                        change_summary_ct: row.get(3)?,
+                        request_hash: row.get(4)?,
+                        integrity_tag: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     fn update_entry_payload(
@@ -2610,6 +2716,76 @@ mod tests {
         let result = SyncApplyRepo::apply_batch(&conn, &ctx, &batch).unwrap();
         assert_eq!(result.applied_commits, 1);
         assert_eq!(result.conflict_count, 0);
+    }
+
+    #[test]
+    fn operation_metadata_roundtrips_through_sync() {
+        let source_path = temp_vault_path("operation-source");
+        let target_path = temp_vault_path("operation-target");
+        let source = VaultConnection::create(&source_path).unwrap();
+        initialize_vault(
+            &source,
+            &VaultInitParams {
+                device_id: "device-a".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        checkpoint(&source);
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let operation = CommitOperation::new(
+            "sync-operation-1",
+            "batch-move",
+            "main",
+            "change",
+            "entry",
+            vec![CommitChange {
+                object_type: "entry".to_string(),
+                object_id: "entry-1".to_string(),
+                action: "move".to_string(),
+                fields: vec!["project_id".to_string()],
+            }],
+        );
+        let commit_id = source_ctx
+            .create_operation_commit(&source, &operation)
+            .unwrap();
+        checkpoint(&source);
+
+        let target = VaultConnection::open(&target_path).unwrap();
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let commits = serialized_commits_from(&source);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+        assert_eq!(result.applied_commits, 1);
+
+        let stored: (String, String, String) = target
+            .inner()
+            .query_row(
+                "SELECT operation_id, operation_kind, branch_name
+                 FROM commit_operations WHERE commit_id = ?1",
+                params![commit_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "sync-operation-1".to_string(),
+                "batch-move".to_string(),
+                "main".to_string()
+            )
+        );
+
+        drop(source);
+        drop(target);
+        for path in [&source_path, &target_path] {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        }
     }
 
     #[test]

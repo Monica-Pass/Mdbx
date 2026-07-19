@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use mdbx_core::model::Commit;
 
 /// 同步协议版本。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 单次批量传输的最大 commit 数。
 pub const MAX_COMMITS_PER_BATCH: usize = 256;
@@ -122,6 +122,10 @@ pub struct SerializedCommit {
     /// Commit 元数据。
     pub commit: Commit,
 
+    /// MDBX2 operation 元数据。旧 MDBX1/MDBX2 commit 没有此字段时按空处理。
+    #[serde(default)]
+    pub operation: Option<CommitOperationMetadata>,
+
     /// 此 commit 的 parent commit ID 列表（DAG 关联）。
     pub parent_ids: Vec<String>,
 
@@ -131,6 +135,17 @@ pub struct SerializedCommit {
     /// 此 commit 引用的对象负载（加密形式）。
     /// `(object_type, object_id, ciphertext)`。
     pub object_payloads: Vec<ObjectPayload>,
+}
+
+/// 可跨同步协议传输的 operation 元数据投影。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitOperationMetadata {
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub branch_name: String,
+    pub change_summary_ct: Vec<u8>,
+    pub request_hash: Vec<u8>,
+    pub integrity_tag: Vec<u8>,
 }
 
 /// Commit 关联的 tombstone。
