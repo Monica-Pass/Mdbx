@@ -26,6 +26,7 @@
 - 明确降低 vault profile 时创建精确且可审计的例外
 - 配置并打开“密码 + 安全密钥”组合解锁方式
 - 通过已授权 storage API 列出和删除解锁方式
+- 通过 Tiga 授权轮换数据密钥 epoch，并返回旧 epoch、新 active epoch、rotation commit 与时间戳
 - 创建 project
 - 创建、列出、更新、软删除、恢复、移动 generic entry
 
@@ -72,6 +73,13 @@
 - `payload_json`
 - `deleted`
 
+`MdbxKeyEpochRotationResult` 包含：
+
+- `previous_epoch_id`：轮换前的 active epoch
+- `active_epoch_id`：轮换后用于新字段写入的 epoch
+- `commit_id`：`key-rotation`、`key-epoch` commit
+- `rotated_at`：UTC 轮换时间
+
 ### Tiga2 运行时边界
 
 `MdbxDeviceContext` 承载每次授权使用的真实设备证据。客户端只有在对应保护对本次操作实际生效时，才能报告 `TrustedHardware`、安全剪贴板、防截屏或安全临时文件能力，不得伪造能力来通过 Power 策略。
@@ -89,6 +97,14 @@ Power 整改通过 `setup_password_security_key_unlock`、`list_unlock_methods` 
 客户端可控迁移应在 `inspect_vault_migration` 之后、`upgrade_vault` 之前调用顶层 `create_portable_backup(source_path, destination)`。该函数只读打开源文件，无需解锁凭据，保留 MDBX1 或 MDBX2 metadata，包含已经提交的 WAL 页面，并保持源主数据库与 WAL 的持久字节不变。
 
 已经打开的 vault 继续调用 `MdbxVault.create_backup(destination)`。两个接口都会验证完整性与 MDBX 身份，并以禁止覆盖的方式发布单个文件；目标主文件、`-wal` 或 `-shm` 已经存在时均返回错误。备份保留源 vault 的解锁方式，可以继续使用相同凭据打开。它与 vault 内部 snapshot、sync bundle 分别承担完整文件副本、逻辑恢复点和增量传输职责；WAL 活跃时客户端不得仅复制 SQLite 主文件。
+
+### 密钥 epoch 轮换
+
+客户端通过 `MdbxVault.rotate_key_epoch(device)` 请求轮换。调用必须使用活动解锁会话并提交真实设备能力。storage core 在一个事务中生成随机 32 字节 epoch key、包装密钥、退休旧 active epoch、激活新 epoch、创建 rotation commit，并把 Tiga 审计记录关联到该 commit。授权拒绝或事务失败不会改变 active epoch，也不会创建 rotation commit。
+
+返回成功后，客户端必须先把 `commit_id` 及其 authenticated sync state 发送到其他副本，再允许新 epoch 下产生的 `MDBXFE2` 字段离开本设备。同步接收端应使用可变、经过验证解锁的 storage apply 入口，使全部 active 和 retired wrapper 在返回前完成认证并刷新 keyring。并发轮换会保留双方 epoch，并通过确定性规则选择同一个 active epoch。
+
+轮换不是普通可重试 operation API。网络层在响应未知时，应先按返回的 commit 或安全审计记录查询结果，避免再次轮换。每次明确的第二次调用都表示新的安全管理动作，并产生新的 epoch 与 commit。
 
 ### Entry Type
 

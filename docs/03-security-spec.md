@@ -283,6 +283,10 @@ MDBX SHOULD support:
 
 Rotation MUST preserve readability of records until migration is complete.
 
+Data-key epoch rotation MUST be authorized as the `RotateKeyEpoch` Tiga administration operation. A successful rotation atomically generates an independent random epoch key, wraps it under the vault root key with AAD bound to vault and epoch identity, retires the previous active epoch, activates the new epoch, updates `vault_meta`, creates a `key-rotation` / `key-epoch` commit, and correlates the security audit event with that commit. Denial and failure preserve the previous active epoch, wrapper set, and commit state.
+
+Sync state MUST carry the active identity, every active and retired wrapper, and a state tag authenticated by the vault integrity subkey. A receiver MUST verify the tag and wrappers before changing epoch state. Concurrent rotations retain both key materials and deterministically choose one active epoch. Senders distribute the rotation commit and key epoch state before fields encrypted under the new epoch.
+
 ## 14. Rejection Rules
 
 A security design is non-compliant if it:

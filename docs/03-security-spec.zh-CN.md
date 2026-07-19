@@ -321,6 +321,10 @@ MDBX 最好支持：
 
 轮换过程中必须保持旧记录可读，直到迁移完成。
 
+数据密钥 epoch 轮换必须通过 `RotateKeyEpoch` Tiga 管理操作授权。成功轮换必须在同一事务中生成独立随机 epoch key、在 vault root key 下使用绑定 vault 与 epoch 身份的 AAD 包装、退休旧 active epoch、激活新 epoch、更新 `vault_meta`、创建 `key-rotation` / `key-epoch` commit，并把安全审计记录关联到该 commit。拒绝和失败必须保持原 active epoch、wrapper 集合与 commit 状态。
+
+同步状态必须携带 active epoch、全部 active 和 retired wrapper 以及由 vault 完整性子密钥认证的状态标签。改变 epoch 状态前必须验证标签和 wrapper；并发轮换必须保留双方密钥材料并确定性选择一个 active epoch。发送端必须先传播 rotation commit 与 key epoch state，再传播使用新 epoch 产生的字段密文。
+
 ## 14. 拒收规则
 
 以下安全设计不符合规范：

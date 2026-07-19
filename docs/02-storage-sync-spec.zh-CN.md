@@ -158,6 +158,14 @@ MDBX 必须基于因果元数据检测并发修改，不能只靠时间戳。
 同一 project 内不同字段的并发修改，在安全时可以自动合并。
 同一秘密字段的并发修改必须产生显式冲突。
 
+### 9.1 密钥 epoch 状态
+
+sync state 中的 key epoch 字段必须保持可选，使 MDBX1 和早期 MDBX2 payload 可以继续反序列化。字段存在时应包含 active epoch ID、按 ID 规范排序的全部 active 和 retired rows，以及状态完整性标签。
+
+顺序历史中的 fast-forward 轮换采用 incoming active epoch。并发轮换对候选 epoch 使用激活时间与 epoch ID 的确定性顺序，所有合法 wrapper 取并集，未选中的候选转为 retired。相同 epoch ID 的 wrapper、profile、创建时间或激活时间发生改写时必须拒绝。
+
+改变 epoch 状态需要经过验证解锁的可变连接。应用事务必须先验证状态标签与 wrapper，再写入依赖新 epoch 的对象密文；事务提交后刷新 active 与历史 epoch keyring。旧 payload 缺少该字段时不得清除或回退本地 epoch 状态。
+
 ## 10. 合并模型
 
 MDBX 最好支持：

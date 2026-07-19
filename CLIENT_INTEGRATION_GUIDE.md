@@ -497,6 +497,7 @@ Storage-owned high-risk operations must use their authorized APIs:
 - snapshot restore: `SnapshotRepo::restore_snapshot_authorized`
 - unlock-method add/change/reset/remove: the `UnlockService` `*_authorized` methods
 - Tiga profile and sparse policy changes: the `TigaService` `*_authorized` methods
+- data-key epoch rotation: `KeyEpochService::rotate_authorized` in Rust or `MdbxVault.rotate_key_epoch` through UniFFI
 
 The first unlock method may use the bootstrap path. Once a method exists, bootstrap APIs reject further additions. `remediation-required` relaxes only the unlock-method repair workflow; it does not weaken Power export, reveal, or other operations.
 
@@ -545,6 +546,10 @@ At minimum, sync state should include:
 - conflicts pending
 - complete
 - failed
+
+Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
+
+Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.
 
 ## 7. Compatibility Requirements
 
@@ -604,6 +609,8 @@ Before claiming MDBX support, another client should pass at least these scenario
 - Attachment chunk verification failure appears in diagnostics.
 - Opening MDBX format management lands on the home screen, not the last database detail page.
 - Normal user UI does not expose raw advanced tools.
+- After rotation, sync the rotation commit and key epoch state before new-epoch ciphertext; another replica can read data from old, new, and concurrent epochs.
+- Authorization denial leaves the active epoch and commit count unchanged.
 
 ## 9. Common Mistakes
 

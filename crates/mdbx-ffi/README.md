@@ -26,6 +26,7 @@ The exported boundary covers:
 - apply an exact audited exception when explicitly weakening a vault profile
 - configure and open password + security-key combined unlock methods
 - list and remove unlock methods through authorized storage APIs
+- rotate the data-key epoch through Tiga authorization and return the old epoch, new active epoch, rotation commit, and timestamp
 - create projects
 - create, list, update, soft-delete, restore, and move generic entries
 
@@ -72,6 +73,13 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 - `payload_json`
 - `deleted`
 
+`MdbxKeyEpochRotationResult` contains:
+
+- `previous_epoch_id`: the active epoch before rotation
+- `active_epoch_id`: the epoch used for subsequent field writes
+- `commit_id`: the `key-rotation` / `key-epoch` commit
+- `rotated_at`: the UTC rotation time
+
 ### Tiga2 Runtime Boundary
 
 `MdbxDeviceContext` carries the device evidence used for each authorization decision. Clients must report actual platform capabilities and must not claim `TrustedHardware`, secure clipboard, screen-capture protection, or secure temporary files unless those protections are active for the operation.
@@ -89,6 +97,14 @@ Use `inspect_vault_migration` before opening when the client needs upgrade conse
 For client-controlled migration, call top-level `create_portable_backup(source_path, destination)` after `inspect_vault_migration` and before `upgrade_vault`. It opens the source read-only, requires no unlock credentials, retains MDBX1 or MDBX2 metadata, includes committed WAL pages, and leaves the persistent source database and WAL bytes unchanged.
 
 Call `MdbxVault.create_backup(destination)` for an already open vault. Both interfaces verify integrity and MDBX identity and publish one file without replacing an existing destination, `-wal`, or `-shm` artifact. The backup retains the source unlock methods and reopens with the same credentials. It is separate from a vault-internal snapshot and a sync bundle; clients must not copy only the SQLite main file while WAL is active.
+
+### Key Epoch Rotation
+
+Call `MdbxVault.rotate_key_epoch(device)` with an active unlock session and truthful device capabilities. In one transaction, storage generates a random 32-byte epoch key, wraps it, retires the previous active epoch, activates the new epoch, creates the rotation commit, and correlates the Tiga audit event with that commit. Authorization denial or transaction failure leaves the active epoch and rotation-commit count unchanged.
+
+After success, distribute the returned `commit_id` and its authenticated sync state to other replicas before allowing fields written under the new epoch to leave the device. Receivers should use the mutable verified-unlocked storage apply entry so active and retired wrappers are authenticated and the connection keyring is refreshed before return. Concurrent rotations retain both epochs and deterministically converge on one active epoch.
+
+Rotation is not an ordinary idempotent operation API. If a network response is unknown, query commit history or security audit correlation before requesting another rotation. A deliberate second call is a new security-administration action and creates another epoch and commit.
 
 ### Entry Types
 

@@ -158,6 +158,14 @@ Minimum acceptable mechanisms:
 Different-field concurrent changes within the same project MAY auto-merge when safe.
 Same-field concurrent secret changes MUST create an explicit conflict.
 
+### 9.1 Key Epoch State
+
+The key epoch field in sync state MUST remain optional so MDBX1 and early MDBX2 payloads continue to deserialize. When present, it carries the active epoch ID, every active and retired row in canonical ID order, and a state integrity tag.
+
+A fast-forward rotation selects the incoming active epoch. Concurrent rotations compare candidate activation time and epoch ID deterministically, retain the union of valid wrappers, and retire candidates that are not selected. Rewriting wrapper bytes, profile, creation time, or activation time under an existing epoch ID is rejected.
+
+Changing epoch state requires a verified-unlocked mutable connection. The apply transaction verifies the state tag and wrappers before writing object ciphertext that depends on the new epoch, then refreshes active and historical epoch keyrings after commit. Older payloads without this field do not clear or roll back local epoch state.
+
 ## 10. Merge Model
 
 MDBX SHOULD support:

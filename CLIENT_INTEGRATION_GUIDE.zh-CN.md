@@ -495,6 +495,7 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 - 快照恢复：`SnapshotRepo::restore_snapshot_authorized`
 - 解锁方式新增、修改、重置和删除：`UnlockService` 的 `*_authorized` 方法
 - Tiga profile 与稀疏覆盖：`TigaService` 的 `*_authorized` 方法
+- 数据密钥 epoch 轮换：Rust 使用 `KeyEpochService::rotate_authorized`，UniFFI 使用 `MdbxVault.rotate_key_epoch`
 
 第一种解锁方式允许 bootstrap；已有解锁方式后，bootstrap API 必须拒绝。`remediation-required` 状态只允许用户完成解锁方式整改，不会放宽导出、显示或其他 Power 操作。
 
@@ -543,6 +544,10 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 - 冲突待处理
 - 完成
 - 失败
+
+密钥 epoch 轮换的同步顺序属于安全不变量。客户端收到成功结果后，必须先传播 rotation commit 与 authenticated key epoch sync state，再上传或广播使用新 epoch 写入的 `MDBXFE2` 字段。接收端改变 epoch 状态时必须处于经过验证的解锁状态，并使用会刷新连接 keyring 的可变 apply 入口。旧 payload 缺少 key epoch state 时保留本地状态；并发轮换必须保留全部 wrapper，并接受 storage core 选出的 active epoch。
+
+轮换调用本身代表一次新的安全管理动作，不使用普通 `operation_id` 幂等重试语义。响应状态未知时，客户端应先按返回 commit、commit history 或 Tiga 审计关联查询，再决定是否发起另一轮轮换。
 
 ## 7. 兼容性要求
 
@@ -602,6 +607,8 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 - 附件 chunk 校验失败时能在诊断页看到。
 - 打开 MDBX 格式管理首页，不自动跳进上次数据库详情页。
 - 普通用户界面不暴露 raw 高级工具。
+- 轮换后先同步 rotation commit 和 key epoch state，再同步新 epoch 密文；另一副本可以读取旧、新和并发 epoch 下的数据。
+- 轮换授权拒绝时 active epoch 与 commit 数量保持不变。
 
 ## 9. 常见错误
 

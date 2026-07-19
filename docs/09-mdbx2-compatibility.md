@@ -113,3 +113,9 @@ Operation summaries use `create`, `update`, `delete`, `restore`, `move`, or the 
 The existing UniFFI `MdbxSecurityAuditEvent` record and `list_security_audit_events` method remain unchanged for generated clients from the previous interface generation. MDBX2 clients use `MdbxSecurityAuditEventV2` and `list_security_audit_events_v2` to read optional operation ID, commit ID, policy version, and policy fingerprint fields.
 
 A present `commit_id` always requires a matching `operation_id`. Storage validates the pair against `commit_operations` on local reads and synchronization. A null pair means that the event predates schema 5 or represents a decision that produced no database commit.
+
+### Key Epoch Rotation API
+
+MDBX2 clients request rotation through Rust `KeyEpochService::rotate_authorized` or UniFFI `MdbxVault.rotate_key_epoch`. The returned `previous_epoch_id`, `active_epoch_id`, `commit_id`, and `rotated_at` are the stable result of one rotation. This is an additive interface and does not change any MDBX1-compatible method signature.
+
+Rotation does not use ordinary operation-idempotency retries. When a response is unknown, inspect commit history or `MdbxSecurityAuditEventV2` commit correlation before calling again; another call creates another epoch and commit. The key epoch field in sync payloads remains optional, so older payloads continue to deserialize and preserve local epoch state.
