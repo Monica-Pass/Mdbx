@@ -556,7 +556,9 @@ If the vault contains an unknown critical extension, the client must refuse writ
 
 Clients may own migration prompts, pre-upgrade backup placement, progress, and remediation UI, but the storage core must perform the format conversion. Android, iOS, and desktop clients must not maintain separate MDBX1 field-mapping implementations.
 
-Use `inspect_migration_path` or the UniFFI `inspect_vault_migration` function for a read-only migration plan before showing consent and backup UI. After consent, call `upgrade_path` or UniFFI `upgrade_vault`; both delegate to the same storage-core transactional migrator. `VaultConnection::open` remains an automatic-upgrade compatibility path for simple callers.
+Use `inspect_migration_path` or the UniFFI `inspect_vault_migration` function for a read-only migration plan. When upgrade is required, create the exact pre-migration archive with `BackupService::create_portable_copy_path` or UniFFI `create_portable_backup`. After backup publication and consent, call `upgrade_path` or UniFFI `upgrade_vault`; both delegate to the same storage-core transactional migrator. `VaultConnection::open` remains an automatic-upgrade compatibility path for simple callers.
+
+The read-only backup contains ciphertext and configured unlock methods without decrypting records, so it does not require user credentials. It preserves the source format generation and includes committed WAL pages. Clients must not call automatic open before this step when the retained artifact must remain MDBX1.
 
 ### 7.2 Stable IDs
 
@@ -584,6 +586,8 @@ List ordering should be stable. Refreshing data must not randomly reorder the sa
 Before claiming MDBX support, another client should pass at least these scenarios:
 
 - Create a vault, close it, and reopen it.
+- Back up an MDBX1 WAL vault before writable open and verify that source and backup still report MDBX1.
+- Upgrade the source explicitly and verify that the pre-migration backup still reports MDBX1.
 - Create an entry in the root directory.
 - Create an entry inside a nested folder.
 - Create an entry from inside an MDBX subfolder and keep that folder as target.

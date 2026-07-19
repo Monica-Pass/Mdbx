@@ -554,7 +554,9 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 
 客户端可以负责迁移提示、升级前备份、进度和整改 UI，但格式转换必须调用 storage core。不得在 Android、iOS、桌面端分别实现一套 MDBX1 字段迁移。
 
-客户端应先用 `inspect_migration_path` 或 UniFFI 的 `inspect_vault_migration` 做只读迁移检查，再展示用户确认和备份 UI；确认后调用 `upgrade_path` 或 UniFFI 的 `upgrade_vault`，两者都会委托同一个 storage-core 事务迁移器。`VaultConnection::open` 仍保留自动升级兼容路径，供简单调用方使用。
+客户端应先用 `inspect_migration_path` 或 UniFFI 的 `inspect_vault_migration` 做只读迁移检查。需要升级时，通过 `BackupService::create_portable_copy_path` 或 UniFFI 的 `create_portable_backup` 创建精确迁移前归档。备份发布且取得确认后，再调用 `upgrade_path` 或 UniFFI 的 `upgrade_vault`；两者都会委托同一个 storage-core 事务迁移器。`VaultConnection::open` 仍保留自动升级兼容路径，供简单调用方使用。
+
+只读备份复制密文与现有解锁方式，不解密业务记录，因此无需用户凭据。结果保留源格式代际，并包含已经提交的 WAL 页面。需要保留 MDBX1 归档时，客户端必须在该步骤完成前避免调用自动 open。
 
 ### 7.2 ID 稳定性
 
@@ -582,6 +584,8 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 其他客户端接入前至少应通过这些场景：
 
 - 创建 vault，关闭后重新打开。
+- 在可写打开前备份带 WAL 的 MDBX1 vault，并确认源文件与备份仍报告 MDBX1。
+- 显式升级源文件后，确认迁移前备份仍报告 MDBX1。
 - 创建根目录条目。
 - 创建嵌套文件夹中的条目。
 - 在子文件夹里新建条目，目标仍是该 MDBX 文件夹。

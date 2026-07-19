@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::migration::{inspect_migration, CURRENT_SCHEMA_VERSION, FORMAT_V2};
+use crate::migration::{inspect_migration, MigrationInfo};
 
 const BACKUP_PAGES_PER_STEP: i32 = 128;
 const BACKUP_RETRY_PAUSE: Duration = Duration::from_millis(10);
@@ -36,11 +36,34 @@ impl BackupService {
         source: &VaultConnection,
         destination: &Path,
     ) -> StorageResult<VaultBackupInfo> {
+        Self::create_portable_copy_from_connection(source.inner(), destination)
+    }
+
+    /// Create a portable backup from a vault path without writable open,
+    /// unlock, or automatic format migration.
+    ///
+    /// This entry point is intended for client-controlled migration. It
+    /// preserves a supported MDBX1 or MDBX2 source generation in the backup.
+    pub fn create_portable_copy_path(
+        source: &Path,
+        destination: &Path,
+    ) -> StorageResult<VaultBackupInfo> {
+        let source = fs::canonicalize(source)?;
+        let connection = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Self::create_portable_copy_from_connection(&connection, destination)
+    }
+
+    fn create_portable_copy_from_connection(
+        source: &Connection,
+        destination: &Path,
+    ) -> StorageResult<VaultBackupInfo> {
         let destination = absolute_destination(destination)?;
-        reject_source_destination_alias(source.inner(), &destination)?;
+        reject_source_destination_alias(source, &destination)?;
         ensure_destination_absent(&destination)?;
 
-        let source_vault_id = read_vault_id(source.inner())?;
+        let source_migration = validated_migration_info(source)?;
+        let source_vault_id = read_vault_id(source)?;
         let parent = destination.parent().ok_or_else(|| {
             StorageError::Validation("backup destination must have a parent directory".to_string())
         })?;
@@ -51,7 +74,7 @@ impl BackupService {
         let mut target =
             Connection::open_with_flags(&temporary_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         target.execute_batch("PRAGMA busy_timeout=5000;")?;
-        copy_online(source.inner(), &mut target)?;
+        copy_online(source, &mut target)?;
 
         let journal_mode: String =
             target.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
@@ -68,15 +91,10 @@ impl BackupService {
             )));
         }
 
-        let migration = inspect_migration(&target)?;
-        if !migration.initialized
-            || migration.unknown_critical_extensions
-            || migration.requires_upgrade
-            || migration.format_version.as_deref() != Some(FORMAT_V2)
-            || migration.schema_version != Some(CURRENT_SCHEMA_VERSION)
-        {
+        let target_migration = validated_migration_info(&target)?;
+        if target_migration != source_migration {
             return Err(StorageError::Validation(
-                "portable backup does not contain current MDBX2 metadata".to_string(),
+                "portable backup metadata does not match the source vault".to_string(),
             ));
         }
 
@@ -97,13 +115,34 @@ impl BackupService {
             .persist_noclobber(&destination)
             .map_err(|error| StorageError::Io(error.error))?;
 
+        let format_version = source_migration.format_version.ok_or_else(|| {
+            StorageError::Validation("source vault has no format version".to_string())
+        })?;
+        let schema_version = source_migration.schema_version.ok_or_else(|| {
+            StorageError::Validation("source vault has no schema version".to_string())
+        })?;
         Ok(VaultBackupInfo {
             vault_id: source_vault_id,
-            format_version: FORMAT_V2.to_string(),
-            schema_version: CURRENT_SCHEMA_VERSION,
+            format_version,
+            schema_version,
             file_size_bytes,
         })
     }
+}
+
+fn validated_migration_info(connection: &Connection) -> StorageResult<MigrationInfo> {
+    let info = inspect_migration(connection)?;
+    if !info.initialized {
+        return Err(StorageError::Validation(
+            "backup source is not an initialized MDBX vault".to_string(),
+        ));
+    }
+    if info.unknown_critical_extensions {
+        return Err(StorageError::Validation(
+            "backup source requires unsupported critical extensions".to_string(),
+        ));
+    }
+    Ok(info)
 }
 
 fn copy_online(source: &Connection, target: &mut Connection) -> StorageResult<()> {
@@ -223,6 +262,9 @@ mod tests {
     use super::*;
     use crate::connection::PendingVaultCreation;
     use crate::init::{initialize_vault, VaultInitParams};
+    use crate::migration::{
+        inspect_migration_path, CURRENT_SCHEMA_VERSION, FORMAT_V1, FORMAT_V1_DRAFT, FORMAT_V2,
+    };
     use crate::repo::{CommitContext, ProjectRepo};
 
     fn create_source(directory: &Path) -> (PathBuf, VaultConnection, String) {
@@ -259,6 +301,163 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.title_ct, b"Latest WAL project");
+    }
+
+    #[test]
+    fn path_backup_preserves_current_format_without_unlock_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source_path, source, vault_id) = create_source(directory.path());
+        let context = CommitContext::new("path-backup-device".to_string());
+        let project =
+            ProjectRepo::create(&source, &context, "Current path backup project", None, None)
+                .unwrap();
+        let destination = directory.path().join("current-path-backup.mdbx");
+
+        let info = BackupService::create_portable_copy_path(&source_path, &destination).unwrap();
+
+        assert_eq!(info.vault_id, vault_id);
+        assert_eq!(info.format_version, FORMAT_V2);
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        let reopened = VaultConnection::open(&destination).unwrap();
+        assert!(ProjectRepo::get_by_id(&reopened, &project.project_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn path_backup_preserves_legacy_format_wal_data_and_persistent_source_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("legacy-source.mdbx");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;",
+            )
+            .unwrap();
+        crate::schema::v1::create_all_tables(&source).unwrap();
+        source
+            .execute(
+                "INSERT INTO vault_meta
+                    (vault_id, format_version, created_at, updated_at,
+                     default_tiga_mode, active_key_epoch_id, compat_flags,
+                     critical_extensions)
+                 VALUES ('legacy-backup-vault', 'MDBX-1',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                         'multi', 'epoch-1', '', '')",
+                [],
+            )
+            .unwrap();
+        source
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO projects
+                    (project_id, title_ct, object_clock, head_commit_id,
+                     created_at, updated_at, created_by_device_id,
+                     updated_by_device_id)
+                 VALUES ('legacy-project', X'6C61746573742D77616C', '{}',
+                         'legacy-commit', '2026-01-01T00:00:00Z',
+                         '2026-01-01T00:00:00Z', 'legacy-device',
+                         'legacy-device')",
+                [],
+            )
+            .unwrap();
+
+        let source_wal = sqlite_sidecar_path(&source_path, "-wal");
+        let source_shm = sqlite_sidecar_path(&source_path, "-shm");
+        let before_main = fs::read(&source_path).unwrap();
+        let before_wal = fs::read(&source_wal).unwrap();
+        let before_shm_len = source_shm.metadata().unwrap().len();
+        let destination = directory.path().join("legacy-backup.mdbx");
+
+        let info = BackupService::create_portable_copy_path(&source_path, &destination).unwrap();
+
+        assert_eq!(info.vault_id, "legacy-backup-vault");
+        assert_eq!(info.format_version, FORMAT_V1);
+        assert_eq!(info.schema_version, 1);
+        let migration = inspect_migration_path(&destination).unwrap();
+        assert_eq!(migration.format_version.as_deref(), Some(FORMAT_V1));
+        assert!(migration.requires_upgrade);
+        assert!(!sqlite_sidecar_path(&destination, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&destination, "-shm").exists());
+        assert_eq!(fs::read(&source_path).unwrap(), before_main);
+        assert_eq!(fs::read(&source_wal).unwrap(), before_wal);
+        assert!(source_shm.exists());
+        assert_eq!(source_shm.metadata().unwrap().len(), before_shm_len);
+
+        drop(source);
+        let upgraded = VaultConnection::open(&destination).unwrap();
+        let title: Vec<u8> = upgraded
+            .inner()
+            .query_row(
+                "SELECT title_ct FROM projects WHERE project_id = 'legacy-project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, b"latest-wal");
+    }
+
+    #[test]
+    fn path_backup_preserves_supported_draft_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("draft-source.mdbx");
+        let source = Connection::open(&source_path).unwrap();
+        crate::schema::v1::create_all_tables(&source).unwrap();
+        source
+            .execute(
+                "INSERT INTO vault_meta
+                    (vault_id, format_version, created_at, updated_at,
+                     default_tiga_mode, active_key_epoch_id, compat_flags,
+                     critical_extensions)
+                 VALUES ('draft-backup-vault', ?1, '2026-01-01T00:00:00Z',
+                         '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+                [FORMAT_V1_DRAFT],
+            )
+            .unwrap();
+        drop(source);
+        let destination = directory.path().join("draft-backup.mdbx");
+
+        let info = BackupService::create_portable_copy_path(&source_path, &destination).unwrap();
+
+        assert_eq!(info.format_version, FORMAT_V1_DRAFT);
+        assert_eq!(info.schema_version, 1);
+        let target = inspect_migration_path(&destination).unwrap();
+        assert_eq!(target.format_version.as_deref(), Some(FORMAT_V1_DRAFT));
+        assert!(target.requires_upgrade);
+    }
+
+    #[test]
+    fn path_backup_rejects_unknown_critical_extensions_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("unknown-extension-source.mdbx");
+        let source = Connection::open(&source_path).unwrap();
+        crate::schema::v1::create_all_tables(&source).unwrap();
+        source
+            .execute(
+                "INSERT INTO vault_meta
+                    (vault_id, format_version, created_at, updated_at,
+                     default_tiga_mode, active_key_epoch_id, compat_flags,
+                     critical_extensions)
+                 VALUES ('unknown-extension-vault', 'MDBX-1',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                         'multi', 'epoch-1', '', 'future-critical')",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let before = fs::read(&source_path).unwrap();
+        let destination = directory.path().join("rejected-backup.mdbx");
+
+        let error = BackupService::create_portable_copy_path(&source_path, &destination)
+            .err()
+            .unwrap();
+
+        assert!(matches!(error, StorageError::Validation(_)));
+        assert_eq!(fs::read(source_path).unwrap(), before);
+        assert!(!destination.exists());
     }
 
     #[test]

@@ -1337,6 +1337,19 @@ pub fn inspect_vault_migration(path: String) -> Result<MdbxMigrationInfo, MdbxFf
     Ok(inspect_migration_path(Path::new(&path))?.into())
 }
 
+/// Create a verified portable backup without writable open, unlock, or
+/// automatic migration of the source vault.
+#[uniffi::export]
+pub fn create_portable_backup(
+    source_path: String,
+    destination: String,
+) -> Result<MdbxBackupInfo, MdbxFfiError> {
+    Ok(
+        BackupService::create_portable_copy_path(Path::new(&source_path), Path::new(&destination))?
+            .into(),
+    )
+}
+
 /// Explicitly run the storage-core migration after the client has inspected,
 /// backed up, and obtained user consent. The compatibility `open_vault` path
 /// remains automatic for callers that do not need this orchestration.

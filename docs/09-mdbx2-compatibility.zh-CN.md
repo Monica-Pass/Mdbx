@@ -129,7 +129,12 @@ MDBX2 同时收紧以下实现边界：
 - `mdbx_storage::migration::inspect_migration_path`
 - UniFFI：`inspect_vault_migration`
 
-检查结果是只读的，包含当前 format/schema、最低读写代际、是否需要升级以及未知 critical extension 标志。用户确认后调用：
+检查结果是只读的，包含当前 format/schema、最低读写代际、是否需要升级以及未知 critical extension 标志。需要升级时，先调用：
+
+- `mdbx_storage::backup::BackupService::create_portable_copy_path`
+- UniFFI：`create_portable_backup`
+
+备份发布且取得用户确认后调用：
 
 - `mdbx_storage::migration::upgrade_path`
 - UniFFI：`upgrade_vault`
@@ -138,13 +143,13 @@ MDBX2 同时收紧以下实现边界：
 
 ### 7.3 可移植备份 API
 
-客户端可以在已经打开的 vault 上通过 Rust `BackupService::create_portable_copy` 或 UniFFI `MdbxVault.create_backup` 创建备份。返回信息包含 vault 身份、格式、schema 与文件大小。参考 CLI 通过 `mdbx backup <output>` 使用同一 storage 服务。
+客户端在建立可写连接前，通过 Rust `BackupService::create_portable_copy_path` 或 UniFFI 顶层函数 `create_portable_backup` 创建备份。返回信息包含 vault 身份、保留的格式、保留的 schema 与文件大小。参考 CLI 的 `mdbx backup <output>` 使用同一只读接口，无需解锁凭据。
 
-`MdbxVault.create_backup` 属于已打开 vault 的日常备份接口。兼容 open 可能已经完成 MDBX1 升级；需要保留精确迁移前副本的客户端，必须在调用自动 open 或 `upgrade_vault` 前完成独立的只读归档步骤。
+`MdbxVault.create_backup` 继续作为已经打开 vault 的日常备份接口。文件路径接口承担迁移前归档：它接受受支持的 MDBX1、MDBX1 draft 与 MDBX2 文件，包含已经提交的 WAL 页面，并在结果中保留源格式 metadata。
 
 可移植备份是完整的加密 vault 文件，保留源 vault 的解锁方式，不解密业务记录。vault 内部 snapshot 仍是逻辑恢复点，sync bundle 仍是增量传输文件。源库采用 WAL 时，仅复制 SQLite 主文件会遗漏仍位于 WAL 的已提交页面。
 
-目标主文件、`-wal` 与 `-shm` 名称共同构成发布目标集合，任一文件已经存在时均保留原内容并返回错误。storage 在发布单文件结果前执行完整性、当前 MDBX2 metadata 与 vault 身份校验。
+目标主文件、`-wal` 与 `-shm` 名称共同构成发布目标集合，任一文件已经存在时均保留原内容并返回错误。storage 在发布单文件结果前执行完整性、与源一致的 MDBX metadata 和 vault 身份校验。
 
 ### 7.4 客户端 operation 写入 API
 

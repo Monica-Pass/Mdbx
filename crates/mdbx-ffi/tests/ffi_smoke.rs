@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
-    create_vault, create_vault_with_tiga_mode, inspect_vault_migration, open_vault,
-    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    create_portable_backup, create_vault, create_vault_with_tiga_mode, inspect_vault_migration,
+    open_vault, open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
     MdbxDeviceAssurance, MdbxDeviceContext, MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation,
     MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
@@ -713,6 +713,47 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
         })
         .unwrap();
     assert_eq!(stored_format, "MDBX-2");
+}
+
+#[test]
+fn clients_can_backup_legacy_vault_before_explicit_upgrade() {
+    let vault_path = temp_vault_path("pre-migration-backup-source");
+    let backup_path = temp_vault_path("pre-migration-backup-target");
+    {
+        let conn = rusqlite::Connection::open(vault_path.path()).unwrap();
+        mdbx_storage::schema::v1::create_all_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO vault_meta (vault_id, format_version, created_at, updated_at,
+             default_tiga_mode, active_key_epoch_id, compat_flags, critical_extensions)
+             VALUES ('ffi-pre-migration-vault', 'MDBX-1', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z', 'multi', 'epoch-1', '', '')",
+            [],
+        )
+        .unwrap();
+    }
+    let source_before = fs::read(vault_path.path()).unwrap();
+
+    let info =
+        create_portable_backup(vault_path.as_path_string(), backup_path.as_path_string()).unwrap();
+
+    assert_eq!(info.vault_id, "ffi-pre-migration-vault");
+    assert_eq!(info.format_version, "MDBX-1");
+    assert_eq!(info.schema_version, 1);
+    assert_eq!(fs::read(vault_path.path()).unwrap(), source_before);
+    let source_plan = inspect_vault_migration(vault_path.as_path_string()).unwrap();
+    let backup_plan = inspect_vault_migration(backup_path.as_path_string()).unwrap();
+    assert_eq!(source_plan, backup_plan);
+    assert!(source_plan.requires_upgrade);
+
+    let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
+    assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
+    assert_eq!(
+        inspect_vault_migration(backup_path.as_path_string())
+            .unwrap()
+            .format_version
+            .as_deref(),
+        Some("MDBX-1")
+    );
 }
 
 #[test]

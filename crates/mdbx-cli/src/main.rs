@@ -360,10 +360,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_health(&conn)
         }
-        Commands::Backup { output } => {
-            let conn = open_or_create_vault(&cli.vault, unlock)?;
-            cmd_backup(&conn, output)
-        }
+        Commands::Backup { output } => cmd_backup(&cli.vault, output),
         Commands::Benchmark { iterations } => cmd_benchmark(iterations),
         Commands::ImportKdbxJson { file } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -1161,8 +1158,8 @@ fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
     }
 }
 
-fn cmd_backup(conn: &VaultConnection, output: PathBuf) -> Result<(), String> {
-    let info = BackupService::create_portable_copy(conn, &output)
+fn cmd_backup(source: &std::path::Path, output: PathBuf) -> Result<(), String> {
+    let info = BackupService::create_portable_copy_path(source, &output)
         .map_err(|error| format!("failed to create portable backup: {error}"))?;
     println!(
         "Created portable backup: vault={} format={} schema={} bytes={} -> {}",
@@ -1517,8 +1514,7 @@ mod tests {
     }
 
     fn backup_vault(source: &Path, target: &Path) {
-        let conn = open_unlocked(source);
-        BackupService::create_portable_copy(&conn, target).unwrap();
+        BackupService::create_portable_copy_path(source, target).unwrap();
     }
 
     fn init_cli(vault: &Path) -> Cli {
@@ -2018,7 +2014,7 @@ mod tests {
         ))
         .unwrap();
 
-        run(cli(
+        run(locked_cli(
             &source_path,
             Commands::Backup {
                 output: backup_path.clone(),
@@ -2052,6 +2048,43 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(backup_path).unwrap(), b"preserve CLI output");
+    }
+
+    #[test]
+    fn cli_backup_preserves_legacy_format_before_automatic_open() {
+        let source = TempVault::new();
+        let backup = TempVault::new();
+        let source_path = source.path();
+        let backup_path = backup.path();
+        {
+            let conn = rusqlite::Connection::open(&source_path).unwrap();
+            mdbx_storage::schema::v1::create_all_tables(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO vault_meta
+                    (vault_id, format_version, created_at, updated_at,
+                     default_tiga_mode, active_key_epoch_id, compat_flags,
+                     critical_extensions)
+                 VALUES ('cli-legacy-backup-vault', 'MDBX-1',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                         'multi', 'epoch-1', '', '')",
+                [],
+            )
+            .unwrap();
+        }
+
+        run(locked_cli(
+            &source_path,
+            Commands::Backup {
+                output: backup_path.clone(),
+            },
+        ))
+        .unwrap();
+
+        let source_plan = mdbx_storage::migration::inspect_migration_path(&source_path).unwrap();
+        let backup_plan = mdbx_storage::migration::inspect_migration_path(&backup_path).unwrap();
+        assert_eq!(source_plan, backup_plan);
+        assert_eq!(source_plan.format_version.as_deref(), Some("MDBX-1"));
+        assert!(source_plan.requires_upgrade);
     }
 
     #[test]

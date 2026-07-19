@@ -60,13 +60,13 @@ Clients own upgrade prompts, backup placement, progress UI, platform capability 
 
 ### Portable Backup API
 
-Clients call `BackupService::create_portable_copy` through Rust or `MdbxVault.create_backup` through UniFFI on an open vault. The result reports vault identity, format, schema, and file size. The reference CLI exposes the same service as `mdbx backup <output>`.
+Clients use `BackupService::create_portable_copy_path` through Rust or top-level UniFFI `create_portable_backup` before writable open. The result reports vault identity, preserved format, preserved schema, and file size. The reference CLI exposes this read-only path as `mdbx backup <output>` without requiring unlock credentials.
 
-`MdbxVault.create_backup` is an operational backup API for an already opened vault. The compatibility open path may already have upgraded an MDBX1 vault, so clients that require an exact pre-migration archive must complete that separate read-only archival step before calling automatic open or `upgrade_vault`.
+`MdbxVault.create_backup` remains the operational backup API for an already opened vault. The path API is the pre-migration archive seam: it accepts supported MDBX1, MDBX1 draft, and MDBX2 files, includes committed WAL pages, and publishes a single file with source format metadata unchanged.
 
 A portable backup is a complete encrypted vault file and retains the source unlock methods. It does not decrypt records. A vault-internal snapshot remains a logical recovery point, while a sync bundle remains an incremental transport artifact. Direct copying of the SQLite main file is invalid while WAL may contain committed frames.
 
-The destination path, `-wal`, and `-shm` names are reserved as one publication set. Existing artifacts are never replaced. Storage verifies integrity and current MDBX2 metadata before publishing the single-file result.
+The destination path, `-wal`, and `-shm` names are reserved as one publication set. Existing artifacts are never replaced. Storage verifies integrity, source-equivalent MDBX metadata, and vault identity before publishing the single-file result.
 
 ### Stable Branch Identity
 
@@ -78,7 +78,7 @@ Synchronization compares branch IDs when both peers provide them. If either peer
 
 ### Client-Controlled Migration APIs
 
-The compatibility path `VaultConnection::open` continues to upgrade automatically so simple callers remain generation-compatible. A client that needs consent, backup, and progress orchestration should first call the read-only `mdbx_storage::migration::inspect_migration_path` (or the UniFFI `inspect_vault_migration` function). The result reports the current format/schema, minimum reader/writer generations, whether an upgrade is required, and whether critical extensions are unknown.
+The compatibility path `VaultConnection::open` continues to upgrade automatically so simple callers remain generation-compatible. A client that needs consent, backup, and progress orchestration first calls the read-only `mdbx_storage::migration::inspect_migration_path` or UniFFI `inspect_vault_migration`. When upgrade is required, it next calls `BackupService::create_portable_copy_path` or UniFFI `create_portable_backup`. Only after backup publication and consent does it call explicit upgrade. The inspection result reports the current format/schema, minimum reader/writer generations, whether an upgrade is required, and whether critical extensions are unknown.
 
 After the client has obtained consent and completed its backup workflow, it can call `mdbx_storage::migration::upgrade_path` (or UniFFI `upgrade_vault`). The same storage-core transactional migrator performs the conversion. Clients own prompts and progress, never a second MDBX1 field-mapping implementation. Open and explicit upgrade repeat the read-only identity preflight before acquiring a writable handle; missing paths, uninitialized SQLite databases, and unknown critical extensions are rejected without modification.
 

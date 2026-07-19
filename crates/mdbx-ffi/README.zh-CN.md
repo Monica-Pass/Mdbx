@@ -14,6 +14,7 @@
 - 使用显式 `Sky`、`Multi` 或 `Power` Tiga 模式创建 vault
 - 使用密码打开 vault
 - 不修改 vault 地检查迁移需求，并显式调用 storage-core 升级
+- 从 vault 文件路径创建只读迁移前可移植备份
 - 从已打开 vault 创建经过验证、禁止覆盖的单文件可移植备份
 - 在已解锁 vault 上配置本地 security-key-material 解锁
 - 使用本地 security-key material 打开 vault
@@ -85,9 +86,9 @@ Power 整改通过 `setup_password_security_key_unlock`、`list_unlock_methods` 
 
 需要升级确认、备份或进度 UI 的客户端，应在打开前调用 `inspect_vault_migration`，用户确认后再调用 `upgrade_vault`；确定性的字段转换始终由 `mdbx-storage` 完成。普通 `open_vault` 函数保留自动升级，供以兼容为优先的简单调用方使用。
 
-客户端可以在已打开 vault 上调用 `MdbxVault.create_backup(destination)`。该方法使用 SQLite online backup，包含已提交的 WAL 页面，验证完整性与 MDBX 身份，并以禁止覆盖的方式发布单个文件；目标主文件、`-wal` 或 `-shm` 已经存在时均返回错误。备份保留源 vault 的解锁方式，可以继续使用相同凭据打开。它与 vault 内部 snapshot、sync bundle 分别承担完整文件副本、逻辑恢复点和增量传输职责；WAL 活跃时客户端不得仅复制 SQLite 主文件。
+客户端可控迁移应在 `inspect_vault_migration` 之后、`upgrade_vault` 之前调用顶层 `create_portable_backup(source_path, destination)`。该函数只读打开源文件，无需解锁凭据，保留 MDBX1 或 MDBX2 metadata，包含已经提交的 WAL 页面，并保持源主数据库与 WAL 的持久字节不变。
 
-兼容 `open_vault` 可能在返回对象前完成 MDBX1 升级。需要保留精确迁移前副本的客户端，必须在自动 open 或 `upgrade_vault` 之前完成只读归档；`MdbxVault.create_backup` 保存的是当前已经打开并验证的 vault 状态。
+已经打开的 vault 继续调用 `MdbxVault.create_backup(destination)`。两个接口都会验证完整性与 MDBX 身份，并以禁止覆盖的方式发布单个文件；目标主文件、`-wal` 或 `-shm` 已经存在时均返回错误。备份保留源 vault 的解锁方式，可以继续使用相同凭据打开。它与 vault 内部 snapshot、sync bundle 分别承担完整文件副本、逻辑恢复点和增量传输职责；WAL 活跃时客户端不得仅复制 SQLite 主文件。
 
 ### Entry Type
 

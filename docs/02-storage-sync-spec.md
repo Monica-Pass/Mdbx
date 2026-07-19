@@ -30,11 +30,13 @@ The writable handle MUST use read-write flags without SQLite create permission. 
 
 A portable backup is a transactionally consistent, self-contained `.mdbx` file produced from a live vault. The storage layer MUST use SQLite's online backup API or an equivalent database snapshot mechanism so committed pages still present only in the source WAL are included. Copying the source main file while WAL is active is not a complete backup operation.
 
-The backup MUST be built in a temporary file in the destination directory, converted to a non-WAL journal mode, checked with SQLite integrity verification, and inspected as a current initialized MDBX vault. The copied `vault_id` MUST equal the source identity. The temporary file MUST be synchronized before publication, and publication MUST use no-clobber semantics.
+The backup MUST be built in a temporary file in the destination directory, converted to a non-WAL journal mode, checked with SQLite integrity verification, and inspected as a supported initialized MDBX vault. The copied format and schema metadata plus `vault_id` MUST equal the source. The temporary file MUST be synchronized before publication, and publication MUST use no-clobber semantics.
 
 The destination main file and its same-name `-wal` and `-shm` sidecars MUST all be absent. Any existing destination artifact is preserved and causes the operation to fail. A successful portable backup has no required sidecars and can be opened independently with the source vault's existing unlock methods.
 
-The storage facade is authoritative for these guarantees. Rust clients use `BackupService::create_portable_copy`, UniFFI clients use `MdbxVault.create_backup`, and the reference CLI uses `mdbx backup <output>`.
+The storage facade is authoritative for these guarantees. An already opened Rust vault uses `BackupService::create_portable_copy`, while a client-controlled migration uses the read-only `BackupService::create_portable_copy_path` before writable open. UniFFI exposes the same distinction through `MdbxVault.create_backup` and top-level `create_portable_backup`. The reference CLI uses the read-only path operation for `mdbx backup <output>`, so backup neither requires unlock credentials nor triggers automatic migration.
+
+Read-only path backup MUST preserve a supported MDBX1, MDBX1 draft, or MDBX2 generation in the result. It MUST leave persistent source database and WAL bytes unchanged. SQLite MAY update transient read marks in an existing SHM coordination file while reading a live WAL source; SHM is rebuildable and is not part of the portable result.
 
 ## 2. Internal Storage Goals
 
