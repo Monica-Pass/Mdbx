@@ -12,6 +12,7 @@ use mdbx_core::tiga::{
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, PolicyException,
     ResolvedTigaPolicy, TigaMode, TigaOperation, TigaPolicyOverride, TigaScope,
 };
+use mdbx_storage::backup::{BackupService, VaultBackupInfo};
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
@@ -61,6 +62,25 @@ impl From<serde_json::Error> for MdbxFfiError {
 pub struct VaultInfo {
     pub vault_id: String,
     pub device_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBackupInfo {
+    pub vault_id: String,
+    pub format_version: String,
+    pub schema_version: u32,
+    pub file_size_bytes: u64,
+}
+
+impl From<VaultBackupInfo> for MdbxBackupInfo {
+    fn from(value: VaultBackupInfo) -> Self {
+        Self {
+            vault_id: value.vault_id,
+            format_version: value.format_version,
+            schema_version: value.schema_version,
+            file_size_bytes: value.file_size_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -752,6 +772,11 @@ impl MdbxVault {
             vault_id: self.vault_id.clone(),
             device_id: self.device_id.clone(),
         }
+    }
+
+    pub fn create_backup(&self, destination: String) -> Result<MdbxBackupInfo, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(BackupService::create_portable_copy(&conn, Path::new(&destination))?.into())
     }
 
     pub fn resolve_tiga_policy(

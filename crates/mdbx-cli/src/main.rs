@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
+use mdbx_storage::backup::BackupService;
 use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::import::{KdbxEntry, KdbxExporter, KdbxImporter};
@@ -106,6 +107,11 @@ enum Commands {
     },
     /// 运行 vault 健康检查
     Health,
+    /// 创建经过验证的单文件 vault 备份
+    Backup {
+        /// 输出 `.mdbx` 文件路径；已有文件不会被替换
+        output: PathBuf,
+    },
     /// 运行本地 benchmark harness
     Benchmark {
         /// 每个 benchmark 的迭代次数
@@ -353,6 +359,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Health => {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_health(&conn)
+        }
+        Commands::Backup { output } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_backup(&conn, output)
         }
         Commands::Benchmark { iterations } => cmd_benchmark(iterations),
         Commands::ImportKdbxJson { file } => {
@@ -1151,6 +1161,20 @@ fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
     }
 }
 
+fn cmd_backup(conn: &VaultConnection, output: PathBuf) -> Result<(), String> {
+    let info = BackupService::create_portable_copy(conn, &output)
+        .map_err(|error| format!("failed to create portable backup: {error}"))?;
+    println!(
+        "Created portable backup: vault={} format={} schema={} bytes={} -> {}",
+        info.vault_id,
+        info.format_version,
+        info.schema_version,
+        info.file_size_bytes,
+        output.display()
+    );
+    Ok(())
+}
+
 fn severity_label(severity: IssueSeverity) -> &'static str {
     match severity {
         IssueSeverity::Info => "info",
@@ -1492,21 +1516,9 @@ mod tests {
         std::env::temp_dir().join(format!("mdbx-cli-sync-{}.mdbx-sync", uuid::Uuid::new_v4()))
     }
 
-    fn checkpoint_and_copy_vault(source: &Path, target: &Path) {
-        {
-            let conn = open_unlocked(source);
-            conn.inner()
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .unwrap();
-        }
-        std::fs::copy(source, target).unwrap();
-        for suffix in ["-wal", "-shm"] {
-            let source_sidecar = PathBuf::from(format!("{}{}", source.display(), suffix));
-            let target_sidecar = PathBuf::from(format!("{}{}", target.display(), suffix));
-            if source_sidecar.exists() {
-                let _ = std::fs::copy(source_sidecar, target_sidecar);
-            }
-        }
+    fn backup_vault(source: &Path, target: &Path) {
+        let conn = open_unlocked(source);
+        BackupService::create_portable_copy(&conn, target).unwrap();
     }
 
     fn init_cli(vault: &Path) -> Cli {
@@ -1989,6 +2001,60 @@ mod tests {
     }
 
     #[test]
+    fn cli_backup_reopens_with_latest_project_and_has_no_sidecars() {
+        let source = TempVault::new();
+        let backup = TempVault::new();
+        let source_path = source.path();
+        let backup_path = backup.path();
+        run(init_cli(&source_path)).unwrap();
+        run(cli(
+            &source_path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Portable backup project".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        run(cli(
+            &source_path,
+            Commands::Backup {
+                output: backup_path.clone(),
+            },
+        ))
+        .unwrap();
+
+        assert!(!PathBuf::from(format!("{}-wal", backup_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", backup_path.display())).exists());
+        let reopened = open_unlocked(&backup_path);
+        let projects = ProjectRepo::list_all(&reopened).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(project_title(&projects[0]), "Portable backup project");
+    }
+
+    #[test]
+    fn cli_backup_preserves_existing_output() {
+        let source = TempVault::new();
+        let backup = TempVault::new();
+        let source_path = source.path();
+        let backup_path = backup.path();
+        run(init_cli(&source_path)).unwrap();
+        std::fs::write(&backup_path, b"preserve CLI output").unwrap();
+
+        let result = run(cli(
+            &source_path,
+            Commands::Backup {
+                output: backup_path.clone(),
+            },
+        ));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(backup_path).unwrap(), b"preserve CLI output");
+    }
+
+    #[test]
     fn cli_can_export_and_apply_sync_bundle_to_same_vault_copy() {
         let source = TempVault::new();
         let target = TempVault::new();
@@ -1999,8 +2065,8 @@ mod tests {
         let bundle_path = sync_bundle_path();
 
         run(init_cli(&source_path)).unwrap();
-        checkpoint_and_copy_vault(&source_path, &target_path);
-        checkpoint_and_copy_vault(&source_path, &core_target_path);
+        backup_vault(&source_path, &target_path);
+        backup_vault(&source_path, &core_target_path);
 
         run(cli(
             &source_path,

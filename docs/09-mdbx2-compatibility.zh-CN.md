@@ -93,6 +93,7 @@ MDBX2 同时收紧以下实现边界：
 - 早期 `MDBX-2/schema 2` 自动执行 `schema 2 -> schema 3`，不改变格式代际。
 - 迁移不得修改现有 KDF 参数或 wrapped vault key；凭据相关升级只能在用户成功认证后执行。
 - CLI bundle apply 统一使用 `mdbx-storage::SyncApplyRepo`，不再维护独立 SQL 同步实现。
+- 可移植备份使用 SQLite online backup，完整包含已提交的 WAL 页面；发布前校验 SQLite 完整性、MDBX metadata 与 `vault_id`，转换为无需旁路文件的单文件，并拒绝替换任何已有目标文件。
 
 ## 6. 验收要求
 
@@ -135,7 +136,17 @@ MDBX2 同时收紧以下实现边界：
 
 转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。open 与显式升级会在建立可写连接前重复执行只读身份预检；路径缺失、未初始化的 SQLite 数据库与未知 critical extension 均会被拒绝，文件内容保持不变。
 
-### 7.3 客户端 operation 写入 API
+### 7.3 可移植备份 API
+
+客户端可以在已经打开的 vault 上通过 Rust `BackupService::create_portable_copy` 或 UniFFI `MdbxVault.create_backup` 创建备份。返回信息包含 vault 身份、格式、schema 与文件大小。参考 CLI 通过 `mdbx backup <output>` 使用同一 storage 服务。
+
+`MdbxVault.create_backup` 属于已打开 vault 的日常备份接口。兼容 open 可能已经完成 MDBX1 升级；需要保留精确迁移前副本的客户端，必须在调用自动 open 或 `upgrade_vault` 前完成独立的只读归档步骤。
+
+可移植备份是完整的加密 vault 文件，保留源 vault 的解锁方式，不解密业务记录。vault 内部 snapshot 仍是逻辑恢复点，sync bundle 仍是增量传输文件。源库采用 WAL 时，仅复制 SQLite 主文件会遗漏仍位于 WAL 的已提交页面。
+
+目标主文件、`-wal` 与 `-shm` 名称共同构成发布目标集合，任一文件已经存在时均保留原内容并返回错误。storage 在发布单文件结果前执行完整性、当前 MDBX2 metadata 与 vault 身份校验。
+
+### 7.4 客户端 operation 写入 API
 
 移动端和桌面端应先通过 UniFFI `MdbxVault::list_branches` 获取稳定 ID，再通过 `execute_write_operation_on_branch` 提交指定分支的多步编辑。原有 `execute_write_operation` 继续作为 main 分支兼容入口。接口只接受有限的类型化命令：创建项目、创建、更新、删除、恢复、移动条目；接口不暴露 SQL。
 
@@ -143,13 +154,13 @@ MDBX2 同时收紧以下实现边界：
 
 原有单项 FFI 方法继续保留，作为 MDBX1 兼容投影和简单调用入口；需要把一个用户动作合并为单一历史节点时，应使用 operation API。
 
-### 7.4 Commit 历史读取 API
+### 7.5 Commit 历史读取 API
 
 原有 `MdbxCommitHistoryItem`、`list_commit_history` 与 `get_commit_history` 保持字段布局和方法语义，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxCommitHistoryItemV2`、`list_commit_history_v2` 与 `get_commit_history_v2` 读取可空的稳定分支 ID。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。
 
 operation 摘要中的 action 使用 `create`、`update`、`delete`、`restore`、`move` 或兼容用的 `change`；fields 使用稳定的领域字段名。repository 产生的泛化 `change` 只作为占位，不会覆盖客户端已经提供的具体摘要。
 
-### 7.5 Tiga 审计读取 API
+### 7.6 Tiga 审计读取 API
 
 原有 UniFFI `MdbxSecurityAuditEvent` 记录与 `list_security_audit_events` 方法保持不变，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxSecurityAuditEventV2` 与 `list_security_audit_events_v2` 读取可空的 operation ID、commit ID、策略版本和策略指纹。
 

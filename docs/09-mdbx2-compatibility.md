@@ -52,10 +52,21 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - Commit2 adds idempotent operation IDs, typed change summaries, stable branch identity, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
 - Sync protocol and offline bundles use version 2 for operation metadata; MDBX2 readers still convert version 1 bundles with no operation metadata.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
+- Portable backup uses SQLite online backup so committed WAL pages are included, verifies SQLite and MDBX metadata plus `vault_id`, converts the result to a sidecar-independent file, and refuses to replace any destination artifact.
 
 ## Client/Core Boundary
 
 Clients own upgrade prompts, backup placement, progress UI, platform capability evidence, and remediation interactions. The storage core owns format detection, deterministic conversion, transactions, rollback, idempotence, and validation. Clients must not reimplement the MDBX1-to-MDBX2 field mapping.
+
+### Portable Backup API
+
+Clients call `BackupService::create_portable_copy` through Rust or `MdbxVault.create_backup` through UniFFI on an open vault. The result reports vault identity, format, schema, and file size. The reference CLI exposes the same service as `mdbx backup <output>`.
+
+`MdbxVault.create_backup` is an operational backup API for an already opened vault. The compatibility open path may already have upgraded an MDBX1 vault, so clients that require an exact pre-migration archive must complete that separate read-only archival step before calling automatic open or `upgrade_vault`.
+
+A portable backup is a complete encrypted vault file and retains the source unlock methods. It does not decrypt records. A vault-internal snapshot remains a logical recovery point, while a sync bundle remains an incremental transport artifact. Direct copying of the SQLite main file is invalid while WAL may contain committed frames.
+
+The destination path, `-wal`, and `-shm` names are reserved as one publication set. Existing artifacts are never replaced. Storage verifies integrity and current MDBX2 metadata before publishing the single-file result.
 
 ### Stable Branch Identity
 

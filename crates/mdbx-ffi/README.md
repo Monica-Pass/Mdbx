@@ -14,6 +14,7 @@ The exported boundary covers:
 - create a vault with explicit `Sky`, `Multi`, or `Power` Tiga mode
 - open a vault with password unlock
 - inspect migration requirements without changing the vault and explicitly invoke the storage-core upgrade
+- create a verified, no-clobber, single-file portable backup from an open vault
 - configure local security-key-material unlock on an already unlocked vault
 - open a vault with local security-key material
 - reset the master password on an already unlocked vault
@@ -49,6 +50,13 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 - `vault_id`: stable vault identifier read from `vault_meta`
 - `device_id`: caller-supplied device identifier used for commit context
 
+`MdbxBackupInfo` contains:
+
+- `vault_id`: source and backup identity
+- `format_version`: verified MDBX format generation
+- `schema_version`: verified schema version
+- `file_size_bytes`: published backup size
+
 `ProjectRecord` contains:
 
 - `project_id`
@@ -76,6 +84,10 @@ Successful connection-backed authorization renews the session idle timestamp wit
 Power remediation is available through `setup_password_security_key_unlock`, `list_unlock_methods`, and `remove_unlock_method`. After removing weaker standalone fallbacks, reopen with `open_vault_with_password_security_key` so the active session carries both factors.
 
 Use `inspect_vault_migration` before opening when the client needs upgrade consent, backup, or progress UI. After consent, call `upgrade_vault`; the deterministic field conversion remains entirely inside `mdbx-storage`. The ordinary `open_vault` functions retain automatic upgrade for compatibility-oriented callers.
+
+Call `MdbxVault.create_backup(destination)` on an open vault. It uses SQLite online backup, includes committed WAL pages, verifies integrity and MDBX identity, and publishes one file without replacing an existing destination, `-wal`, or `-shm` artifact. The backup retains the source unlock methods and reopens with the same credentials. It is separate from a vault-internal snapshot and a sync bundle; clients must not copy only the SQLite main file while WAL is active.
+
+The compatibility `open_vault` path may upgrade MDBX1 before the object becomes available. A client that requires an exact pre-migration archive must complete that read-only archival step before automatic open or `upgrade_vault`; `MdbxVault.create_backup` represents the verified state of the already opened vault.
 
 ### Entry Types
 

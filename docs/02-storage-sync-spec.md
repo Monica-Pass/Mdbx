@@ -26,6 +26,16 @@ Open and explicit upgrade MUST first inspect the file through a read-only SQLite
 
 The writable handle MUST use read-write flags without SQLite create permission. A missing path or an uninitialized SQLite database is an error and must remain unchanged. Connection-only settings such as foreign-key enforcement and busy timeout may be applied before migration; persistent WAL and secure-delete settings plus legacy plaintext-index cleanup are applied only after identity validation and a successful transactional migration.
 
+### Portable Backup Lifecycle
+
+A portable backup is a transactionally consistent, self-contained `.mdbx` file produced from a live vault. The storage layer MUST use SQLite's online backup API or an equivalent database snapshot mechanism so committed pages still present only in the source WAL are included. Copying the source main file while WAL is active is not a complete backup operation.
+
+The backup MUST be built in a temporary file in the destination directory, converted to a non-WAL journal mode, checked with SQLite integrity verification, and inspected as a current initialized MDBX vault. The copied `vault_id` MUST equal the source identity. The temporary file MUST be synchronized before publication, and publication MUST use no-clobber semantics.
+
+The destination main file and its same-name `-wal` and `-shm` sidecars MUST all be absent. Any existing destination artifact is preserved and causes the operation to fail. A successful portable backup has no required sidecars and can be opened independently with the source vault's existing unlock methods.
+
+The storage facade is authoritative for these guarantees. Rust clients use `BackupService::create_portable_copy`, UniFFI clients use `MdbxVault.create_backup`, and the reference CLI uses `mdbx backup <output>`.
+
 ## 2. Internal Storage Goals
 
 The internal layout MUST support all of the following:
@@ -167,6 +177,8 @@ Minimum requirements:
 - snapshots can be produced periodically
 - snapshots can rebuild projects, entries, attachment metadata, and embedded attachment chunks when present
 - partially damaged vaults SHOULD still allow partial recovery
+
+A snapshot is a logical recovery point stored inside a vault. It is distinct from a portable backup, which creates an independently openable complete vault file, and from a sync bundle, which carries incremental commit state between replicas. None of these artifacts can be replaced by copying only the SQLite main file while WAL is active.
 
 ## 12. Attachment Storage Modes
 

@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod benchmark;
 pub(crate) mod commit_integrity;
 pub mod conflict;

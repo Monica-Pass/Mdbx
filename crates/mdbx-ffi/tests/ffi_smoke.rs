@@ -177,6 +177,65 @@ fn open_and_upgrade_reject_non_mdbx_sqlite_without_modification() {
 }
 
 #[test]
+fn backup_reopens_with_original_password_and_remains_writable() {
+    let source_path = temp_vault_path("backup-source");
+    let backup_path = temp_vault_path("backup-target");
+    let password = "backup 中文 password 12345!";
+    let device_id = "ffi-backup-device";
+    let vault = create_vault(
+        source_path.as_path_string(),
+        password.to_string(),
+        device_id.to_string(),
+    )
+    .unwrap();
+    let project = vault
+        .create_project("Backed up project".to_string())
+        .unwrap();
+
+    let info = vault.create_backup(backup_path.as_path_string()).unwrap();
+
+    assert_eq!(info.vault_id, vault.info().vault_id);
+    assert_eq!(info.format_version, "MDBX-2");
+    assert!(info.file_size_bytes > 0);
+    assert!(!sqlite_sidecar_path(backup_path.path(), "-wal").exists());
+    assert!(!sqlite_sidecar_path(backup_path.path(), "-shm").exists());
+    let reopened = open_vault(
+        backup_path.as_path_string(),
+        password.to_string(),
+        device_id.to_string(),
+    )
+    .unwrap();
+    let entry = reopened
+        .create_entry(
+            project.project_id.clone(),
+            "note".to_string(),
+            "Backup remains writable".to_string(),
+            r#"{"body":"verified"}"#.to_string(),
+        )
+        .unwrap();
+    assert_eq!(entry.project_id, project.project_id);
+}
+
+#[test]
+fn backup_does_not_replace_existing_destination() {
+    let source_path = temp_vault_path("backup-no-clobber-source");
+    let backup_path = temp_vault_path("backup-no-clobber-target");
+    let vault = create_vault(
+        source_path.as_path_string(),
+        "backup no clobber password 12345!".to_string(),
+        "ffi-backup-no-clobber-device".to_string(),
+    )
+    .unwrap();
+    fs::write(backup_path.path(), b"preserve existing destination").unwrap();
+
+    assert!(vault.create_backup(backup_path.as_path_string()).is_err());
+    assert_eq!(
+        fs::read(backup_path.path()).unwrap(),
+        b"preserve existing destination"
+    );
+}
+
+#[test]
 fn write_operation_coalesces_commands_and_retries_idempotently() {
     let vault_path = temp_vault_path("write-operation");
     let vault = create_vault(
