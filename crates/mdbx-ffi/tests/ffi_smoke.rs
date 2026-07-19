@@ -6,7 +6,7 @@ use mdbx_ffi::{
     open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
     MdbxDeviceAssurance, MdbxDeviceContext, MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation,
-    MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType,
+    MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use uuid::Uuid;
 
@@ -66,6 +66,143 @@ fn trusted_device() -> MdbxDeviceContext {
         screen_capture_protection_available: true,
         secure_temp_files_available: true,
     }
+}
+
+fn count_rows(path: &Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+#[test]
+fn write_operation_coalesces_commands_and_retries_idempotently() {
+    let vault_path = temp_vault_path("write-operation");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "operation password 12345!".to_string(),
+        "ffi-operation-device".to_string(),
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    let entry_id = Uuid::new_v4().to_string();
+    let commands = vec![
+        MdbxWriteCommand::CreateProject {
+            project_id: project_id.clone(),
+            title: "Operation Project".to_string(),
+        },
+        MdbxWriteCommand::CreateEntry {
+            entry_id: entry_id.clone(),
+            project_id: project_id.clone(),
+            entry_type: "login".to_string(),
+            title: "Operation Entry".to_string(),
+            payload_json: r#"{"username":"alice","password":"secret"}"#.to_string(),
+        },
+    ];
+    let before = count_rows(vault_path.path(), "commits");
+
+    let first = vault
+        .execute_write_operation(
+            "ffi-operation-1".to_string(),
+            "create-project-with-entry".to_string(),
+            commands.clone(),
+        )
+        .unwrap();
+    assert!(!first.already_committed);
+    assert_eq!(first.project_ids, vec![project_id.clone()]);
+    assert_eq!(first.entry_ids, vec![entry_id.clone()]);
+    assert_eq!(count_rows(vault_path.path(), "commits"), before + 1);
+
+    let db = rusqlite::Connection::open(vault_path.path()).unwrap();
+    let (project_head, entry_head): (String, String) = db
+        .query_row(
+            "SELECT p.head_commit_id, e.head_commit_id
+             FROM projects p JOIN entries e ON e.project_id = p.project_id
+             WHERE p.project_id = ?1 AND e.entry_id = ?2",
+            rusqlite::params![project_id, entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(project_head, first.commit_id);
+    assert_eq!(entry_head, first.commit_id);
+    drop(db);
+
+    let retry = vault
+        .execute_write_operation(
+            "ffi-operation-1".to_string(),
+            "create-project-with-entry".to_string(),
+            commands.clone(),
+        )
+        .unwrap();
+    assert!(retry.already_committed);
+    assert_eq!(retry.commit_id, first.commit_id);
+    assert_eq!(count_rows(vault_path.path(), "commits"), before + 1);
+
+    let mut changed_commands = commands;
+    if let MdbxWriteCommand::CreateProject { title, .. } = &mut changed_commands[0] {
+        *title = "Different Intent".to_string();
+    }
+    assert!(vault
+        .execute_write_operation(
+            "ffi-operation-1".to_string(),
+            "create-project-with-entry".to_string(),
+            changed_commands,
+        )
+        .is_err());
+}
+
+#[test]
+fn write_operation_rolls_back_every_command_on_failure() {
+    let vault_path = temp_vault_path("write-operation-rollback");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "rollback password 12345!".to_string(),
+        "ffi-operation-device".to_string(),
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    let entry_id = Uuid::new_v4().to_string();
+    let missing_project_id = Uuid::new_v4().to_string();
+    let before = count_rows(vault_path.path(), "commits");
+
+    let result = vault.execute_write_operation(
+        "ffi-operation-rollback".to_string(),
+        "failing-batch".to_string(),
+        vec![
+            MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Rolled Back".to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id,
+                project_id: missing_project_id,
+                entry_type: "note".to_string(),
+                title: "Fails".to_string(),
+                payload_json: r#"{"body":"failure"}"#.to_string(),
+            },
+        ],
+    );
+    assert!(result.is_err());
+
+    let db = rusqlite::Connection::open(vault_path.path()).unwrap();
+    let project_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let operation_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM commit_operations WHERE operation_id = 'ffi-operation-rollback'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(project_count, 0);
+    assert_eq!(operation_count, 0);
+    assert_eq!(count_rows(vault_path.path(), "commits"), before);
 }
 
 #[test]

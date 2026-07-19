@@ -38,6 +38,8 @@ pub struct CommitOperation {
     pub message: Option<String>,
     #[serde(default)]
     pub parents: Vec<String>,
+    #[serde(default)]
+    pub intent_hash: Option<Vec<u8>>,
 }
 
 impl CommitOperation {
@@ -58,6 +60,7 @@ impl CommitOperation {
             changed_objects,
             message: None,
             parents: Vec::new(),
+            intent_hash: None,
         }
     }
 
@@ -68,6 +71,11 @@ impl CommitOperation {
 
     pub fn with_parents(mut self, parents: Vec<String>) -> Self {
         self.parents = parents;
+        self
+    }
+
+    pub fn with_intent_hash(mut self, intent_hash: Vec<u8>) -> Self {
+        self.intent_hash = Some(intent_hash);
         self
     }
 }
@@ -120,7 +128,7 @@ impl CommitContext {
             .inner()
             .query_row(
                 "SELECT o.commit_id, o.operation_kind, o.branch_name,
-                        c.commit_kind, c.change_scope
+                        c.commit_kind, c.change_scope, o.request_hash
                  FROM commit_operations o
                  JOIN commits c ON c.commit_id = o.commit_id
                  WHERE o.operation_id = ?1",
@@ -132,6 +140,7 @@ impl CommitContext {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
                     ))
                 },
             )
@@ -143,14 +152,24 @@ impl CommitContext {
                 return Err(StorageError::Database(error));
             }
         };
-        if let Some((commit_id, operation_kind, branch_name, commit_kind, change_scope)) = existing
+        if let Some((
+            commit_id,
+            operation_kind,
+            branch_name,
+            commit_kind,
+            change_scope,
+            request_hash,
+        )) = existing
         {
             let compatible_scope =
                 change_scope == operation.change_scope || change_scope == "multi";
+            let compatible_intent = operation.intent_hash.is_none()
+                || request_hash == Self::operation_request_hash(&operation)?;
             if operation_kind != operation.operation_kind
                 || branch_name != operation.branch_name
                 || commit_kind != operation.commit_kind
                 || !compatible_scope
+                || !compatible_intent
             {
                 let _ = conn.inner().execute_batch("ROLLBACK;");
                 return Err(StorageError::Validation(format!(
@@ -757,6 +776,22 @@ impl CommitContext {
     }
 
     fn operation_request_hash(operation: &CommitOperation) -> StorageResult<Vec<u8>> {
+        if let Some(intent_hash) = &operation.intent_hash {
+            let mut hasher = Sha256::new();
+            for part in [
+                b"mdbx-operation-intent-v1".as_slice(),
+                operation.operation_id.as_bytes(),
+                operation.operation_kind.as_bytes(),
+                operation.branch_name.as_bytes(),
+                operation.commit_kind.as_bytes(),
+                operation.change_scope.as_bytes(),
+                intent_hash.as_slice(),
+            ] {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+            return Ok(hasher.finalize().to_vec());
+        }
         let encoded = serde_json::to_vec(operation)
             .map_err(|error| StorageError::SchemaCreation(error.to_string()))?;
         Ok(Sha256::digest(encoded).to_vec())
@@ -1297,5 +1332,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(operation_commit, commit_id);
+    }
+
+    #[test]
+    fn operation_retry_rejects_a_different_immutable_intent() {
+        let (conn, ctx) = initialized();
+        let operation = CommitOperation::new(
+            "stable-intent-operation",
+            "client-edit",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        )
+        .with_intent_hash(vec![1; 32]);
+        ctx.run_operation(&conn, operation, |scoped| {
+            ProjectRepo::create(&conn, scoped, "First", None, None)
+        })
+        .unwrap();
+
+        let changed_intent = CommitOperation::new(
+            "stable-intent-operation",
+            "client-edit",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        )
+        .with_intent_hash(vec![2; 32]);
+        let error = ctx
+            .run_operation(&conn, changed_intent, |scoped| {
+                ProjectRepo::create(&conn, scoped, "Second", None, None)
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reused for a different operation"));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
     }
 }

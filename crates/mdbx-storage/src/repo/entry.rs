@@ -30,9 +30,30 @@ impl EntryRepo {
         title: Option<&str>,
         payload: &serde_json::Value,
     ) -> StorageResult<Entry> {
+        Self::create_with_id(
+            conn,
+            ctx,
+            &Uuid::new_v4().to_string(),
+            project_id,
+            entry_type,
+            title,
+            payload,
+        )
+    }
+
+    pub fn create_with_id(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        entry_id: &str,
+        project_id: &str,
+        entry_type: EntryType,
+        title: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> StorageResult<Entry> {
+        Uuid::parse_str(entry_id)
+            .map_err(|_| StorageError::Validation(format!("entry_id {entry_id} must be a UUID")))?;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
-            let entry_id = Uuid::new_v4().to_string();
 
             // 验证 project 存在且未删除
             let (exists, deleted): (bool, bool) = conn
@@ -59,14 +80,15 @@ impl EntryRepo {
                 )));
             }
 
-            let commit_id = ctx.create_commit(conn, "change", "entry", &[entry_id.clone()], &[])?;
+            let commit_id =
+                ctx.create_commit(conn, "change", "entry", &[entry_id.to_string()], &[])?;
 
-            let object_clock = format!(r#"{{"counter":1}}"#);
+            let object_clock = r#"{"counter":1}"#.to_string();
             let payload_blob = serde_json::to_vec(payload)
                 .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
-            let payload_ct = Self::encrypt_record(conn, &entry_id, "payload", &payload_blob)?;
+            let payload_ct = Self::encrypt_record(conn, entry_id, "payload", &payload_blob)?;
             let title_ct = title
-                .map(|t| Self::encrypt_metadata(conn, &entry_id, "title", t.as_bytes()))
+                .map(|t| Self::encrypt_metadata(conn, entry_id, "title", t.as_bytes()))
                 .transpose()?;
 
             conn.inner().execute(
@@ -88,9 +110,10 @@ impl EntryRepo {
                 ],
             )?;
 
-            ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry_id)?;
+            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
 
-            EntryRepo::get_by_id(conn, &entry_id)?.ok_or_else(|| StorageError::NotFound(entry_id))
+            EntryRepo::get_by_id(conn, entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))
         })
     }
 
@@ -671,6 +694,24 @@ mod tests {
         assert!(!entry.payload_ct.is_empty());
         assert!(!entry.head_commit_id.is_empty());
         assert!(!entry.deleted);
+    }
+
+    #[test]
+    fn test_create_entry_with_stable_id() {
+        let (conn, ctx, project_id) = setup();
+        let entry_id = Uuid::new_v4().to_string();
+        let entry = EntryRepo::create_with_id(
+            &conn,
+            &ctx,
+            &entry_id,
+            &project_id,
+            EntryType::Login,
+            Some("Stable"),
+            &login_payload(),
+        )
+        .unwrap();
+
+        assert_eq!(entry.entry_id, entry_id);
     }
 
     #[test]

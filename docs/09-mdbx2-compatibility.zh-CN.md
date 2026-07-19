@@ -120,3 +120,11 @@ MDBX2 同时收紧以下实现边界：
 - UniFFI：`upgrade_vault`
 
 转换仍由 storage core 的同一事务迁移器执行；客户端只负责备份、提示、进度和整改 UI。未知 critical extension 可以被检查并展示，但显式升级必须拒绝写入。
+
+### 7.2 客户端 operation 写入 API
+
+移动端和桌面端的多步编辑应通过 UniFFI `MdbxVault::execute_write_operation` 提交。接口只接受有限的类型化命令：创建项目、创建/更新/删除/恢复/移动条目；接口不暴露 SQL。
+
+每个创建命令必须携带客户端生成的稳定 UUID。客户端在首次调用和重试时复用同一 `operation_id` 与完整命令列表。storage 会将命令作为一个事务和一个 commit 执行；已完成 operation 的重试只返回 commit ID 与请求中的对象 ID，不再次执行写入。相同 operation ID 搭配不同命令内容会被拒绝，任一命令失败会回滚整个批次。
+
+原有单项 FFI 方法继续保留，作为 MDBX1 兼容投影和简单调用入口；需要把一个用户动作合并为单一历史节点时，应使用 operation API。

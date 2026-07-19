@@ -59,3 +59,11 @@ Clients own upgrade prompts, backup placement, progress UI, platform capability 
 The compatibility path `VaultConnection::open` continues to upgrade automatically so simple callers remain generation-compatible. A client that needs consent, backup, and progress orchestration should first call the read-only `mdbx_storage::migration::inspect_migration_path` (or the UniFFI `inspect_vault_migration` function). The result reports the current format/schema, minimum reader/writer generations, whether an upgrade is required, and whether critical extensions are unknown.
 
 After the client has obtained consent and completed its backup workflow, it can call `mdbx_storage::migration::upgrade_path` (or UniFFI `upgrade_vault`). The same storage-core transactional migrator performs the conversion. Clients own prompts and progress, never a second MDBX1 field-mapping implementation. Unknown critical extensions may be inspected and shown in read-only UI, but explicit upgrade still refuses to write.
+
+### Client Operation Write API
+
+Mobile and desktop clients should submit multi-step edits through the UniFFI `MdbxVault::execute_write_operation` method. The boundary accepts a finite typed command set for project creation and entry create, update, delete, restore, and move operations; it never exposes SQL.
+
+Every create command carries a client-generated stable UUID. The client reuses the same `operation_id` and complete command list for the initial call and retries. Storage executes the command list as one transaction and one commit. A completed operation retry returns the commit ID and the object IDs from the request without running mutations again. Reusing an operation ID with different command content is rejected, and failure of any command rolls back the entire batch.
+
+The existing single-mutation FFI methods remain available as the MDBX1-compatible projection and simple-call entry points. A client action that must appear as one history node should use the operation API.

@@ -29,16 +29,36 @@ impl ProjectRepo {
         group_id: Option<&str>,
         icon_ref: Option<&str>,
     ) -> StorageResult<Project> {
+        Self::create_with_id(
+            conn,
+            ctx,
+            &Uuid::new_v4().to_string(),
+            title,
+            group_id,
+            icon_ref,
+        )
+    }
+
+    pub fn create_with_id(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        title: &str,
+        group_id: Option<&str>,
+        icon_ref: Option<&str>,
+    ) -> StorageResult<Project> {
+        Uuid::parse_str(project_id).map_err(|_| {
+            StorageError::Validation(format!("project_id {project_id} must be a UUID"))
+        })?;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
-            let project_id = Uuid::new_v4().to_string();
 
             let commit_id =
-                ctx.create_commit(conn, "change", "project", &[project_id.clone()], &[])?;
+                ctx.create_commit(conn, "change", "project", &[project_id.to_string()], &[])?;
 
-            let object_clock = format!(r#"{{"counter":1}}"#);
+            let object_clock = r#"{"counter":1}"#.to_string();
 
-            let title_ct = Self::encrypt_metadata(conn, &project_id, "title", title.as_bytes())?;
+            let title_ct = Self::encrypt_metadata(conn, project_id, "title", title.as_bytes())?;
 
             conn.inner().execute(
                 "INSERT INTO projects (project_id, title_ct, summary_ct, group_id, icon_ref,
@@ -57,10 +77,10 @@ impl ProjectRepo {
                     ctx.device_id,
                 ],
             )?;
-            ObjectVersionRepo::record_project_current(conn, &commit_id, &project_id)?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
 
-            ProjectRepo::get_by_id(conn, &project_id)?
-                .ok_or_else(|| StorageError::NotFound(project_id.clone()))
+            ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))
         })
     }
 
@@ -394,6 +414,16 @@ mod tests {
             .unwrap();
         assert_eq!(integrity_tag.len(), 32);
         assert_ne!(integrity_tag, vec![0]);
+    }
+
+    #[test]
+    fn test_create_project_with_stable_id() {
+        let (conn, ctx) = setup();
+        let project_id = Uuid::new_v4().to_string();
+        let project =
+            ProjectRepo::create_with_id(&conn, &ctx, &project_id, "Stable", None, None).unwrap();
+
+        assert_eq!(project.project_id, project_id);
     }
 
     #[test]

@@ -16,10 +16,13 @@ use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
-use mdbx_storage::repo::{CommitContext, EntryRepo, ProjectRepo};
+use mdbx_storage::repo::{
+    CommitChange, CommitContext, CommitOperation, EntryRepo, OperationExecution, ProjectRepo,
+};
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -102,6 +105,50 @@ pub struct EntryRecord {
     pub title: String,
     pub payload_json: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MdbxWriteCommand {
+    CreateProject {
+        project_id: String,
+        title: String,
+    },
+    CreateEntry {
+        entry_id: String,
+        project_id: String,
+        entry_type: String,
+        title: String,
+        payload_json: String,
+    },
+    UpdateEntry {
+        entry_id: String,
+        project_id: String,
+        entry_type: String,
+        title: String,
+        payload_json: String,
+    },
+    DeleteEntry {
+        entry_id: String,
+        project_id: String,
+    },
+    RestoreEntry {
+        entry_id: String,
+        project_id: String,
+    },
+    MoveEntry {
+        entry_id: String,
+        project_id: String,
+        target_project_id: String,
+    },
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxWriteOperationResult {
+    pub commit_id: String,
+    pub already_committed: bool,
+    pub project_ids: Vec<String>,
+    pub entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -747,6 +794,42 @@ impl MdbxVault {
         })
     }
 
+    pub fn execute_write_operation(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        validate_write_operation(&operation_id, &operation_kind, &commands)?;
+        let intent = serde_json::to_vec(&commands)?;
+        let intent_hash = Sha256::digest(intent).to_vec();
+        let changed_objects = write_operation_changes(&commands);
+        let operation = CommitOperation::new(
+            operation_id,
+            operation_kind,
+            "main",
+            "change",
+            write_operation_scope(&changed_objects),
+            changed_objects,
+        )
+        .with_intent_hash(intent_hash);
+
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let execution = ctx.run_operation(&conn, operation, |scoped| {
+            execute_write_commands(&conn, scoped, &commands)
+        })?;
+        let (commit_id, already_committed) = match execution {
+            OperationExecution::Applied { commit_id, .. } => (commit_id, false),
+            OperationExecution::AlreadyCommitted { commit_id } => (commit_id, true),
+        };
+        Ok(write_operation_result(
+            &commands,
+            commit_id,
+            already_committed,
+        ))
+    }
+
     pub fn create_entry(
         &self,
         project_id: String,
@@ -1197,6 +1280,199 @@ fn entry_for_project(
         )));
     }
     Ok(entry)
+}
+
+fn validate_write_operation(
+    operation_id: &str,
+    operation_kind: &str,
+    commands: &[MdbxWriteCommand],
+) -> Result<(), MdbxFfiError> {
+    if operation_id.trim().is_empty() {
+        return Err(StorageError::Validation("operation_id must not be empty".to_string()).into());
+    }
+    if operation_kind.trim().is_empty() {
+        return Err(
+            StorageError::Validation("operation_kind must not be empty".to_string()).into(),
+        );
+    }
+    if commands.is_empty() {
+        return Err(
+            StorageError::Validation("write operation requires commands".to_string()).into(),
+        );
+    }
+    for command in commands {
+        match command {
+            MdbxWriteCommand::CreateProject { project_id, .. } => {
+                validate_uuid(project_id, "project_id")?
+            }
+            MdbxWriteCommand::CreateEntry {
+                entry_id,
+                entry_type,
+                payload_json,
+                ..
+            }
+            | MdbxWriteCommand::UpdateEntry {
+                entry_id,
+                entry_type,
+                payload_json,
+                ..
+            } => {
+                validate_uuid(entry_id, "entry_id")?;
+                parse_entry_type(entry_type)?;
+                parse_payload_json(payload_json)?;
+            }
+            MdbxWriteCommand::DeleteEntry { entry_id, .. }
+            | MdbxWriteCommand::RestoreEntry { entry_id, .. }
+            | MdbxWriteCommand::MoveEntry { entry_id, .. } => validate_uuid(entry_id, "entry_id")?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_uuid(value: &str, field: &str) -> Result<(), MdbxFfiError> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| StorageError::Validation(format!("{field} {value} must be a UUID")).into())
+}
+
+fn write_operation_changes(commands: &[MdbxWriteCommand]) -> Vec<CommitChange> {
+    let mut changes = Vec::new();
+    for command in commands {
+        let (object_type, object_id) = match command {
+            MdbxWriteCommand::CreateProject { project_id, .. } => ("project", project_id),
+            MdbxWriteCommand::CreateEntry { entry_id, .. }
+            | MdbxWriteCommand::UpdateEntry { entry_id, .. }
+            | MdbxWriteCommand::DeleteEntry { entry_id, .. }
+            | MdbxWriteCommand::RestoreEntry { entry_id, .. }
+            | MdbxWriteCommand::MoveEntry { entry_id, .. } => ("entry", entry_id),
+        };
+        if !changes.iter().any(|change: &CommitChange| {
+            change.object_type == object_type && change.object_id == *object_id
+        }) {
+            changes.push(CommitChange {
+                object_type: object_type.to_string(),
+                object_id: object_id.clone(),
+                action: "change".to_string(),
+                fields: Vec::new(),
+            });
+        }
+    }
+    changes
+}
+
+fn write_operation_scope(changes: &[CommitChange]) -> String {
+    let first = &changes[0].object_type;
+    if changes.iter().all(|change| change.object_type == *first) {
+        first.clone()
+    } else {
+        "multi".to_string()
+    }
+}
+
+fn execute_write_commands(
+    conn: &VaultConnection,
+    ctx: &CommitContext,
+    commands: &[MdbxWriteCommand],
+) -> StorageResult<()> {
+    for command in commands {
+        match command {
+            MdbxWriteCommand::CreateProject { project_id, title } => {
+                ProjectRepo::create_with_id(conn, ctx, project_id, title, None, None)?;
+            }
+            MdbxWriteCommand::CreateEntry {
+                entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload_json,
+            } => {
+                let payload = serde_json::from_str(payload_json)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+                let entry_type = entry_type.parse().map_err(|_| {
+                    StorageError::Validation(format!("invalid entry type: {entry_type}"))
+                })?;
+                EntryRepo::create_with_id(
+                    conn,
+                    ctx,
+                    entry_id,
+                    project_id,
+                    entry_type,
+                    Some(title),
+                    &payload,
+                )?;
+            }
+            MdbxWriteCommand::UpdateEntry {
+                entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload_json,
+            } => {
+                let expected_type = entry_type.parse().map_err(|_| {
+                    StorageError::Validation(format!("invalid entry type: {entry_type}"))
+                })?;
+                let mut entry = entry_for_project(conn, project_id, entry_id)?;
+                if entry.deleted || entry.entry_type != expected_type {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "entry {entry_id} cannot be updated"
+                    )));
+                }
+                entry.title_ct = Some(title.as_bytes().to_vec());
+                entry.payload_ct = serde_json::to_vec(
+                    &serde_json::from_str::<serde_json::Value>(payload_json)
+                        .map_err(|error| StorageError::Validation(error.to_string()))?,
+                )
+                .map_err(|error| StorageError::Validation(error.to_string()))?;
+                EntryRepo::update(conn, ctx, &entry)?;
+            }
+            MdbxWriteCommand::DeleteEntry {
+                entry_id,
+                project_id,
+            } => {
+                entry_for_project(conn, project_id, entry_id)?;
+                EntryRepo::soft_delete(conn, ctx, entry_id)?;
+            }
+            MdbxWriteCommand::RestoreEntry {
+                entry_id,
+                project_id,
+            } => {
+                entry_for_project(conn, project_id, entry_id)?;
+                EntryRepo::restore(conn, ctx, entry_id)?;
+            }
+            MdbxWriteCommand::MoveEntry {
+                entry_id,
+                project_id,
+                target_project_id,
+            } => {
+                entry_for_project(conn, project_id, entry_id)?;
+                EntryRepo::move_to_project(conn, ctx, entry_id, target_project_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_operation_result(
+    commands: &[MdbxWriteCommand],
+    commit_id: String,
+    already_committed: bool,
+) -> MdbxWriteOperationResult {
+    let changes = write_operation_changes(commands);
+    let mut project_ids = Vec::new();
+    let mut entry_ids = Vec::new();
+    for change in changes {
+        match change.object_type.as_str() {
+            "project" => project_ids.push(change.object_id),
+            "entry" => entry_ids.push(change.object_id),
+            _ => {}
+        }
+    }
+    MdbxWriteOperationResult {
+        commit_id,
+        already_committed,
+        project_ids,
+        entry_ids,
+    }
 }
 
 fn parse_entry_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
