@@ -71,3 +71,5 @@ The existing single-mutation FFI methods remain available as the MDBX1-compatibl
 ### Commit History Read API
 
 Clients page through history with `MdbxVault::list_commit_history` using the returned keyset cursor and fetch one detail with `get_commit_history`. Results include operation metadata, branch, parents, typed change summaries, and a compatibility flag; MDBX1 commits without operation metadata remain visible through a compatibility summary. Clients must treat the storage-returned cursor as opaque and must not recreate pagination with offsets.
+
+Operation summaries use `create`, `update`, `delete`, `restore`, `move`, or the compatibility `change` action, with stable domain field names. Repository-generated generic `change` records are placeholders and never overwrite a more specific client-provided summary.

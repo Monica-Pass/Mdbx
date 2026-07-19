@@ -214,12 +214,24 @@ fn commit_history_pages_include_operation_and_legacy_records() {
         "ffi-history-device".to_string(),
     )
     .unwrap();
-    let project = vault.create_project("History Project".to_string()).unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    vault
+        .execute_write_operation(
+            "history-typed-summary".to_string(),
+            "create-project".to_string(),
+            vec![MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "History Project".to_string(),
+            }],
+        )
+        .unwrap();
 
     let first = vault.list_commit_history(1, None).unwrap();
     assert_eq!(first.items.len(), 1);
     assert!(first.items[0].operation_id.is_some());
-    assert_eq!(first.items[0].changes[0].object_id, project.project_id);
+    assert_eq!(first.items[0].changes[0].object_id, project_id);
+    assert_eq!(first.items[0].changes[0].action, "create");
+    assert_eq!(first.items[0].changes[0].fields, vec!["title"]);
     let detail = vault
         .get_commit_history(first.items[0].commit_id.clone())
         .unwrap()

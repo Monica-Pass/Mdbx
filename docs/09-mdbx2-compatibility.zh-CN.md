@@ -132,3 +132,5 @@ MDBX2 同时收紧以下实现边界：
 ### 7.3 Commit 历史读取 API
 
 客户端通过 `MdbxVault::list_commit_history` 使用稳定游标分页读取历史，通过 `get_commit_history` 读取单条详情。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。
+
+operation 摘要中的 action 使用 `create`、`update`、`delete`、`restore`、`move` 或兼容用的 `change`；fields 使用稳定的领域字段名。repository 产生的泛化 `change` 只作为占位，不会覆盖客户端已经提供的具体摘要。

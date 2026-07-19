@@ -911,6 +911,15 @@ fn merge_change(changes: &mut Vec<CommitChange>, incoming: CommitChange) {
     if let Some(existing) = changes.iter_mut().find(|change| {
         change.object_type == incoming.object_type && change.object_id == incoming.object_id
     }) {
+        let incoming_is_placeholder = incoming.action == "change" && incoming.fields.is_empty();
+        if incoming_is_placeholder {
+            return;
+        }
+        let existing_is_placeholder = existing.action == "change" && existing.fields.is_empty();
+        if existing_is_placeholder {
+            *existing = incoming;
+            return;
+        }
         if existing.action != incoming.action {
             existing.action = "change".to_string();
         }
@@ -1403,5 +1412,51 @@ mod tests {
             .to_string()
             .contains("reused for a different operation"));
         assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn generic_change_does_not_erase_a_specific_summary() {
+        let mut changes = vec![CommitChange {
+            object_type: "entry".to_string(),
+            object_id: "entry-1".to_string(),
+            action: "move".to_string(),
+            fields: vec!["project_id".to_string()],
+        }];
+
+        merge_change(
+            &mut changes,
+            CommitChange {
+                object_type: "entry".to_string(),
+                object_id: "entry-1".to_string(),
+                action: "change".to_string(),
+                fields: Vec::new(),
+            },
+        );
+
+        assert_eq!(changes[0].action, "move");
+        assert_eq!(changes[0].fields, vec!["project_id"]);
+    }
+
+    #[test]
+    fn specific_summary_replaces_a_generic_placeholder() {
+        let mut changes = vec![CommitChange {
+            object_type: "entry".to_string(),
+            object_id: "entry-1".to_string(),
+            action: "change".to_string(),
+            fields: Vec::new(),
+        }];
+
+        merge_change(
+            &mut changes,
+            CommitChange {
+                object_type: "entry".to_string(),
+                object_id: "entry-1".to_string(),
+                action: "delete".to_string(),
+                fields: vec!["deleted".to_string()],
+            },
+        );
+
+        assert_eq!(changes[0].action, "delete");
+        assert_eq!(changes[0].fields, vec!["deleted"]);
     }
 }

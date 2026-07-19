@@ -1388,23 +1388,49 @@ fn validate_uuid(value: &str, field: &str) -> Result<(), MdbxFfiError> {
 fn write_operation_changes(commands: &[MdbxWriteCommand]) -> Vec<CommitChange> {
     let mut changes = Vec::new();
     for command in commands {
-        let (object_type, object_id) = match command {
-            MdbxWriteCommand::CreateProject { project_id, .. } => ("project", project_id),
-            MdbxWriteCommand::CreateEntry { entry_id, .. }
-            | MdbxWriteCommand::UpdateEntry { entry_id, .. }
-            | MdbxWriteCommand::DeleteEntry { entry_id, .. }
-            | MdbxWriteCommand::RestoreEntry { entry_id, .. }
-            | MdbxWriteCommand::MoveEntry { entry_id, .. } => ("entry", entry_id),
+        let (object_type, object_id, action, fields): (&str, &String, &str, &[&str]) = match command
+        {
+            MdbxWriteCommand::CreateProject { project_id, .. } => {
+                ("project", project_id, "create", &["title"])
+            }
+            MdbxWriteCommand::CreateEntry { entry_id, .. } => (
+                "entry",
+                entry_id,
+                "create",
+                &["project_id", "entry_type", "title", "payload"],
+            ),
+            MdbxWriteCommand::UpdateEntry { entry_id, .. } => {
+                ("entry", entry_id, "update", &["title", "payload"])
+            }
+            MdbxWriteCommand::DeleteEntry { entry_id, .. } => {
+                ("entry", entry_id, "delete", &["deleted"])
+            }
+            MdbxWriteCommand::RestoreEntry { entry_id, .. } => {
+                ("entry", entry_id, "restore", &["deleted"])
+            }
+            MdbxWriteCommand::MoveEntry { entry_id, .. } => {
+                ("entry", entry_id, "move", &["project_id"])
+            }
         };
-        if !changes.iter().any(|change: &CommitChange| {
+        let incoming = CommitChange {
+            object_type: object_type.to_string(),
+            object_id: object_id.clone(),
+            action: action.to_string(),
+            fields: fields.iter().map(|field| (*field).to_string()).collect(),
+        };
+        if let Some(existing) = changes.iter_mut().find(|change: &&mut CommitChange| {
             change.object_type == object_type && change.object_id == *object_id
         }) {
-            changes.push(CommitChange {
-                object_type: object_type.to_string(),
-                object_id: object_id.clone(),
-                action: "change".to_string(),
-                fields: Vec::new(),
-            });
+            if existing.action != incoming.action {
+                existing.action = "change".to_string();
+            }
+            for field in incoming.fields {
+                if !existing.fields.contains(&field) {
+                    existing.fields.push(field);
+                }
+            }
+        } else {
+            changes.push(incoming);
         }
     }
     changes
@@ -1596,4 +1622,65 @@ fn entry_record_from_entry(entry: &mdbx_core::model::Entry) -> Result<EntryRecor
         payload_json: serde_json::to_string(&payload)?,
         deleted: entry.deleted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_write_command_has_a_typed_change_summary() {
+        let commands = vec![
+            MdbxWriteCommand::CreateProject {
+                project_id: "project".to_string(),
+                title: "Project".to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id: "created".to_string(),
+                project_id: "project".to_string(),
+                entry_type: "login".to_string(),
+                title: "Created".to_string(),
+                payload_json: "{}".to_string(),
+            },
+            MdbxWriteCommand::UpdateEntry {
+                entry_id: "updated".to_string(),
+                project_id: "project".to_string(),
+                entry_type: "login".to_string(),
+                title: "Updated".to_string(),
+                payload_json: "{}".to_string(),
+            },
+            MdbxWriteCommand::DeleteEntry {
+                entry_id: "deleted".to_string(),
+                project_id: "project".to_string(),
+            },
+            MdbxWriteCommand::RestoreEntry {
+                entry_id: "restored".to_string(),
+                project_id: "project".to_string(),
+            },
+            MdbxWriteCommand::MoveEntry {
+                entry_id: "moved".to_string(),
+                project_id: "project".to_string(),
+                target_project_id: "target".to_string(),
+            },
+        ];
+
+        let changes = write_operation_changes(&commands);
+        let actions = changes
+            .iter()
+            .map(|change| change.action.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec!["create", "create", "update", "delete", "restore", "move"]
+        );
+        assert_eq!(changes[0].fields, vec!["title"]);
+        assert_eq!(
+            changes[1].fields,
+            vec!["project_id", "entry_type", "title", "payload"]
+        );
+        assert_eq!(changes[2].fields, vec!["title", "payload"]);
+        assert_eq!(changes[3].fields, vec!["deleted"]);
+        assert_eq!(changes[4].fields, vec!["deleted"]);
+        assert_eq!(changes[5].fields, vec!["project_id"]);
+    }
 }
