@@ -181,6 +181,12 @@ MDBX2 写入客户端 SHOULD 在用户动作开始时生成稳定的 `operation_
 摘要。storage core 负责原子分配设备 `local_seq`、合并 parent 向量时钟、写入旧 `commits`
 兼容投影，并同步更新 device head 和指定 branch head。客户端不得自行计算 `MAX(local_seq)+1`。
 
+对于编辑器自动保存、批量移动、批量导入等场景，客户端 SHOULD 使用
+`CommitContext::run_operation` 包住一次完整用户动作。闭包中的多次 `ProjectRepo`、`EntryRepo`
+或 `AttachmentRepo` 写入会共享一条 commit；闭包失败会整组回滚，重试已完成的 operation
+只返回原 commit，不再次执行写入。事务边界应覆盖一个有限的用户动作，不应跨越整个编辑器
+页面生命周期。用户明确点击两次“保存”时，应生成两个 operation，而不是无限追加到同一个事务。
+
 ### 4.2 删除必须走 tombstone
 
 删除对象时 MUST：

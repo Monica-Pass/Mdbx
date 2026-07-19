@@ -182,6 +182,13 @@ and field summaries. Storage atomically allocates the device `local_seq`, merges
 clocks, writes the legacy `commits` compatibility projection, and advances device and selected
 branch heads. Clients must not calculate `MAX(local_seq)+1` themselves.
 
+For editor autosave, batch move, and batch import, clients SHOULD wrap one complete user action in
+`CommitContext::run_operation`. Multiple `ProjectRepo`, `EntryRepo`, or `AttachmentRepo` writes in
+the closure share one commit; a failed closure rolls the whole action back, and retrying a completed
+operation returns its original commit without running the writes again. Keep the transaction bounded
+to one finite user action, not the lifetime of an editor page. Two explicit user saves should be two
+operations rather than an unbounded transaction.
+
 ### 4.2 Deletion Must Use Tombstones
 
 Deleting an object must:
