@@ -16,6 +16,7 @@ use mdbx_storage::backup::{BackupService, VaultBackupInfo};
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
+use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::repo::{
     BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
@@ -658,6 +659,25 @@ pub struct MdbxSessionInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxKeyEpochRotationResult {
+    pub previous_epoch_id: String,
+    pub active_epoch_id: String,
+    pub commit_id: String,
+    pub rotated_at: String,
+}
+
+impl From<KeyEpochRotationResult> for MdbxKeyEpochRotationResult {
+    fn from(value: KeyEpochRotationResult) -> Self {
+        Self {
+            previous_epoch_id: value.previous_epoch_id,
+            active_epoch_id: value.active_epoch_id,
+            commit_id: value.commit_id,
+            rotated_at: value.rotated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxTigaUnlockAssessment {
     pub mode: MdbxTigaMode,
     pub configured_methods: Vec<MdbxUnlockMethodType>,
@@ -839,6 +859,26 @@ impl MdbxVault {
                 updated_at: method.updated_at,
             })
             .collect())
+    }
+
+    pub fn rotate_key_epoch(
+        &self,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxKeyEpochRotationResult, MdbxFfiError> {
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let session = conn.active_session().cloned();
+        let device = device.into_core(&self.device_id);
+        let ctx = CommitContext::new(self.device_id.clone());
+        Ok(KeyEpochService::rotate_authorized(
+            &mut conn,
+            &ctx,
+            TigaAuthorizationContext {
+                session: session.as_ref(),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?
+        .into())
     }
 
     pub fn assess_tiga_unlock_policy(&self) -> Result<MdbxTigaUnlockAssessment, MdbxFfiError> {

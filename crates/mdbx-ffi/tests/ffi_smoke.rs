@@ -76,6 +76,14 @@ fn count_rows(path: &Path, table: &str) -> i64 {
     .unwrap()
 }
 
+fn active_key_epoch_id(path: &Path) -> String {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row("SELECT active_key_epoch_id FROM vault_meta", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
@@ -846,6 +854,51 @@ fn exposes_tiga_policy_typed_authorization_and_exact_exceptions() {
         .unwrap();
     assert!(copy_v2.commit_id.is_none());
     assert_eq!(copy_v2.policy_version, Some(2));
+}
+
+#[test]
+fn clients_can_rotate_key_epochs_with_tiga_authorization() {
+    let vault_path = temp_vault_path("key-epoch-rotation");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "rotation 中文 password 12345!".to_string(),
+        "ffi-rotation-device".to_string(),
+    )
+    .unwrap();
+    let before_epoch = active_key_epoch_id(vault_path.path());
+    let before_commits = count_rows(vault_path.path(), "commits");
+
+    let denied = vault.rotate_key_epoch(MdbxDeviceContext {
+        assurance: MdbxDeviceAssurance::Unknown,
+        secure_clipboard_available: false,
+        screen_capture_protection_available: false,
+        secure_temp_files_available: false,
+    });
+    assert!(denied.is_err());
+    assert_eq!(active_key_epoch_id(vault_path.path()), before_epoch);
+    assert_eq!(count_rows(vault_path.path(), "commits"), before_commits);
+
+    let rotated = vault.rotate_key_epoch(standard_device()).unwrap();
+    assert_eq!(rotated.previous_epoch_id, before_epoch);
+    assert_ne!(rotated.active_epoch_id, rotated.previous_epoch_id);
+    assert_eq!(
+        active_key_epoch_id(vault_path.path()),
+        rotated.active_epoch_id
+    );
+    assert_eq!(count_rows(vault_path.path(), "commits"), before_commits + 1);
+
+    let db = rusqlite::Connection::open(vault_path.path()).unwrap();
+    let commit: (String, String) = db
+        .query_row(
+            "SELECT commit_kind, change_scope FROM commits WHERE commit_id = ?1",
+            rusqlite::params![rotated.commit_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        commit,
+        ("key-rotation".to_string(), "key-epoch".to_string())
+    );
 }
 
 #[test]
