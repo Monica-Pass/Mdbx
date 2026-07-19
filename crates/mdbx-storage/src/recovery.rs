@@ -36,6 +36,7 @@ pub enum IssueSeverity {
 /// - 陈旧设备 head 检测
 /// - 快照完整性
 /// - 孤儿记录检测
+/// - 对象删除状态与墓碑一致性
 pub struct RecoveryVerifier;
 
 impl RecoveryVerifier {
@@ -92,7 +93,17 @@ impl RecoveryVerifier {
             }),
         }
 
-        // 6. 检查陈旧 head
+        // 6. 检查对象删除状态与墓碑
+        match Self::check_tombstone_consistency(conn) {
+            Ok(tombstone_issues) => issues.extend(tombstone_issues),
+            Err(e) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "tombstones".to_string(),
+                description: format!("tombstone consistency check failed: {}", e),
+            }),
+        }
+
+        // 7. 检查陈旧 head
         match Self::check_stale_heads(conn) {
             Ok(head_issues) => issues.extend(head_issues),
             Err(e) => issues.push(HealthIssue {
@@ -433,6 +444,138 @@ impl RecoveryVerifier {
         Ok(issues)
     }
 
+    /// 检查带删除状态的对象是否具有精确类型且唯一的当前墓碑。
+    pub fn check_tombstone_consistency(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
+        let mut issues = Vec::new();
+
+        let mut duplicate_stmt = conn
+            .inner()
+            .prepare(
+                "SELECT target_object_type, target_object_id, COUNT(*)
+                 FROM tombstones
+                 WHERE target_object_type IN
+                    ('project', 'entry', 'attachment', 'object-relation',
+                     'object-label', 'object-label-assignment')
+                 GROUP BY target_object_type, target_object_id
+                 HAVING COUNT(*) > 1
+                 ORDER BY target_object_type, target_object_id",
+            )
+            .map_err(StorageError::Database)?;
+        let duplicates = duplicate_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+        for (object_type, object_id, count) in &duplicates {
+            issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "tombstones".to_string(),
+                description: format!(
+                    "{} {} has {} typed tombstones; expected exactly one current marker",
+                    object_type, object_id, count
+                ),
+            });
+        }
+
+        let mut state_stmt = conn
+            .inner()
+            .prepare(
+                "WITH object_states(object_type, object_id, deleted) AS (
+                    SELECT 'project', project_id, deleted FROM projects
+                    UNION ALL SELECT 'entry', entry_id, deleted FROM entries
+                    UNION ALL SELECT 'attachment', attachment_id, deleted FROM attachments
+                    UNION ALL SELECT 'object-relation', relation_id, deleted FROM object_relations
+                    UNION ALL SELECT 'object-label', label_id, deleted FROM object_labels
+                    UNION ALL SELECT 'object-label-assignment', assignment_id, deleted
+                              FROM object_label_assignments
+                 )
+                 SELECT o.object_type, o.object_id, o.deleted, COUNT(t.tombstone_id)
+                 FROM object_states o
+                 LEFT JOIN tombstones t
+                    ON t.target_object_type = o.object_type
+                   AND t.target_object_id = o.object_id
+                 GROUP BY o.object_type, o.object_id, o.deleted
+                 ORDER BY o.object_type, o.object_id",
+            )
+            .map_err(StorageError::Database)?;
+        let states = state_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)? != 0,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+
+        for (object_type, object_id, deleted, tombstone_count) in states {
+            if tombstone_count > 1 {
+                continue;
+            }
+            if deleted && tombstone_count == 0 {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "tombstones".to_string(),
+                    description: format!(
+                        "{} {} is deleted without an exact typed tombstone",
+                        object_type, object_id
+                    ),
+                });
+                continue;
+            }
+            if !deleted
+                && tombstone_count == 1
+                && !Self::has_unresolved_deletion_conflict(conn, &object_type, &object_id)?
+            {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "tombstones".to_string(),
+                    description: format!(
+                        "{} {} is active but retains a typed tombstone without an unresolved deletion conflict",
+                        object_type, object_id
+                    ),
+                });
+            }
+        }
+
+        Ok(issues)
+    }
+
+    fn has_unresolved_deletion_conflict(
+        conn: &VaultConnection,
+        object_type: &str,
+        object_id: &str,
+    ) -> StorageResult<bool> {
+        let mut stmt = conn
+            .inner()
+            .prepare(
+                "SELECT conflicting_fields FROM conflicts
+                 WHERE object_type = ?1 AND object_id = ?2 AND resolution = 'unresolved'",
+            )
+            .map_err(StorageError::Database)?;
+        let fields = stmt
+            .query_map(rusqlite::params![object_type, object_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+        Ok(fields.iter().any(|encoded| {
+            serde_json::from_str::<Vec<String>>(encoded)
+                .map(|fields| fields.iter().any(|field| field == "deleted"))
+                .unwrap_or(false)
+        }))
+    }
+
     /// 检查陈旧 device head：head 对应的 commit 是否存在。
     pub fn check_stale_heads(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
         let mut issues: Vec<HealthIssue> = Vec::new();
@@ -725,8 +868,15 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::commit_ctx::CommitContext;
+    use crate::repo::conflict::ConflictRepo;
     use crate::repo::entry::EntryRepo;
+    use crate::repo::object_label::{
+        ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+        ObjectLabelRepo,
+    };
+    use crate::repo::object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
     use crate::repo::project::ProjectRepo;
+    use mdbx_core::model::{ConflictObjectType, RelationKindId};
 
     fn setup() -> (VaultConnection, CommitContext, String) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -742,6 +892,74 @@ mod tests {
         let keyring =
             mdbx_crypto::keyring::Keyring::from_vault_key(&vault_key, b"recovery-test").unwrap();
         conn.attach_keyring(keyring);
+    }
+
+    fn tombstone_object_fixture(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+    ) -> Vec<(&'static str, String)> {
+        let first = EntryRepo::create(
+            conn,
+            ctx,
+            project_id,
+            mdbx_core::model::EntryType::custom("com.monica.health.first").unwrap(),
+            Some("First"),
+            &serde_json::json!({"body":"first"}),
+        )
+        .unwrap();
+        let second = EntryRepo::create(
+            conn,
+            ctx,
+            project_id,
+            mdbx_core::model::EntryType::custom("com.monica.health.second").unwrap(),
+            Some("Second"),
+            &serde_json::json!({"body":"second"}),
+        )
+        .unwrap();
+        let attachment = AttachmentRepo::add(
+            conn,
+            ctx,
+            project_id,
+            Some(&first.entry_id),
+            "health.bin",
+            Some("application/octet-stream"),
+            "",
+            0,
+        )
+        .unwrap();
+        let relation = ObjectRelationRepo::create(
+            conn,
+            ctx,
+            ObjectRelationCreateRequest::new(
+                &first.entry_id,
+                &second.entry_id,
+                RelationKindId::new("com.monica.health.related").unwrap(),
+                serde_json::json!({}),
+            ),
+        )
+        .unwrap();
+        let label = ObjectLabelRepo::create(
+            conn,
+            ctx,
+            ObjectLabelCreateRequest::new(project_id, "Health", serde_json::json!({})),
+        )
+        .unwrap();
+        let assignment = ObjectLabelAssignmentRepo::create(
+            conn,
+            ctx,
+            ObjectLabelAssignmentCreateRequest::new(&first.entry_id, &label.label_id),
+        )
+        .unwrap();
+
+        vec![
+            ("project", project_id.to_string()),
+            ("entry", first.entry_id),
+            ("attachment", attachment.attachment_id),
+            ("object-relation", relation.relation_id),
+            ("object-label", label.label_id),
+            ("object-label-assignment", assignment.assignment_id),
+        ]
     }
 
     // -----------------------------------------------------------------------
@@ -765,6 +983,89 @@ mod tests {
             .iter()
             .any(|i| i.severity >= IssueSeverity::Error);
         assert!(!has_errors, "unexpected errors: {:?}", result.issues);
+    }
+
+    #[test]
+    fn tombstone_consistency_detects_missing_markers_for_every_object_family() {
+        let (conn, ctx, project_id) = setup();
+        let objects = tombstone_object_fixture(&conn, &ctx, &project_id);
+
+        ObjectLabelAssignmentRepo::soft_delete(&conn, &ctx, &objects[5].1).unwrap();
+        ObjectLabelRepo::soft_delete(&conn, &ctx, &objects[4].1).unwrap();
+        ObjectRelationRepo::soft_delete(&conn, &ctx, &objects[3].1).unwrap();
+        AttachmentRepo::soft_delete(&conn, &ctx, &objects[2].1).unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &objects[1].1).unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &objects[0].1).unwrap();
+        conn.inner().execute("DELETE FROM tombstones", []).unwrap();
+
+        let issues = RecoveryVerifier::check_tombstone_consistency(&conn).unwrap();
+        for (object_type, object_id) in &objects {
+            assert!(issues.iter().any(|issue| {
+                issue.severity == IssueSeverity::Error
+                    && issue.category == "tombstones"
+                    && issue.description.contains(object_type)
+                    && issue.description.contains(object_id)
+                    && issue.description.contains("deleted without")
+            }));
+        }
+        assert!(!RecoveryVerifier::full_health_check(&conn).unwrap().healthy);
+    }
+
+    #[test]
+    fn tombstone_consistency_detects_stale_and_duplicate_markers() {
+        let (conn, ctx, project_id) = setup();
+        let objects = tombstone_object_fixture(&conn, &ctx, &project_id);
+        for (object_type, object_id) in &objects {
+            ctx.create_tombstone(&conn, object_type, object_id).unwrap();
+        }
+
+        let stale = RecoveryVerifier::check_tombstone_consistency(&conn).unwrap();
+        assert_eq!(
+            stale
+                .iter()
+                .filter(|issue| issue.description.contains("is active but retains"))
+                .count(),
+            objects.len()
+        );
+
+        ctx.create_tombstone(&conn, objects[0].0, &objects[0].1)
+            .unwrap();
+        let duplicated = RecoveryVerifier::check_tombstone_consistency(&conn).unwrap();
+        assert!(duplicated.iter().any(|issue| {
+            issue.description.contains(&objects[0].1)
+                && issue.description.contains("has 2 typed tombstones")
+        }));
+    }
+
+    #[test]
+    fn tombstone_consistency_allows_unresolved_delete_conflict_marker() {
+        let (conn, ctx, project_id) = setup();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            mdbx_core::model::EntryType::Login,
+            Some("Conflicted"),
+            &serde_json::json!({"password":"local"}),
+        )
+        .unwrap();
+        ctx.create_tombstone(&conn, "entry", &entry.entry_id)
+            .unwrap();
+        ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Entry,
+            &entry.entry_id,
+            &entry.head_commit_id,
+            &entry.head_commit_id,
+            "incoming-delete",
+            &["deleted".to_string()],
+        )
+        .unwrap();
+
+        let issues = RecoveryVerifier::check_tombstone_consistency(&conn).unwrap();
+        assert!(issues.is_empty(), "unexpected issues: {:?}", issues);
+        assert!(RecoveryVerifier::full_health_check(&conn).unwrap().healthy);
     }
 
     #[test]

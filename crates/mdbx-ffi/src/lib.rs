@@ -21,6 +21,7 @@ use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
+use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
     BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
     CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
@@ -90,6 +91,57 @@ impl From<VaultBackupInfo> for MdbxBackupInfo {
             format_version: value.format_version,
             schema_version: value.schema_version,
             file_size_bytes: value.file_size_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxHealthIssueSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl From<IssueSeverity> for MdbxHealthIssueSeverity {
+    fn from(value: IssueSeverity) -> Self {
+        match value {
+            IssueSeverity::Info => Self::Info,
+            IssueSeverity::Warning => Self::Warning,
+            IssueSeverity::Error => Self::Error,
+            IssueSeverity::Critical => Self::Critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthIssue {
+    pub severity: MdbxHealthIssueSeverity,
+    pub category: String,
+    pub description: String,
+}
+
+impl From<HealthIssue> for MdbxHealthIssue {
+    fn from(value: HealthIssue) -> Self {
+        Self {
+            severity: value.severity.into(),
+            category: value.category,
+            description: value.description,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthCheckResult {
+    pub healthy: bool,
+    pub issues: Vec<MdbxHealthIssue>,
+}
+
+impl From<HealthCheckResult> for MdbxHealthCheckResult {
+    fn from(value: HealthCheckResult) -> Self {
+        Self {
+            healthy: value.healthy,
+            issues: value.issues.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -870,6 +922,11 @@ impl MdbxVault {
     pub fn create_backup(&self, destination: String) -> Result<MdbxBackupInfo, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(BackupService::create_portable_copy(&conn, Path::new(&destination))?.into())
+    }
+
+    pub fn health_check(&self) -> Result<MdbxHealthCheckResult, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(RecoveryVerifier::full_health_check(&conn)?.into())
     }
 
     pub fn resolve_tiga_policy(
@@ -2565,6 +2622,43 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
             serde_json::json!({"position":2})
         );
+    }
+
+    #[test]
+    fn health_check_returns_structured_tombstone_issues() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("ffi-health-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Health", None, None).unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-health-device".to_string(),
+            vault_id: "ffi-health-vault".to_string(),
+        };
+
+        let clean = vault.health_check().unwrap();
+        assert!(clean.healthy);
+
+        {
+            let conn = vault.conn.lock().unwrap();
+            ProjectRepo::soft_delete(&conn, &ctx, &project.project_id).unwrap();
+            conn.inner()
+                .execute(
+                    "DELETE FROM tombstones
+                     WHERE target_object_type = 'project' AND target_object_id = ?1",
+                    rusqlite::params![project.project_id],
+                )
+                .unwrap();
+        }
+
+        let unhealthy = vault.health_check().unwrap();
+        assert!(!unhealthy.healthy);
+        assert!(unhealthy.issues.iter().any(|issue| {
+            issue.severity == MdbxHealthIssueSeverity::Error
+                && issue.category == "tombstones"
+                && issue.description.contains(&project.project_id)
+                && issue.description.contains("deleted without")
+        }));
     }
 
     #[test]
