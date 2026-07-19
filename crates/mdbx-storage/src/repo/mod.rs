@@ -8,7 +8,7 @@ pub mod snapshot;
 pub mod tombstone;
 
 pub use attachment::AttachmentRepo;
-pub use commit_ctx::CommitContext;
+pub use commit_ctx::{CommitChange, CommitContext, CommitOperation};
 pub use conflict::ConflictRepo;
 pub use entry::EntryRepo;
 pub use object_version::ObjectVersionRepo;

@@ -11,9 +11,10 @@ use crate::schema::v2;
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
+pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
@@ -289,6 +290,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
             params![MIGRATION_TIGA2_POLICY, FORMAT_V2, now],
         )?;
         conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_COMMIT2, FORMAT_V2, now],
+        )?;
+        conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
              tiga_compliance_status = ?3, min_writer_version = ?4, updated_at = ?5",
             params![
@@ -472,6 +479,8 @@ fn validate_v2_schema(conn: &Connection) -> StorageResult<()> {
         "tiga_policy_overrides",
         "tiga_policy_exceptions",
         "security_audit_events",
+        "commit_operations",
+        "commit_device_sequences",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -695,6 +704,8 @@ mod tests {
         assert!(table_exists(&conn, "tiga_policy_overrides").unwrap());
         assert!(table_exists(&conn, "tiga_policy_exceptions").unwrap());
         assert!(table_exists(&conn, "security_audit_events").unwrap());
+        assert!(table_exists(&conn, "commit_operations").unwrap());
+        assert!(table_exists(&conn, "commit_device_sequences").unwrap());
     }
 
     #[test]
@@ -731,6 +742,8 @@ mod tests {
         let info = upgrade_to_latest(&conn).unwrap().unwrap();
         assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(table_exists(&conn, "tiga_policy_overrides").unwrap());
+        assert!(table_exists(&conn, "commit_operations").unwrap());
+        assert!(table_exists(&conn, "commit_device_sequences").unwrap());
         let migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -739,6 +752,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
+        let commit2_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_COMMIT2],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commit2_migration_count, 1);
     }
 
     #[test]

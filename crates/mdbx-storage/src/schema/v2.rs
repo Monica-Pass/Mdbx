@@ -10,6 +10,32 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at   TEXT NOT NULL
 );";
 
+/// MDBX2 commit operation state. These tables are additive: MDBX1 readers
+/// continue to read the legacy `commits` projection and never write these
+/// unknown tables.
+pub const COMMIT2_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS commit_operations (
+    operation_id       TEXT PRIMARY KEY NOT NULL,
+    commit_id          TEXT NOT NULL UNIQUE,
+    operation_kind     TEXT NOT NULL,
+    branch_name        TEXT NOT NULL,
+    change_summary_ct  BLOB NOT NULL,
+    request_hash       BLOB NOT NULL,
+    created_at         TEXT NOT NULL,
+    integrity_tag      BLOB NOT NULL,
+    FOREIGN KEY (commit_id) REFERENCES commits(commit_id)
+);
+
+CREATE TABLE IF NOT EXISTS commit_device_sequences (
+    device_id          TEXT PRIMARY KEY NOT NULL,
+    last_local_seq     INTEGER NOT NULL CHECK (last_local_seq >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commit_operations_commit
+    ON commit_operations (commit_id);
+CREATE INDEX IF NOT EXISTS idx_commit_operations_kind
+    ON commit_operations (operation_kind, created_at);";
+
 pub const TIGA_POLICY_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS tiga_policy_exceptions (
     exception_id         TEXT PRIMARY KEY NOT NULL,
@@ -91,8 +117,10 @@ pub fn create_extensions(conn: &Connection) -> StorageResult<()> {
         "tiga_compliance_status",
         "TEXT NOT NULL DEFAULT 'compliant'",
     )?;
-    conn.execute_batch(&format!("{SCHEMA_MIGRATIONS_DDL}{TIGA_POLICY_DDL}"))
-        .map_err(StorageError::Database)
+    conn.execute_batch(&format!(
+        "{SCHEMA_MIGRATIONS_DDL}{COMMIT2_DDL}{TIGA_POLICY_DDL}"
+    ))
+    .map_err(StorageError::Database)
 }
 
 pub(crate) fn add_column_if_missing(
