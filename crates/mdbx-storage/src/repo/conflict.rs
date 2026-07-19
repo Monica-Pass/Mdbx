@@ -17,8 +17,20 @@ use crate::sync_state::{AttachmentRow, EntryRow, ProjectRow};
 /// 后续供 UI 层查询并交由用户手动解决。
 pub struct ConflictRepo;
 
+#[derive(Debug, Clone)]
+pub struct ConflictCreateRequest<'a> {
+    pub object_type: ConflictObjectType,
+    pub object_id: &'a str,
+    pub base_commit_id: &'a str,
+    pub local_commit_id: &'a str,
+    pub incoming_commit_id: &'a str,
+    pub conflicting_fields: &'a [String],
+}
+
 impl ConflictRepo {
     /// 记录一个新的冲突。
+    // Kept for MDBX1 callers; new code should use ConflictCreateRequest.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -29,6 +41,33 @@ impl ConflictRepo {
         incoming_commit_id: &str,
         conflicting_fields: &[String],
     ) -> StorageResult<Conflict> {
+        Self::create_with_request(
+            conn,
+            ctx,
+            ConflictCreateRequest {
+                object_type,
+                object_id,
+                base_commit_id,
+                local_commit_id,
+                incoming_commit_id,
+                conflicting_fields,
+            },
+        )
+    }
+
+    pub fn create_with_request(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        request: ConflictCreateRequest<'_>,
+    ) -> StorageResult<Conflict> {
+        let ConflictCreateRequest {
+            object_type,
+            object_id,
+            base_commit_id,
+            local_commit_id,
+            incoming_commit_id,
+            conflicting_fields,
+        } = request;
         let now = chrono::Utc::now().to_rfc3339();
         let conflict_id = Uuid::new_v4().to_string();
         let fields_json = serde_json::to_string(conflicting_fields)
@@ -863,15 +902,18 @@ mod tests {
         )
         .unwrap();
 
-        let conflict = ConflictRepo::create(
+        let fields = ["pass".to_string(), "user".to_string()];
+        let conflict = ConflictRepo::create_with_request(
             &conn,
             &ctx,
-            ConflictObjectType::Entry,
-            &entry.entry_id,
-            "base-commit-1",
-            "local-commit-1",
-            "incoming-commit-1",
-            &["pass".to_string(), "user".to_string()],
+            ConflictCreateRequest {
+                object_type: ConflictObjectType::Entry,
+                object_id: &entry.entry_id,
+                base_commit_id: "base-commit-1",
+                local_commit_id: "local-commit-1",
+                incoming_commit_id: "incoming-commit-1",
+                conflicting_fields: &fields,
+            },
         )
         .unwrap();
 

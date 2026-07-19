@@ -72,7 +72,7 @@ fn sha256_length_prefixed(parts: &[&[u8]]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn sample<'a>(parents: &'a [String]) -> CommitIntegrityInput<'a> {
+    fn sample(parents: &[String]) -> CommitIntegrityInput<'_> {
         CommitIntegrityInput {
             commit_id: "commit-1",
             device_id: "device-a",

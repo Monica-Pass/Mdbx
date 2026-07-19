@@ -1223,12 +1223,14 @@ impl SyncApplyRepo {
         Self::apply_merged_entry(
             conn,
             ctx,
-            &base_row,
-            &local_row,
-            incoming,
-            local_commit_id,
-            incoming_commit_id,
-            &merged_payload,
+            EntryMergeInput {
+                base: &base_row,
+                local: &local_row,
+                incoming,
+                local_commit_id,
+                incoming_commit_id,
+                merged_payload: &merged_payload,
+            },
         )?;
         Ok(0)
     }
@@ -1236,13 +1238,16 @@ impl SyncApplyRepo {
     fn apply_merged_entry(
         conn: &VaultConnection,
         ctx: &CommitContext,
-        base: &EntryRow,
-        local: &EntryRow,
-        incoming: &EntryRow,
-        local_commit_id: &str,
-        incoming_commit_id: &str,
-        merged_payload: &serde_json::Value,
+        input: EntryMergeInput<'_>,
     ) -> StorageResult<()> {
+        let EntryMergeInput {
+            base,
+            local,
+            incoming,
+            local_commit_id,
+            incoming_commit_id,
+            merged_payload,
+        } = input;
         let mut parents = vec![local_commit_id.to_string()];
         if incoming_commit_id != local_commit_id {
             parents.push(incoming_commit_id.to_string());
@@ -1585,12 +1590,14 @@ impl SyncApplyRepo {
         Self::apply_merged_attachment(
             conn,
             ctx,
-            &base_row,
-            &local_row,
-            incoming,
-            local_commit_id,
-            incoming_commit_id,
-            replace_incoming_chunks,
+            AttachmentMergeInput {
+                base: &base_row,
+                local: &local_row,
+                incoming,
+                local_commit_id,
+                incoming_commit_id,
+                use_incoming_content: replace_incoming_chunks,
+            },
         )?;
         Ok(AttachmentMergeResult {
             conflict_count: 0,
@@ -1601,13 +1608,16 @@ impl SyncApplyRepo {
     fn apply_merged_attachment(
         conn: &VaultConnection,
         ctx: &CommitContext,
-        base: &AttachmentRow,
-        local: &AttachmentRow,
-        incoming: &AttachmentRow,
-        local_commit_id: &str,
-        incoming_commit_id: &str,
-        use_incoming_content: bool,
+        input: AttachmentMergeInput<'_>,
     ) -> StorageResult<()> {
+        let AttachmentMergeInput {
+            base,
+            local,
+            incoming,
+            local_commit_id,
+            incoming_commit_id,
+            use_incoming_content,
+        } = input;
         let mut parents = vec![local_commit_id.to_string()];
         if incoming_commit_id != local_commit_id {
             parents.push(incoming_commit_id.to_string());
@@ -1940,6 +1950,24 @@ struct AttachmentMergeResult {
     replace_incoming_chunks: bool,
 }
 
+struct EntryMergeInput<'a> {
+    base: &'a EntryRow,
+    local: &'a EntryRow,
+    incoming: &'a EntryRow,
+    local_commit_id: &'a str,
+    incoming_commit_id: &'a str,
+    merged_payload: &'a serde_json::Value,
+}
+
+struct AttachmentMergeInput<'a> {
+    base: &'a AttachmentRow,
+    local: &'a AttachmentRow,
+    incoming: &'a AttachmentRow,
+    local_commit_id: &'a str,
+    incoming_commit_id: &'a str,
+    use_incoming_content: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ObjectDecision {
     Insert,
@@ -1962,9 +1990,7 @@ fn exists(
 }
 
 fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, incoming: &T) -> Option<T> {
-    if local == incoming {
-        Some(local.clone())
-    } else if local != base && incoming == base {
+    if local == incoming || incoming == base {
         Some(local.clone())
     } else if local == base && incoming != base {
         Some(incoming.clone())
@@ -2927,7 +2953,7 @@ mod tests {
         let batch = CommitBatch::new(vec![incoming], 0, true);
         let result = SyncApplyRepo::apply_batch(&conn, &ctx, &batch).unwrap();
         assert_eq!(result.conflict_count, 1);
-        assert!(ConflictRepo::list_unresolved(&conn).unwrap().len() >= 1);
+        assert!(!ConflictRepo::list_unresolved(&conn).unwrap().is_empty());
     }
 
     #[test]

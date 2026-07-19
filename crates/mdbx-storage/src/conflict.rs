@@ -7,6 +7,16 @@ use serde_json::Value;
 /// - 双方都修改且结果不同的字段 → 冲突，不可自动合并
 pub struct ConflictDetector;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectConflictState<'a> {
+    pub title_ct: &'a [u8],
+    pub summary_ct: Option<&'a [u8]>,
+    pub group_id: Option<&'a str>,
+    pub icon_ref: Option<&'a str>,
+    pub favorite: bool,
+    pub archived: bool,
+}
+
 impl ConflictDetector {
     /// 对 entry payload 做字段级三路合并分析。
     ///
@@ -83,12 +93,12 @@ impl ConflictDetector {
                 }
 
                 // 只在 local 侧有变化
-                (Some(b), Some(l), Some(i)) if b != i && l != b && i == b => {
+                (Some(b), Some(l), Some(i)) if l != b && i == b => {
                     // local 修改了，incoming 没改 → 安全，采用 local
                 }
 
                 // 只在 incoming 侧有变化
-                (Some(b), Some(l), Some(i)) if b != i && l == b && i != b => {
+                (Some(b), Some(l), Some(i)) if l == b && i != b => {
                     // incoming 修改了，local 没改 → 安全，采用 incoming
                 }
 
@@ -127,6 +137,8 @@ impl ConflictDetector {
     ///
     /// 比较非系统字段：title_ct, summary_ct, group_id, icon_ref, favorite, archived。
     /// 系统字段（head_commit_id, object_clock, updated_at 等）不参与比较。
+    // Kept for MDBX1 callers; new code should pass named project states.
+    #[allow(clippy::too_many_arguments)]
     pub fn detect_project_conflict(
         base_title: &[u8],
         local_title: &[u8],
@@ -147,43 +159,76 @@ impl ConflictDetector {
         local_archived: bool,
         incoming_archived: bool,
     ) -> Vec<String> {
+        Self::detect_project_conflict_states(
+            ProjectConflictState {
+                title_ct: base_title,
+                summary_ct: base_summary,
+                group_id: base_group_id,
+                icon_ref: base_icon_ref,
+                favorite: base_favorite,
+                archived: base_archived,
+            },
+            ProjectConflictState {
+                title_ct: local_title,
+                summary_ct: local_summary,
+                group_id: local_group_id,
+                icon_ref: local_icon_ref,
+                favorite: local_favorite,
+                archived: local_archived,
+            },
+            ProjectConflictState {
+                title_ct: incoming_title,
+                summary_ct: incoming_summary,
+                group_id: incoming_group_id,
+                icon_ref: incoming_icon_ref,
+                favorite: incoming_favorite,
+                archived: incoming_archived,
+            },
+        )
+    }
+
+    pub fn detect_project_conflict_states(
+        base: ProjectConflictState<'_>,
+        local: ProjectConflictState<'_>,
+        incoming: ProjectConflictState<'_>,
+    ) -> Vec<String> {
         let mut conflicting: Vec<String> = Vec::new();
 
         // title_ct
-        if is_field_conflicting(base_title, local_title, incoming_title) {
+        if is_field_conflicting(base.title_ct, local.title_ct, incoming.title_ct) {
             conflicting.push("title_ct".to_string());
         }
 
         // summary_ct
-        if is_opt_field_conflicting(base_summary, local_summary, incoming_summary) {
+        if is_opt_field_conflicting(base.summary_ct, local.summary_ct, incoming.summary_ct) {
             conflicting.push("summary_ct".to_string());
         }
 
         // group_id
         if is_opt_field_conflicting(
-            base_group_id.map(|s| s.as_bytes()),
-            local_group_id.map(|s| s.as_bytes()),
-            incoming_group_id.map(|s| s.as_bytes()),
+            base.group_id.map(|s| s.as_bytes()),
+            local.group_id.map(|s| s.as_bytes()),
+            incoming.group_id.map(|s| s.as_bytes()),
         ) {
             conflicting.push("group_id".to_string());
         }
 
         // icon_ref
         if is_opt_field_conflicting(
-            base_icon_ref.map(|s| s.as_bytes()),
-            local_icon_ref.map(|s| s.as_bytes()),
-            incoming_icon_ref.map(|s| s.as_bytes()),
+            base.icon_ref.map(|s| s.as_bytes()),
+            local.icon_ref.map(|s| s.as_bytes()),
+            incoming.icon_ref.map(|s| s.as_bytes()),
         ) {
             conflicting.push("icon_ref".to_string());
         }
 
         // favorite
-        if is_field_conflicting(&base_favorite, &local_favorite, &incoming_favorite) {
+        if is_field_conflicting(&base.favorite, &local.favorite, &incoming.favorite) {
             conflicting.push("favorite".to_string());
         }
 
         // archived
-        if is_field_conflicting(&base_archived, &local_archived, &incoming_archived) {
+        if is_field_conflicting(&base.archived, &local.archived, &incoming.archived) {
             conflicting.push("archived".to_string());
         }
 

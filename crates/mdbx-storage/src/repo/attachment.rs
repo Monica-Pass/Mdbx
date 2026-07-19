@@ -19,11 +19,23 @@ use crate::repo::object_version::ObjectVersionRepo;
 /// 改名只改元数据，不改变 content_hash。
 pub struct AttachmentRepo;
 
+#[derive(Debug, Clone, Copy)]
+pub struct AttachmentCreateRequest<'a> {
+    pub project_id: &'a str,
+    pub entry_id: Option<&'a str>,
+    pub file_name: &'a str,
+    pub media_type: Option<&'a str>,
+    pub content_hash: &'a str,
+    pub original_size: u64,
+}
+
 impl AttachmentRepo {
     // -----------------------------------------------------------------------
     // CREATE
     // -----------------------------------------------------------------------
 
+    // Kept for MDBX1 callers; new code should use AttachmentCreateRequest.
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -34,6 +46,33 @@ impl AttachmentRepo {
         content_hash: &str,
         original_size: u64,
     ) -> StorageResult<Attachment> {
+        Self::add_with_request(
+            conn,
+            ctx,
+            AttachmentCreateRequest {
+                project_id,
+                entry_id,
+                file_name,
+                media_type,
+                content_hash,
+                original_size,
+            },
+        )
+    }
+
+    pub fn add_with_request(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        request: AttachmentCreateRequest<'_>,
+    ) -> StorageResult<Attachment> {
+        let AttachmentCreateRequest {
+            project_id,
+            entry_id,
+            file_name,
+            media_type,
+            content_hash,
+            original_size,
+        } = request;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
             let attachment_id = Uuid::new_v4().to_string();
@@ -769,15 +808,17 @@ mod tests {
     #[test]
     fn test_add_attachment_to_project() {
         let (conn, ctx, project_id) = setup();
-        let att = AttachmentRepo::add(
+        let att = AttachmentRepo::add_with_request(
             &conn,
             &ctx,
-            &project_id,
-            None,
-            "screenshot.png",
-            Some("image/png"),
-            "abc123hash",
-            1024,
+            AttachmentCreateRequest {
+                project_id: &project_id,
+                entry_id: None,
+                file_name: "screenshot.png",
+                media_type: Some("image/png"),
+                content_hash: "abc123hash",
+                original_size: 1024,
+            },
         )
         .unwrap();
 
@@ -1446,9 +1487,9 @@ mod tests {
             AttachmentRepo::add(&conn, &ctx, &project_id, None, "concat.bin", None, "", 0).unwrap();
 
         // 创建内容：每 chunk 不同内容，确保拼接顺序正确
-        let chunk0 = vec![0u8; 50];
-        let chunk1 = vec![1u8; 50];
-        let chunk2 = vec![2u8; 50];
+        let chunk0 = [0u8; 50];
+        let chunk1 = [1u8; 50];
+        let chunk2 = [2u8; 50];
         let all_data: Vec<u8> = [&chunk0[..], &chunk1[..], &chunk2[..]].concat();
 
         AttachmentRepo::write_chunked_content(&conn, &ctx, &att.attachment_id, &all_data, 50)

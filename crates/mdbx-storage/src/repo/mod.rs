@@ -9,11 +9,11 @@ pub mod project;
 pub mod snapshot;
 pub mod tombstone;
 
-pub use attachment::AttachmentRepo;
+pub use attachment::{AttachmentCreateRequest, AttachmentRepo};
 pub use branch::BranchRepo;
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
-pub use conflict::ConflictRepo;
+pub use conflict::{ConflictCreateRequest, ConflictRepo};
 pub use entry::EntryRepo;
 pub use object_version::ObjectVersionRepo;
 pub use project::ProjectRepo;

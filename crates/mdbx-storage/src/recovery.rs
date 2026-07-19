@@ -338,7 +338,7 @@ impl RecoveryVerifier {
         let mut current_att_id: Option<&str> = None;
         let mut expected_index: i32 = 0;
         for (att_id, chunk_index) in &chunks {
-            if current_att_id.as_deref() != Some(att_id.as_str()) {
+            if current_att_id != Some(att_id.as_str()) {
                 current_att_id = Some(att_id.as_str());
                 expected_index = 0;
             }
@@ -1030,7 +1030,7 @@ mod tests {
 
         // 完整性验证应该检测到
         let result = AttachmentRepo::verify_integrity(&conn, &att.attachment_id);
-        assert!(result.is_err() || result.unwrap() == false);
+        assert!(result.is_err() || !result.unwrap());
     }
 
     #[test]

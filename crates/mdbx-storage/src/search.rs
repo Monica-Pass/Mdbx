@@ -10,6 +10,9 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::project::ProjectRepo;
 
+type SearchRow = (String, Vec<u8>, Option<Vec<u8>>, String);
+type RankedSearchRow = (String, Vec<u8>, Option<Vec<u8>>, String, f64);
+
 /// 搜索结果条目。
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -328,7 +331,7 @@ impl SearchService {
             )
             .map_err(StorageError::Database)?;
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String, f64)> = stmt
+        let rows: Vec<RankedSearchRow> = stmt
             .query_map(params![fts_query], |row| {
                 Ok((
                     row.get(0)?,
@@ -379,7 +382,7 @@ impl SearchService {
             )
             .map_err(StorageError::Database)?;
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(params![pattern], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
@@ -404,7 +407,7 @@ impl SearchService {
             )
             .map_err(StorageError::Database)?;
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(params![tag.trim().to_lowercase()], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
@@ -435,7 +438,7 @@ impl SearchService {
             )
             .map_err(StorageError::Database)?;
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(params![entry_type.to_string()], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
@@ -468,7 +471,7 @@ impl SearchService {
             )
             .map_err(StorageError::Database)?;
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(params![from, to], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
@@ -556,7 +559,7 @@ impl SearchService {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
-        let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>, String)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
@@ -595,7 +598,7 @@ impl SearchService {
 
     fn build_results(
         conn: &VaultConnection,
-        rows: &[(String, Vec<u8>, Option<Vec<u8>>, String)],
+        rows: &[SearchRow],
     ) -> StorageResult<Vec<SearchResult>> {
         let mut results = Vec::new();
         for (project_id, title_ct, summary_ct, updated_at) in rows {

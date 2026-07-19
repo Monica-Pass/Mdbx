@@ -225,7 +225,7 @@ impl BenchmarkRunner {
 
         for i in 0..iterations {
             let data = format!("benchmark attachment data {}", i);
-            match AttachmentRepo::add(
+            if let Ok(att) = AttachmentRepo::add(
                 &conn,
                 &ctx,
                 &project.project_id,
@@ -235,19 +235,16 @@ impl BenchmarkRunner {
                 "",
                 0,
             ) {
-                Ok(att) => {
-                    if AttachmentRepo::write_inline_content(
-                        &conn,
-                        &ctx,
-                        &att.attachment_id,
-                        data.as_bytes(),
-                    )
-                    .is_ok()
-                    {
-                        success += 1;
-                    }
+                if AttachmentRepo::write_inline_content(
+                    &conn,
+                    &ctx,
+                    &att.attachment_id,
+                    data.as_bytes(),
+                )
+                .is_ok()
+                {
+                    success += 1;
                 }
-                Err(_) => {}
             }
         }
 
