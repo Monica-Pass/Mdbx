@@ -6,7 +6,10 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use mdbx_core::model::{EntryType, ObjectTypeId, RelationKindId, UnlockMethodType};
+use mdbx_core::model::{
+    Conflict, ConflictObjectType, ConflictResolution, EntryType, ObjectTypeId, RelationKindId,
+    UnlockMethodType,
+};
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, PolicyException,
@@ -20,9 +23,10 @@ use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::repo::{
     BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
-    CommitHistoryRepo, CommitOperation, EntryRepo, ObjectLabelAssignmentCreateRequest,
-    ObjectLabelAssignmentRepo, ObjectLabelCreateRequest, ObjectLabelRepo,
-    ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution, ProjectRepo,
+    CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
+    ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
+    ProjectRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -173,6 +177,26 @@ pub struct MdbxObjectLabelAssignmentRecord {
     pub object_id: String,
     pub label_id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxConflictChoice {
+    LocalWins,
+    IncomingWins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxConflictRecord {
+    pub conflict_id: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub base_commit_id: String,
+    pub local_commit_id: String,
+    pub incoming_commit_id: String,
+    pub conflicting_fields: Vec<String>,
+    pub resolution: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
@@ -1395,6 +1419,144 @@ impl MdbxVault {
         Ok(())
     }
 
+    pub fn list_unresolved_conflicts(&self) -> Result<Vec<MdbxConflictRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(ConflictRepo::list_unresolved(&conn)?
+            .iter()
+            .map(conflict_record)
+            .collect())
+    }
+
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: String,
+        choice: MdbxConflictChoice,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let resolution = conflict_resolution(choice);
+        let resolved = match conflict.object_type {
+            ConflictObjectType::Project => {
+                ConflictRepo::resolve_project(&conn, &ctx, &conflict_id, resolution)?
+            }
+            ConflictObjectType::Entry => {
+                ConflictRepo::resolve_entry(&conn, &ctx, &conflict_id, resolution)?
+            }
+            ConflictObjectType::Attachment => {
+                ConflictRepo::resolve_attachment(&conn, &ctx, &conflict_id, resolution)?
+            }
+            ConflictObjectType::ObjectRelation => {
+                ConflictRepo::resolve_object_relation(&conn, &ctx, &conflict_id, resolution)?
+            }
+            ConflictObjectType::ObjectLabel => {
+                ConflictRepo::resolve_object_label(&conn, &ctx, &conflict_id, resolution)?
+            }
+            ConflictObjectType::ObjectLabelAssignment => {
+                ConflictRepo::resolve_object_label_assignment(
+                    &conn,
+                    &ctx,
+                    &conflict_id,
+                    resolution,
+                )?
+            }
+        };
+        Ok(conflict_record(&resolved))
+    }
+
+    pub fn resolve_entry_conflict_custom_payload(
+        &self,
+        conflict_id: String,
+        payload_json: String,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let resolved = ConflictRepo::resolve_entry_custom_payload(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &parse_payload_json(&payload_json)?,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_object_relation_conflict_custom(
+        &self,
+        conflict_id: String,
+        source_object_id: String,
+        target_object_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+        deleted: bool,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        let mut merged = ObjectRelationRepo::get_by_id(&conn, &conflict.object_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict.object_id.clone()))?;
+        merged.source_object_id = source_object_id;
+        merged.target_object_id = target_object_id;
+        merged.relation_kind = parse_relation_kind(&relation_kind)?;
+        merged.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
+        merged.payload_schema_version = payload_schema_version;
+        merged.deleted = deleted;
+        let resolved = ConflictRepo::resolve_object_relation_custom(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &merged,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
+    pub fn resolve_object_label_conflict_custom(
+        &self,
+        conflict_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+        deleted: bool,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        let mut merged = ObjectLabelRepo::get_by_id(&conn, &conflict.object_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict.object_id.clone()))?;
+        merged.name_ct = name.into_bytes();
+        merged.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
+        merged.payload_schema_version = payload_schema_version;
+        merged.deleted = deleted;
+        let resolved = ConflictRepo::resolve_object_label_custom(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &merged,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
+    pub fn resolve_object_label_assignment_conflict_custom(
+        &self,
+        conflict_id: String,
+        deleted: bool,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        let mut merged = ObjectLabelAssignmentRepo::get_by_id(&conn, &conflict.object_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict.object_id.clone()))?;
+        merged.deleted = deleted;
+        let resolved = ConflictRepo::resolve_object_label_assignment_custom(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &merged,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
     pub fn list_entries(
         &self,
         project_id: String,
@@ -2242,6 +2404,28 @@ fn object_record_from_entry(
     })
 }
 
+fn conflict_resolution(choice: MdbxConflictChoice) -> ConflictResolution {
+    match choice {
+        MdbxConflictChoice::LocalWins => ConflictResolution::LocalWins,
+        MdbxConflictChoice::IncomingWins => ConflictResolution::IncomingWins,
+    }
+}
+
+fn conflict_record(conflict: &Conflict) -> MdbxConflictRecord {
+    MdbxConflictRecord {
+        conflict_id: conflict.conflict_id.clone(),
+        object_type: conflict.object_type.to_string(),
+        object_id: conflict.object_id.clone(),
+        base_commit_id: conflict.base_commit_id.clone(),
+        local_commit_id: conflict.local_commit_id.clone(),
+        incoming_commit_id: conflict.incoming_commit_id.clone(),
+        conflicting_fields: conflict.conflicting_fields.clone(),
+        resolution: conflict.resolution.to_string(),
+        created_at: conflict.created_at.clone(),
+        resolved_at: conflict.resolved_at.clone(),
+    }
+}
+
 fn object_relation_record(
     relation: &mdbx_core::model::ObjectRelation,
 ) -> Result<MdbxObjectRelationRecord, MdbxFfiError> {
@@ -2289,6 +2473,99 @@ fn object_label_assignment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_facade_lists_and_resolves_generic_metadata() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("ffi-conflict-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Mail", None, None).unwrap();
+        let first = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("First"),
+            &serde_json::json!({"body":"first"}),
+        )
+        .unwrap();
+        let second = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("Second"),
+            &serde_json::json!({"body":"second"}),
+        )
+        .unwrap();
+        let relation = ObjectRelationRepo::create(
+            &conn,
+            &ctx,
+            ObjectRelationCreateRequest::new(
+                &first.entry_id,
+                &second.entry_id,
+                RelationKindId::new("com.monica.mail.reply-to").unwrap(),
+                serde_json::json!({"position":1}),
+            ),
+        )
+        .unwrap();
+        let current = mdbx_storage::repo::ObjectVersionRepo::current_object_relation_row(
+            &conn,
+            &relation.relation_id,
+        )
+        .unwrap();
+        let incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "object-relation",
+                std::slice::from_ref(&relation.relation_id),
+                std::slice::from_ref(&current.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming = current.clone();
+        incoming.payload_ct = serde_json::to_vec(&serde_json::json!({"position":2})).unwrap();
+        incoming.head_commit_id = incoming_commit.clone();
+        mdbx_storage::repo::ObjectVersionRepo::record_object_relation_row(
+            &conn,
+            &incoming_commit,
+            &incoming,
+        )
+        .unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectRelation,
+            &relation.relation_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["payload_ct".to_string()],
+        )
+        .unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-conflict-device".to_string(),
+            vault_id: "ffi-conflict-vault".to_string(),
+        };
+
+        let listed = vault.list_unresolved_conflicts().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].object_type, "object-relation");
+        let resolved = vault
+            .resolve_conflict(conflict.conflict_id, MdbxConflictChoice::IncomingWins)
+            .unwrap();
+        assert_eq!(resolved.resolution, "incoming-wins");
+        assert!(vault.list_unresolved_conflicts().unwrap().is_empty());
+        let conn = vault.conn.lock().unwrap();
+        let stored = ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
+            serde_json::json!({"position":2})
+        );
+    }
 
     #[test]
     fn every_write_command_has_a_typed_change_summary() {

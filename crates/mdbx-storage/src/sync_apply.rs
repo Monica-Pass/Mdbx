@@ -1216,6 +1216,17 @@ impl SyncApplyRepo {
                             )
                             .optional()?;
                         if let Some((duplicate_id, local_head)) = duplicate {
+                            // The conflict represents one logical membership even when
+                            // two devices created different assignment UUIDs. Preserve
+                            // the incoming candidate under the local logical identity so
+                            // IncomingWins can resolve it without creating a duplicate.
+                            let mut logical_incoming = row.clone();
+                            logical_incoming.assignment_id = duplicate_id.clone();
+                            ObjectVersionRepo::record_object_label_assignment_row(
+                                conn,
+                                &row.head_commit_id,
+                                &logical_incoming,
+                            )?;
                             conflicts += Self::record_generic_metadata_conflict(
                                 conn,
                                 ctx,
@@ -3957,6 +3968,128 @@ mod tests {
         )
         .unwrap()
         .is_some());
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn duplicate_assignment_conflict_maps_incoming_state_to_local_logical_identity() {
+        let source_path = temp_vault_path("assignment-conflict-source");
+        let target_path = temp_vault_path("assignment-conflict-target");
+        let object_id;
+        let label_id;
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("assignment-conflict-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let ctx = CommitContext::new("device-a".to_string());
+            let project = ProjectRepo::create(&source, &ctx, "Mail", None, None).unwrap();
+            object_id = EntryRepo::create(
+                &source,
+                &ctx,
+                &project.project_id,
+                EntryType::custom("com.monica.mail.message").unwrap(),
+                Some("Message"),
+                &serde_json::json!({"body":"message"}),
+            )
+            .unwrap()
+            .entry_id;
+            label_id = ObjectLabelRepo::create(
+                &source,
+                &ctx,
+                ObjectLabelCreateRequest::new(
+                    &project.project_id,
+                    "Important",
+                    serde_json::json!({}),
+                ),
+            )
+            .unwrap()
+            .label_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let incoming_assignment = ObjectLabelAssignmentRepo::create(
+            &source,
+            &source_ctx,
+            ObjectLabelAssignmentCreateRequest::new(&object_id, &label_id),
+        )
+        .unwrap();
+        let local_assignment = ObjectLabelAssignmentRepo::create(
+            &target,
+            &target_ctx,
+            ObjectLabelAssignmentCreateRequest::new(&object_id, &label_id),
+        )
+        .unwrap();
+        assert_ne!(
+            incoming_assignment.assignment_id,
+            local_assignment.assignment_id
+        );
+
+        let mut commits = serialized_commits_from(&source);
+        commits
+            .last_mut()
+            .unwrap()
+            .object_payloads
+            .push(collect_sync_state_payload(&source).unwrap());
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+        assert_eq!(result.conflict_count, 1);
+
+        let conflict = ConflictRepo::list_by_object(
+            &target,
+            ConflictObjectType::ObjectLabelAssignment,
+            &local_assignment.assignment_id,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let logical_incoming = ObjectVersionRepo::get_object_label_assignment(
+            &target,
+            &local_assignment.assignment_id,
+            &conflict.incoming_commit_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            logical_incoming.assignment_id,
+            local_assignment.assignment_id
+        );
+        assert_eq!(logical_incoming.object_id, object_id);
+        assert_eq!(logical_incoming.label_id, label_id);
+
+        ConflictRepo::resolve_object_label_assignment(
+            &target,
+            &target_ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert!(
+            ObjectLabelAssignmentRepo::get_by_id(&target, &local_assignment.assignment_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ObjectLabelAssignmentRepo::get_by_id(&target, &incoming_assignment.assignment_id)
+                .unwrap()
+                .is_none()
+        );
 
         drop(source);
         drop(target);

@@ -29,6 +29,9 @@
 - 通过 Tiga 授权轮换数据密钥 epoch，并返回旧 epoch、新 active epoch、rotation commit 与时间戳
 - 创建 project
 - 创建、列出、更新、软删除、恢复、移动 generic entry
+- 创建、查询、更新和删除通用关系、标签及标签分配
+- 列出未解决冲突，并对 project、entry、attachment、关系、标签和标签分配执行本地优先或传入优先解决
+- 应用经过验证的自定义 payload 或通用元数据冲突解决状态
 
 当前还没有暴露：
 
@@ -38,7 +41,6 @@
 - attachment 与 attachment content
 - sync bundle/apply 操作
 - snapshot
-- conflict 与 conflict resolution
 - diagnostics / maintenance 数据
 
 这些能力应该视为“缺少 facade 方法”，不能因此绕过 storage 层直接写表。

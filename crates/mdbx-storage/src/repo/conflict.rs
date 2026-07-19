@@ -2,14 +2,21 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use mdbx_core::model::{Conflict, ConflictObjectType, ConflictResolution};
+use mdbx_core::model::{
+    Conflict, ConflictObjectType, ConflictResolution, ObjectLabel, ObjectLabelAssignment,
+    ObjectRelation, RelationKindId,
+};
 
 use crate::connection::VaultConnection;
+use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::sync_state::{AttachmentRow, EntryRow, ProjectRow};
+use crate::sync_state::{
+    AttachmentRow, EntryRow, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
+    ProjectRow,
+};
 
 /// 冲突记录的持久化仓库。
 ///
@@ -162,8 +169,23 @@ impl ConflictRepo {
         )
     }
 
-    /// 解决冲突：更新 resolution 和 resolved_at。
+    /// Legacy MDBX1 method retained as an explicit compatibility error.
+    ///
+    /// A conflict cannot be resolved safely without an object-specific state
+    /// write and merge commit. Call one of the typed resolution methods.
+    #[deprecated(note = "use a typed conflict resolution method with CommitContext")]
     pub fn resolve(
+        _conn: &VaultConnection,
+        _conflict_id: &str,
+        _resolution: ConflictResolution,
+    ) -> StorageResult<()> {
+        Err(StorageError::ConstraintViolation(
+            "legacy conflict flag updates are disabled; use a typed conflict resolution method"
+                .to_string(),
+        ))
+    }
+
+    fn mark_resolved(
         conn: &VaultConnection,
         conflict_id: &str,
         resolution: ConflictResolution,
@@ -220,7 +242,7 @@ impl ConflictRepo {
                 }
             }
 
-            Self::resolve(conn, conflict_id, resolution)?;
+            Self::mark_resolved(conn, conflict_id, resolution)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -246,7 +268,7 @@ impl ConflictRepo {
             )?;
 
             Self::write_entry_custom_payload_resolution(conn, ctx, &conflict, merged_payload)?;
-            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -287,7 +309,7 @@ impl ConflictRepo {
                 }
             }
 
-            Self::resolve(conn, conflict_id, resolution)?;
+            Self::mark_resolved(conn, conflict_id, resolution)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -314,7 +336,7 @@ impl ConflictRepo {
             }
 
             Self::write_project_custom_row_resolution(conn, ctx, &conflict, merged)?;
-            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -359,7 +381,7 @@ impl ConflictRepo {
                 }
             }
 
-            Self::resolve(conn, conflict_id, resolution)?;
+            Self::mark_resolved(conn, conflict_id, resolution)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -387,7 +409,275 @@ impl ConflictRepo {
 
             Self::ensure_attachment_content_material_is_local(conn, &conflict, merged)?;
             Self::write_attachment_custom_row_resolution(conn, ctx, &conflict, merged)?;
-            Self::resolve(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a generic object-relation conflict and persist the selected state.
+    pub fn resolve_object_relation(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectRelation,
+                "resolve_object_relation",
+            )?;
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_object_relation_local_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_object_relation_incoming_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom object relation resolution requires an explicit merged relation"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
+            Self::mark_resolved(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a relation conflict with caller-provided plaintext metadata.
+    pub fn resolve_object_relation_custom(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &ObjectRelation,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectRelation,
+                "resolve_object_relation_custom",
+            )?;
+            if merged.relation_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom relation does not match conflict object".to_string(),
+                ));
+            }
+            let current =
+                ObjectVersionRepo::current_object_relation_row(conn, &conflict.object_id)?;
+            let row = ObjectRelationRow {
+                relation_id: merged.relation_id.clone(),
+                source_object_id: merged.source_object_id.clone(),
+                target_object_id: merged.target_object_id.clone(),
+                relation_kind: merged.relation_kind.to_string(),
+                payload_ct: encrypt_field(
+                    conn,
+                    FieldKeyPurpose::Record,
+                    &merged.payload_ct,
+                    "object-relation",
+                    &merged.relation_id,
+                    "payload",
+                )?,
+                payload_schema_version: merged.payload_schema_version,
+                object_clock: current.object_clock.clone(),
+                head_commit_id: current.head_commit_id.clone(),
+                deleted: merged.deleted,
+                created_at: current.created_at.clone(),
+                updated_at: current.updated_at.clone(),
+                created_by_device_id: current.created_by_device_id.clone(),
+                updated_by_device_id: current.updated_by_device_id.clone(),
+            };
+            Self::write_object_relation_row_resolution(conn, ctx, &conflict, &current, &row)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a generic object-label conflict and persist the selected state.
+    pub fn resolve_object_label(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectLabel,
+                "resolve_object_label",
+            )?;
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_object_label_local_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_object_label_incoming_wins_resolution(conn, ctx, &conflict)?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom object label resolution requires an explicit merged label"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
+            Self::mark_resolved(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a label conflict with caller-provided plaintext metadata.
+    pub fn resolve_object_label_custom(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &ObjectLabel,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectLabel,
+                "resolve_object_label_custom",
+            )?;
+            if merged.label_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom label does not match conflict object".to_string(),
+                ));
+            }
+            let current = ObjectVersionRepo::current_object_label_row(conn, &conflict.object_id)?;
+            let row = ObjectLabelRow {
+                label_id: merged.label_id.clone(),
+                collection_id: merged.collection_id.clone(),
+                name_ct: encrypt_field(
+                    conn,
+                    FieldKeyPurpose::Metadata,
+                    &merged.name_ct,
+                    "object-label",
+                    &merged.label_id,
+                    "name",
+                )?,
+                payload_ct: encrypt_field(
+                    conn,
+                    FieldKeyPurpose::Record,
+                    &merged.payload_ct,
+                    "object-label",
+                    &merged.label_id,
+                    "payload",
+                )?,
+                payload_schema_version: merged.payload_schema_version,
+                object_clock: current.object_clock.clone(),
+                head_commit_id: current.head_commit_id.clone(),
+                deleted: merged.deleted,
+                created_at: current.created_at.clone(),
+                updated_at: current.updated_at.clone(),
+                created_by_device_id: current.created_by_device_id.clone(),
+                updated_by_device_id: current.updated_by_device_id.clone(),
+            };
+            Self::write_object_label_row_resolution(conn, ctx, &conflict, &current, &row)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve a generic label-assignment conflict and persist the selected state.
+    pub fn resolve_object_label_assignment(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectLabelAssignment,
+                "resolve_object_label_assignment",
+            )?;
+            match resolution {
+                ConflictResolution::LocalWins => {
+                    Self::write_object_label_assignment_local_wins_resolution(
+                        conn, ctx, &conflict,
+                    )?;
+                }
+                ConflictResolution::IncomingWins => {
+                    Self::write_object_label_assignment_incoming_wins_resolution(
+                        conn, ctx, &conflict,
+                    )?;
+                }
+                ConflictResolution::Custom => {
+                    return Err(StorageError::ConstraintViolation(
+                        "custom label assignment resolution requires an explicit merged assignment"
+                            .to_string(),
+                    ));
+                }
+                ConflictResolution::Unresolved => {
+                    return Err(StorageError::ConstraintViolation(
+                        "cannot resolve a conflict as unresolved".to_string(),
+                    ));
+                }
+            }
+            Self::mark_resolved(conn, conflict_id, resolution)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve an assignment conflict with a caller-provided logical state.
+    pub fn resolve_object_label_assignment_custom(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &ObjectLabelAssignment,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::ObjectLabelAssignment,
+                "resolve_object_label_assignment_custom",
+            )?;
+            if merged.assignment_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom assignment does not match conflict object".to_string(),
+                ));
+            }
+            let current =
+                ObjectVersionRepo::current_object_label_assignment_row(conn, &conflict.object_id)?;
+            let row = ObjectLabelAssignmentRow {
+                assignment_id: merged.assignment_id.clone(),
+                object_id: merged.object_id.clone(),
+                label_id: merged.label_id.clone(),
+                object_clock: current.object_clock.clone(),
+                head_commit_id: current.head_commit_id.clone(),
+                deleted: merged.deleted,
+                created_at: current.created_at.clone(),
+                updated_at: current.updated_at.clone(),
+                created_by_device_id: current.created_by_device_id.clone(),
+                updated_by_device_id: current.updated_by_device_id.clone(),
+            };
+            Self::write_object_label_assignment_row_resolution(
+                conn, ctx, &conflict, &current, &row,
+            )?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
         })
@@ -702,6 +992,449 @@ impl ConflictRepo {
         Ok(())
     }
 
+    fn write_object_relation_local_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_object_relation_row(conn, &conflict.object_id)?;
+        Self::write_object_relation_row_resolution(conn, ctx, conflict, &current, &current)
+    }
+
+    fn write_object_relation_incoming_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_object_relation_row(conn, &conflict.object_id)?;
+        let incoming = ObjectVersionRepo::get_object_relation(
+            conn,
+            &conflict.object_id,
+            &conflict.incoming_commit_id,
+        )?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "incoming object relation snapshot {}@{}",
+                conflict.object_id, conflict.incoming_commit_id
+            ))
+        })?;
+        Self::write_object_relation_row_resolution(conn, ctx, conflict, &current, &incoming)
+    }
+
+    fn write_object_relation_row_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+        current: &ObjectRelationRow,
+        selected: &ObjectRelationRow,
+    ) -> StorageResult<()> {
+        Self::validate_object_relation_resolution_row(conn, conflict, selected)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        let affected = conn.inner().execute(
+            "UPDATE object_relations SET source_object_id = ?2, target_object_id = ?3,
+                relation_kind = ?4, payload_ct = ?5, payload_schema_version = ?6,
+                object_clock = ?7, head_commit_id = ?8, deleted = ?9,
+                updated_at = ?10, updated_by_device_id = ?11
+             WHERE relation_id = ?1",
+            params![
+                selected.relation_id,
+                selected.source_object_id,
+                selected.target_object_id,
+                selected.relation_kind,
+                selected.payload_ct,
+                selected.payload_schema_version as i64,
+                bump_object_clock(&current.object_clock),
+                commit_id,
+                selected.deleted as i32,
+                chrono::Utc::now().to_rfc3339(),
+                ctx.device_id,
+            ],
+        )?;
+        Self::ensure_resolution_updated(affected, &conflict.object_id)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "object-relation",
+            &conflict.object_id,
+            selected.deleted,
+        )?;
+        ObjectVersionRepo::record_object_relation_current(conn, &commit_id, &conflict.object_id)
+    }
+
+    fn write_object_label_local_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_object_label_row(conn, &conflict.object_id)?;
+        Self::write_object_label_row_resolution(conn, ctx, conflict, &current, &current)
+    }
+
+    fn write_object_label_incoming_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current = ObjectVersionRepo::current_object_label_row(conn, &conflict.object_id)?;
+        let incoming = ObjectVersionRepo::get_object_label(
+            conn,
+            &conflict.object_id,
+            &conflict.incoming_commit_id,
+        )?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "incoming object label snapshot {}@{}",
+                conflict.object_id, conflict.incoming_commit_id
+            ))
+        })?;
+        Self::write_object_label_row_resolution(conn, ctx, conflict, &current, &incoming)
+    }
+
+    fn write_object_label_row_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+        current: &ObjectLabelRow,
+        selected: &ObjectLabelRow,
+    ) -> StorageResult<()> {
+        Self::validate_object_label_resolution_row(conn, conflict, current, selected)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        let affected = conn.inner().execute(
+            "UPDATE object_labels SET name_ct = ?2, payload_ct = ?3,
+                payload_schema_version = ?4, object_clock = ?5, head_commit_id = ?6,
+                deleted = ?7, updated_at = ?8, updated_by_device_id = ?9
+             WHERE label_id = ?1",
+            params![
+                selected.label_id,
+                selected.name_ct,
+                selected.payload_ct,
+                selected.payload_schema_version as i64,
+                bump_object_clock(&current.object_clock),
+                commit_id,
+                selected.deleted as i32,
+                chrono::Utc::now().to_rfc3339(),
+                ctx.device_id,
+            ],
+        )?;
+        Self::ensure_resolution_updated(affected, &conflict.object_id)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "object-label",
+            &conflict.object_id,
+            selected.deleted,
+        )?;
+        ObjectVersionRepo::record_object_label_current(conn, &commit_id, &conflict.object_id)
+    }
+
+    fn write_object_label_assignment_local_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current =
+            ObjectVersionRepo::current_object_label_assignment_row(conn, &conflict.object_id)?;
+        Self::write_object_label_assignment_row_resolution(conn, ctx, conflict, &current, &current)
+    }
+
+    fn write_object_label_assignment_incoming_wins_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+    ) -> StorageResult<()> {
+        let current =
+            ObjectVersionRepo::current_object_label_assignment_row(conn, &conflict.object_id)?;
+        let incoming = ObjectVersionRepo::get_object_label_assignment(
+            conn,
+            &conflict.object_id,
+            &conflict.incoming_commit_id,
+        )?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "incoming object label assignment snapshot {}@{}",
+                conflict.object_id, conflict.incoming_commit_id
+            ))
+        })?;
+        Self::write_object_label_assignment_row_resolution(conn, ctx, conflict, &current, &incoming)
+    }
+
+    fn write_object_label_assignment_row_resolution(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict: &Conflict,
+        current: &ObjectLabelAssignmentRow,
+        selected: &ObjectLabelAssignmentRow,
+    ) -> StorageResult<()> {
+        Self::validate_object_label_assignment_resolution_row(conn, conflict, current, selected)?;
+        let commit_id =
+            Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
+        let affected = conn.inner().execute(
+            "UPDATE object_label_assignments SET object_clock = ?2, head_commit_id = ?3,
+                deleted = ?4, updated_at = ?5, updated_by_device_id = ?6
+             WHERE assignment_id = ?1",
+            params![
+                selected.assignment_id,
+                bump_object_clock(&current.object_clock),
+                commit_id,
+                selected.deleted as i32,
+                chrono::Utc::now().to_rfc3339(),
+                ctx.device_id,
+            ],
+        )?;
+        Self::ensure_resolution_updated(affected, &conflict.object_id)?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "object-label-assignment",
+            &conflict.object_id,
+            selected.deleted,
+        )?;
+        ObjectVersionRepo::record_object_label_assignment_current(
+            conn,
+            &commit_id,
+            &conflict.object_id,
+        )
+    }
+
+    fn validate_object_relation_resolution_row(
+        conn: &VaultConnection,
+        conflict: &Conflict,
+        row: &ObjectRelationRow,
+    ) -> StorageResult<()> {
+        if row.relation_id != conflict.object_id {
+            return Err(StorageError::ConstraintViolation(
+                "relation resolution row does not match conflict object".to_string(),
+            ));
+        }
+        Uuid::parse_str(&row.relation_id).map_err(|_| {
+            StorageError::Validation("relation resolution ID must be a UUID".to_string())
+        })?;
+        RelationKindId::new(&row.relation_kind).map_err(StorageError::Validation)?;
+        Self::validate_payload_schema_version(row.payload_schema_version)?;
+        if row.source_object_id == row.target_object_id {
+            return Err(StorageError::Validation(
+                "relation resolution cannot create a self relation".to_string(),
+            ));
+        }
+        decrypt_field(
+            conn,
+            FieldKeyPurpose::Record,
+            &row.payload_ct,
+            "object-relation",
+            &row.relation_id,
+            "payload",
+        )?;
+        if !row.deleted {
+            Self::ensure_active_entry(conn, &row.source_object_id)?;
+            Self::ensure_active_entry(conn, &row.target_object_id)?;
+        }
+        Ok(())
+    }
+
+    fn validate_object_label_resolution_row(
+        conn: &VaultConnection,
+        conflict: &Conflict,
+        current: &ObjectLabelRow,
+        row: &ObjectLabelRow,
+    ) -> StorageResult<()> {
+        if row.label_id != conflict.object_id {
+            return Err(StorageError::ConstraintViolation(
+                "label resolution row does not match conflict object".to_string(),
+            ));
+        }
+        if row.collection_id != current.collection_id {
+            return Err(StorageError::ConstraintViolation(
+                "label collection cannot change during conflict resolution".to_string(),
+            ));
+        }
+        Self::validate_payload_schema_version(row.payload_schema_version)?;
+        let name = decrypt_field(
+            conn,
+            FieldKeyPurpose::Metadata,
+            &row.name_ct,
+            "object-label",
+            &row.label_id,
+            "name",
+        )?;
+        let name = std::str::from_utf8(&name)
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        if name.trim().is_empty() || name.len() > 512 {
+            return Err(StorageError::Validation(
+                "object label name must contain 1 to 512 UTF-8 bytes".to_string(),
+            ));
+        }
+        decrypt_field(
+            conn,
+            FieldKeyPurpose::Record,
+            &row.payload_ct,
+            "object-label",
+            &row.label_id,
+            "payload",
+        )?;
+        if row.deleted {
+            let active_assignments: i64 = conn.inner().query_row(
+                "SELECT COUNT(*) FROM object_label_assignments
+                 WHERE label_id = ?1 AND deleted = 0",
+                params![row.label_id],
+                |stored| stored.get(0),
+            )?;
+            if active_assignments > 0 {
+                return Err(StorageError::ConstraintViolation(
+                    "label conflict deletion requires its assignments to be deleted first"
+                        .to_string(),
+                ));
+            }
+        } else {
+            Self::ensure_active_collection(conn, &row.collection_id)?;
+        }
+        Ok(())
+    }
+
+    fn validate_object_label_assignment_resolution_row(
+        conn: &VaultConnection,
+        conflict: &Conflict,
+        current: &ObjectLabelAssignmentRow,
+        row: &ObjectLabelAssignmentRow,
+    ) -> StorageResult<()> {
+        if row.assignment_id != conflict.object_id {
+            return Err(StorageError::ConstraintViolation(
+                "assignment resolution row does not match conflict object".to_string(),
+            ));
+        }
+        if row.object_id != current.object_id || row.label_id != current.label_id {
+            return Err(StorageError::ConstraintViolation(
+                "assignment object and label identities cannot change during conflict resolution"
+                    .to_string(),
+            ));
+        }
+        if !row.deleted {
+            let object_collection = Self::active_entry_collection(conn, &row.object_id)?;
+            let label_collection = Self::active_label_collection(conn, &row.label_id)?;
+            if object_collection != label_collection {
+                return Err(StorageError::ConstraintViolation(
+                    "assignment object and label must belong to the same collection".to_string(),
+                ));
+            }
+            let duplicate: i64 = conn.inner().query_row(
+                "SELECT COUNT(*) FROM object_label_assignments
+                 WHERE object_id = ?1 AND label_id = ?2 AND deleted = 0
+                   AND assignment_id <> ?3",
+                params![row.object_id, row.label_id, row.assignment_id],
+                |stored| stored.get(0),
+            )?;
+            if duplicate > 0 {
+                return Err(StorageError::ConstraintViolation(
+                    "assignment resolution would create a duplicate active assignment".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_payload_schema_version(value: u32) -> StorageResult<()> {
+        if value == 0 {
+            return Err(StorageError::Validation(
+                "payload_schema_version must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_active_entry(conn: &VaultConnection, object_id: &str) -> StorageResult<()> {
+        Self::active_entry_collection(conn, object_id).map(|_| ())
+    }
+
+    fn active_entry_collection(conn: &VaultConnection, object_id: &str) -> StorageResult<String> {
+        let row = conn
+            .inner()
+            .query_row(
+                "SELECT project_id, deleted FROM entries WHERE entry_id = ?1",
+                params![object_id],
+                |stored| Ok((stored.get::<_, String>(0)?, stored.get::<_, i32>(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Err(StorageError::NotFound(object_id.to_string())),
+            Some((collection_id, 0)) => Ok(collection_id),
+            Some(_) => Err(StorageError::ConstraintViolation(format!(
+                "object {object_id} is deleted"
+            ))),
+        }
+    }
+
+    fn ensure_active_collection(conn: &VaultConnection, collection_id: &str) -> StorageResult<()> {
+        let deleted = conn
+            .inner()
+            .query_row(
+                "SELECT deleted FROM projects WHERE project_id = ?1",
+                params![collection_id],
+                |stored| stored.get::<_, i32>(0),
+            )
+            .optional()?;
+        match deleted {
+            None => Err(StorageError::NotFound(collection_id.to_string())),
+            Some(0) => Ok(()),
+            Some(_) => Err(StorageError::ConstraintViolation(format!(
+                "collection {collection_id} is deleted"
+            ))),
+        }
+    }
+
+    fn active_label_collection(conn: &VaultConnection, label_id: &str) -> StorageResult<String> {
+        let row = conn
+            .inner()
+            .query_row(
+                "SELECT collection_id, deleted FROM object_labels WHERE label_id = ?1",
+                params![label_id],
+                |stored| Ok((stored.get::<_, String>(0)?, stored.get::<_, i32>(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Err(StorageError::NotFound(label_id.to_string())),
+            Some((collection_id, 0)) => Ok(collection_id),
+            Some(_) => Err(StorageError::ConstraintViolation(format!(
+                "object label {label_id} is deleted"
+            ))),
+        }
+    }
+
+    fn reconcile_resolution_tombstone(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        object_type: &str,
+        object_id: &str,
+        deleted: bool,
+    ) -> StorageResult<()> {
+        if deleted {
+            let existing: i64 = conn.inner().query_row(
+                "SELECT COUNT(*) FROM tombstones
+                 WHERE target_object_type = ?1 AND target_object_id = ?2",
+                params![object_type, object_id],
+                |row| row.get(0),
+            )?;
+            if existing == 0 {
+                ctx.create_tombstone(conn, object_type, object_id)?;
+            }
+        } else {
+            conn.inner().execute(
+                "DELETE FROM tombstones
+                 WHERE target_object_type = ?1 AND target_object_id = ?2",
+                params![object_type, object_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_resolution_updated(affected: usize, object_id: &str) -> StorageResult<()> {
+        if affected == 1 {
+            Ok(())
+        } else {
+            Err(StorageError::NotFound(object_id.to_string()))
+        }
+    }
+
     fn ensure_attachment_content_material_is_local(
         conn: &VaultConnection,
         conflict: &Conflict,
@@ -878,7 +1611,14 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::entry::EntryRepo;
+    use crate::repo::object_label::{
+        ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+        ObjectLabelRepo,
+    };
+    use crate::repo::object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
     use crate::repo::project::ProjectRepo;
+    use crate::repo::tombstone::TombstoneRepo;
+    use mdbx_core::model::{EntryType, TombstoneTargetType};
 
     fn setup() -> (VaultConnection, CommitContext) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -886,6 +1626,76 @@ mod tests {
         initialize_vault(&conn, &params).unwrap();
         let ctx = CommitContext::new("test-device".to_string());
         (conn, ctx)
+    }
+
+    fn generic_metadata_fixture(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+    ) -> (ObjectRelation, ObjectLabel, ObjectLabelAssignment) {
+        let project = ProjectRepo::create(conn, ctx, "Mail", None, None).unwrap();
+        let first = EntryRepo::create(
+            conn,
+            ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("First"),
+            &serde_json::json!({"body":"first"}),
+        )
+        .unwrap();
+        let second = EntryRepo::create(
+            conn,
+            ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("Second"),
+            &serde_json::json!({"body":"second"}),
+        )
+        .unwrap();
+        let relation = ObjectRelationRepo::create(
+            conn,
+            ctx,
+            ObjectRelationCreateRequest::new(
+                &first.entry_id,
+                &second.entry_id,
+                RelationKindId::new("com.monica.mail.reply-to").unwrap(),
+                serde_json::json!({"position":1}),
+            ),
+        )
+        .unwrap();
+        let label = ObjectLabelRepo::create(
+            conn,
+            ctx,
+            ObjectLabelCreateRequest::new(
+                &project.project_id,
+                "Important",
+                serde_json::json!({"color":"red"}),
+            ),
+        )
+        .unwrap();
+        let assignment = ObjectLabelAssignmentRepo::create(
+            conn,
+            ctx,
+            ObjectLabelAssignmentCreateRequest::new(&first.entry_id, &label.label_id),
+        )
+        .unwrap();
+        (relation, label, assignment)
+    }
+
+    fn create_incoming_commit(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        object_type: &str,
+        object_id: &str,
+        parent: &str,
+    ) -> String {
+        ctx.create_commit(
+            conn,
+            "change",
+            object_type,
+            &[object_id.to_string()],
+            &[parent.to_string()],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -989,8 +1799,7 @@ mod tests {
         let unresolved = ConflictRepo::list_unresolved(&conn).unwrap();
         assert_eq!(unresolved.len(), 2);
 
-        // resolve one
-        ConflictRepo::resolve(
+        ConflictRepo::mark_resolved(
             &conn,
             &unresolved[1].conflict_id,
             ConflictResolution::LocalWins,
@@ -1073,7 +1882,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve() {
+    #[allow(deprecated)]
+    fn legacy_resolve_rejects_flag_only_updates() {
         let (conn, ctx) = setup();
         let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
 
@@ -1089,16 +1899,20 @@ mod tests {
         )
         .unwrap();
 
-        ConflictRepo::resolve(&conn, &conflict.conflict_id, ConflictResolution::LocalWins).unwrap();
+        assert!(
+            ConflictRepo::resolve(&conn, &conflict.conflict_id, ConflictResolution::LocalWins)
+                .is_err()
+        );
 
         let resolved = ConflictRepo::get_by_id(&conn, &conflict.conflict_id)
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.resolution, ConflictResolution::LocalWins);
-        assert!(resolved.resolved_at.is_some());
+        assert_eq!(resolved.resolution, ConflictResolution::Unresolved);
+        assert!(resolved.resolved_at.is_none());
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_nonexistent() {
         let (conn, _ctx) = setup();
         assert!(ConflictRepo::resolve(&conn, "nonexistent", ConflictResolution::Custom).is_err());
@@ -1347,5 +2161,485 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(still_unresolved.resolution, ConflictResolution::Unresolved);
         assert_eq!(updated.content_hash, attachment.content_hash);
+    }
+
+    #[test]
+    fn generic_metadata_conflict_incoming_wins_applies_relation_and_records_merge_version() {
+        let (conn, ctx) = setup();
+        let (relation, _, _) = generic_metadata_fixture(&conn, &ctx);
+        let current =
+            ObjectVersionRepo::current_object_relation_row(&conn, &relation.relation_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-relation",
+            &relation.relation_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.payload_ct = serde_json::to_vec(&serde_json::json!({"position":2})).unwrap();
+        incoming.payload_schema_version = 2;
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_object_relation_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectRelation,
+            &relation.relation_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["payload_ct".to_string()],
+        )
+        .unwrap();
+
+        let resolved = ConflictRepo::resolve_object_relation(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        let stored = ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::IncomingWins);
+        assert_eq!(stored.payload_schema_version, 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
+            serde_json::json!({"position":2})
+        );
+        assert!(ObjectVersionRepo::get_object_relation(
+            &conn,
+            &relation.relation_id,
+            &stored.head_commit_id
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn generic_metadata_conflict_local_wins_preserves_relation_and_label_state() {
+        let (conn, ctx) = setup();
+        let (relation, label, _) = generic_metadata_fixture(&conn, &ctx);
+
+        let relation_current =
+            ObjectVersionRepo::current_object_relation_row(&conn, &relation.relation_id).unwrap();
+        let relation_incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-relation",
+            &relation.relation_id,
+            &relation_current.head_commit_id,
+        );
+        let mut relation_incoming = relation_current.clone();
+        relation_incoming.payload_ct =
+            serde_json::to_vec(&serde_json::json!({"position":99})).unwrap();
+        relation_incoming.head_commit_id = relation_incoming_commit.clone();
+        ObjectVersionRepo::record_object_relation_row(
+            &conn,
+            &relation_incoming_commit,
+            &relation_incoming,
+        )
+        .unwrap();
+        let relation_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectRelation,
+            &relation.relation_id,
+            &relation_current.head_commit_id,
+            &relation_current.head_commit_id,
+            &relation_incoming_commit,
+            &["payload_ct".to_string()],
+        )
+        .unwrap();
+
+        let label_current =
+            ObjectVersionRepo::current_object_label_row(&conn, &label.label_id).unwrap();
+        let label_incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label",
+            &label.label_id,
+            &label_current.head_commit_id,
+        );
+        let mut label_incoming = label_current.clone();
+        label_incoming.name_ct = b"Incoming".to_vec();
+        label_incoming.head_commit_id = label_incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_row(&conn, &label_incoming_commit, &label_incoming)
+            .unwrap();
+        let label_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabel,
+            &label.label_id,
+            &label_current.head_commit_id,
+            &label_current.head_commit_id,
+            &label_incoming_commit,
+            &["name_ct".to_string()],
+        )
+        .unwrap();
+
+        ConflictRepo::resolve_object_relation(
+            &conn,
+            &ctx,
+            &relation_conflict.conflict_id,
+            ConflictResolution::LocalWins,
+        )
+        .unwrap();
+        ConflictRepo::resolve_object_label(
+            &conn,
+            &ctx,
+            &label_conflict.conflict_id,
+            ConflictResolution::LocalWins,
+        )
+        .unwrap();
+
+        let stored_relation = ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+        let stored_label = ObjectLabelRepo::get_by_id(&conn, &label.label_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_relation.payload_ct, relation.payload_ct);
+        assert_ne!(stored_relation.head_commit_id, relation.head_commit_id);
+        assert_eq!(stored_label.name_ct, label.name_ct);
+        assert_ne!(stored_label.head_commit_id, label.head_commit_id);
+    }
+
+    #[test]
+    fn generic_metadata_conflict_custom_relation_validates_and_applies_atomically() {
+        let (conn, ctx) = setup();
+        let (relation, _, _) = generic_metadata_fixture(&conn, &ctx);
+        let current =
+            ObjectVersionRepo::current_object_relation_row(&conn, &relation.relation_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-relation",
+            &relation.relation_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_object_relation_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectRelation,
+            &relation.relation_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["relation_kind".to_string()],
+        )
+        .unwrap();
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut invalid = relation.clone();
+        invalid.source_object_id = invalid.target_object_id.clone();
+
+        let result = ConflictRepo::resolve_object_relation_custom(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            &invalid,
+        );
+        let unresolved = ConflictRepo::get_by_id(&conn, &conflict.conflict_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(unresolved.resolution, ConflictResolution::Unresolved);
+        assert_eq!(commit_count_after, commit_count_before);
+        assert_eq!(
+            ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+                .unwrap()
+                .unwrap(),
+            relation
+        );
+
+        let mut merged = relation.clone();
+        merged.relation_kind = RelationKindId::new("com.monica.mail.thread-member").unwrap();
+        merged.payload_ct = serde_json::to_vec(&serde_json::json!({"position":9})).unwrap();
+        merged.payload_schema_version = 4;
+        let resolved = ConflictRepo::resolve_object_relation_custom(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            &merged,
+        )
+        .unwrap();
+        let stored = ObjectRelationRepo::get_by_id(&conn, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.resolution, ConflictResolution::Custom);
+        assert_eq!(stored.relation_kind, merged.relation_kind);
+        assert_eq!(stored.payload_schema_version, 4);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
+            serde_json::json!({"position":9})
+        );
+    }
+
+    #[test]
+    fn generic_metadata_conflict_custom_label_updates_plaintext_under_merge_commit() {
+        let (conn, ctx) = setup();
+        let (_, label, assignment) = generic_metadata_fixture(&conn, &ctx);
+        ObjectLabelAssignmentRepo::soft_delete(&conn, &ctx, &assignment.assignment_id).unwrap();
+        let current = ObjectVersionRepo::current_object_label_row(&conn, &label.label_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label",
+            &label.label_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabel,
+            &label.label_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["name_ct".to_string(), "payload_ct".to_string()],
+        )
+        .unwrap();
+        let mut merged = label.clone();
+        merged.name_ct = b"Priority".to_vec();
+        merged.payload_ct = serde_json::to_vec(&serde_json::json!({"color":"orange"})).unwrap();
+        merged.payload_schema_version = 3;
+
+        let resolved =
+            ConflictRepo::resolve_object_label_custom(&conn, &ctx, &conflict.conflict_id, &merged)
+                .unwrap();
+        let stored = ObjectLabelRepo::get_by_id(&conn, &label.label_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::Custom);
+        assert_eq!(stored.name_ct, b"Priority");
+        assert_eq!(stored.payload_schema_version, 3);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
+            serde_json::json!({"color":"orange"})
+        );
+    }
+
+    #[test]
+    fn generic_metadata_conflict_incoming_label_deletion_requires_assignment_cleanup() {
+        let (conn, ctx) = setup();
+        let (_, label, assignment) = generic_metadata_fixture(&conn, &ctx);
+        let current = ObjectVersionRepo::current_object_label_row(&conn, &label.label_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label",
+            &label.label_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.deleted = true;
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabel,
+            &label.label_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+
+        assert!(ConflictRepo::resolve_object_label(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .is_err());
+        ObjectLabelAssignmentRepo::soft_delete(&conn, &ctx, &assignment.assignment_id).unwrap();
+        ConflictRepo::resolve_object_label(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+
+        assert!(
+            ObjectLabelRepo::get_by_id(&conn, &label.label_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            TombstoneRepo::count_by_type(&conn, TombstoneTargetType::ObjectLabel).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn generic_metadata_conflict_assignment_supports_all_resolution_modes() {
+        let (conn, ctx) = setup();
+        let (_, _, assignment) = generic_metadata_fixture(&conn, &ctx);
+        let current = ObjectVersionRepo::current_object_label_assignment_row(
+            &conn,
+            &assignment.assignment_id,
+        )
+        .unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label-assignment",
+            &assignment.assignment_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.deleted = true;
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_assignment_row(&conn, &incoming_commit, &incoming)
+            .unwrap();
+        let local_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabelAssignment,
+            &assignment.assignment_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_object_label_assignment(
+            &conn,
+            &ctx,
+            &local_conflict.conflict_id,
+            ConflictResolution::LocalWins,
+        )
+        .unwrap();
+        assert!(
+            !ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment.assignment_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+
+        let local = ObjectVersionRepo::current_object_label_assignment_row(
+            &conn,
+            &assignment.assignment_id,
+        )
+        .unwrap();
+        let second_incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label-assignment",
+            &assignment.assignment_id,
+            &local.head_commit_id,
+        );
+        let mut second_incoming = local.clone();
+        second_incoming.deleted = true;
+        second_incoming.head_commit_id = second_incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_assignment_row(
+            &conn,
+            &second_incoming_commit,
+            &second_incoming,
+        )
+        .unwrap();
+        let incoming_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabelAssignment,
+            &assignment.assignment_id,
+            &local.head_commit_id,
+            &local.head_commit_id,
+            &second_incoming_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_object_label_assignment(
+            &conn,
+            &ctx,
+            &incoming_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert!(
+            ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment.assignment_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            TombstoneRepo::count_by_type(&conn, TombstoneTargetType::ObjectLabelAssignment)
+                .unwrap(),
+            1
+        );
+
+        let deleted = ObjectVersionRepo::current_object_label_assignment_row(
+            &conn,
+            &assignment.assignment_id,
+        )
+        .unwrap();
+        let third_incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "object-label-assignment",
+            &assignment.assignment_id,
+            &deleted.head_commit_id,
+        );
+        let mut third_incoming = deleted.clone();
+        third_incoming.head_commit_id = third_incoming_commit.clone();
+        ObjectVersionRepo::record_object_label_assignment_row(
+            &conn,
+            &third_incoming_commit,
+            &third_incoming,
+        )
+        .unwrap();
+        let custom_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::ObjectLabelAssignment,
+            &assignment.assignment_id,
+            &deleted.head_commit_id,
+            &deleted.head_commit_id,
+            &third_incoming_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        let mut custom = assignment.clone();
+        custom.deleted = false;
+        ConflictRepo::resolve_object_label_assignment_custom(
+            &conn,
+            &ctx,
+            &custom_conflict.conflict_id,
+            &custom,
+        )
+        .unwrap();
+        assert!(
+            !ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment.assignment_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            TombstoneRepo::count_by_type(&conn, TombstoneTargetType::ObjectLabelAssignment)
+                .unwrap(),
+            0
+        );
     }
 }

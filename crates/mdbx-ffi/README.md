@@ -29,6 +29,9 @@ The exported boundary covers:
 - rotate the data-key epoch through Tiga authorization and return the old epoch, new active epoch, rotation commit, and timestamp
 - create projects
 - create, list, update, soft-delete, restore, and move generic entries
+- create, query, update, and delete generic relations, labels, and label assignments
+- list unresolved conflicts and resolve project, entry, attachment, relation, label, and assignment conflicts with local-wins or incoming-wins
+- apply validated custom payload or generic metadata conflict resolutions
 
 The boundary does not currently expose:
 
@@ -38,7 +41,6 @@ The boundary does not currently expose:
 - attachments and attachment content
 - sync bundle/apply operations
 - snapshots
-- conflicts and conflict resolution
 - diagnostics and maintenance data
 
 Treat unsupported features as missing facade methods, not permission to bypass the storage layer.

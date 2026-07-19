@@ -54,6 +54,10 @@ A `CapabilitySet` is the compile-time and runtime set of optional adapters prese
 
 A `CommitOperation` is one finite user intent executed atomically and represented by one commit whenever practical. Importing one `mafile`, moving a bookmark group, or applying one mail synchronization batch can contain multiple row mutations without producing a commit per internal row.
 
+### ConflictResolutionOperation
+
+A `ConflictResolutionOperation` selects local state, incoming state, or a validated custom state for one conflicted object. It atomically writes the selected state, creates a two-parent merge commit, advances the object clock and heads, records a new ObjectVersion, reconciles tombstones, and marks the conflict resolved.
+
 ## Core Invariants
 
 1. MDBX2 always reads MDBX1 data and preserves legacy public interfaces.
@@ -66,6 +70,8 @@ A `CommitOperation` is one finite user intent executed atomically and represente
 8. One user intent should create one CommitOperation, avoiding histories filled with internal implementation commits.
 9. Every stored payload is opaque to the core and remains protected by authenticated encryption, integrity context, version metadata, and atomic history rules.
 10. Optional domain capabilities may add interpretation and rebuildable indexes, but they cannot weaken encryption, history, synchronization, recovery, or compatibility guarantees.
+11. Conflict resolution is a tracked object mutation. Marking a conflict row resolved without applying and versioning the selected object state is invalid.
+12. Custom conflict state preserves stable object identity and structural ownership. Plaintext custom metadata is authenticated and encrypted by the core inside the resolution transaction.
 
 ## Module Architecture
 
@@ -80,6 +86,10 @@ The Legacy Password Adapter maps existing EntryType values and MDBX1 methods ont
 ### Domain Adapters
 
 Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payload schemas. They may add rebuildable indexes through explicit seams. One adapter alone does not justify a core interface; shared behavior moves into the core only after at least two adapters need the same seam.
+
+### Conflict Resolution Module
+
+The Conflict Resolution Module loads authenticated local and incoming ObjectVersions, validates identity and ownership constraints, and applies LocalWins, IncomingWins, or Custom state through one transaction. ObjectRelations, ObjectLabels, and ObjectLabelAssignments use the same merge-commit and tombstone rules as legacy projects, entries, and attachments. Duplicate assignment UUIDs for the same logical object-label membership are mapped to the local logical identity before resolution.
 
 ### Capability Features
 
