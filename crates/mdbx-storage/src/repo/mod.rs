@@ -4,6 +4,7 @@ pub mod commit_ctx;
 pub mod commit_history;
 pub mod conflict;
 pub mod entry;
+pub mod object_relation;
 pub mod object_version;
 pub mod project;
 pub mod snapshot;
@@ -15,6 +16,7 @@ pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExec
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use conflict::{ConflictCreateRequest, ConflictRepo};
 pub use entry::{EntryCreateRequest, EntryRepo};
+pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
 pub use object_version::ObjectVersionRepo;
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;

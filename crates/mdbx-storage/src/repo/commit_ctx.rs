@@ -744,12 +744,27 @@ impl CommitContext {
         commit_kind: &str,
         change_scope: &str,
     ) -> StorageResult<String> {
-        let parent_head = self.current_head(
+        self.commit_object_change_with_id_column(
             conn,
             object_table,
             &format!("{}_id", change_scope),
             object_id,
-        )?;
+            commit_kind,
+            change_scope,
+        )
+    }
+
+    /// 为物理主键名称与逻辑变更范围不同的对象创建 commit。
+    pub fn commit_object_change_with_id_column(
+        &self,
+        conn: &VaultConnection,
+        object_table: &str,
+        object_id_column: &str,
+        object_id: &str,
+        commit_kind: &str,
+        change_scope: &str,
+    ) -> StorageResult<String> {
+        let parent_head = self.current_head(conn, object_table, object_id_column, object_id)?;
         let parents: Vec<String> = parent_head.into_iter().collect();
 
         self.create_commit(
