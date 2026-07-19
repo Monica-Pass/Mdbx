@@ -1,0 +1,82 @@
+# MDBX Domain Context
+
+## Purpose
+
+MDBX is a local-first encrypted object database. Password management is one domain adapter, alongside bookmarks, mail, Steam `mafile`, and future application domains. The core keeps encryption, collections, object records, attachments, commits, synchronization, conflicts, snapshots, and policy independent from product-specific payload meaning.
+
+## Domain Vocabulary
+
+### Vault
+
+A `Vault` is one encrypted MDBX database with a stable vault identity, unlock methods, Tiga policy, key epochs, commit history, and synchronization state.
+
+### Collection
+
+A `Collection` is a stable container for object records. Password projects, bookmark folders, mailboxes, and Steam account groups are domain presentations of this concept. MDBX1 stores collections in the physical `projects` table; the generic Module hides that compatibility implementation from new callers.
+
+### ObjectRecord
+
+An `ObjectRecord` is one encrypted, versioned item inside a collection. Password entries, bookmarks, mail messages, mail contacts, and `mafile` documents are ObjectRecords. MDBX1 stores ObjectRecords in the physical `entries` table.
+
+### ObjectTypeId
+
+An `ObjectTypeId` is the exact stable identifier for an ObjectRecord payload contract. MDBX legacy identifiers such as `login`, `note`, and `totp` remain valid. Extension identifiers use a namespaced form such as `com.monica.bookmark`, `com.monica.mail.message`, or `com.monica.steam.mafile`.
+
+The core preserves every valid ObjectTypeId exactly. An unknown identifier remains unknown and must never be converted to a password type or another fallback. Interpretation belongs to a domain adapter.
+
+### PayloadSchemaVersion
+
+`PayloadSchemaVersion` is the unsigned version of the payload contract owned by an ObjectTypeId. It is independent from the MDBX database schema version. A domain adapter migrates its own plaintext payload after authenticated decryption; the core stores and synchronizes the declared version.
+
+### ObjectRelation
+
+An `ObjectRelation` is a typed directed edge between stable objects. It represents mail thread membership, reply relationships, bookmark aliases, label membership, contact links, Steam account ownership, or future cross-domain references. Relation kinds use stable namespaced identifiers and participate in commit, tombstone, snapshot, and synchronization rules.
+
+### ObjectLabel
+
+An `ObjectLabel` is a stable searchable classification attached to an ObjectRecord. Labels support mail labels, bookmark tags, and domain-neutral organization. They are user-visible metadata and therefore participate in commits and synchronization.
+
+### Attachment
+
+An `Attachment` is authenticated binary content or an external content reference owned by a Collection and optionally by an ObjectRecord. Mail attachments and `mafile` source documents use the same attachment integrity rules as password-vault files.
+
+### ExtensionProfile
+
+An `ExtensionProfile` declares the ObjectTypeIds, relation kinds, optional indexes, import/export adapters, and client presentation hints supplied by one domain extension. It never receives raw SQL authority over core history or key tables.
+
+### CapabilitySet
+
+A `CapabilitySet` is the compile-time and runtime set of optional adapters present in a build. Core readers, MDBX1 compatibility, encryption, commits, and synchronization are mandatory. KDBX import/export, benchmarks, mail indexes, bookmark indexes, and Steam adapters can be excluded when unused.
+
+### CommitOperation
+
+A `CommitOperation` is one finite user intent executed atomically and represented by one commit whenever practical. Importing one `mafile`, moving a bookmark group, or applying one mail synchronization batch can contain multiple row mutations without producing a commit per internal row.
+
+## Core Invariants
+
+1. MDBX2 always reads MDBX1 data and preserves legacy public interfaces.
+2. Physical `projects` and `entries` remain compatibility storage; new code uses Collection and ObjectRecord interfaces.
+3. Unknown ObjectTypeIds round-trip exactly and remain opaque to adapters that do not support them.
+4. The core authenticates storage context and ciphertext without needing to understand domain payload fields.
+5. Domain-specific indexes are derived data. They can be rebuilt from authenticated ObjectRecords and must not become the only copy of user data.
+6. ObjectRelations and ObjectLabels are first-class synchronized metadata with stable IDs and tombstones.
+7. Optional capabilities may be removed from a build only when doing so preserves safe reading or produces an explicit unsupported-extension error.
+8. One user intent should create one CommitOperation, avoiding histories filled with internal implementation commits.
+
+## Module Architecture
+
+### Generic Object Module
+
+The Generic Object Module is the primary Interface for Collection, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
+
+### Legacy Password Adapter
+
+The Legacy Password Adapter maps existing EntryType values and MDBX1 methods onto the Generic Object Module. It remains available for old clients and KDBX interoperability. The adapter does not define the generic core vocabulary.
+
+### Domain Adapters
+
+Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payload schemas. They may add rebuildable indexes through explicit seams. One adapter alone does not justify a core interface; shared behavior moves into the core only after at least two adapters need the same seam.
+
+### Capability Features
+
+Cargo features select optional adapters and tools. Default builds retain current behavior. Minimal builds may remove imports, benchmarks, or domain indexes while keeping the same file reader, compatibility migrator, encryption, and generic object interfaces.
