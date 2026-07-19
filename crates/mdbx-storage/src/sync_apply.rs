@@ -20,7 +20,7 @@ use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
     KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow,
     ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
-    TigaPolicyOverrideRow, TigaVaultStateRow,
+    TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -418,6 +418,11 @@ impl SyncApplyRepo {
             Self::apply_security_audit_events(conn, audit_events)?;
         }
         Self::apply_branches(conn, &state.branches)?;
+        if matches!(key_epoch_merge_mode, KeyEpochMergeMode::FastForward) && conflicts == 0 {
+            if let Some(tombstones) = &state.tombstones {
+                Self::apply_complete_tombstone_state(conn, tombstones)?;
+            }
+        }
         Ok(conflicts)
     }
 
@@ -1480,6 +1485,31 @@ impl SyncApplyRepo {
                     params![row.project_id, trimmed],
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn apply_complete_tombstone_state(
+        conn: &VaultConnection,
+        tombstones: &[TombstoneRow],
+    ) -> StorageResult<()> {
+        conn.inner().execute("DELETE FROM tombstones", [])?;
+        for row in tombstones {
+            conn.inner().execute(
+                "INSERT INTO tombstones
+                    (tombstone_id, target_object_type, target_object_id, delete_clock,
+                     deleted_by_device_id, deleted_at, purge_eligible_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    row.tombstone_id,
+                    row.target_object_type,
+                    row.target_object_id,
+                    row.delete_clock,
+                    row.deleted_by_device_id,
+                    row.deleted_at,
+                    row.purge_eligible_at,
+                ],
+            )?;
         }
         Ok(())
     }
@@ -3298,6 +3328,17 @@ mod tests {
         serde_json::from_slice(&entry.payload_ct).unwrap()
     }
 
+    fn entry_tombstone_count(conn: &VaultConnection, entry_id: &str) -> i64 {
+        conn.inner()
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones
+                 WHERE target_object_type = 'entry' AND target_object_id = ?1",
+                params![entry_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn create_project_divergence(label: &str) -> (PathBuf, PathBuf, String) {
         let source_path = temp_vault_path(&format!("{}-source", label));
         let target_path = temp_vault_path(&format!("{}-target", label));
@@ -4864,6 +4905,82 @@ mod tests {
         drop(target);
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn resolved_conflict_sync_converges_delete_and_revival_tombstones() {
+        for (label, remote_deletes, expected_deleted) in [
+            ("resolved-revival", true, false),
+            ("resolved-delete", false, true),
+        ] {
+            let (source_path, target_path, entry_id) =
+                create_delete_modify_conflict(label, remote_deletes);
+            let source = VaultConnection::open(&source_path).unwrap();
+            let target = VaultConnection::open(&target_path).unwrap();
+            let source_ctx = CommitContext::new("device-a".to_string());
+            let target_ctx = CommitContext::new("device-b".to_string());
+            let conflict = ConflictRepo::list_unresolved(&target).unwrap().remove(0);
+
+            ConflictRepo::resolve_entry(
+                &target,
+                &target_ctx,
+                &conflict.conflict_id,
+                ConflictResolution::LocalWins,
+            )
+            .unwrap();
+            let resolved = EntryRepo::get_by_id(&target, &entry_id).unwrap().unwrap();
+            assert_eq!(resolved.deleted, expected_deleted);
+            assert_eq!(
+                entry_tombstone_count(&target, &entry_id),
+                i64::from(expected_deleted)
+            );
+            assert!(ConflictRepo::list_unresolved(&target).unwrap().is_empty());
+
+            let mut commits = serialized_commits_from(&target);
+            attach_state_payload_to_commit(&target, &mut commits, &resolved.head_commit_id);
+            let batch = CommitBatch::new(commits, 0, true);
+            let result = SyncApplyRepo::apply_batch(&source, &source_ctx, &batch).unwrap();
+
+            assert_eq!(result.conflict_count, 0);
+            assert!(ConflictRepo::list_unresolved(&source).unwrap().is_empty());
+            let synchronized = EntryRepo::get_by_id(&source, &entry_id).unwrap().unwrap();
+            assert_eq!(synchronized.deleted, expected_deleted);
+            assert_eq!(synchronized.head_commit_id, resolved.head_commit_id);
+            assert_eq!(
+                entry_tombstone_count(&source, &entry_id),
+                i64::from(expected_deleted)
+            );
+            assert!(
+                ObjectVersionRepo::get_entry(&source, &entry_id, &synchronized.head_commit_id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                SyncApplyRepo::current_branch_head(&source, None, "main")
+                    .unwrap()
+                    .as_deref(),
+                Some(resolved.head_commit_id.as_str())
+            );
+
+            let repeated = SyncApplyRepo::apply_batch(&source, &source_ctx, &batch).unwrap();
+            assert_eq!(repeated.conflict_count, 0);
+            assert_eq!(
+                EntryRepo::get_by_id(&source, &entry_id)
+                    .unwrap()
+                    .unwrap()
+                    .head_commit_id,
+                resolved.head_commit_id
+            );
+            assert_eq!(
+                entry_tombstone_count(&source, &entry_id),
+                i64::from(expected_deleted)
+            );
+
+            drop(source);
+            drop(target);
+            remove_vault_files(&source_path);
+            remove_vault_files(&target_path);
+        }
     }
 
     #[test]

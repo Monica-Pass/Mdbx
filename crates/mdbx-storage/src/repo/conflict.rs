@@ -791,6 +791,13 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "entry",
+            &conflict.object_id,
+            current.deleted,
+        )?;
         ObjectVersionRepo::record_entry_current(conn, &commit_id, &conflict.object_id)?;
         Ok(())
     }
@@ -855,6 +862,7 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
+        Self::reconcile_resolution_tombstone(conn, ctx, "entry", &conflict.object_id, false)?;
         ObjectVersionRepo::record_entry_current(conn, &commit_id, &conflict.object_id)?;
         Ok(())
     }
@@ -879,6 +887,13 @@ impl ConflictRepo {
                 now,
                 ctx.device_id,
             ],
+        )?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "project",
+            &conflict.object_id,
+            current.deleted,
         )?;
         ObjectVersionRepo::record_project_current(conn, &commit_id, &conflict.object_id)?;
         Ok(())
@@ -948,6 +963,13 @@ impl ConflictRepo {
              updated_at = ?3, updated_by_device_id = ?4
              WHERE attachment_id = ?1",
             params![conflict.object_id, commit_id, now, ctx.device_id],
+        )?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "attachment",
+            &conflict.object_id,
+            current.deleted,
         )?;
         ObjectVersionRepo::record_attachment_current(conn, &commit_id, &conflict.object_id)?;
         Ok(())
@@ -1514,6 +1536,7 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
+        Self::reconcile_resolution_tombstone(conn, ctx, "entry", &row.entry_id, row.deleted)?;
         Ok(())
     }
 
@@ -1548,6 +1571,7 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
+        Self::reconcile_resolution_tombstone(conn, ctx, "project", &row.project_id, row.deleted)?;
         Ok(())
     }
 
@@ -1581,6 +1605,13 @@ impl ConflictRepo {
                 now,
                 ctx.device_id,
             ],
+        )?;
+        Self::reconcile_resolution_tombstone(
+            conn,
+            ctx,
+            "attachment",
+            &row.attachment_id,
+            row.deleted,
         )?;
         Ok(())
     }
@@ -1696,6 +1727,17 @@ mod tests {
             &[parent.to_string()],
         )
         .unwrap()
+    }
+
+    fn typed_tombstone_count(conn: &VaultConnection, object_type: &str, object_id: &str) -> i64 {
+        conn.inner()
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones
+                 WHERE target_object_type = ?1 AND target_object_id = ?2",
+                params![object_type, object_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -2161,6 +2203,303 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(still_unresolved.resolution, ConflictResolution::Unresolved);
         assert_eq!(updated.content_hash, attachment.content_hash);
+    }
+
+    #[test]
+    fn conflict_resolution_tombstone_tracks_project_entry_and_attachment_state() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("E"),
+            &serde_json::json!({"password":"secret"}),
+        )
+        .unwrap();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            Some(&entry.entry_id),
+            "a.txt",
+            Some("text/plain"),
+            "hash",
+            4,
+        )
+        .unwrap();
+
+        let project_current =
+            ObjectVersionRepo::current_project_row(&conn, &project.project_id).unwrap();
+        let project_delete_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "project",
+            &project.project_id,
+            &project_current.head_commit_id,
+        );
+        let mut project_deleted = project_current.clone();
+        project_deleted.deleted = true;
+        project_deleted.head_commit_id = project_delete_commit.clone();
+        ObjectVersionRepo::record_project_row(&conn, &project_delete_commit, &project_deleted)
+            .unwrap();
+        let project_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &project_current.head_commit_id,
+            &project_current.head_commit_id,
+            &project_delete_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_project(
+            &conn,
+            &ctx,
+            &project_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(
+            typed_tombstone_count(&conn, "project", &project.project_id),
+            1
+        );
+
+        let entry_current = ObjectVersionRepo::current_entry_row(&conn, &entry.entry_id).unwrap();
+        let entry_delete_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "entry",
+            &entry.entry_id,
+            &entry_current.head_commit_id,
+        );
+        let mut entry_deleted = entry_current.clone();
+        entry_deleted.deleted = true;
+        entry_deleted.head_commit_id = entry_delete_commit.clone();
+        ObjectVersionRepo::record_entry_row(&conn, &entry_delete_commit, &entry_deleted).unwrap();
+        let entry_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Entry,
+            &entry.entry_id,
+            &entry_current.head_commit_id,
+            &entry_current.head_commit_id,
+            &entry_delete_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_entry(
+            &conn,
+            &ctx,
+            &entry_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(typed_tombstone_count(&conn, "entry", &entry.entry_id), 1);
+
+        let attachment_current =
+            ObjectVersionRepo::current_attachment_row(&conn, &attachment.attachment_id).unwrap();
+        let attachment_delete_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "attachment",
+            &attachment.attachment_id,
+            &attachment_current.head_commit_id,
+        );
+        let mut attachment_deleted = attachment_current.clone();
+        attachment_deleted.deleted = true;
+        attachment_deleted.head_commit_id = attachment_delete_commit.clone();
+        ObjectVersionRepo::record_attachment_row(
+            &conn,
+            &attachment_delete_commit,
+            &attachment_deleted,
+        )
+        .unwrap();
+        let attachment_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &attachment_current.head_commit_id,
+            &attachment_current.head_commit_id,
+            &attachment_delete_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_attachment(
+            &conn,
+            &ctx,
+            &attachment_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(
+            typed_tombstone_count(&conn, "attachment", &attachment.attachment_id),
+            1
+        );
+
+        let project_deleted_current =
+            ObjectVersionRepo::current_project_row(&conn, &project.project_id).unwrap();
+        let project_revive_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "project",
+            &project.project_id,
+            &project_deleted_current.head_commit_id,
+        );
+        let mut project_active = project_deleted_current.clone();
+        project_active.deleted = false;
+        project_active.head_commit_id = project_revive_commit.clone();
+        ObjectVersionRepo::record_project_row(&conn, &project_revive_commit, &project_active)
+            .unwrap();
+        let project_revive_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &project_deleted_current.head_commit_id,
+            &project_deleted_current.head_commit_id,
+            &project_revive_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_project(
+            &conn,
+            &ctx,
+            &project_revive_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(
+            typed_tombstone_count(&conn, "project", &project.project_id),
+            0
+        );
+
+        let entry_deleted_current =
+            ObjectVersionRepo::current_entry_row(&conn, &entry.entry_id).unwrap();
+        let entry_revive_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "entry",
+            &entry.entry_id,
+            &entry_deleted_current.head_commit_id,
+        );
+        let mut entry_active = entry_deleted_current.clone();
+        entry_active.deleted = false;
+        entry_active.head_commit_id = entry_revive_commit.clone();
+        ObjectVersionRepo::record_entry_row(&conn, &entry_revive_commit, &entry_active).unwrap();
+        let entry_revive_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Entry,
+            &entry.entry_id,
+            &entry_deleted_current.head_commit_id,
+            &entry_deleted_current.head_commit_id,
+            &entry_revive_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_entry(
+            &conn,
+            &ctx,
+            &entry_revive_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(typed_tombstone_count(&conn, "entry", &entry.entry_id), 0);
+
+        let attachment_deleted_current =
+            ObjectVersionRepo::current_attachment_row(&conn, &attachment.attachment_id).unwrap();
+        let attachment_revive_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "attachment",
+            &attachment.attachment_id,
+            &attachment_deleted_current.head_commit_id,
+        );
+        let mut attachment_active = attachment_deleted_current.clone();
+        attachment_active.deleted = false;
+        attachment_active.head_commit_id = attachment_revive_commit.clone();
+        ObjectVersionRepo::record_attachment_row(
+            &conn,
+            &attachment_revive_commit,
+            &attachment_active,
+        )
+        .unwrap();
+        let attachment_revive_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &attachment_deleted_current.head_commit_id,
+            &attachment_deleted_current.head_commit_id,
+            &attachment_revive_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+        ConflictRepo::resolve_attachment(
+            &conn,
+            &ctx,
+            &attachment_revive_conflict.conflict_id,
+            ConflictResolution::IncomingWins,
+        )
+        .unwrap();
+        assert_eq!(
+            typed_tombstone_count(&conn, "attachment", &attachment.attachment_id),
+            0
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_tombstone_local_wins_removes_remote_delete_marker() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "P", None, None).unwrap();
+        let current = ObjectVersionRepo::current_project_row(&conn, &project.project_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "project",
+            &project.project_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.deleted = true;
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_project_row(&conn, &incoming_commit, &incoming).unwrap();
+        ctx.create_tombstone(&conn, "project", &project.project_id)
+            .unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["deleted".to_string()],
+        )
+        .unwrap();
+
+        ConflictRepo::resolve_project(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            ConflictResolution::LocalWins,
+        )
+        .unwrap();
+
+        assert_eq!(
+            typed_tombstone_count(&conn, "project", &project.project_id),
+            0
+        );
+        assert!(
+            !ProjectRepo::get_by_id(&conn, &project.project_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub struct SyncStatePayload {
     pub attachment_chunks: Vec<AttachmentChunkRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_tags: Option<Vec<ProjectTagSetRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstones: Option<Vec<TombstoneRow>>,
     pub branches: Vec<BranchRow>,
 }
 
@@ -264,6 +266,17 @@ pub struct ProjectTagSetRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TombstoneRow {
+    pub tombstone_id: String,
+    pub target_object_type: String,
+    pub target_object_id: String,
+    pub delete_clock: String,
+    pub deleted_by_device_id: String,
+    pub deleted_at: String,
+    pub purge_eligible_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchRow {
     pub branch_id: String,
     pub branch_name: String,
@@ -288,6 +301,7 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         attachments: load_attachment_rows(conn)?,
         attachment_chunks: load_attachment_chunk_rows(conn)?,
         project_tags: Some(load_project_tag_set_rows(conn)?),
+        tombstones: Some(load_tombstone_rows(conn)?),
         branches: load_branch_rows(conn)?,
     })
 }
@@ -747,6 +761,27 @@ fn load_project_tag_set_rows(conn: &VaultConnection) -> StorageResult<Vec<Projec
         .collect())
 }
 
+fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT tombstone_id, target_object_type, target_object_id, delete_clock,
+                deleted_by_device_id, deleted_at, purge_eligible_at
+         FROM tombstones
+         ORDER BY target_object_type ASC, target_object_id ASC, tombstone_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TombstoneRow {
+            tombstone_id: row.get(0)?,
+            target_object_type: row.get(1)?,
+            target_object_id: row.get(2)?,
+            delete_clock: row.get(3)?,
+            deleted_by_device_id: row.get(4)?,
+            deleted_at: row.get(5)?,
+            purge_eligible_at: row.get(6)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT branch_id, branch_name, head_commit_id, created_at, updated_at
@@ -843,5 +878,6 @@ mod tests {
 
         let decoded = decode_sync_state_payload(&payload).unwrap().unwrap();
         assert!(decoded.key_epoch_state.is_none());
+        assert!(decoded.tombstones.is_none());
     }
 }
