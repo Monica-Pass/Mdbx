@@ -26,5 +26,6 @@ pub use object_version::ObjectVersionRepo;
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
 pub use tombstone::{
-    TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
+    PermanentPurgeReceipt, TombstonePurgeBlocker, TombstonePurgeEligibility,
+    TombstonePurgeScheduleResult, TombstoneRepo,
 };

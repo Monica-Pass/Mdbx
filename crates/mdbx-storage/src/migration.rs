@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v2, v7, v8};
+use crate::schema::{v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -19,6 +19,7 @@ pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlatio
 pub const MIGRATION_STABLE_BRANCH_ID: &str = "mdbx-2-stable-branch-id-v1";
 pub const MIGRATION_GENERIC_METADATA: &str = "mdbx-2-generic-metadata-v1";
 pub const MIGRATION_TOMBSTONE_DELETE_PROOF: &str = "mdbx-2-tombstone-delete-proof-v1";
+pub const MIGRATION_PURGE_RECEIPTS: &str = "mdbx-2-purge-receipts-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -248,6 +249,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v2::create_extensions(conn)?;
         v7::create_extensions(conn)?;
         v8::create_extensions(conn)?;
+        v9::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -312,6 +314,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v2::create_extensions(conn)?;
         v7::create_extensions(conn)?;
         v8::create_extensions(conn)?;
+        v9::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
@@ -349,6 +352,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_TOMBSTONE_DELETE_PROOF, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_PURGE_RECEIPTS, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -550,6 +559,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "object_labels",
         "object_label_assignments",
         "tombstone_acknowledgements",
+        "purge_receipts",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -940,6 +950,35 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
                 params![MIGRATION_GENERIC_METADATA],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn schema8_vault_gains_permanent_purge_receipts() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        conn.inner()
+            .execute_batch(
+                "DROP TABLE purge_receipts;
+                 DELETE FROM schema_migrations
+                 WHERE migration_id = 'mdbx-2-purge-receipts-v1';
+                 UPDATE vault_meta SET schema_version = 8;",
+            )
+            .unwrap();
+
+        let inspection = inspect_migration(conn.inner()).unwrap();
+        assert!(inspection.requires_upgrade);
+        let info = upgrade_to_latest(conn.inner()).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(conn.inner(), "purge_receipts").unwrap());
+        let migration_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_PURGE_RECEIPTS],
                 |row| row.get(0),
             )
             .unwrap();

@@ -10,6 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::TombstoneRepo;
 
 #[derive(Debug, Clone)]
 pub struct ObjectLabelCreateRequest {
@@ -79,6 +80,12 @@ impl ObjectLabelRepo {
         validate_uuid(&request.label_id, "label_id")?;
         validate_name(&request.name)?;
         validate_schema_version(request.payload_schema_version)?;
+        if TombstoneRepo::is_permanently_purged(conn, "object-label", &request.label_id)? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "label ID {} has a permanent purge receipt",
+                request.label_id
+            )));
+        }
         conn.with_immediate_transaction(|| {
             ensure_active_collection(conn, &request.collection_id)?;
             let now = chrono::Utc::now().to_rfc3339();
@@ -288,6 +295,16 @@ impl ObjectLabelAssignmentRepo {
         request: ObjectLabelAssignmentCreateRequest,
     ) -> StorageResult<ObjectLabelAssignment> {
         validate_uuid(&request.assignment_id, "assignment_id")?;
+        if TombstoneRepo::is_permanently_purged(
+            conn,
+            "object-label-assignment",
+            &request.assignment_id,
+        )? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "assignment ID {} has a permanent purge receipt",
+                request.assignment_id
+            )));
+        }
         conn.with_immediate_transaction(|| {
             let object_collection = active_object_collection(conn, &request.object_id)?;
             let label = ObjectLabelRepo::get_by_id(conn, &request.label_id)?

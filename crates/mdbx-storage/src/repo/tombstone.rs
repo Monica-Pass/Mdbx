@@ -4,6 +4,7 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use mdbx_core::model::Tombstone;
 use mdbx_core::model::TombstoneTargetType;
@@ -13,7 +14,9 @@ use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitChange, CommitContext, CommitOperation};
 use crate::tiga::TigaService;
-use crate::tiga_policy::TigaAuthorizationContext;
+use crate::tiga_policy::{
+    optional_integrity_tag, verify_optional_integrity_tag, TigaAuthorizationContext,
+};
 
 /// 墓碑查询仓库。
 ///
@@ -33,6 +36,7 @@ pub enum TombstonePurgeBlocker {
     TargetNotDeleted,
     UnresolvedConflict,
     DeviceHasNotAcknowledgedDelete { device_id: String },
+    DependentObjectsRemain { object_type: String, count: u64 },
     UnsupportedTargetType,
 }
 
@@ -48,6 +52,61 @@ pub struct TombstonePurgeScheduleResult {
     pub tombstone_id: String,
     pub purge_eligible_at: String,
     pub commit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentPurgeReceipt {
+    pub purge_id: String,
+    pub tombstone_id: String,
+    pub target_object_type: String,
+    pub target_object_id: String,
+    pub delete_commit_id: String,
+    pub purge_commit_id: String,
+    pub delete_clock: String,
+    pub retention_eligible_at: String,
+    pub purged_by_device_id: String,
+    pub purged_at: String,
+    pub integrity_tag: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct PurgeReceiptIntegrityValue<'a> {
+    purge_id: &'a str,
+    tombstone_id: &'a str,
+    target_object_type: &'a str,
+    target_object_id: &'a str,
+    delete_commit_id: &'a str,
+    purge_commit_id: &'a str,
+    delete_clock: &'a str,
+    retention_eligible_at: &'a str,
+    purged_by_device_id: &'a str,
+    purged_at: &'a str,
+}
+
+impl PermanentPurgeReceipt {
+    fn integrity_value(&self) -> PurgeReceiptIntegrityValue<'_> {
+        PurgeReceiptIntegrityValue {
+            purge_id: &self.purge_id,
+            tombstone_id: &self.tombstone_id,
+            target_object_type: &self.target_object_type,
+            target_object_id: &self.target_object_id,
+            delete_commit_id: &self.delete_commit_id,
+            purge_commit_id: &self.purge_commit_id,
+            delete_clock: &self.delete_clock,
+            retention_eligible_at: &self.retention_eligible_at,
+            purged_by_device_id: &self.purged_by_device_id,
+            purged_at: &self.purged_at,
+        }
+    }
+
+    pub fn verify_integrity(&self, conn: &VaultConnection) -> StorageResult<()> {
+        verify_optional_integrity_tag(
+            conn,
+            b"permanent-purge-receipt-v1",
+            &self.integrity_value(),
+            Some(&self.integrity_tag),
+        )
+    }
 }
 
 impl TombstoneRepo {
@@ -177,6 +236,11 @@ impl TombstoneRepo {
                 blockers.push(TombstonePurgeBlocker::UnsupportedTargetType);
             }
             None => blockers.push(TombstonePurgeBlocker::TargetMissing),
+        }
+        for (object_type, count) in Self::dependent_object_counts(conn, &tombstone)? {
+            if count > 0 {
+                blockers.push(TombstonePurgeBlocker::DependentObjectsRemain { object_type, count });
+            }
         }
 
         let unresolved_conflicts: i64 = conn.inner().query_row(
@@ -315,6 +379,164 @@ impl TombstoneRepo {
         Ok((result, decision))
     }
 
+    /// 在 TIGA 管理授权后执行永久清理，并保留单调清理证明。
+    pub fn purge_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        tombstone_id: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(PermanentPurgeReceipt, AuthorizationDecision)> {
+        let evaluation_time = chrono::DateTime::from_timestamp(context.now_unix_secs, 0)
+            .ok_or_else(|| {
+                StorageError::Validation("invalid purge authorization time".to_string())
+            })?
+            .to_rfc3339();
+        let (receipt, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::PurgeDeletedObject,
+            context,
+            || {
+                if let Some(receipt) = Self::find_purge_receipt_by_tombstone(conn, tombstone_id)? {
+                    let commit_id = receipt.purge_commit_id.clone();
+                    return Ok((receipt, commit_id));
+                }
+
+                let eligibility =
+                    Self::evaluate_purge_eligibility(conn, tombstone_id, &evaluation_time)?;
+                if !eligibility.eligible {
+                    let encoded = serde_json::to_string(&eligibility.blockers)
+                        .map_err(|error| StorageError::Validation(error.to_string()))?;
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "tombstone is not eligible for permanent purge: {encoded}"
+                    )));
+                }
+                let tombstone = Self::find_by_id(conn, tombstone_id)?
+                    .ok_or_else(|| StorageError::NotFound(tombstone_id.to_string()))?;
+                let delete_commit_id = tombstone.delete_commit_id.clone().ok_or_else(|| {
+                    StorageError::ConstraintViolation(
+                        "eligible tombstone is missing delete commit proof".to_string(),
+                    )
+                })?;
+                let retention_eligible_at =
+                    tombstone.purge_eligible_at.clone().ok_or_else(|| {
+                        StorageError::ConstraintViolation(
+                            "eligible tombstone is missing retention time".to_string(),
+                        )
+                    })?;
+                let operation = CommitOperation::new(
+                    purge_operation_id(tombstone_id, &delete_commit_id),
+                    "purge-deleted-object",
+                    "main",
+                    "change",
+                    tombstone.target_object_type.to_string(),
+                    vec![CommitChange {
+                        object_type: tombstone.target_object_type.to_string(),
+                        object_id: tombstone.target_object_id.clone(),
+                        action: "purge".to_string(),
+                        fields: vec![
+                            "object-row".to_string(),
+                            "object-versions".to_string(),
+                            "tombstone".to_string(),
+                        ],
+                    }],
+                );
+                let purge_commit_id = ctx.create_operation_commit(conn, &operation)?;
+                let mut receipt = PermanentPurgeReceipt {
+                    purge_id: Uuid::new_v4().to_string(),
+                    tombstone_id: tombstone.tombstone_id.clone(),
+                    target_object_type: tombstone.target_object_type.to_string(),
+                    target_object_id: tombstone.target_object_id.clone(),
+                    delete_commit_id,
+                    purge_commit_id: purge_commit_id.clone(),
+                    delete_clock: tombstone.delete_clock.clone(),
+                    retention_eligible_at,
+                    purged_by_device_id: ctx.device_id.clone(),
+                    purged_at: evaluation_time.clone(),
+                    integrity_tag: Vec::new(),
+                };
+                receipt.integrity_tag = optional_integrity_tag(
+                    conn,
+                    b"permanent-purge-receipt-v1",
+                    &receipt.integrity_value(),
+                )?
+                .ok_or_else(|| {
+                    StorageError::Validation(
+                        "vault must be unlocked to authenticate a permanent purge receipt"
+                            .to_string(),
+                    )
+                })?;
+                Self::insert_purge_receipt(conn, &receipt)?;
+                Self::delete_physical_object(conn, &tombstone)?;
+                conn.inner().execute(
+                    "DELETE FROM object_versions WHERE object_type = ?1 AND object_id = ?2",
+                    params![
+                        tombstone.target_object_type.to_string(),
+                        tombstone.target_object_id
+                    ],
+                )?;
+                conn.inner().execute(
+                    "DELETE FROM tombstones WHERE tombstone_id = ?1",
+                    params![tombstone.tombstone_id],
+                )?;
+                Ok((receipt, purge_commit_id))
+            },
+        )?;
+        Ok((receipt, decision))
+    }
+
+    pub fn find_purge_receipt_by_tombstone(
+        conn: &VaultConnection,
+        tombstone_id: &str,
+    ) -> StorageResult<Option<PermanentPurgeReceipt>> {
+        Self::find_purge_receipt_where(conn, "tombstone_id = ?1", params![tombstone_id])
+    }
+
+    pub fn find_purge_receipt_by_target(
+        conn: &VaultConnection,
+        target_object_type: &str,
+        target_object_id: &str,
+    ) -> StorageResult<Option<PermanentPurgeReceipt>> {
+        Self::find_purge_receipt_where(
+            conn,
+            "target_object_type = ?1 AND target_object_id = ?2",
+            params![target_object_type, target_object_id],
+        )
+    }
+
+    pub fn is_permanently_purged(
+        conn: &VaultConnection,
+        target_object_type: &str,
+        target_object_id: &str,
+    ) -> StorageResult<bool> {
+        Ok(
+            Self::find_purge_receipt_by_target(conn, target_object_type, target_object_id)?
+                .is_some(),
+        )
+    }
+
+    pub(crate) fn apply_synced_purge_receipt(
+        conn: &VaultConnection,
+        receipt: &PermanentPurgeReceipt,
+    ) -> StorageResult<()> {
+        receipt.verify_integrity(conn)?;
+        if let Some(existing) = Self::find_purge_receipt_by_target(
+            conn,
+            &receipt.target_object_type,
+            &receipt.target_object_id,
+        )? {
+            if existing != *receipt {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "permanent purge receipt for {} {} was rewritten",
+                    receipt.target_object_type, receipt.target_object_id
+                )));
+            }
+        } else {
+            Self::insert_purge_receipt(conn, receipt)?;
+        }
+        Self::delete_object_for_receipt(conn, receipt)
+    }
+
     fn list_where(
         conn: &VaultConnection,
         where_clause: &str,
@@ -426,6 +648,241 @@ impl TombstoneRepo {
         }
         Ok(false)
     }
+
+    fn dependent_object_counts(
+        conn: &VaultConnection,
+        tombstone: &Tombstone,
+    ) -> StorageResult<Vec<(String, u64)>> {
+        let id = tombstone.target_object_id.as_str();
+        let queries: Vec<(&str, &str)> = match tombstone.target_object_type {
+            TombstoneTargetType::Project => vec![
+                (
+                    "entry",
+                    "SELECT COUNT(*) FROM entries WHERE project_id = ?1",
+                ),
+                (
+                    "attachment",
+                    "SELECT COUNT(*) FROM attachments WHERE project_id = ?1",
+                ),
+                (
+                    "object-label",
+                    "SELECT COUNT(*) FROM object_labels WHERE collection_id = ?1",
+                ),
+            ],
+            TombstoneTargetType::Entry => vec![
+                (
+                    "attachment",
+                    "SELECT COUNT(*) FROM attachments WHERE entry_id = ?1",
+                ),
+                (
+                    "object-relation",
+                    "SELECT COUNT(*) FROM object_relations
+                     WHERE source_object_id = ?1 OR target_object_id = ?1",
+                ),
+                (
+                    "object-label-assignment",
+                    "SELECT COUNT(*) FROM object_label_assignments WHERE object_id = ?1",
+                ),
+            ],
+            TombstoneTargetType::ObjectLabel => vec![(
+                "object-label-assignment",
+                "SELECT COUNT(*) FROM object_label_assignments WHERE label_id = ?1",
+            )],
+            TombstoneTargetType::Attachment
+            | TombstoneTargetType::ObjectRelation
+            | TombstoneTargetType::ObjectLabelAssignment
+            | TombstoneTargetType::Branch => Vec::new(),
+        };
+        queries
+            .into_iter()
+            .map(|(object_type, sql)| {
+                let count = conn
+                    .inner()
+                    .query_row(sql, params![id], |row| row.get::<_, i64>(0))?;
+                Ok((object_type.to_string(), count as u64))
+            })
+            .collect()
+    }
+
+    fn insert_purge_receipt(
+        conn: &VaultConnection,
+        receipt: &PermanentPurgeReceipt,
+    ) -> StorageResult<()> {
+        conn.inner().execute(
+            "INSERT INTO purge_receipts
+                (purge_id, tombstone_id, target_object_type, target_object_id,
+                 delete_commit_id, purge_commit_id, delete_clock,
+                 retention_eligible_at, purged_by_device_id, purged_at, integrity_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                receipt.purge_id,
+                receipt.tombstone_id,
+                receipt.target_object_type,
+                receipt.target_object_id,
+                receipt.delete_commit_id,
+                receipt.purge_commit_id,
+                receipt.delete_clock,
+                receipt.retention_eligible_at,
+                receipt.purged_by_device_id,
+                receipt.purged_at,
+                receipt.integrity_tag,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn find_purge_receipt_where(
+        conn: &VaultConnection,
+        where_clause: &str,
+        query_params: impl rusqlite::Params,
+    ) -> StorageResult<Option<PermanentPurgeReceipt>> {
+        let sql = format!(
+            "SELECT purge_id, tombstone_id, target_object_type, target_object_id,
+                    delete_commit_id, purge_commit_id, delete_clock,
+                    retention_eligible_at, purged_by_device_id, purged_at, integrity_tag
+             FROM purge_receipts WHERE {where_clause} LIMIT 1"
+        );
+        let receipt = conn
+            .inner()
+            .query_row(&sql, query_params, |row| {
+                Ok(PermanentPurgeReceipt {
+                    purge_id: row.get(0)?,
+                    tombstone_id: row.get(1)?,
+                    target_object_type: row.get(2)?,
+                    target_object_id: row.get(3)?,
+                    delete_commit_id: row.get(4)?,
+                    purge_commit_id: row.get(5)?,
+                    delete_clock: row.get(6)?,
+                    retention_eligible_at: row.get(7)?,
+                    purged_by_device_id: row.get(8)?,
+                    purged_at: row.get(9)?,
+                    integrity_tag: row.get(10)?,
+                })
+            })
+            .optional()?;
+        if let Some(receipt) = &receipt {
+            receipt.verify_integrity(conn)?;
+        }
+        Ok(receipt)
+    }
+
+    fn delete_physical_object(conn: &VaultConnection, tombstone: &Tombstone) -> StorageResult<()> {
+        let id = tombstone.target_object_id.as_str();
+        let (table, id_column) = match tombstone.target_object_type {
+            TombstoneTargetType::Project => {
+                conn.inner().execute(
+                    "DELETE FROM project_tags WHERE project_id = ?1",
+                    params![id],
+                )?;
+                conn.inner().execute(
+                    "DELETE FROM tiga_policy_overrides
+                     WHERE scope_type = 'project' AND scope_id = ?1",
+                    params![id],
+                )?;
+                ("projects", "project_id")
+            }
+            TombstoneTargetType::Entry => {
+                conn.inner().execute(
+                    "DELETE FROM tiga_policy_overrides
+                     WHERE scope_type = 'entry' AND scope_id = ?1",
+                    params![id],
+                )?;
+                ("entries", "entry_id")
+            }
+            TombstoneTargetType::Attachment => {
+                conn.inner().execute(
+                    "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+                    params![id],
+                )?;
+                ("attachments", "attachment_id")
+            }
+            TombstoneTargetType::ObjectRelation => ("object_relations", "relation_id"),
+            TombstoneTargetType::ObjectLabel => ("object_labels", "label_id"),
+            TombstoneTargetType::ObjectLabelAssignment => {
+                ("object_label_assignments", "assignment_id")
+            }
+            TombstoneTargetType::Branch => {
+                return Err(StorageError::ConstraintViolation(
+                    "branch tombstones do not support physical purge".to_string(),
+                ));
+            }
+        };
+        let affected = conn.inner().execute(
+            &format!("DELETE FROM {table} WHERE {id_column} = ?1 AND deleted = 1"),
+            params![id],
+        )?;
+        if affected != 1 {
+            return Err(StorageError::ConstraintViolation(format!(
+                "purge target {} {} changed before physical deletion",
+                tombstone.target_object_type, tombstone.target_object_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn delete_object_for_receipt(
+        conn: &VaultConnection,
+        receipt: &PermanentPurgeReceipt,
+    ) -> StorageResult<()> {
+        let target_type: TombstoneTargetType = receipt
+            .target_object_type
+            .parse()
+            .map_err(StorageError::Validation)?;
+        let id = receipt.target_object_id.as_str();
+        let (table, id_column) = match target_type {
+            TombstoneTargetType::Project => {
+                conn.inner().execute(
+                    "DELETE FROM project_tags WHERE project_id = ?1",
+                    params![id],
+                )?;
+                conn.inner().execute(
+                    "DELETE FROM tiga_policy_overrides
+                     WHERE scope_type = 'project' AND scope_id = ?1",
+                    params![id],
+                )?;
+                ("projects", "project_id")
+            }
+            TombstoneTargetType::Entry => {
+                conn.inner().execute(
+                    "DELETE FROM tiga_policy_overrides
+                     WHERE scope_type = 'entry' AND scope_id = ?1",
+                    params![id],
+                )?;
+                ("entries", "entry_id")
+            }
+            TombstoneTargetType::Attachment => {
+                conn.inner().execute(
+                    "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+                    params![id],
+                )?;
+                ("attachments", "attachment_id")
+            }
+            TombstoneTargetType::ObjectRelation => ("object_relations", "relation_id"),
+            TombstoneTargetType::ObjectLabel => ("object_labels", "label_id"),
+            TombstoneTargetType::ObjectLabelAssignment => {
+                ("object_label_assignments", "assignment_id")
+            }
+            TombstoneTargetType::Branch => {
+                return Err(StorageError::ConstraintViolation(
+                    "branch purge receipts are unsupported".to_string(),
+                ));
+            }
+        };
+        conn.inner().execute(
+            &format!("DELETE FROM {table} WHERE {id_column} = ?1"),
+            params![id],
+        )?;
+        conn.inner().execute(
+            "DELETE FROM object_versions WHERE object_type = ?1 AND object_id = ?2",
+            params![receipt.target_object_type, id],
+        )?;
+        conn.inner().execute(
+            "DELETE FROM tombstones
+             WHERE target_object_type = ?1 AND target_object_id = ?2",
+            params![receipt.target_object_type, id],
+        )?;
+        Ok(())
+    }
 }
 
 fn schedule_operation_id(tombstone_id: &str, purge_eligible_at: &str) -> String {
@@ -436,6 +893,16 @@ fn schedule_operation_id(tombstone_id: &str, purge_eligible_at: &str) -> String 
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("tombstone-purge-schedule-{encoded}")
+}
+
+fn purge_operation_id(tombstone_id: &str, delete_commit_id: &str) -> String {
+    let digest =
+        Sha256::digest([tombstone_id.as_bytes(), b"\0", delete_commit_id.as_bytes()].concat());
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("permanent-object-purge-{encoded}")
 }
 
 fn read_target_type(
@@ -460,12 +927,15 @@ fn read_target_type(
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
+    use crate::recovery::{IssueSeverity, RecoveryVerifier};
     use crate::repo::attachment::AttachmentRepo;
     use crate::repo::commit_ctx::CommitContext;
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
+    use crate::repo::snapshot::SnapshotRepo;
     use mdbx_core::model::{UnlockMethodType, VaultSession};
     use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
+    use mdbx_crypto::keyring::Keyring;
 
     fn setup() -> (VaultConnection, CommitContext, String) {
         let conn = VaultConnection::open_in_memory().unwrap();
@@ -474,6 +944,19 @@ mod tests {
             ..VaultInitParams::default()
         };
         initialize_vault(&conn, &params).unwrap();
+        let ctx = CommitContext::new("test-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Tombstone Project", None, None).unwrap();
+        (conn, ctx, project.project_id)
+    }
+
+    fn setup_with_keyring(context: &[u8]) -> (VaultConnection, CommitContext, String) {
+        let mut conn = VaultConnection::open_in_memory().unwrap();
+        let params = VaultInitParams {
+            device_id: "test-device".to_string(),
+            ..VaultInitParams::default()
+        };
+        initialize_vault(&conn, &params).unwrap();
+        conn.attach_keyring(Keyring::from_vault_key(&[7_u8; 32], context).unwrap());
         let ctx = CommitContext::new("test-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Tombstone Project", None, None).unwrap();
         (conn, ctx, project.project_id)
@@ -498,6 +981,12 @@ mod tests {
             screen_capture_protection_available: false,
             secure_temp_files_available: true,
         }
+    }
+
+    fn unix_time(value: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .timestamp()
     }
 
     #[test]
@@ -790,6 +1279,201 @@ mod tests {
             )
             .unwrap();
         assert!(stored.is_none());
+    }
+
+    #[test]
+    fn authorized_tombstone_purge_is_atomic_audited_and_idempotent() {
+        let (conn, ctx, project_id) = setup_with_keyring(b"purge-test");
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        let now = unix_time("2031-01-01T00:00:00Z");
+        let session = administrative_session(now);
+        let device = administrative_device();
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: now,
+        };
+        TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            context,
+        )
+        .unwrap();
+
+        let (receipt, decision) =
+            TombstoneRepo::purge_authorized(&conn, &ctx, &tombstone.tombstone_id, context).unwrap();
+        assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
+        assert_eq!(receipt.target_object_id, project_id);
+        receipt.verify_integrity(&conn).unwrap();
+        assert!(ProjectRepo::get_by_id(&conn, &receipt.target_object_id)
+            .unwrap()
+            .is_none());
+        assert!(
+            TombstoneRepo::find_by_target(&conn, &receipt.target_object_id)
+                .unwrap()
+                .is_none()
+        );
+        let version_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions
+                 WHERE object_type = 'project' AND object_id = ?1",
+                params![receipt.target_object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, 0);
+        let acknowledgement_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM tombstone_acknowledgements WHERE tombstone_id = ?1",
+                params![receipt.tombstone_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledgement_count, 0);
+        let reuse_error = ProjectRepo::create_with_id(
+            &conn,
+            &ctx,
+            &receipt.target_object_id,
+            "Reused",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(reuse_error.to_string().contains("permanent purge receipt"));
+        let commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        let (retry, _) =
+            TombstoneRepo::purge_authorized(&conn, &ctx, &receipt.tombstone_id, context).unwrap();
+        assert_eq!(retry.purge_id, receipt.purge_id);
+        let retry_commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retry_commit_count, commit_count);
+        let events = TigaService::list_security_audit_events(&conn, 20).unwrap();
+        assert!(events.iter().any(|event| {
+            event.operation == TigaOperation::PurgeDeletedObject
+                && event.commit_id.as_deref() == Some(receipt.purge_commit_id.as_str())
+        }));
+        assert!(RecoveryVerifier::check_purge_receipts(&conn)
+            .unwrap()
+            .is_empty());
+        conn.inner()
+            .execute(
+                "UPDATE purge_receipts SET integrity_tag = X'00' WHERE purge_id = ?1",
+                params![receipt.purge_id],
+            )
+            .unwrap();
+        assert!(RecoveryVerifier::check_purge_receipts(&conn)
+            .unwrap()
+            .iter()
+            .any(|issue| issue.severity == IssueSeverity::Critical));
+    }
+
+    #[test]
+    fn authorized_tombstone_purge_rejects_remaining_dependents_without_partial_changes() {
+        let (conn, ctx, project_id) = setup_with_keyring(b"purge-dependency");
+        EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            mdbx_core::model::EntryType::Note,
+            Some("Dependent"),
+            &serde_json::json!({"text":"retained"}),
+        )
+        .unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        let now = unix_time("2031-01-01T00:00:00Z");
+        let session = administrative_session(now);
+        let device = administrative_device();
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: now,
+        };
+        TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            context,
+        )
+        .unwrap();
+        let commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        let error = TombstoneRepo::purge_authorized(&conn, &ctx, &tombstone.tombstone_id, context)
+            .unwrap_err();
+        assert!(error.to_string().contains("dependent-objects-remain"));
+        assert!(ProjectRepo::get_by_id(&conn, &project_id)
+            .unwrap()
+            .is_some());
+        assert!(TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .is_some());
+        assert!(
+            TombstoneRepo::find_purge_receipt_by_tombstone(&conn, &tombstone.tombstone_id)
+                .unwrap()
+                .is_none()
+        );
+        let after_commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_commit_count, commit_count);
+    }
+
+    #[test]
+    fn purge_receipt_prevents_snapshot_restore_from_reintroducing_object() {
+        let (conn, ctx, project_id) = setup_with_keyring(b"purge-snapshot");
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&conn, &project_id)
+            .unwrap()
+            .unwrap();
+        let now = unix_time("2031-01-01T00:00:00Z");
+        let session = administrative_session(now);
+        let device = administrative_device();
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: now,
+        };
+        TombstoneRepo::schedule_purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone.tombstone_id,
+            "2030-01-01T00:00:00Z",
+            context,
+        )
+        .unwrap();
+        TombstoneRepo::purge_authorized(&conn, &ctx, &tombstone.tombstone_id, context).unwrap();
+
+        SnapshotRepo::restore_snapshot_authorized(&conn, &ctx, &snapshot.snapshot_id, context)
+            .unwrap();
+        assert!(ProjectRepo::get_by_id(&conn, &project_id)
+            .unwrap()
+            .is_none());
+        assert!(
+            TombstoneRepo::find_purge_receipt_by_target(&conn, "project", &project_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

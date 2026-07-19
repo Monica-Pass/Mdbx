@@ -10,6 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::TombstoneRepo;
 
 /// Project 的持久化仓库。
 ///
@@ -50,6 +51,11 @@ impl ProjectRepo {
         Uuid::parse_str(project_id).map_err(|_| {
             StorageError::Validation(format!("project_id {project_id} must be a UUID"))
         })?;
+        if TombstoneRepo::is_permanently_purged(conn, "project", project_id)? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "project ID {project_id} has a permanent purge receipt"
+            )));
+        }
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
 

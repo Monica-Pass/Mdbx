@@ -66,6 +66,12 @@ A `ConflictResolutionOperation` selects local state, incoming state, or a valida
 
 A `TombstoneAcknowledgement` records that one registered device observed a deletion commit. It is separate from `DeviceHead`, because receiving a commit does not require the device to author a later commit. A tombstone can enter the authorized cleanup stage only after every non-revoked device has a causally valid acknowledgement.
 
+### PermanentPurgeReceipt
+
+A `PermanentPurgeReceipt` is the monotonic authenticated proof that one stable physical object identity completed authorized cleanup. It binds the tombstone, target type and ID, delete commit and clock, retention time, purge commit, executing device, and execution time. The receipt remains after the active row, object versions, tombstone, acknowledgements, and owned binary chunks are removed.
+
+Receipts participate in complete synchronization state and snapshot recovery guards. Once a receipt exists, the same physical type and stable ID cannot be recreated from an old commit, tombstone collection, snapshot, or explicit local create operation.
+
 ### HealthReport
 
 A `HealthReport` is a read-only structured diagnosis of vault integrity. Each issue has a stable severity, category, and description suitable for CLI output and native client presentation. Tombstone diagnostics compare exact typed markers with the current deletion state of every synchronized object family while recognizing unresolved delete-versus-modify conflicts as a temporary valid state.
@@ -89,6 +95,10 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 15. TombstoneTargetType identifies a physical core object family. Unknown stored values require declared reader support and produce an explicit error; they must never be converted to Project or another known family.
 16. A tombstone is not eligible for physical cleanup until retention has expired, the object remains deleted, conflicts are resolved, the delete commit exists, and every non-revoked device has causally acknowledged that commit.
 17. Device revocation is monotonic security state. Synchronization may advance a revoked device's recorded head but cannot reactivate it.
+18. A PermanentPurgeReceipt is monotonic. A different receipt for the same tombstone or physical object identity is an integrity violation.
+19. Permanent cleanup rechecks authorization, eligibility, conflicts, acknowledgements, and dependent objects in one transaction before creating one purge CommitOperation.
+20. Project, Entry, and ObjectLabel cleanup requires dependent objects to be cleaned first. Attachment chunks, project labels, object versions, tombstone acknowledgements, and object-scoped Tiga overrides are removed with their owner.
+21. A permanent receipt prevents the current vault from restoring the same stable identity. Historical snapshot files, exported copies, and external backups remain separate retention media and require independent media erasure or future object-key destruction.
 
 ## Module Architecture
 
@@ -112,9 +122,11 @@ The synchronization state carries an optional complete TombstoneState. New produ
 
 Tombstone acknowledgements are monotonic synchronized metadata. Per-commit tombstones acknowledge the deleting and receiving devices; complete state transfers accumulated acknowledgements. `device_heads` supplies the active-device set but is not treated as proof that a device observed a deletion.
 
+Permanent purge receipts are applied before ordinary objects during complete synchronization. Applying a receipt removes stale local state in dependency order, and every later object, relation, label, assignment, attachment, version, and tombstone application checks the receipt guard. Snapshot restoration uses the same guard before restoring owner rows, attachment chunks, and project labels.
+
 ### Recovery and Health Module
 
-The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, and typed tombstones. It reports missing markers for deleted rows, unexplained markers for active rows, and duplicate markers as errors. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
+The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, typed tombstones, and permanent purge receipts. It reports missing markers for deleted rows, unexplained markers for active rows, duplicate markers, invalid receipt authentication tags, and active rows that contradict a permanent receipt. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
 
 ### Capability Features
 

@@ -4,6 +4,7 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
+use crate::repo::TombstoneRepo;
 
 /// 数据库健康检查结果。
 #[derive(Debug, Clone)]
@@ -100,6 +101,15 @@ impl RecoveryVerifier {
                 severity: IssueSeverity::Error,
                 category: "tombstones".to_string(),
                 description: format!("tombstone consistency check failed: {}", e),
+            }),
+        }
+
+        match Self::check_purge_receipts(conn) {
+            Ok(receipt_issues) => issues.extend(receipt_issues),
+            Err(e) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "purge-receipts".to_string(),
+                description: format!("purge receipt check failed: {}", e),
             }),
         }
 
@@ -550,6 +560,60 @@ impl RecoveryVerifier {
         Ok(issues)
     }
 
+    pub fn check_purge_receipts(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
+        let mut issues = Vec::new();
+        let mut stmt = conn.inner().prepare(
+            "SELECT target_object_type, target_object_id FROM purge_receipts
+             ORDER BY target_object_type, target_object_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let targets = rows.collect::<Result<Vec<_>, _>>()?;
+        for (object_type, object_id) in targets {
+            if let Err(error) =
+                TombstoneRepo::find_purge_receipt_by_target(conn, &object_type, &object_id)
+            {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Critical,
+                    category: "purge-receipts".to_string(),
+                    description: format!(
+                        "permanent purge receipt for {} {} failed integrity verification: {}",
+                        object_type, object_id, error
+                    ),
+                });
+                continue;
+            }
+            let tombstone_count: i64 = conn.inner().query_row(
+                "SELECT COUNT(*) FROM tombstones
+                 WHERE target_object_type = ?1 AND target_object_id = ?2",
+                rusqlite::params![object_type, object_id],
+                |row| row.get(0),
+            )?;
+            if tombstone_count > 0 {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "purge-receipts".to_string(),
+                    description: format!(
+                        "permanently purged {} {} still has a tombstone",
+                        object_type, object_id
+                    ),
+                });
+            }
+            if physical_object_exists(conn, &object_type, &object_id)? {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Critical,
+                    category: "purge-receipts".to_string(),
+                    description: format!(
+                        "permanently purged {} {} still has an active storage row",
+                        object_type, object_id
+                    ),
+                });
+            }
+        }
+        Ok(issues)
+    }
+
     fn has_unresolved_deletion_conflict(
         conn: &VaultConnection,
         object_type: &str,
@@ -679,6 +743,26 @@ impl RecoveryVerifier {
         use crate::repo::snapshot::SnapshotRepo;
         SnapshotRepo::verify_integrity(conn, snapshot_id)
     }
+}
+
+fn physical_object_exists(
+    conn: &VaultConnection,
+    object_type: &str,
+    object_id: &str,
+) -> StorageResult<bool> {
+    let (table, id_column) = match object_type {
+        "project" => ("projects", "project_id"),
+        "entry" => ("entries", "entry_id"),
+        "attachment" => ("attachments", "attachment_id"),
+        "object-relation" => ("object_relations", "relation_id"),
+        "object-label" => ("object_labels", "label_id"),
+        "object-label-assignment" => ("object_label_assignments", "assignment_id"),
+        _ => return Ok(false),
+    };
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {id_column} = ?1)");
+    conn.inner()
+        .query_row(&sql, rusqlite::params![object_id], |row| row.get(0))
+        .map_err(StorageError::Database)
 }
 
 struct CommitIntegrityRow {

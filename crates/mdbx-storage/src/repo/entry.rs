@@ -10,6 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::TombstoneRepo;
 
 /// Entry 的持久化仓库。
 ///
@@ -106,6 +107,11 @@ impl EntryRepo {
         } = request;
         Uuid::parse_str(entry_id)
             .map_err(|_| StorageError::Validation(format!("entry_id {entry_id} must be a UUID")))?;
+        if TombstoneRepo::is_permanently_purged(conn, "entry", entry_id)? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "entry ID {entry_id} has a permanent purge receipt"
+            )));
+        }
         entry_type.validate().map_err(StorageError::Validation)?;
         if payload_schema_version == 0 {
             return Err(StorageError::Validation(

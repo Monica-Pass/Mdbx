@@ -16,6 +16,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::TombstoneRepo;
 use crate::sync_state::ProjectTagSetRow;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
@@ -234,66 +235,76 @@ impl SnapshotRepo {
 
             // Restore in dependency order, but give every row a new causal head.
             for project in &payload.projects {
-                upsert_project(conn, project, &restore_commit_id, &now, &ctx.device_id)?;
-                ObjectVersionRepo::record_project_current(
-                    conn,
-                    &restore_commit_id,
-                    &project.project_id,
-                )?;
+                if upsert_project(conn, project, &restore_commit_id, &now, &ctx.device_id)? {
+                    ObjectVersionRepo::record_project_current(
+                        conn,
+                        &restore_commit_id,
+                        &project.project_id,
+                    )?;
+                }
             }
             for entry in &payload.entries {
-                upsert_entry(conn, entry, &restore_commit_id, &now, &ctx.device_id)?;
-                ObjectVersionRepo::record_entry_current(conn, &restore_commit_id, &entry.entry_id)?;
+                if upsert_entry(conn, entry, &restore_commit_id, &now, &ctx.device_id)? {
+                    ObjectVersionRepo::record_entry_current(
+                        conn,
+                        &restore_commit_id,
+                        &entry.entry_id,
+                    )?;
+                }
             }
             if let Some(labels) = &payload.object_labels {
                 for label in labels {
-                    upsert_object_label(conn, label, &restore_commit_id, &now, &ctx.device_id)?;
-                    ObjectVersionRepo::record_object_label_current(
-                        conn,
-                        &restore_commit_id,
-                        &label.label_id,
-                    )?;
+                    if upsert_object_label(conn, label, &restore_commit_id, &now, &ctx.device_id)? {
+                        ObjectVersionRepo::record_object_label_current(
+                            conn,
+                            &restore_commit_id,
+                            &label.label_id,
+                        )?;
+                    }
                 }
             }
             if let Some(relations) = &payload.object_relations {
                 for relation in relations {
-                    upsert_object_relation(
+                    if upsert_object_relation(
                         conn,
                         relation,
                         &restore_commit_id,
                         &now,
                         &ctx.device_id,
-                    )?;
-                    ObjectVersionRepo::record_object_relation_current(
-                        conn,
-                        &restore_commit_id,
-                        &relation.relation_id,
-                    )?;
+                    )? {
+                        ObjectVersionRepo::record_object_relation_current(
+                            conn,
+                            &restore_commit_id,
+                            &relation.relation_id,
+                        )?;
+                    }
                 }
             }
             if let Some(assignments) = &payload.object_label_assignments {
                 for assignment in assignments {
-                    upsert_object_label_assignment(
+                    if upsert_object_label_assignment(
                         conn,
                         assignment,
                         &restore_commit_id,
                         &now,
                         &ctx.device_id,
-                    )?;
-                    ObjectVersionRepo::record_object_label_assignment_current(
-                        conn,
-                        &restore_commit_id,
-                        &assignment.assignment_id,
-                    )?;
+                    )? {
+                        ObjectVersionRepo::record_object_label_assignment_current(
+                            conn,
+                            &restore_commit_id,
+                            &assignment.assignment_id,
+                        )?;
+                    }
                 }
             }
             for attachment in &payload.attachments {
-                upsert_attachment(conn, attachment, &restore_commit_id, &now, &ctx.device_id)?;
-                ObjectVersionRepo::record_attachment_current(
-                    conn,
-                    &restore_commit_id,
-                    &attachment.attachment_id,
-                )?;
+                if upsert_attachment(conn, attachment, &restore_commit_id, &now, &ctx.device_id)? {
+                    ObjectVersionRepo::record_attachment_current(
+                        conn,
+                        &restore_commit_id,
+                        &attachment.attachment_id,
+                    )?;
+                }
             }
 
             if let Some(chunks) = &payload.attachment_chunks {
@@ -787,7 +798,10 @@ fn upsert_project(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(conn, "project", &p.project_id)? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "INSERT INTO projects (project_id, title_ct, summary_ct, group_id,
          icon_ref, favorite, archived, deleted, tiga_mode_override, object_clock,
@@ -826,7 +840,7 @@ fn upsert_project(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn upsert_entry(
@@ -835,7 +849,10 @@ fn upsert_entry(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(conn, "entry", &e.entry_id)? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
          payload_ct, payload_schema_version, tiga_mode_override, object_clock,
@@ -870,7 +887,7 @@ fn upsert_entry(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn upsert_object_relation(
@@ -879,7 +896,10 @@ fn upsert_object_relation(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(conn, "object-relation", &relation.relation_id)? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "INSERT INTO object_relations
             (relation_id, source_object_id, target_object_id, relation_kind,
@@ -913,7 +933,7 @@ fn upsert_object_relation(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn upsert_object_label(
@@ -922,7 +942,10 @@ fn upsert_object_label(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(conn, "object-label", &label.label_id)? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "INSERT INTO object_labels
             (label_id, collection_id, name_ct, payload_ct, payload_schema_version,
@@ -953,7 +976,7 @@ fn upsert_object_label(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn upsert_object_label_assignment(
@@ -962,7 +985,14 @@ fn upsert_object_label_assignment(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(
+        conn,
+        "object-label-assignment",
+        &assignment.assignment_id,
+    )? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "UPDATE object_label_assignments SET deleted = 1
          WHERE object_id = ?1 AND label_id = ?2 AND assignment_id <> ?3 AND deleted = 0",
@@ -998,7 +1028,7 @@ fn upsert_object_label_assignment(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn upsert_attachment(
@@ -1007,7 +1037,10 @@ fn upsert_attachment(
     restore_commit_id: &str,
     now: &str,
     device_id: &str,
-) -> StorageResult<()> {
+) -> StorageResult<bool> {
+    if TombstoneRepo::is_permanently_purged(conn, "attachment", &a.attachment_id)? {
+        return Ok(false);
+    }
     conn.inner().execute(
         "INSERT INTO attachments (attachment_id, project_id, entry_id,
          file_name_ct, media_type_ct, storage_mode, content_hash,
@@ -1046,7 +1079,7 @@ fn upsert_attachment(
             device_id,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn restore_attachment_chunks(
@@ -1055,6 +1088,9 @@ fn restore_attachment_chunks(
     chunks: &[AttachmentChunk],
 ) -> StorageResult<()> {
     for attachment_id in attachment_ids {
+        if TombstoneRepo::is_permanently_purged(conn, "attachment", attachment_id)? {
+            continue;
+        }
         conn.inner().execute(
             "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
             params![attachment_id],
@@ -1062,6 +1098,9 @@ fn restore_attachment_chunks(
     }
 
     for chunk in chunks {
+        if TombstoneRepo::is_permanently_purged(conn, "attachment", &chunk.attachment_id)? {
+            continue;
+        }
         conn.inner().execute(
             "INSERT OR REPLACE INTO attachment_chunks (attachment_id, chunk_index,
              chunk_hash, chunk_ct, external_uri_ct, stored_size, created_at)
@@ -1087,12 +1126,18 @@ fn restore_project_tags(
     tag_sets: &[ProjectTagSetRow],
 ) -> StorageResult<()> {
     for project_id in project_ids {
+        if TombstoneRepo::is_permanently_purged(conn, "project", project_id)? {
+            continue;
+        }
         conn.inner().execute(
             "DELETE FROM project_tags WHERE project_id = ?1",
             params![project_id],
         )?;
     }
     for row in tag_sets {
+        if TombstoneRepo::is_permanently_purged(conn, "project", &row.project_id)? {
+            continue;
+        }
         for tag in &row.tags {
             conn.inner().execute(
                 "INSERT OR IGNORE INTO project_tags (project_id, tag) VALUES (?1, ?2)",

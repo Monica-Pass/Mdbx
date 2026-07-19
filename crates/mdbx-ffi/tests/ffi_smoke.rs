@@ -596,6 +596,89 @@ fn updates_deletes_restores_and_moves_generic_entry() {
 }
 
 #[test]
+fn clients_can_schedule_and_execute_permanent_entry_purge() {
+    let vault_path = temp_vault_path("permanent-entry-purge");
+    let path = vault_path.as_path_string();
+    let password = "permanent purge password 12345!";
+    let device_id = "ffi-permanent-purge-device";
+
+    let vault = create_vault(path.clone(), password.to_string(), device_id.to_string()).unwrap();
+    drop(vault);
+    let vault = open_vault(path.clone(), password.to_string(), device_id.to_string()).unwrap();
+    let project = vault.create_project("Purge test".to_string()).unwrap();
+    let entry = vault
+        .create_entry(
+            project.project_id.clone(),
+            "note".to_string(),
+            "Temporary".to_string(),
+            r#"{"kind":"note","body":"erase after retention"}"#.to_string(),
+        )
+        .unwrap();
+
+    vault
+        .delete_entry(project.project_id.clone(), entry.entry_id.clone())
+        .unwrap();
+    let tombstone = vault
+        .find_tombstone_by_target(entry.entry_id.clone())
+        .unwrap()
+        .unwrap();
+    let schedule = vault
+        .schedule_tombstone_purge(
+            tombstone.tombstone_id.clone(),
+            tombstone.deleted_at.clone(),
+            standard_device(),
+        )
+        .unwrap();
+    assert_eq!(schedule.tombstone_id, tombstone.tombstone_id);
+    assert_eq!(schedule.purge_eligible_at, tombstone.deleted_at);
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let receipt = vault
+        .purge_tombstone(tombstone.tombstone_id.clone(), standard_device())
+        .unwrap();
+    assert_eq!(receipt.tombstone_id, tombstone.tombstone_id);
+    assert_eq!(receipt.target_object_type, "entry");
+    assert_eq!(receipt.target_object_id, entry.entry_id);
+    assert_eq!(receipt.delete_clock, tombstone.delete_clock);
+    assert!(!receipt.integrity_tag.is_empty());
+    assert!(vault
+        .find_tombstone_by_target(receipt.target_object_id.clone())
+        .unwrap()
+        .is_none());
+    assert!(vault
+        .list_deleted_entries(project.project_id.clone(), Some("note".to_string()))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        vault
+            .find_permanent_purge_receipt_by_target(
+                "entry".to_string(),
+                receipt.target_object_id.clone(),
+            )
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+
+    let retried = vault
+        .purge_tombstone(tombstone.tombstone_id.clone(), standard_device())
+        .unwrap();
+    assert_eq!(retried.purge_id, receipt.purge_id);
+    assert_eq!(retried.purge_commit_id, receipt.purge_commit_id);
+    assert_eq!(count_rows(vault_path.path(), "purge_receipts"), 1);
+
+    drop(vault);
+    let reopened = open_vault(path, password.to_string(), device_id.to_string()).unwrap();
+    assert_eq!(
+        reopened
+            .find_permanent_purge_receipt_by_tombstone(tombstone.tombstone_id)
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+}
+
+#[test]
 fn namespaced_objects_roundtrip_through_the_generic_client_api() {
     let vault_path = temp_vault_path("generic-object-api");
     let vault = create_vault(
@@ -893,7 +976,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(8));
+    assert_eq!(upgraded.schema_version, Some(9));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())
@@ -903,6 +986,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
         })
         .unwrap();
     assert_eq!(stored_format, "MDBX-2");
+    assert_eq!(count_rows(vault_path.path(), "purge_receipts"), 0);
 }
 
 #[test]

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
     Conflict, ConflictObjectType, ConflictResolution, EntryType, ObjectTypeId, RelationKindId,
-    UnlockMethodType,
+    Tombstone, UnlockMethodType,
 };
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
@@ -27,8 +27,8 @@ use mdbx_storage::repo::{
     CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
     ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
-    ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult,
-    TombstoneRepo,
+    PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility,
+    TombstonePurgeScheduleResult, TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -153,6 +153,35 @@ pub struct MdbxTombstonePurgeBlocker {
     pub device_id: Option<String>,
     pub commit_id: Option<String>,
     pub timestamp: Option<String>,
+    pub dependent_object_type: Option<String>,
+    pub dependent_object_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxTombstoneRecord {
+    pub tombstone_id: String,
+    pub target_object_type: String,
+    pub target_object_id: String,
+    pub delete_clock: String,
+    pub deleted_by_device_id: String,
+    pub deleted_at: String,
+    pub purge_eligible_at: Option<String>,
+    pub delete_commit_id: Option<String>,
+}
+
+impl From<Tombstone> for MdbxTombstoneRecord {
+    fn from(value: Tombstone) -> Self {
+        Self {
+            tombstone_id: value.tombstone_id,
+            target_object_type: value.target_object_type.to_string(),
+            target_object_id: value.target_object_id,
+            delete_clock: value.delete_clock,
+            deleted_by_device_id: value.deleted_by_device_id,
+            deleted_at: value.deleted_at,
+            purge_eligible_at: value.purge_eligible_at,
+            delete_commit_id: value.delete_commit_id,
+        }
+    }
 }
 
 impl From<TombstonePurgeBlocker> for MdbxTombstonePurgeBlocker {
@@ -179,6 +208,11 @@ impl From<TombstonePurgeBlocker> for MdbxTombstonePurgeBlocker {
                 device_id: Some(device_id),
                 ..Self::new("device-has-not-acknowledged-delete")
             },
+            TombstonePurgeBlocker::DependentObjectsRemain { object_type, count } => Self {
+                dependent_object_type: Some(object_type),
+                dependent_object_count: Some(count),
+                ..Self::new("dependent-objects-remain")
+            },
             TombstonePurgeBlocker::UnsupportedTargetType => Self::new("unsupported-target-type"),
         }
     }
@@ -191,6 +225,8 @@ impl MdbxTombstonePurgeBlocker {
             device_id: None,
             commit_id: None,
             timestamp: None,
+            dependent_object_type: None,
+            dependent_object_count: None,
         }
     }
 }
@@ -225,6 +261,39 @@ impl From<TombstonePurgeScheduleResult> for MdbxTombstonePurgeScheduleResult {
             tombstone_id: value.tombstone_id,
             purge_eligible_at: value.purge_eligible_at,
             commit_id: value.commit_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPermanentPurgeReceipt {
+    pub purge_id: String,
+    pub tombstone_id: String,
+    pub target_object_type: String,
+    pub target_object_id: String,
+    pub delete_commit_id: String,
+    pub purge_commit_id: String,
+    pub delete_clock: String,
+    pub retention_eligible_at: String,
+    pub purged_by_device_id: String,
+    pub purged_at: String,
+    pub integrity_tag: Vec<u8>,
+}
+
+impl From<PermanentPurgeReceipt> for MdbxPermanentPurgeReceipt {
+    fn from(value: PermanentPurgeReceipt) -> Self {
+        Self {
+            purge_id: value.purge_id,
+            tombstone_id: value.tombstone_id,
+            target_object_type: value.target_object_type,
+            target_object_id: value.target_object_id,
+            delete_commit_id: value.delete_commit_id,
+            purge_commit_id: value.purge_commit_id,
+            delete_clock: value.delete_clock,
+            retention_eligible_at: value.retention_eligible_at,
+            purged_by_device_id: value.purged_by_device_id,
+            purged_at: value.purged_at,
+            integrity_tag: value.integrity_tag,
         }
     }
 }
@@ -1027,6 +1096,36 @@ impl MdbxVault {
         Ok(TombstoneRepo::evaluate_purge_eligibility(&conn, &tombstone_id, &now)?.into())
     }
 
+    pub fn find_tombstone_by_target(
+        &self,
+        target_object_id: String,
+    ) -> Result<Option<MdbxTombstoneRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(TombstoneRepo::find_by_target(&conn, &target_object_id)?.map(Into::into))
+    }
+
+    pub fn find_permanent_purge_receipt_by_tombstone(
+        &self,
+        tombstone_id: String,
+    ) -> Result<Option<MdbxPermanentPurgeReceipt>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(TombstoneRepo::find_purge_receipt_by_tombstone(&conn, &tombstone_id)?.map(Into::into))
+    }
+
+    pub fn find_permanent_purge_receipt_by_target(
+        &self,
+        target_object_type: String,
+        target_object_id: String,
+    ) -> Result<Option<MdbxPermanentPurgeReceipt>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(TombstoneRepo::find_purge_receipt_by_target(
+            &conn,
+            &target_object_type,
+            &target_object_id,
+        )?
+        .map(Into::into))
+    }
+
     pub fn schedule_tombstone_purge(
         &self,
         tombstone_id: String,
@@ -1049,6 +1148,28 @@ impl MdbxVault {
             },
         )?;
         Ok(result.into())
+    }
+
+    pub fn purge_tombstone(
+        &self,
+        tombstone_id: String,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxPermanentPurgeReceipt, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let session = conn.active_session().cloned();
+        let device = device.into_core(&self.device_id);
+        let ctx = CommitContext::new(self.device_id.clone());
+        let (receipt, _) = TombstoneRepo::purge_authorized(
+            &conn,
+            &ctx,
+            &tombstone_id,
+            TigaAuthorizationContext {
+                session: session.as_ref(),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?;
+        Ok(receipt.into())
     }
 
     pub fn resolve_tiga_policy(

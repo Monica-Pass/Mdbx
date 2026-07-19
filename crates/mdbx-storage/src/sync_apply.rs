@@ -15,12 +15,16 @@ use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
 use crate::migration::FIELD_KEY_EPOCHS_EXTENSION;
-use crate::repo::{BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
+use crate::repo::{
+    BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo, PermanentPurgeReceipt,
+    TombstoneRepo,
+};
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
     KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow,
-    ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
-    TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneAcknowledgementRow, TombstoneRow,
+    ProjectTagSetRow, PurgeReceiptRow, SecurityAuditEventRow, SyncStatePayload,
+    TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneAcknowledgementRow,
+    TombstoneRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -257,6 +261,13 @@ impl SyncApplyRepo {
         }
 
         for tombstone in &serialized.tombstones {
+            if TombstoneRepo::is_permanently_purged(
+                conn,
+                &tombstone.target_object_type,
+                &tombstone.target_object_id,
+            )? {
+                continue;
+            }
             conn.inner().execute(
                 "INSERT INTO tombstones (tombstone_id, target_object_type, target_object_id,
                  delete_clock, deleted_by_device_id, deleted_at, purge_eligible_at,
@@ -304,6 +315,13 @@ impl SyncApplyRepo {
         serialized: &SerializedCommit,
     ) -> StorageResult<()> {
         for tombstone in &serialized.tombstones {
+            if TombstoneRepo::is_permanently_purged(
+                conn,
+                &tombstone.target_object_type,
+                &tombstone.target_object_id,
+            )? {
+                continue;
+            }
             conn.inner().execute(
                 "INSERT INTO tombstone_acknowledgements
                     (tombstone_id, device_id, observed_commit_id, acknowledged_at)
@@ -430,6 +448,9 @@ impl SyncApplyRepo {
                 key_epoch_merge_mode,
                 allow_key_epoch_changes,
             )?;
+        }
+        if let Some(receipts) = &state.purge_receipts {
+            Self::apply_purge_receipts(conn, receipts)?;
         }
         conflicts += Self::apply_projects(conn, ctx, incoming_commit_id, &state.projects)?;
         conflicts += Self::apply_entries(conn, ctx, incoming_commit_id, &state.entries)?;
@@ -884,6 +905,38 @@ impl SyncApplyRepo {
         Ok(())
     }
 
+    fn apply_purge_receipts(conn: &VaultConnection, rows: &[PurgeReceiptRow]) -> StorageResult<()> {
+        let mut receipts = rows
+            .iter()
+            .map(|row| PermanentPurgeReceipt {
+                purge_id: row.purge_id.clone(),
+                tombstone_id: row.tombstone_id.clone(),
+                target_object_type: row.target_object_type.clone(),
+                target_object_id: row.target_object_id.clone(),
+                delete_commit_id: row.delete_commit_id.clone(),
+                purge_commit_id: row.purge_commit_id.clone(),
+                delete_clock: row.delete_clock.clone(),
+                retention_eligible_at: row.retention_eligible_at.clone(),
+                purged_by_device_id: row.purged_by_device_id.clone(),
+                purged_at: row.purged_at.clone(),
+                integrity_tag: row.integrity_tag.clone(),
+            })
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| purge_dependency_order(&receipt.target_object_type));
+        for receipt in receipts {
+            if !Self::commit_exists(conn, &receipt.delete_commit_id)?
+                || !Self::commit_exists(conn, &receipt.purge_commit_id)?
+            {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "permanent purge receipt {} references unavailable commits",
+                    receipt.purge_id
+                )));
+            }
+            TombstoneRepo::apply_synced_purge_receipt(conn, &receipt)?;
+        }
+        Ok(())
+    }
+
     fn apply_projects(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -892,6 +945,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in projects {
+            if TombstoneRepo::is_permanently_purged(conn, "project", &row.project_id)? {
+                continue;
+            }
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
             }
@@ -977,6 +1033,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in entries {
+            if TombstoneRepo::is_permanently_purged(conn, "entry", &row.entry_id)? {
+                continue;
+            }
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_entry_row(conn, &row.head_commit_id, row)?;
             }
@@ -1056,6 +1115,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in relations {
+            if TombstoneRepo::is_permanently_purged(conn, "object-relation", &row.relation_id)? {
+                continue;
+            }
             row.relation_kind
                 .parse::<mdbx_core::model::RelationKindId>()
                 .map_err(StorageError::Validation)?;
@@ -1153,6 +1215,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in labels {
+            if TombstoneRepo::is_permanently_purged(conn, "object-label", &row.label_id)? {
+                continue;
+            }
             validate_payload_schema_version(row.payload_schema_version)?;
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
@@ -1244,6 +1309,13 @@ impl SyncApplyRepo {
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for row in assignments {
+            if TombstoneRepo::is_permanently_purged(
+                conn,
+                "object-label-assignment",
+                &row.assignment_id,
+            )? {
+                continue;
+            }
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_object_label_assignment_row(
                     conn,
@@ -1402,6 +1474,9 @@ impl SyncApplyRepo {
     ) -> StorageResult<AttachmentApplyResult> {
         let mut result = AttachmentApplyResult::default();
         for row in attachments {
+            if TombstoneRepo::is_permanently_purged(conn, "attachment", &row.attachment_id)? {
+                continue;
+            }
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_attachment_row(conn, &row.head_commit_id, row)?;
             }
@@ -1522,6 +1597,9 @@ impl SyncApplyRepo {
         tag_sets: &[ProjectTagSetRow],
     ) -> StorageResult<()> {
         for row in tag_sets {
+            if TombstoneRepo::is_permanently_purged(conn, "project", &row.project_id)? {
+                continue;
+            }
             conn.inner().execute(
                 "DELETE FROM project_tags WHERE project_id = ?1",
                 params![row.project_id],
@@ -1546,6 +1624,13 @@ impl SyncApplyRepo {
     ) -> StorageResult<()> {
         conn.inner().execute("DELETE FROM tombstones", [])?;
         for row in tombstones {
+            if TombstoneRepo::is_permanently_purged(
+                conn,
+                &row.target_object_type,
+                &row.target_object_id,
+            )? {
+                continue;
+            }
             let delete_commit_id = match row.delete_commit_id.as_deref() {
                 Some(commit_id) if Self::commit_exists(conn, commit_id)? => Some(commit_id),
                 _ => None,
@@ -2922,6 +3007,18 @@ fn tiga_scope_from_parts(scope_type: &str, scope_id: &str) -> StorageResult<Tiga
     }
 }
 
+fn purge_dependency_order(object_type: &str) -> u8 {
+    match object_type {
+        "object-label-assignment" => 0,
+        "object-relation" => 1,
+        "attachment" => 2,
+        "object-label" => 3,
+        "entry" => 4,
+        "project" => 5,
+        _ => u8::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2933,7 +3030,7 @@ mod tests {
         AttachmentRepo, CommitChange, CommitOperation, EntryRepo,
         ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
         ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ObjectVersionRepo,
-        ProjectRepo,
+        ProjectRepo, TombstoneRepo,
     };
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
     use crate::tiga::TigaService;
@@ -4024,6 +4121,106 @@ mod tests {
         drop(target);
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn purge_receipt_sync_removes_stale_object_and_blocks_old_state_revival() {
+        let source_path = temp_vault_path("purge-receipt-source");
+        let target_path = temp_vault_path("purge-receipt-target");
+        let project_id;
+
+        {
+            let mut source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("purge-receipt-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            UnlockService::setup_password(&mut source, "purge receipt password").unwrap();
+            let source_ctx = CommitContext::new("device-a".to_string());
+            project_id = ProjectRepo::create(&source, &source_ctx, "Purged", None, None)
+                .unwrap()
+                .project_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        let session =
+            UnlockService::unlock_with_password(&mut source, "purge receipt password").unwrap();
+        UnlockService::unlock_with_password(&mut target, "purge receipt password").unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let stale_state = collect_sync_state(&target).unwrap();
+
+        ProjectRepo::soft_delete(&source, &source_ctx, &project_id).unwrap();
+        let tombstone = TombstoneRepo::find_by_target(&source, &project_id)
+            .unwrap()
+            .unwrap();
+        let device = rotation_device("device-a");
+        let now = chrono::Utc::now().timestamp() + 1;
+        let context = TigaAuthorizationContext {
+            session: Some(&session),
+            device: &device,
+            now_unix_secs: now,
+        };
+        TombstoneRepo::schedule_purge_authorized(
+            &source,
+            &source_ctx,
+            &tombstone.tombstone_id,
+            &tombstone.deleted_at,
+            context,
+        )
+        .unwrap();
+        let (receipt, _) =
+            TombstoneRepo::purge_authorized(&source, &source_ctx, &tombstone.tombstone_id, context)
+                .unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &receipt.purge_commit_id);
+        SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+            .unwrap();
+        assert!(ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .is_none());
+        assert!(
+            TombstoneRepo::find_purge_receipt_by_target(&target, "project", &project_id)
+                .unwrap()
+                .is_some()
+        );
+
+        SyncApplyRepo::apply_projects(
+            &target,
+            &target_ctx,
+            &receipt.purge_commit_id,
+            &stale_state.projects,
+        )
+        .unwrap();
+        assert!(ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            target
+                .inner()
+                .query_row(
+                    "SELECT COUNT(*) FROM object_versions
+                     WHERE object_type = 'project' AND object_id = ?1",
+                    params![project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub struct SyncStatePayload {
     pub tombstones: Option<Vec<TombstoneRow>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_acknowledgements: Option<Vec<TombstoneAcknowledgementRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_receipts: Option<Vec<PurgeReceiptRow>>,
     pub branches: Vec<BranchRow>,
 }
 
@@ -289,6 +291,21 @@ pub struct TombstoneAcknowledgementRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PurgeReceiptRow {
+    pub purge_id: String,
+    pub tombstone_id: String,
+    pub target_object_type: String,
+    pub target_object_id: String,
+    pub delete_commit_id: String,
+    pub purge_commit_id: String,
+    pub delete_clock: String,
+    pub retention_eligible_at: String,
+    pub purged_by_device_id: String,
+    pub purged_at: String,
+    pub integrity_tag: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchRow {
     pub branch_id: String,
     pub branch_name: String,
@@ -315,6 +332,7 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         project_tags: Some(load_project_tag_set_rows(conn)?),
         tombstones: Some(load_tombstone_rows(conn)?),
         tombstone_acknowledgements: Some(load_tombstone_acknowledgement_rows(conn)?),
+        purge_receipts: Some(load_purge_receipt_rows(conn)?),
         branches: load_branch_rows(conn)?,
     })
 }
@@ -815,6 +833,32 @@ fn load_tombstone_acknowledgement_rows(
     collect_rows(rows)
 }
 
+fn load_purge_receipt_rows(conn: &VaultConnection) -> StorageResult<Vec<PurgeReceiptRow>> {
+    let mut stmt = conn.inner().prepare(
+        "SELECT purge_id, tombstone_id, target_object_type, target_object_id,
+                delete_commit_id, purge_commit_id, delete_clock,
+                retention_eligible_at, purged_by_device_id, purged_at, integrity_tag
+         FROM purge_receipts
+         ORDER BY purged_at ASC, purge_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PurgeReceiptRow {
+            purge_id: row.get(0)?,
+            tombstone_id: row.get(1)?,
+            target_object_type: row.get(2)?,
+            target_object_id: row.get(3)?,
+            delete_commit_id: row.get(4)?,
+            purge_commit_id: row.get(5)?,
+            delete_clock: row.get(6)?,
+            retention_eligible_at: row.get(7)?,
+            purged_by_device_id: row.get(8)?,
+            purged_at: row.get(9)?,
+            integrity_tag: row.get(10)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT branch_id, branch_name, head_commit_id, created_at, updated_at
@@ -913,5 +957,6 @@ mod tests {
         assert!(decoded.key_epoch_state.is_none());
         assert!(decoded.tombstones.is_none());
         assert!(decoded.tombstone_acknowledgements.is_none());
+        assert!(decoded.purge_receipts.is_none());
     }
 }

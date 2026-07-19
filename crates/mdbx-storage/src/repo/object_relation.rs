@@ -10,6 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::TombstoneRepo;
 
 #[derive(Debug, Clone)]
 pub struct ObjectRelationCreateRequest {
@@ -58,6 +59,12 @@ impl ObjectRelationRepo {
         request: ObjectRelationCreateRequest,
     ) -> StorageResult<ObjectRelation> {
         validate_create_request(&request)?;
+        if TombstoneRepo::is_permanently_purged(conn, "object-relation", &request.relation_id)? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "relation ID {} has a permanent purge receipt",
+                request.relation_id
+            )));
+        }
         conn.with_immediate_transaction(|| {
             ensure_active_object(conn, &request.source_object_id)?;
             ensure_active_object(conn, &request.target_object_id)?;
