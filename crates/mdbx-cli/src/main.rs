@@ -24,8 +24,8 @@ use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_st
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
-    build_bundle, read_bundle, write_bundle, CommitBatch, CommitOperationMetadata,
-    SerializedCommit, TombstoneRecord,
+    build_bundle, read_bundle_with_limits, write_bundle, BundleReadLimits, CommitBatch,
+    CommitOperationMetadata, SerializedCommit, TombstoneRecord,
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -1128,8 +1128,8 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
         SyncAction::Apply { file } => {
             let mut input = std::fs::File::open(&file)
                 .map_err(|e| format!("failed to open bundle '{}': {}", file.display(), e))?;
-            let bundle =
-                read_bundle(&mut input).map_err(|e| format!("bundle read failed: {}", e))?;
+            let bundle = read_bundle_with_limits(&mut input, BundleReadLimits::desktop())
+                .map_err(|e| format!("bundle read failed: {}", e))?;
             let summary = apply_sync_bundle(conn, &bundle)?;
             println!(
                 "Applied bundle: applied={} skipped={} conflicts={} missing-parents={}",
@@ -2166,8 +2166,10 @@ mod tests {
         .unwrap();
 
         let bundle = {
+            let bytes = std::fs::read(&bundle_path).unwrap();
+            assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
             let mut file = std::fs::File::open(&bundle_path).unwrap();
-            read_bundle(&mut file).unwrap()
+            mdbx_sync::read_bundle(&mut file).unwrap()
         };
         assert!(bundle.commits.iter().any(|commit| {
             commit

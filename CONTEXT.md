@@ -76,6 +76,10 @@ Receipts participate in complete synchronization state and snapshot recovery gua
 
 The `MigrationIntegrityGate` is the read-only verification performed before an MDBX1 or older MDBX2 file enters a writable schema migration. It runs SQLite `integrity_check` and `foreign_key_check`, reports bounded diagnostic samples, and leaves the source generation unchanged when verification fails. The exact read-only callback error emitted by the known non-authoritative legacy FTS5 index is ignored while every other result from the same integrity scan remains authoritative; the index is removed during open.
 
+### BoundedSyncBundle
+
+A `BoundedSyncBundle` is an offline commit transport with a hash-checked payload and an explicit resource contract. Version 3 records the encoded payload length before the body, applies a configurable reader limit and a hard decoder ceiling, and rejects reserved-header changes or trailing bytes. MDBX2 continues to read bundle versions 1 and 2 through a bounded legacy reader.
+
 ### HealthReport
 
 A `HealthReport` is a read-only structured diagnosis of vault integrity. Each issue has a stable severity, category, and description suitable for CLI output and native client presentation. Tombstone diagnostics compare exact typed markers with the current deletion state of every synchronized object family while recognizing unresolved delete-versus-modify conflicts as a temporary valid state.
@@ -104,6 +108,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 20. Project, Entry, and ObjectLabel cleanup requires dependent objects to be cleaned first. Attachment chunks, project labels, object versions, tombstone acknowledgements, and object-scoped Tiga overrides are removed with their owner.
 21. A permanent receipt prevents the current vault from restoring the same stable identity. Historical snapshot files, exported copies, and external backups remain separate retention media and require independent media erasure or future object-key destruction.
 22. Every path-based migration plan, automatic compatibility open, explicit upgrade, and direct storage-core upgrade verifies database integrity before the first migration write. A failed verification preserves the previous format generation.
+23. Untrusted sync input must have a byte limit before allocation and deserialization. New offline bundles declare their payload length, while legacy bundles are read through a bounded adapter.
 
 ## Module Architecture
 

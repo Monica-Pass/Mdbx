@@ -190,6 +190,8 @@ Minimum requirements:
 
 A snapshot is a logical recovery point stored inside a vault. It is distinct from a portable backup, which creates an independently openable complete vault file, and from a sync bundle, which carries incremental commit state between replicas. None of these artifacts can be replaced by copying only the SQLite main file while WAL is active.
 
+Offline sync bundle readers MUST enforce a payload limit before allocation and deserialization. Bundle v3 stores the payload length in the header and rejects non-zero reserved bytes or data after the payload hash. Bundle v1 and v2 compatibility readers MUST cap the underlying reader rather than call an unbounded read. Resource profiles may choose a lower limit; the protocol hard ceiling remains mandatory.
+
 ## 12. Attachment Storage Modes
 
 MDBX MUST define these storage modes even if not all are enabled in MVP:

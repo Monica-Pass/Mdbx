@@ -28,6 +28,13 @@ pub enum SyncError {
 
     #[error("bundle integrity: {0}")]
     BundleIntegrity(String),
+
+    #[error("resource limit exceeded for {resource}: {actual} bytes > {limit} bytes")]
+    ResourceLimit {
+        resource: String,
+        actual: u64,
+        limit: u64,
+    },
 }
 
 pub type SyncResult<T> = Result<T, SyncError>;

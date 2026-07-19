@@ -94,8 +94,8 @@ MDBX2 同时收紧以下实现边界：
 - snapshot 恢复为所有受影响对象写入统一 causal head 和 object version。
 - Commit2 增加幂等 operation ID、结构化变更摘要、稳定分支身份、合并后的 vector clock 和
   原子设备序列分配，不重写任何历史 commit。
-- 同步协议与离线 bundle 使用 v2 传输 operation 元数据；MDBX2 仍可转换读取没有 operation
-  元数据的 v1 bundle。
+- 离线 bundle v3 增加显式 payload 长度和有界解码；MDBX2 继续转换读取没有 operation
+  元数据的 v1 bundle，并继续读取携带 operation 元数据的 v2 bundle。
 - 新 snapshot 明确携带 project tags 和 attachment chunks；旧快照缺少这些字段时不清空现有兼容数据。
 - Tiga global/project/entry mutation 的 commit、对象更新、head 和 object version 原子提交。
 - Tiga2 增加版本化策略、精确例外和类型化安全审计；策略状态、覆盖、例外和审计进入同步状态。

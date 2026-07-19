@@ -50,7 +50,7 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - New audit events record the Tiga policy version and a SHA-256 fingerprint of the resolved policy used for the decision. The evidence is captured before a policy mutation changes the active policy.
 - Audit synchronization authenticates the new fields, verifies that the operation and commit identify the same `commit_operations` row, and rejects immutable-event rewrites. MDBX1 and early MDBX2 audit rows retain null correlation and evidence fields.
 - Commit2 adds idempotent operation IDs, typed change summaries, stable branch identity, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
-- Sync protocol and offline bundles use version 2 for operation metadata; MDBX2 readers still convert version 1 bundles with no operation metadata.
+- Offline sync bundle version 3 adds an explicit payload length and bounded decoding. MDBX2 readers continue to convert version 1 bundles without operation metadata and read version 2 bundles with operation metadata.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
 - Portable backup uses SQLite online backup so committed WAL pages are included, verifies SQLite and MDBX metadata plus `vault_id`, converts the result to a sidecar-independent file, and refuses to replace any destination artifact.
 
