@@ -10,7 +10,7 @@ use mdbx_core::model::{Attachment, Entry, EntryType, Project, Snapshot};
 use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
-use crate::crypto_layer::{decrypt_field, encrypt_field};
+use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
@@ -339,19 +339,14 @@ impl SnapshotRepo {
         id: &str,
         plaintext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.metadata_subkey.clone())
-            .unwrap_or_default();
         encrypt_field(
-            conn.keyring(),
-            &subkey,
+            conn,
+            FieldKeyPurpose::Metadata,
             plaintext,
             "snapshot",
             id,
             "payload",
         )
-        .map_err(StorageError::Crypto)
     }
 
     fn decrypt_payload(
@@ -359,19 +354,14 @@ impl SnapshotRepo {
         id: &str,
         ciphertext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.metadata_subkey.clone())
-            .unwrap_or_default();
         decrypt_field(
-            conn.keyring(),
-            &subkey,
+            conn,
+            FieldKeyPurpose::Metadata,
             ciphertext,
             "snapshot",
             id,
             "payload",
         )
-        .map_err(StorageError::Crypto)
     }
 }
 

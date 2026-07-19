@@ -139,6 +139,7 @@ cargo run -p mdbx-cli -- --help
 - project、entry、attachment 的高风险用户可见 mutation 已包裹为原子事务，commit、对象行、head、object version 会一起成功或一起回滚。
 - `project_tags` 已进入 sync state；新 payload 会携带每个 project 的完整 tag 集合，旧 payload 缺少 tag 字段时不会清空本地标签。用户可见 tag 修改应使用 tracked tag API；会话临时搜索索引不进入历史。
 - 初始化 key epoch 使用 `mdbx-init-marker-v1` 随机 marker；配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍是后续边界。
+- 正式解锁后的新字段使用携带 epoch ID 的 `MDBXFE2` 外层 envelope；旧 `MDBXAE1` 密文继续读取，`field-key-epochs-v1` 关键扩展阻止旧 MDBX2 writer 覆盖新格式字段。
 
 ## 实现规则
 

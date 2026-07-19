@@ -139,6 +139,7 @@ Key capabilities currently verified in the Rust storage core:
 - High-risk user-visible project, entry, and attachment mutations are wrapped in atomic transactions so commits, object rows, heads, and object versions succeed or roll back together.
 - `project_tags` are included in sync state. New payloads carry the complete tag set for each project, while old payloads that lack the tag field do not clear local tags. User-visible tag changes should use tracked tag APIs; temporary session search indexes do not enter history.
 - Initial key epochs use a random `mdbx-init-marker-v1` marker; configuring or changing an unlock method binds `mdbx-active-key-epoch-v1` active epoch wrapping. Full key rotation / retirement remains future work.
+- New fields written after an official unlock use the epoch-tagged `MDBXFE2` outer envelope. Existing `MDBXAE1` ciphertext remains readable, while the `field-key-epochs-v1` critical extension prevents older MDBX2 writers from overwriting fields that use the new format.
 
 ## Implementation Rules
 

@@ -17,6 +17,9 @@ pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
 pub const MIGRATION_TIGA_AUDIT_CORRELATION: &str = "mdbx-2-tiga-audit-correlation-v1";
 pub const MIGRATION_STABLE_BRANCH_ID: &str = "mdbx-2-stable-branch-id-v1";
+pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
+
+const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatInfo {
@@ -569,8 +572,58 @@ fn reject_unknown_critical_extensions(value: &str) -> StorageResult<()> {
 }
 
 fn has_unknown_critical_extensions(value: &str) -> bool {
+    parse_critical_extensions(value)
+        .map(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| !SUPPORTED_CRITICAL_EXTENSIONS.contains(&extension.as_str()))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) fn merge_critical_extension(value: &str, extension: &str) -> StorageResult<String> {
+    if !SUPPORTED_CRITICAL_EXTENSIONS.contains(&extension) {
+        return Err(StorageError::Validation(format!(
+            "cannot register unsupported critical extension: {}",
+            extension
+        )));
+    }
+    let mut extensions = parse_critical_extensions(value)?;
+    if !extensions.iter().any(|current| current == extension) {
+        extensions.push(extension.to_string());
+    }
+    extensions.sort();
+    extensions.dedup();
+    serde_json::to_string(&extensions).map_err(|error| {
+        StorageError::Validation(format!("cannot serialize critical extensions: {}", error))
+    })
+}
+
+fn parse_critical_extensions(value: &str) -> StorageResult<Vec<String>> {
     let trimmed = value.trim();
-    !trimmed.is_empty() && trimmed != "[]"
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(Vec::new());
+    }
+
+    let raw = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).map_err(|error| {
+            StorageError::Validation(format!("invalid critical_extensions JSON: {}", error))
+        })?
+    } else {
+        trimmed.split(',').map(str::to_string).collect()
+    };
+
+    let mut extensions = Vec::with_capacity(raw.len());
+    for extension in raw {
+        let extension = extension.trim();
+        if extension.is_empty() {
+            return Err(StorageError::Validation(
+                "critical extension identifiers must not be empty".to_string(),
+            ));
+        }
+        extensions.push(extension.to_string());
+    }
+    Ok(extensions)
 }
 
 fn table_exists(conn: &Connection, table: &str) -> StorageResult<bool> {
@@ -693,6 +746,53 @@ mod tests {
             .unwrap();
         assert_eq!(version, FORMAT_V1);
         assert!(!v2::column_exists(&conn, "vault_meta", "schema_version").unwrap());
+    }
+
+    #[test]
+    fn field_key_epoch_extension_is_supported_during_upgrade() {
+        let conn = v1_database();
+        conn.execute(
+            "UPDATE vault_meta SET critical_extensions = ?1",
+            params![serde_json::to_string(&[FIELD_KEY_EPOCHS_EXTENSION]).unwrap()],
+        )
+        .unwrap();
+
+        let inspection = inspect_migration(&conn).unwrap();
+        assert!(!inspection.unknown_critical_extensions);
+        assert_eq!(
+            upgrade_to_latest(&conn).unwrap().unwrap().format_version,
+            FORMAT_V2
+        );
+    }
+
+    #[test]
+    fn known_and_unknown_critical_extensions_still_reject() {
+        let conn = v1_database();
+        conn.execute(
+            "UPDATE vault_meta SET critical_extensions = ?1",
+            params![
+                serde_json::to_string(&[FIELD_KEY_EPOCHS_EXTENSION, "future-secret-index"])
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+
+        let inspection = inspect_migration(&conn).unwrap();
+        assert!(inspection.unknown_critical_extensions);
+        assert!(upgrade_to_latest(&conn).is_err());
+    }
+
+    #[test]
+    fn merge_critical_extension_is_canonical_and_idempotent() {
+        let merged = merge_critical_extension("", FIELD_KEY_EPOCHS_EXTENSION).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&merged).unwrap(),
+            vec![FIELD_KEY_EPOCHS_EXTENSION.to_string()]
+        );
+        assert_eq!(
+            merge_critical_extension(&merged, FIELD_KEY_EPOCHS_EXTENSION).unwrap(),
+            merged
+        );
     }
 
     #[test]

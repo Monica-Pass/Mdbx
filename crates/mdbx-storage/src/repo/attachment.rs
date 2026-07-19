@@ -8,7 +8,7 @@ use mdbx_core::model::attachment::StorageMode;
 use mdbx_core::model::Attachment;
 
 use crate::connection::VaultConnection;
-use crate::crypto_layer::{decrypt_field, encrypt_field};
+use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
@@ -715,12 +715,14 @@ impl AttachmentRepo {
         field: &str,
         plaintext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.attachment_subkey.clone())
-            .unwrap_or_default();
-        encrypt_field(conn.keyring(), &subkey, plaintext, "attachment", id, field)
-            .map_err(StorageError::Crypto)
+        encrypt_field(
+            conn,
+            FieldKeyPurpose::Attachment,
+            plaintext,
+            "attachment",
+            id,
+            field,
+        )
     }
 
     fn decrypt_attachment_field(
@@ -729,12 +731,14 @@ impl AttachmentRepo {
         field: &str,
         ciphertext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.attachment_subkey.clone())
-            .unwrap_or_default();
-        decrypt_field(conn.keyring(), &subkey, ciphertext, "attachment", id, field)
-            .map_err(StorageError::Crypto)
+        decrypt_field(
+            conn,
+            FieldKeyPurpose::Attachment,
+            ciphertext,
+            "attachment",
+            id,
+            field,
+        )
     }
 }
 

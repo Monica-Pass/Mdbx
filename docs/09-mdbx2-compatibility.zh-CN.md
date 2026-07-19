@@ -73,6 +73,18 @@ schema 5 随后以增量迁移升级到 schema 6，增加可空的 `commit_opera
 - 未知关键扩展 MUST 阻止写入。
 - 格式版本标记 MUST 是迁移事务的最后一个数据变更。
 
+### 4.1 Epoch 标记字段密文
+
+经过正式解锁的新字段密文使用以下外层格式：
+
+```text
+MDBXFE2\0 || epoch_id_len_u16_le || epoch_id_utf8 || MDBXAE1 committed AEAD
+```
+
+内层 AEAD 使用对应 epoch 的 record、attachment、metadata 或 history 子密钥。AAD 以长度前缀认证 domain、epoch ID、对象类型、对象 ID 和字段名，修改外层 epoch ID、移动密文到其他字段或修改内层密文都会导致认证失败。
+
+reader MUST 继续读取旧的 `MDBXAE1` committed envelope 和更早的 nonce envelope。首次产生 `MDBXFE2` 密文时，storage core MUST 在同一数据库事务中登记关键扩展 `field-key-epochs-v1`。支持该扩展的 reader 可以继续打开；较早的 MDBX2 writer 会把该标识视为未知关键扩展并拒绝可写打开，从而避免使用旧密钥规则覆盖新字段。
+
 ## 5. MDBX2 首批一致性修复
 
 MDBX2 同时收紧以下实现边界：

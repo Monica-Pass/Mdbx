@@ -6,7 +6,7 @@ use uuid::Uuid;
 use mdbx_core::model::Project;
 
 use crate::connection::VaultConnection;
-use crate::crypto_layer::{decrypt_field, encrypt_field};
+use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
@@ -333,12 +333,14 @@ impl ProjectRepo {
         field: &str,
         plaintext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.metadata_subkey.clone())
-            .unwrap_or_default();
-        encrypt_field(conn.keyring(), &subkey, plaintext, "project", id, field)
-            .map_err(StorageError::Crypto)
+        encrypt_field(
+            conn,
+            FieldKeyPurpose::Metadata,
+            plaintext,
+            "project",
+            id,
+            field,
+        )
     }
 
     pub(crate) fn decrypt_metadata(
@@ -347,12 +349,14 @@ impl ProjectRepo {
         field: &str,
         ciphertext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.metadata_subkey.clone())
-            .unwrap_or_default();
-        decrypt_field(conn.keyring(), &subkey, ciphertext, "project", id, field)
-            .map_err(StorageError::Crypto)
+        decrypt_field(
+            conn,
+            FieldKeyPurpose::Metadata,
+            ciphertext,
+            "project",
+            id,
+            field,
+        )
     }
 }
 

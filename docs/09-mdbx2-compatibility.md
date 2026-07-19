@@ -68,6 +68,18 @@ A portable backup is a complete encrypted vault file and retains the source unlo
 
 The destination path, `-wal`, and `-shm` names are reserved as one publication set. Existing artifacts are never replaced. Storage verifies integrity, source-equivalent MDBX metadata, and vault identity before publishing the single-file result.
 
+### Epoch-Tagged Field Ciphertext
+
+New field ciphertext written by an officially unlocked connection uses this outer format:
+
+```text
+MDBXFE2\0 || epoch_id_len_u16_le || epoch_id_utf8 || MDBXAE1 committed AEAD
+```
+
+The inner AEAD uses the record, attachment, metadata, or history subkey for the identified epoch. Length-prefixed AAD authenticates the domain, epoch ID, object type, object ID, and field name. Changing the outer epoch ID, moving ciphertext to another field, or modifying the inner ciphertext fails authentication.
+
+Readers continue to accept existing `MDBXAE1` committed envelopes and earlier nonce envelopes. Before publishing the first `MDBXFE2` field, storage records the critical extension `field-key-epochs-v1` in the same database transaction. Current readers recognize it. Older MDBX2 writers treat it as an unknown critical extension and reject writable open, preventing writes that apply legacy key-selection rules to the new field format.
+
 ### Stable Branch Identity
 
 `branch_id` is the immutable internal identity of a branch. `branch_name` is a mutable display attribute and a compatibility selector for interfaces created before schema 6. Multiple branches may have the same display name.

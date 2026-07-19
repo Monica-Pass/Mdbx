@@ -10,6 +10,7 @@ use mdbx_core::model::Commit;
 
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
+use crate::crypto_layer::FieldKeyPurpose;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::branch::BranchRepo;
 
@@ -680,19 +681,14 @@ impl CommitContext {
         field: &str,
         plaintext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.history_subkey.clone())
-            .unwrap_or_default();
         crate::crypto_layer::encrypt_field(
-            conn.keyring(),
-            &subkey,
+            conn,
+            FieldKeyPurpose::History,
             plaintext,
             "commit",
             commit_id,
             field,
         )
-        .map_err(StorageError::Crypto)
     }
 
     pub(crate) fn decrypt_history(
@@ -701,19 +697,14 @@ impl CommitContext {
         field: &str,
         ciphertext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        let subkey = conn
-            .keyring()
-            .map(|kr| kr.history_subkey.clone())
-            .unwrap_or_default();
         crate::crypto_layer::decrypt_field(
-            conn.keyring(),
-            &subkey,
+            conn,
+            FieldKeyPurpose::History,
             ciphertext,
             "commit",
             commit_id,
             field,
         )
-        .map_err(StorageError::Crypto)
     }
 
     /// 写入 tombstone 记录。

@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ pub struct VaultConnection {
     pub(crate) conn: Connection,
     pub(crate) keyring: Option<Keyring>,
     pub(crate) active_key_epoch_id: Option<String>,
+    pub(crate) epoch_keyrings: HashMap<String, Keyring>,
     pub(crate) active_session: Option<VaultSession>,
 }
 
@@ -86,6 +88,7 @@ impl VaultConnection {
             conn,
             keyring: None,
             active_key_epoch_id: None,
+            epoch_keyrings: HashMap::new(),
             active_session: None,
         })
     }
@@ -108,6 +111,7 @@ impl VaultConnection {
                 conn,
                 keyring: None,
                 active_key_epoch_id: None,
+                epoch_keyrings: HashMap::new(),
                 active_session: None,
             })
         })();
@@ -128,6 +132,7 @@ impl VaultConnection {
             conn,
             keyring: None,
             active_key_epoch_id: None,
+            epoch_keyrings: HashMap::new(),
             active_session: None,
         })
     }
@@ -224,15 +229,18 @@ impl VaultConnection {
     pub fn attach_keyring(&mut self, keyring: Keyring) {
         self.keyring = Some(keyring);
         self.active_key_epoch_id = None;
+        self.epoch_keyrings.clear();
     }
 
     pub(crate) fn attach_verified_keyring(
         &mut self,
         keyring: Keyring,
         active_key_epoch_id: String,
+        epoch_keyrings: HashMap<String, Keyring>,
     ) {
         self.keyring = Some(keyring);
         self.active_key_epoch_id = Some(active_key_epoch_id);
+        self.epoch_keyrings = epoch_keyrings;
     }
 
     pub fn attach_session(&mut self, session: VaultSession) {
@@ -253,6 +261,7 @@ impl VaultConnection {
         self.active_session = None;
         self.keyring = None;
         self.active_key_epoch_id = None;
+        self.epoch_keyrings.clear();
     }
 
     /// 获取密钥环的引用（存在时）。
@@ -263,6 +272,31 @@ impl VaultConnection {
     /// 返回经过解锁流程认证的 active key epoch 身份。
     pub fn active_key_epoch_id(&self) -> Option<&str> {
         self.active_key_epoch_id.as_deref()
+    }
+
+    pub(crate) fn keyring_for_epoch(&self, key_epoch_id: &str) -> Option<&Keyring> {
+        self.epoch_keyrings.get(key_epoch_id)
+    }
+
+    pub(crate) fn ensure_critical_extension(&self, extension: &str) -> StorageResult<()> {
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT critical_extensions FROM vault_meta LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Database)?;
+        let merged = crate::migration::merge_critical_extension(&current, extension)?;
+        if merged != current {
+            self.conn
+                .execute(
+                    "UPDATE vault_meta SET critical_extensions = ?1, updated_at = ?2",
+                    rusqlite::params![merged, chrono::Utc::now().to_rfc3339()],
+                )
+                .map_err(StorageError::Database)?;
+        }
+        Ok(())
     }
 
     /// 当前连接是否已启用加密。
