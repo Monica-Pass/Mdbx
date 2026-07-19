@@ -12,6 +12,7 @@ use mdbx_core::tiga::{TigaMode, TigaOperation, TigaScope};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
+use crate::key_epoch::{random_epoch_wrap_aad, RANDOM_KEY_EPOCH_PROFILE_ID};
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
 
@@ -887,6 +888,31 @@ impl UnlockService {
                     }
                 }
             }
+            RANDOM_KEY_EPOCH_PROFILE_ID => {
+                if wrapped_epoch_key_ct.len() < 72 {
+                    return Err(StorageError::Validation(
+                        "random key epoch wrapping is too short".to_string(),
+                    ));
+                }
+                if let Some(vault_key) = vault_key {
+                    let vault_ctx = Self::read_vault_context(conn)?;
+                    let epoch_key = aead::decrypt(
+                        vault_key,
+                        &wrapped_epoch_key_ct,
+                        &random_epoch_wrap_aad(&vault_ctx, &active_key_epoch_id),
+                    )
+                    .map_err(|_| {
+                        StorageError::Validation(
+                            "random key epoch wrapper authentication failed".to_string(),
+                        )
+                    })?;
+                    if epoch_key.len() != 32 {
+                        return Err(StorageError::Validation(
+                            "random key epoch material must be 32 bytes".to_string(),
+                        ));
+                    }
+                }
+            }
             other => {
                 return Err(StorageError::Validation(format!(
                     "unsupported active key epoch profile: {}",
@@ -941,6 +967,19 @@ impl UnlockService {
         Ok(())
     }
 
+    pub(crate) fn refresh_verified_keyring(conn: &mut VaultConnection) -> StorageResult<()> {
+        let vault_key = Zeroizing::new(
+            conn.keyring()
+                .map(|keyring| keyring.vault_key.clone())
+                .ok_or_else(|| {
+                    StorageError::Validation(
+                        "vault must be unlocked before refreshing key epochs".to_string(),
+                    )
+                })?,
+        );
+        Self::attach_verified_keyring(conn, vault_key.as_slice())
+    }
+
     fn load_epoch_keyrings(
         conn: &VaultConnection,
         vault_key: &[u8],
@@ -986,6 +1025,26 @@ impl UnlockService {
                         )));
                     }
                     unwrapped
+                }
+                RANDOM_KEY_EPOCH_PROFILE_ID => {
+                    let epoch_key = aead::decrypt(
+                        vault_key,
+                        &wrapped_epoch_key_ct,
+                        &random_epoch_wrap_aad(vault_ctx, &key_epoch_id),
+                    )
+                    .map_err(|_| {
+                        StorageError::Validation(format!(
+                            "random key epoch {} wrapper authentication failed",
+                            key_epoch_id
+                        ))
+                    })?;
+                    if epoch_key.len() != 32 {
+                        return Err(StorageError::Validation(format!(
+                            "random key epoch {} material must be 32 bytes",
+                            key_epoch_id
+                        )));
+                    }
+                    epoch_key
                 }
                 INIT_KEY_EPOCH_PROFILE_ID => {
                     return Err(StorageError::Validation(format!(

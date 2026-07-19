@@ -7,6 +7,7 @@ pub(crate) mod crypto_layer;
 pub mod error;
 pub mod import;
 pub mod init;
+pub mod key_epoch;
 pub mod migration;
 pub mod recovery;
 pub mod repo;

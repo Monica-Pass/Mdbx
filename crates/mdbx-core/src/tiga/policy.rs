@@ -983,6 +983,7 @@ pub enum TigaOperation {
     ChangeUnlockMethods,
     ChangeSecurityPolicy,
     ChangeRecoveryMethods,
+    RotateKeyEpoch,
     DeleteAuditRecords,
     BackgroundAccess,
     SyncCiphertext,
@@ -1159,6 +1160,7 @@ impl TigaPolicy {
             | TigaOperation::ChangeUnlockMethods
             | TigaOperation::ChangeSecurityPolicy
             | TigaOperation::ChangeRecoveryMethods
+            | TigaOperation::RotateKeyEpoch
             | TigaOperation::DeleteAuditRecords => {
                 if operation == TigaOperation::DeleteAuditRecords
                     && !self.administration.audit_deletion_allowed
@@ -1247,6 +1249,7 @@ impl TigaPolicy {
                     | TigaOperation::ChangeUnlockMethods
                     | TigaOperation::ChangeSecurityPolicy
                     | TigaOperation::ChangeRecoveryMethods
+                    | TigaOperation::RotateKeyEpoch
                     | TigaOperation::DeleteAuditRecords
             ),
         }
