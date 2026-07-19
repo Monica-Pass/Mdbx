@@ -9,6 +9,6 @@ pub use commit::{
     ChangeScope, Commit, CommitKind, CommitParent, Conflict, ConflictObjectType,
     ConflictResolution, Snapshot, Tombstone, TombstoneTargetType,
 };
-pub use entry::{Entry, EntryType};
+pub use entry::{Entry, EntryType, ObjectTypeId};
 pub use project::Project;
 pub use unlock::{KdfParams, UnlockMethod, UnlockMethodType, VaultSession};

@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use mdbx_core::model::{EntryType, UnlockMethodType};
+use mdbx_core::model::{EntryType, ObjectTypeId, UnlockMethodType};
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, PolicyException,
@@ -39,6 +39,8 @@ pub enum MdbxFfiError {
     Serialization { message: String },
     #[error("invalid entry type: {entry_type}")]
     InvalidEntryType { entry_type: String },
+    #[error("invalid object type ID: {object_type_id}")]
+    InvalidObjectTypeId { object_type_id: String },
     #[error("vault lock poisoned")]
     LockPoisoned,
 }
@@ -126,6 +128,17 @@ pub struct EntryRecord {
     pub entry_type: String,
     pub title: String,
     pub payload_json: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRecord {
+    pub object_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub title: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
     pub deleted: bool,
 }
 
@@ -1066,6 +1079,96 @@ impl MdbxVault {
         entry_record_from_entry(&entry)
     }
 
+    pub fn create_object(
+        &self,
+        collection_id: String,
+        object_type_id: String,
+        title: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let payload = parse_payload_json(&payload_json)?;
+        let object = EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &collection_id,
+            parse_object_type_id(&object_type_id)?,
+            Some(&title),
+            &payload,
+            payload_schema_version,
+        )?;
+        object_record_from_entry(&object)
+    }
+
+    pub fn get_object(
+        &self,
+        collection_id: String,
+        object_id: String,
+    ) -> Result<Option<MdbxObjectRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let Some(object) = EntryRepo::get_by_id(&conn, &object_id)? else {
+            return Ok(None);
+        };
+        if object.project_id != collection_id {
+            return Ok(None);
+        }
+        Ok(Some(object_record_from_entry(&object)?))
+    }
+
+    pub fn list_objects(
+        &self,
+        collection_id: String,
+        object_type_id: Option<String>,
+    ) -> Result<Vec<MdbxObjectRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let object_type_id = parse_optional_object_type_id(object_type_id)?;
+        let objects = match object_type_id {
+            Some(object_type_id) => {
+                EntryRepo::list_by_project_and_type(&conn, &collection_id, object_type_id)?
+            }
+            None => EntryRepo::list_by_project(&conn, &collection_id)?,
+        };
+        objects.iter().map(object_record_from_entry).collect()
+    }
+
+    pub fn update_object(
+        &self,
+        collection_id: String,
+        object_id: String,
+        object_type_id: String,
+        title: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    ) -> Result<MdbxObjectRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let expected_type = parse_object_type_id(&object_type_id)?;
+        let mut object = entry_for_project(&conn, &collection_id, &object_id)?;
+        if object.deleted {
+            return Err(StorageError::ConstraintViolation(format!(
+                "object {} is deleted",
+                object_id
+            ))
+            .into());
+        }
+        if object.entry_type != expected_type {
+            return Err(StorageError::ConstraintViolation(format!(
+                "object {} does not have type {}",
+                object_id, object_type_id
+            ))
+            .into());
+        }
+
+        object.title_ct = Some(title.into_bytes());
+        object.payload_ct = serde_json::to_vec(&parse_payload_json(&payload_json)?)?;
+        object.payload_schema_version = payload_schema_version;
+
+        let ctx = CommitContext::new(self.device_id.clone());
+        let updated = EntryRepo::update(&conn, &ctx, &object)?;
+        object_record_from_entry(&updated)
+    }
+
     pub fn list_entries(
         &self,
         project_id: String,
@@ -1827,17 +1930,41 @@ fn commit_history_item_from_storage(item: CommitHistoryItem) -> MdbxCommitHistor
 }
 
 fn parse_entry_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
-    entry_type
+    let parsed: EntryType = entry_type
         .parse()
         .map_err(|_| MdbxFfiError::InvalidEntryType {
             entry_type: entry_type.to_string(),
+        })?;
+    if parsed.is_legacy() {
+        Ok(parsed)
+    } else {
+        Err(MdbxFfiError::InvalidEntryType {
+            entry_type: entry_type.to_string(),
         })
+    }
 }
 
 fn parse_optional_entry_type(
     entry_type: Option<String>,
 ) -> Result<Option<EntryType>, MdbxFfiError> {
     entry_type.as_deref().map(parse_entry_type).transpose()
+}
+
+fn parse_object_type_id(object_type_id: &str) -> Result<ObjectTypeId, MdbxFfiError> {
+    object_type_id
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidObjectTypeId {
+            object_type_id: object_type_id.to_string(),
+        })
+}
+
+fn parse_optional_object_type_id(
+    object_type_id: Option<String>,
+) -> Result<Option<ObjectTypeId>, MdbxFfiError> {
+    object_type_id
+        .as_deref()
+        .map(parse_object_type_id)
+        .transpose()
 }
 
 fn parse_payload_json(payload_json: &str) -> Result<serde_json::Value, MdbxFfiError> {
@@ -1857,6 +1984,26 @@ fn entry_record_from_entry(entry: &mdbx_core::model::Entry) -> Result<EntryRecor
             .map(|s| s.to_string())
             .unwrap_or_default(),
         payload_json: serde_json::to_string(&payload)?,
+        deleted: entry.deleted,
+    })
+}
+
+fn object_record_from_entry(
+    entry: &mdbx_core::model::Entry,
+) -> Result<MdbxObjectRecord, MdbxFfiError> {
+    let payload: serde_json::Value = serde_json::from_slice(&entry.payload_ct)?;
+    Ok(MdbxObjectRecord {
+        object_id: entry.entry_id.clone(),
+        collection_id: entry.project_id.clone(),
+        object_type_id: entry.entry_type.to_string(),
+        title: entry
+            .title_ct
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: entry.payload_schema_version,
         deleted: entry.deleted,
     })
 }

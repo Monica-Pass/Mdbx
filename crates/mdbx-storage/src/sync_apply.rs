@@ -3439,6 +3439,63 @@ mod tests {
     }
 
     #[test]
+    fn sync_state_preserves_custom_object_type_and_payload_schema_version() {
+        let source_path = temp_vault_path("custom-object-source");
+        let target_path = temp_vault_path("custom-object-target");
+
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("custom-object-sync-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let project = ProjectRepo::create(&source, &source_ctx, "Mail", None, None).unwrap();
+        let object = EntryRepo::create_with_payload_schema_version(
+            &source,
+            &source_ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("Encrypted message"),
+            &serde_json::json!({"subject": "sync", "body": "opaque"}),
+            12,
+        )
+        .unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        commits
+            .last_mut()
+            .unwrap()
+            .object_payloads
+            .push(collect_sync_state_payload(&source).unwrap());
+        SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+            .unwrap();
+
+        let synced = EntryRepo::get_by_id(&target, &object.entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced.entry_type.as_str(), "com.monica.mail.message");
+        assert_eq!(synced.payload_schema_version, 12);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
     fn audit_commit_correlation_roundtrips_and_rejects_tampering() {
         let source_path = temp_vault_path("audit-correlation-source");
         let target_path = temp_vault_path("audit-correlation-target");

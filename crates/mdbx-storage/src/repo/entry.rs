@@ -17,6 +17,15 @@ use crate::repo::object_version::ObjectVersionRepo;
 /// `_ct` 字段在写入时加密、读取时解密。
 pub struct EntryRepo;
 
+pub struct EntryCreateRequest<'a> {
+    pub entry_id: &'a str,
+    pub project_id: &'a str,
+    pub entry_type: EntryType,
+    pub title: Option<&'a str>,
+    pub payload: &'a serde_json::Value,
+    pub payload_schema_version: u32,
+}
+
 impl EntryRepo {
     // -----------------------------------------------------------------------
     // CREATE
@@ -30,14 +39,32 @@ impl EntryRepo {
         title: Option<&str>,
         payload: &serde_json::Value,
     ) -> StorageResult<Entry> {
-        Self::create_with_id(
+        Self::create_with_payload_schema_version(
+            conn, ctx, project_id, entry_type, title, payload, 1,
+        )
+    }
+
+    pub fn create_with_payload_schema_version(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        entry_type: EntryType,
+        title: Option<&str>,
+        payload: &serde_json::Value,
+        payload_schema_version: u32,
+    ) -> StorageResult<Entry> {
+        let entry_id = Uuid::new_v4().to_string();
+        Self::create_with_request(
             conn,
             ctx,
-            &Uuid::new_v4().to_string(),
-            project_id,
-            entry_type,
-            title,
-            payload,
+            EntryCreateRequest {
+                entry_id: &entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload,
+                payload_schema_version,
+            },
         )
     }
 
@@ -50,8 +77,41 @@ impl EntryRepo {
         title: Option<&str>,
         payload: &serde_json::Value,
     ) -> StorageResult<Entry> {
+        Self::create_with_request(
+            conn,
+            ctx,
+            EntryCreateRequest {
+                entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload,
+                payload_schema_version: 1,
+            },
+        )
+    }
+
+    pub fn create_with_request(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        request: EntryCreateRequest<'_>,
+    ) -> StorageResult<Entry> {
+        let EntryCreateRequest {
+            entry_id,
+            project_id,
+            entry_type,
+            title,
+            payload,
+            payload_schema_version,
+        } = request;
         Uuid::parse_str(entry_id)
             .map_err(|_| StorageError::Validation(format!("entry_id {entry_id} must be a UUID")))?;
+        entry_type.validate().map_err(StorageError::Validation)?;
+        if payload_schema_version == 0 {
+            return Err(StorageError::Validation(
+                "payload_schema_version must be greater than zero".to_string(),
+            ));
+        }
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -96,13 +156,14 @@ impl EntryRepo {
              payload_ct, payload_schema_version, tiga_mode_override, object_clock,
              head_commit_id, deleted, created_at, updated_at,
              created_by_device_id, updated_by_device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, ?6, ?7, 0, ?8, ?8, ?9, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 0, ?9, ?9, ?10, ?10)",
                 params![
                     entry_id,
                     project_id,
                     entry_type.to_string(),
                     title_ct,
                     payload_ct,
+                    payload_schema_version as i64,
                     object_clock,
                     commit_id,
                     now,
@@ -139,7 +200,13 @@ impl EntryRepo {
                         project_id: row.get(1)?,
                         entry_type: {
                             let s: String = row.get(2)?;
-                            s.parse().unwrap_or(EntryType::Login)
+                            s.parse().map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    Type::Text,
+                                    Box::new(StorageError::Validation(error)),
+                                )
+                            })?
                         },
                         title_ct: raw_title
                             .map(|t| {
@@ -160,7 +227,7 @@ impl EntryRepo {
                                     Box::new(e),
                                 )
                             })?,
-                        payload_schema_version: row.get::<_, i32>(5)? as u32,
+                        payload_schema_version: read_payload_schema_version(row, 5)?,
                         tiga_mode_override: row
                             .get::<_, Option<String>>(6)?
                             .and_then(|s| s.parse().ok()),
@@ -263,7 +330,13 @@ impl EntryRepo {
                 project_id: row.get(1)?,
                 entry_type: {
                     let s: String = row.get(2)?;
-                    s.parse().unwrap_or(EntryType::Login)
+                    s.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            Type::Text,
+                            Box::new(StorageError::Validation(error)),
+                        )
+                    })?
                 },
                 title_ct: raw_title
                     .map(|t| {
@@ -275,7 +348,7 @@ impl EntryRepo {
                 payload_ct: Self::decrypt_record(conn, &eid, "payload", &raw_payload).map_err(
                     |e| rusqlite::Error::FromSqlConversionFailure(4, Type::Blob, Box::new(e)),
                 )?,
-                payload_schema_version: row.get::<_, i32>(5)? as u32,
+                payload_schema_version: read_payload_schema_version(row, 5)?,
                 tiga_mode_override: row
                     .get::<_, Option<String>>(6)?
                     .and_then(|s| s.parse().ok()),
@@ -305,6 +378,15 @@ impl EntryRepo {
         ctx: &CommitContext,
         entry: &Entry,
     ) -> StorageResult<Entry> {
+        entry
+            .entry_type
+            .validate()
+            .map_err(StorageError::Validation)?;
+        if entry.payload_schema_version == 0 {
+            return Err(StorageError::Validation(
+                "payload_schema_version must be greater than zero".to_string(),
+            ));
+        }
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -332,7 +414,7 @@ impl EntryRepo {
                     entry.entry_id,
                     title_ct,
                     payload_ct,
-                    entry.payload_schema_version as i32,
+                    entry.payload_schema_version as i64,
                     entry.entry_type.to_string(),
                     entry.tiga_mode_override.as_ref().map(|m| m.to_string()),
                     object_clock,
@@ -442,7 +524,7 @@ impl EntryRepo {
                     source.entry_type.to_string(),
                     title_ct,
                     payload_ct,
-                    source.payload_schema_version as i32,
+                    source.payload_schema_version as i64,
                     source.tiga_mode_override.as_ref().map(|m| m.to_string()),
                     r#"{"counter":1}"#,
                     commit_id,
@@ -609,6 +691,13 @@ impl EntryRepo {
     ) -> StorageResult<Vec<u8>> {
         Self::decrypt_record(conn, entry_id, "payload", ciphertext)
     }
+}
+
+fn read_payload_schema_version(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(column)?;
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
 }
 
 fn bump_clock(clock: &str) -> String {
@@ -1240,6 +1329,93 @@ mod tests {
                 .len(),
             9
         );
+    }
+
+    #[test]
+    fn custom_object_type_and_payload_schema_version_roundtrip() {
+        let (conn, ctx, project_id) = setup();
+        let object_type = EntryType::custom("com.monica.mail.message").unwrap();
+        let created = EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &project_id,
+            object_type.clone(),
+            Some("Encrypted message"),
+            &serde_json::json!({"subject": "MDBX2", "body": "ciphertext at rest"}),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(created.entry_type, object_type);
+        assert_eq!(created.payload_schema_version, 7);
+
+        let by_type = EntryRepo::list_by_project_and_type(
+            &conn,
+            &project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type[0].entry_id, created.entry_id);
+
+        let mut updated = created;
+        updated.payload_schema_version = 8;
+        updated.payload_ct = serde_json::to_vec(&serde_json::json!({
+            "subject": "MDBX2 updated",
+            "body": "opaque to the database core"
+        }))
+        .unwrap();
+        let updated = EntryRepo::update(&conn, &ctx, &updated).unwrap();
+        assert_eq!(updated.entry_type.as_str(), "com.monica.mail.message");
+        assert_eq!(updated.payload_schema_version, 8);
+    }
+
+    #[test]
+    fn invalid_object_type_and_zero_payload_schema_version_are_rejected() {
+        let (conn, ctx, project_id) = setup();
+        assert!(EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Custom("Mail".to_string()),
+            None,
+            &serde_json::json!({}),
+            1,
+        )
+        .is_err());
+        assert!(EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::custom("com.monica.bookmark").unwrap(),
+            None,
+            &serde_json::json!({}),
+            0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_stored_object_type_returns_an_explicit_error() {
+        let (conn, ctx, project_id) = setup();
+        let created = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project_id,
+            EntryType::Login,
+            None,
+            &login_payload(),
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET entry_type = 'Mail' WHERE entry_id = ?1",
+                params![created.entry_id],
+            )
+            .unwrap();
+
+        assert!(EntryRepo::get_by_id(&conn, &created.entry_id).is_err());
+        assert!(EntryRepo::list_by_project(&conn, &project_id).is_err());
     }
 
     // -----------------------------------------------------------------------

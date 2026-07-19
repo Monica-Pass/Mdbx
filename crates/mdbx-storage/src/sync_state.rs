@@ -480,7 +480,16 @@ fn load_entry_rows(conn: &VaultConnection) -> StorageResult<Vec<EntryRow>> {
             entry_type: row.get(2)?,
             title_ct: row.get(3)?,
             payload_ct: row.get(4)?,
-            payload_schema_version: row.get::<_, i64>(5)? as u32,
+            payload_schema_version: {
+                let value = row.get::<_, i64>(5)?;
+                u32::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?
+            },
             tiga_mode_override: row.get(6)?,
             object_clock: row.get(7)?,
             head_commit_id: row.get(8)?,

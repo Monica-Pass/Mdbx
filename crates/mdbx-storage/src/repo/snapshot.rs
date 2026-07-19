@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
-use mdbx_core::model::{Attachment, Entry, EntryType, Project, Snapshot};
+use mdbx_core::model::{Attachment, Entry, Project, Snapshot};
 use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
@@ -423,11 +423,26 @@ fn read_all_active_entries(conn: &VaultConnection) -> StorageResult<Vec<Entry>> 
             project_id: row.get(1)?,
             entry_type: {
                 let s: String = row.get(2)?;
-                s.parse().unwrap_or(EntryType::Login)
+                s.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(StorageError::Validation(error)),
+                    )
+                })?
             },
             title_ct: row.get::<_, Option<Vec<u8>>>(3)?,
             payload_ct: row.get::<_, Vec<u8>>(4)?,
-            payload_schema_version: row.get::<_, i32>(5)? as u32,
+            payload_schema_version: {
+                let value = row.get::<_, i64>(5)?;
+                u32::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?
+            },
             tiga_mode_override: row
                 .get::<_, Option<String>>(6)?
                 .and_then(|s| s.parse().ok()),
@@ -624,7 +639,7 @@ fn upsert_entry(
             e.entry_type.to_string(),
             e.title_ct,
             e.payload_ct,
-            e.payload_schema_version as i32,
+            e.payload_schema_version as i64,
             e.tiga_mode_override.as_ref().map(|m| m.to_string()),
             bump_clock(&e.object_clock),
             restore_commit_id,
@@ -838,7 +853,7 @@ mod tests {
     use crate::repo::project::ProjectRepo;
     use crate::search::SearchService;
     use crate::tiga::TigaService;
-    use mdbx_core::model::{UnlockMethodType, VaultSession};
+    use mdbx_core::model::{EntryType, UnlockMethodType, VaultSession};
     use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext) {
@@ -1043,6 +1058,37 @@ mod tests {
         for e in &payload.entries {
             assert_eq!(e.project_id, project.project_id);
         }
+    }
+
+    #[test]
+    fn snapshot_restores_custom_object_type_and_payload_schema_version() {
+        let (conn, ctx) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Generic", None, None).unwrap();
+        let object = EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.steam.mafile").unwrap(),
+            Some("Steam Guard"),
+            &serde_json::json!({"account_name": "alice", "device_id": "android:test"}),
+            5,
+        )
+        .unwrap();
+
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        conn.inner()
+            .execute(
+                "DELETE FROM entries WHERE entry_id = ?1",
+                params![object.entry_id],
+            )
+            .unwrap();
+        SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).unwrap();
+
+        let restored = EntryRepo::get_by_id(&conn, &object.entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.entry_type.as_str(), "com.monica.steam.mafile");
+        assert_eq!(restored.payload_schema_version, 5);
     }
 
     #[test]

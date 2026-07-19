@@ -5,8 +5,8 @@ use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode, inspect_vault_migration,
     open_vault, open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
-    MdbxDeviceAssurance, MdbxDeviceContext, MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation,
-    MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
+    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxPolicyCompliance, MdbxTigaMode,
+    MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use uuid::Uuid;
 
@@ -593,6 +593,83 @@ fn updates_deletes_restores_and_moves_generic_entry() {
         .unwrap();
     assert_eq!(moved.project_id, target.project_id);
     assert_eq!(moved.entry_id, created.entry_id);
+}
+
+#[test]
+fn namespaced_objects_roundtrip_through_the_generic_client_api() {
+    let vault_path = temp_vault_path("generic-object-api");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "generic object password 12345!".to_string(),
+        "ffi-generic-object-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Encrypted mail".to_string()).unwrap();
+
+    let created = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "MDBX2 design".to_string(),
+            r#"{"from":"alice@example.com","body":"opaque domain payload"}"#.to_string(),
+            3,
+        )
+        .unwrap();
+    assert_eq!(created.collection_id, collection.project_id);
+    assert_eq!(created.object_type_id, "com.monica.mail.message");
+    assert_eq!(created.payload_schema_version, 3);
+
+    let fetched = vault
+        .get_object(collection.project_id.clone(), created.object_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched, created);
+
+    let listed = vault
+        .list_objects(
+            collection.project_id.clone(),
+            Some("com.monica.mail.message".to_string()),
+        )
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].object_id, created.object_id);
+
+    let updated = vault
+        .update_object(
+            collection.project_id.clone(),
+            created.object_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "MDBX2 design updated".to_string(),
+            r#"{"from":"alice@example.com","body":"new authenticated payload"}"#.to_string(),
+            4,
+        )
+        .unwrap();
+    assert_eq!(updated.object_id, created.object_id);
+    assert_eq!(updated.payload_schema_version, 4);
+    assert_eq!(updated.title, "MDBX2 design updated");
+
+    let legacy_result = vault.create_entry(
+        collection.project_id.clone(),
+        "com.monica.bookmark".to_string(),
+        "Legacy adapter".to_string(),
+        "{}".to_string(),
+    );
+    assert!(matches!(
+        legacy_result,
+        Err(MdbxFfiError::InvalidEntryType { .. })
+    ));
+
+    let invalid_object = vault.create_object(
+        collection.project_id,
+        "Mail.Message".to_string(),
+        "Invalid".to_string(),
+        "{}".to_string(),
+        1,
+    );
+    assert!(matches!(
+        invalid_object,
+        Err(MdbxFfiError::InvalidObjectTypeId { .. })
+    ));
 }
 
 #[test]

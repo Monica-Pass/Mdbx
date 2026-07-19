@@ -2,7 +2,9 @@
 
 ## Purpose
 
-MDBX is a local-first encrypted object database. Password management is one domain adapter, alongside bookmarks, mail, Steam `mafile`, and future application domains. The core keeps encryption, collections, object records, attachments, commits, synchronization, conflicts, snapshots, and policy independent from product-specific payload meaning.
+MDBX is a local-first advanced encrypted database core for authenticated, versioned objects and binary content. Password management is one domain adapter, alongside bookmarks, mail, Steam `mafile`, and future application domains. The core keeps encryption, collections, object records, attachments, commits, synchronization, conflicts, snapshots, and policy independent from product-specific payload meaning.
+
+The database core accepts opaque application payloads and provides durable security properties around them: authenticated encryption at rest, stable object identity, atomic commit operations, causal synchronization, recovery, audit, key epoch rotation, and MDBX1 compatibility. Application meaning and presentation stay in optional adapters.
 
 ## Domain Vocabulary
 
@@ -62,6 +64,8 @@ A `CommitOperation` is one finite user intent executed atomically and represente
 6. ObjectRelations and ObjectLabels are first-class synchronized metadata with stable IDs and tombstones.
 7. Optional capabilities may be removed from a build only when doing so preserves safe reading or produces an explicit unsupported-extension error.
 8. One user intent should create one CommitOperation, avoiding histories filled with internal implementation commits.
+9. Every stored payload is opaque to the core and remains protected by authenticated encryption, integrity context, version metadata, and atomic history rules.
+10. Optional domain capabilities may add interpretation and rebuildable indexes, but they cannot weaken encryption, history, synchronization, recovery, or compatibility guarantees.
 
 ## Module Architecture
 
