@@ -272,6 +272,9 @@ pub enum ConflictObjectType {
     Project,
     Entry,
     Attachment,
+    ObjectRelation,
+    ObjectLabel,
+    ObjectLabelAssignment,
 }
 
 impl std::fmt::Display for ConflictObjectType {
@@ -280,6 +283,9 @@ impl std::fmt::Display for ConflictObjectType {
             ConflictObjectType::Project => write!(f, "project"),
             ConflictObjectType::Entry => write!(f, "entry"),
             ConflictObjectType::Attachment => write!(f, "attachment"),
+            ConflictObjectType::ObjectRelation => write!(f, "object-relation"),
+            ConflictObjectType::ObjectLabel => write!(f, "object-label"),
+            ConflictObjectType::ObjectLabelAssignment => write!(f, "object-label-assignment"),
         }
     }
 }
@@ -292,6 +298,9 @@ impl std::str::FromStr for ConflictObjectType {
             "project" => Ok(ConflictObjectType::Project),
             "entry" => Ok(ConflictObjectType::Entry),
             "attachment" => Ok(ConflictObjectType::Attachment),
+            "object-relation" => Ok(ConflictObjectType::ObjectRelation),
+            "object-label" => Ok(ConflictObjectType::ObjectLabel),
+            "object-label-assignment" => Ok(ConflictObjectType::ObjectLabelAssignment),
             _ => Err(format!("unknown ConflictObjectType: {}", s)),
         }
     }

@@ -18,8 +18,9 @@ use crate::migration::FIELD_KEY_EPOCHS_EXTENSION;
 use crate::repo::{BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo};
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
-    KeyEpochState, ProjectRow, ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload,
-    TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow,
+    KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow,
+    ProjectTagSetRow, SecurityAuditEventRow, SyncStatePayload, TigaPolicyExceptionRow,
+    TigaPolicyOverrideRow, TigaVaultStateRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -384,6 +385,15 @@ impl SyncApplyRepo {
         }
         conflicts += Self::apply_projects(conn, ctx, incoming_commit_id, &state.projects)?;
         conflicts += Self::apply_entries(conn, ctx, incoming_commit_id, &state.entries)?;
+        if let Some(labels) = &state.object_labels {
+            conflicts += Self::apply_object_labels(conn, ctx, labels)?;
+        }
+        if let Some(relations) = &state.object_relations {
+            conflicts += Self::apply_object_relations(conn, ctx, relations)?;
+        }
+        if let Some(assignments) = &state.object_label_assignments {
+            conflicts += Self::apply_object_label_assignments(conn, ctx, assignments)?;
+        }
         let replace_attachment_chunks =
             Self::apply_attachments(conn, ctx, incoming_commit_id, &state.attachments)?;
         conflicts += replace_attachment_chunks.conflict_count;
@@ -981,6 +991,340 @@ impl SyncApplyRepo {
             }
         }
         Ok(conflicts)
+    }
+
+    fn apply_object_relations(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        relations: &[ObjectRelationRow],
+    ) -> StorageResult<u32> {
+        let mut conflicts = 0;
+        for row in relations {
+            row.relation_kind
+                .parse::<mdbx_core::model::RelationKindId>()
+                .map_err(StorageError::Validation)?;
+            validate_payload_schema_version(row.payload_schema_version)?;
+            if Self::commit_exists(conn, &row.head_commit_id)? {
+                ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
+            }
+            match Self::object_apply_decision(
+                conn,
+                "object_relations",
+                "relation_id",
+                &row.relation_id,
+                &row.head_commit_id,
+            )? {
+                ObjectDecision::Insert => {
+                    conn.inner().execute(
+                        "INSERT INTO object_relations
+                            (relation_id, source_object_id, target_object_id, relation_kind,
+                             payload_ct, payload_schema_version, object_clock, head_commit_id,
+                             deleted, created_at, updated_at, created_by_device_id,
+                             updated_by_device_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            row.relation_id,
+                            row.source_object_id,
+                            row.target_object_id,
+                            row.relation_kind,
+                            row.payload_ct,
+                            row.payload_schema_version as i64,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
+                }
+                ObjectDecision::FastForward => {
+                    conn.inner().execute(
+                        "UPDATE object_relations SET source_object_id = ?2,
+                            target_object_id = ?3, relation_kind = ?4, payload_ct = ?5,
+                            payload_schema_version = ?6, object_clock = ?7,
+                            head_commit_id = ?8, deleted = ?9, created_at = ?10,
+                            updated_at = ?11, created_by_device_id = ?12,
+                            updated_by_device_id = ?13 WHERE relation_id = ?1",
+                        params![
+                            row.relation_id,
+                            row.source_object_id,
+                            row.target_object_id,
+                            row.relation_kind,
+                            row.payload_ct,
+                            row.payload_schema_version as i64,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
+                }
+                ObjectDecision::Conflict { local_head } => {
+                    conflicts += Self::record_generic_metadata_conflict(
+                        conn,
+                        ctx,
+                        ConflictObjectType::ObjectRelation,
+                        &row.relation_id,
+                        &local_head,
+                        &row.head_commit_id,
+                        &[
+                            "source_object_id",
+                            "target_object_id",
+                            "relation_kind",
+                            "payload_ct",
+                            "payload_schema_version",
+                            "deleted",
+                        ],
+                    )?;
+                }
+                ObjectDecision::Skip => {}
+            }
+        }
+        Ok(conflicts)
+    }
+
+    fn apply_object_labels(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        labels: &[ObjectLabelRow],
+    ) -> StorageResult<u32> {
+        let mut conflicts = 0;
+        for row in labels {
+            validate_payload_schema_version(row.payload_schema_version)?;
+            if Self::commit_exists(conn, &row.head_commit_id)? {
+                ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
+            }
+            match Self::object_apply_decision(
+                conn,
+                "object_labels",
+                "label_id",
+                &row.label_id,
+                &row.head_commit_id,
+            )? {
+                ObjectDecision::Insert => {
+                    conn.inner().execute(
+                        "INSERT INTO object_labels
+                            (label_id, collection_id, name_ct, payload_ct,
+                             payload_schema_version, object_clock, head_commit_id,
+                             deleted, created_at, updated_at, created_by_device_id,
+                             updated_by_device_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            row.label_id,
+                            row.collection_id,
+                            row.name_ct,
+                            row.payload_ct,
+                            row.payload_schema_version as i64,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
+                }
+                ObjectDecision::FastForward => {
+                    conn.inner().execute(
+                        "UPDATE object_labels SET collection_id = ?2, name_ct = ?3,
+                            payload_ct = ?4, payload_schema_version = ?5,
+                            object_clock = ?6, head_commit_id = ?7, deleted = ?8,
+                            created_at = ?9, updated_at = ?10,
+                            created_by_device_id = ?11, updated_by_device_id = ?12
+                         WHERE label_id = ?1",
+                        params![
+                            row.label_id,
+                            row.collection_id,
+                            row.name_ct,
+                            row.payload_ct,
+                            row.payload_schema_version as i64,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
+                }
+                ObjectDecision::Conflict { local_head } => {
+                    conflicts += Self::record_generic_metadata_conflict(
+                        conn,
+                        ctx,
+                        ConflictObjectType::ObjectLabel,
+                        &row.label_id,
+                        &local_head,
+                        &row.head_commit_id,
+                        &[
+                            "collection_id",
+                            "name_ct",
+                            "payload_ct",
+                            "payload_schema_version",
+                            "deleted",
+                        ],
+                    )?;
+                }
+                ObjectDecision::Skip => {}
+            }
+        }
+        Ok(conflicts)
+    }
+
+    fn apply_object_label_assignments(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        assignments: &[ObjectLabelAssignmentRow],
+    ) -> StorageResult<u32> {
+        let mut conflicts = 0;
+        for row in assignments {
+            if Self::commit_exists(conn, &row.head_commit_id)? {
+                ObjectVersionRepo::record_object_label_assignment_row(
+                    conn,
+                    &row.head_commit_id,
+                    row,
+                )?;
+            }
+            match Self::object_apply_decision(
+                conn,
+                "object_label_assignments",
+                "assignment_id",
+                &row.assignment_id,
+                &row.head_commit_id,
+            )? {
+                ObjectDecision::Insert => {
+                    if !row.deleted {
+                        let duplicate: Option<(String, String)> = conn
+                            .inner()
+                            .query_row(
+                                "SELECT assignment_id, head_commit_id
+                                 FROM object_label_assignments
+                                 WHERE object_id = ?1 AND label_id = ?2 AND deleted = 0
+                                 LIMIT 1",
+                                params![row.object_id, row.label_id],
+                                |stored| Ok((stored.get(0)?, stored.get(1)?)),
+                            )
+                            .optional()?;
+                        if let Some((duplicate_id, local_head)) = duplicate {
+                            conflicts += Self::record_generic_metadata_conflict(
+                                conn,
+                                ctx,
+                                ConflictObjectType::ObjectLabelAssignment,
+                                &duplicate_id,
+                                &local_head,
+                                &row.head_commit_id,
+                                &["object_id", "label_id", "duplicate-active-assignment"],
+                            )?;
+                            continue;
+                        }
+                    }
+                    conn.inner().execute(
+                        "INSERT INTO object_label_assignments
+                            (assignment_id, object_id, label_id, object_clock,
+                             head_commit_id, deleted, created_at, updated_at,
+                             created_by_device_id, updated_by_device_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            row.assignment_id,
+                            row.object_id,
+                            row.label_id,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_label_assignment_row(
+                        conn,
+                        &row.head_commit_id,
+                        row,
+                    )?;
+                }
+                ObjectDecision::FastForward => {
+                    conn.inner().execute(
+                        "UPDATE object_label_assignments SET object_id = ?2,
+                            label_id = ?3, object_clock = ?4, head_commit_id = ?5,
+                            deleted = ?6, created_at = ?7, updated_at = ?8,
+                            created_by_device_id = ?9, updated_by_device_id = ?10
+                         WHERE assignment_id = ?1",
+                        params![
+                            row.assignment_id,
+                            row.object_id,
+                            row.label_id,
+                            row.object_clock,
+                            row.head_commit_id,
+                            row.deleted as i32,
+                            row.created_at,
+                            row.updated_at,
+                            row.created_by_device_id,
+                            row.updated_by_device_id,
+                        ],
+                    )?;
+                    ObjectVersionRepo::record_object_label_assignment_row(
+                        conn,
+                        &row.head_commit_id,
+                        row,
+                    )?;
+                }
+                ObjectDecision::Conflict { local_head } => {
+                    conflicts += Self::record_generic_metadata_conflict(
+                        conn,
+                        ctx,
+                        ConflictObjectType::ObjectLabelAssignment,
+                        &row.assignment_id,
+                        &local_head,
+                        &row.head_commit_id,
+                        &["object_id", "label_id", "deleted"],
+                    )?;
+                }
+                ObjectDecision::Skip => {}
+            }
+        }
+        Ok(conflicts)
+    }
+
+    fn record_generic_metadata_conflict(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        object_type: ConflictObjectType,
+        object_id: &str,
+        local_head: &str,
+        incoming_head: &str,
+        fields: &[&str],
+    ) -> StorageResult<u32> {
+        if ConflictRepo::has_unresolved_conflict(conn, object_type.clone(), object_id)? {
+            return Ok(0);
+        }
+        let base_commit_id = Self::nearest_known_common_parent(conn, local_head, incoming_head)?
+            .unwrap_or_else(|| local_head.to_string());
+        let fields = fields
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect::<Vec<_>>();
+        ConflictRepo::create(
+            conn,
+            ctx,
+            object_type,
+            object_id,
+            &base_commit_id,
+            local_head,
+            incoming_head,
+            &fields,
+        )?;
+        Ok(1)
     }
 
     fn apply_attachments(
@@ -2333,6 +2677,15 @@ fn bump_object_clock(clock: &str) -> String {
     format!(r#"{{"counter":{}}}"#, counter + 1)
 }
 
+fn validate_payload_schema_version(value: u32) -> StorageResult<()> {
+    if value == 0 {
+        return Err(StorageError::Validation(
+            "payload_schema_version must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn stricter_compliance_status<'a>(a: &'a str, b: &'a str) -> StorageResult<&'a str> {
     fn rank(value: &str) -> Option<u8> {
         match value {
@@ -2447,15 +2800,18 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::key_epoch::{KeyEpochRotationResult, KeyEpochService};
     use crate::repo::{
-        AttachmentRepo, CommitChange, CommitOperation, EntryRepo, ObjectVersionRepo, ProjectRepo,
+        AttachmentRepo, CommitChange, CommitOperation, EntryRepo,
+        ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+        ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ObjectVersionRepo,
+        ProjectRepo,
     };
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
     use crate::unlock::UnlockService;
     use mdbx_core::model::{
-        ChangeScope, Commit, CommitKind, ConflictResolution, EntryType, UnlockMethodType,
-        VaultSession,
+        ChangeScope, Commit, CommitKind, ConflictObjectType, ConflictResolution, EntryType,
+        RelationKindId, UnlockMethodType, VaultSession,
     };
     use mdbx_core::tiga::{
         DeviceAssurance, DeviceContext, SessionAssurance, TigaScope, TIGA_POLICY_VERSION,
@@ -2820,6 +3176,9 @@ mod tests {
             "project" => ChangeScope::Project,
             "entry" => ChangeScope::Entry,
             "attachment" => ChangeScope::Attachment,
+            "object-relation" => ChangeScope::ObjectRelation,
+            "object-label" => ChangeScope::ObjectLabel,
+            "object-label-assignment" => ChangeScope::ObjectLabelAssignment,
             "vault-meta" => ChangeScope::VaultMeta,
             "key-epoch" => ChangeScope::KeyEpoch,
             _ => ChangeScope::Multi,
@@ -3488,6 +3847,212 @@ mod tests {
             .unwrap();
         assert_eq!(synced.entry_type.as_str(), "com.monica.mail.message");
         assert_eq!(synced.payload_schema_version, 12);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn relation_sync_roundtrips_generic_metadata_and_versions() {
+        let source_path = temp_vault_path("relation-sync-source");
+        let target_path = temp_vault_path("relation-sync-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("relation-sync-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let project = ProjectRepo::create(&source, &source_ctx, "Mail", None, None).unwrap();
+        let first = EntryRepo::create(
+            &source,
+            &source_ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("First"),
+            &serde_json::json!({"body": "first"}),
+        )
+        .unwrap();
+        let second = EntryRepo::create(
+            &source,
+            &source_ctx,
+            &project.project_id,
+            EntryType::custom("com.monica.mail.message").unwrap(),
+            Some("Second"),
+            &serde_json::json!({"body": "second"}),
+        )
+        .unwrap();
+        let relation = ObjectRelationRepo::create(
+            &source,
+            &source_ctx,
+            ObjectRelationCreateRequest::new(
+                &first.entry_id,
+                &second.entry_id,
+                RelationKindId::new("com.monica.mail.reply-to").unwrap(),
+                serde_json::json!({"position": 1}),
+            )
+            .with_payload_schema_version(4),
+        )
+        .unwrap();
+        let label = ObjectLabelRepo::create(
+            &source,
+            &source_ctx,
+            ObjectLabelCreateRequest::new(
+                &project.project_id,
+                "Important",
+                serde_json::json!({"color": "red"}),
+            ),
+        )
+        .unwrap();
+        let assignment = ObjectLabelAssignmentRepo::create(
+            &source,
+            &source_ctx,
+            ObjectLabelAssignmentCreateRequest::new(&first.entry_id, &label.label_id),
+        )
+        .unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        commits
+            .last_mut()
+            .unwrap()
+            .object_payloads
+            .push(collect_sync_state_payload(&source).unwrap());
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+        assert_eq!(result.conflict_count, 0);
+
+        let synced_relation = ObjectRelationRepo::get_by_id(&target, &relation.relation_id)
+            .unwrap()
+            .unwrap();
+        let synced_label = ObjectLabelRepo::get_by_id(&target, &label.label_id)
+            .unwrap()
+            .unwrap();
+        let synced_assignment =
+            ObjectLabelAssignmentRepo::get_by_id(&target, &assignment.assignment_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(synced_relation.relation_kind, relation.relation_kind);
+        assert_eq!(synced_relation.payload_schema_version, 4);
+        assert_eq!(synced_label.name_ct, label.name_ct);
+        assert_eq!(synced_assignment.object_id, first.entry_id);
+        assert!(ObjectVersionRepo::get_object_relation(
+            &target,
+            &relation.relation_id,
+            &relation.head_commit_id,
+        )
+        .unwrap()
+        .is_some());
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn divergent_relation_changes_create_a_typed_conflict() {
+        let source_path = temp_vault_path("relation-conflict-source");
+        let target_path = temp_vault_path("relation-conflict-target");
+        let relation_id;
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("relation-conflict-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let ctx = CommitContext::new("device-a".to_string());
+            let project = ProjectRepo::create(&source, &ctx, "Mail", None, None).unwrap();
+            let first = EntryRepo::create(
+                &source,
+                &ctx,
+                &project.project_id,
+                EntryType::custom("com.monica.mail.message").unwrap(),
+                Some("First"),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+            let second = EntryRepo::create(
+                &source,
+                &ctx,
+                &project.project_id,
+                EntryType::custom("com.monica.mail.message").unwrap(),
+                Some("Second"),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+            relation_id = ObjectRelationRepo::create(
+                &source,
+                &ctx,
+                ObjectRelationCreateRequest::new(
+                    first.entry_id,
+                    second.entry_id,
+                    RelationKindId::new("com.monica.mail.reply-to").unwrap(),
+                    serde_json::json!({"position": 1}),
+                ),
+            )
+            .unwrap()
+            .relation_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let mut remote = ObjectRelationRepo::get_by_id(&source, &relation_id)
+            .unwrap()
+            .unwrap();
+        remote.payload_ct = serde_json::to_vec(&serde_json::json!({"position": 2})).unwrap();
+        ObjectRelationRepo::update(&source, &source_ctx, &remote).unwrap();
+        let mut local = ObjectRelationRepo::get_by_id(&target, &relation_id)
+            .unwrap()
+            .unwrap();
+        local.payload_ct = serde_json::to_vec(&serde_json::json!({"position": 3})).unwrap();
+        let local = ObjectRelationRepo::update(&target, &target_ctx, &local).unwrap();
+
+        let mut commits = serialized_commits_from(&source);
+        commits
+            .last_mut()
+            .unwrap()
+            .object_payloads
+            .push(collect_sync_state_payload(&source).unwrap());
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+        assert_eq!(result.conflict_count, 1);
+        assert_eq!(
+            ObjectRelationRepo::get_by_id(&target, &relation_id)
+                .unwrap()
+                .unwrap()
+                .head_commit_id,
+            local.head_commit_id
+        );
+        let conflicts =
+            ConflictRepo::list_by_object(&target, ConflictObjectType::ObjectRelation, &relation_id)
+                .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].object_type, ConflictObjectType::ObjectRelation);
 
         drop(source);
         drop(target);
