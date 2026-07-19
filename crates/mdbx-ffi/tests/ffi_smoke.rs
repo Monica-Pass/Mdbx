@@ -206,6 +206,37 @@ fn write_operation_rolls_back_every_command_on_failure() {
 }
 
 #[test]
+fn commit_history_pages_include_operation_and_legacy_records() {
+    let vault_path = temp_vault_path("commit-history");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "history password 12345!".to_string(),
+        "ffi-history-device".to_string(),
+    )
+    .unwrap();
+    let project = vault.create_project("History Project".to_string()).unwrap();
+
+    let first = vault.list_commit_history(1, None).unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(first.items[0].operation_id.is_some());
+    assert_eq!(first.items[0].changes[0].object_id, project.project_id);
+    let detail = vault
+        .get_commit_history(first.items[0].commit_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.commit_id, first.items[0].commit_id);
+
+    let second = vault.list_commit_history(1, first.next_cursor).unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert!(second.items[0].legacy);
+    assert!(second.items[0].operation_id.is_none());
+    assert!(vault
+        .get_commit_history("missing-commit".to_string())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn creates_reopens_and_preserves_generic_entries() {
     let vault_path = temp_vault_path("roundtrip");
     let path = vault_path.as_path_string();

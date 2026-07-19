@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod commit_ctx;
+pub mod commit_history;
 pub mod conflict;
 pub mod entry;
 pub mod object_version;
@@ -9,6 +10,7 @@ pub mod tombstone;
 
 pub use attachment::AttachmentRepo;
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
+pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use conflict::ConflictRepo;
 pub use entry::EntryRepo;
 pub use object_version::ObjectVersionRepo;

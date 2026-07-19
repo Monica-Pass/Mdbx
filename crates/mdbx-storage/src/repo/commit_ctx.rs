@@ -659,6 +659,27 @@ impl CommitContext {
         .map_err(StorageError::Crypto)
     }
 
+    pub(crate) fn decrypt_history(
+        conn: &VaultConnection,
+        commit_id: &str,
+        field: &str,
+        ciphertext: &[u8],
+    ) -> StorageResult<Vec<u8>> {
+        let subkey = conn
+            .keyring()
+            .map(|kr| kr.history_subkey.clone())
+            .unwrap_or_default();
+        crate::crypto_layer::decrypt_field(
+            conn.keyring(),
+            &subkey,
+            ciphertext,
+            "commit",
+            commit_id,
+            field,
+        )
+        .map_err(StorageError::Crypto)
+    }
+
     /// 写入 tombstone 记录。
     pub fn create_tombstone(
         &self,
@@ -856,7 +877,19 @@ impl CommitContext {
                 hasher.finalize().to_vec()
             }
         };
-        if expected != operation.integrity_tag {
+        let mut valid = expected == operation.integrity_tag;
+        if !valid
+            && conn.keyring().is_some()
+            && serde_json::from_slice::<serde_json::Value>(&operation.change_summary_ct).is_ok()
+        {
+            let mut hasher = Sha256::new();
+            for part in parts {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+            valid = hasher.finalize().as_slice() == operation.integrity_tag.as_slice();
+        }
+        if !valid {
             return Err(StorageError::Validation(format!(
                 "incoming operation {} integrity mismatch",
                 operation.operation_id

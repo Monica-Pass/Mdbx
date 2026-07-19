@@ -67,3 +67,7 @@ Mobile and desktop clients should submit multi-step edits through the UniFFI `Md
 Every create command carries a client-generated stable UUID. The client reuses the same `operation_id` and complete command list for the initial call and retries. Storage executes the command list as one transaction and one commit. A completed operation retry returns the commit ID and the object IDs from the request without running mutations again. Reusing an operation ID with different command content is rejected, and failure of any command rolls back the entire batch.
 
 The existing single-mutation FFI methods remain available as the MDBX1-compatible projection and simple-call entry points. A client action that must appear as one history node should use the operation API.
+
+### Commit History Read API
+
+Clients page through history with `MdbxVault::list_commit_history` using the returned keyset cursor and fetch one detail with `get_commit_history`. Results include operation metadata, branch, parents, typed change summaries, and a compatibility flag; MDBX1 commits without operation metadata remain visible through a compatibility summary. Clients must treat the storage-returned cursor as opaque and must not recreate pagination with offsets.
