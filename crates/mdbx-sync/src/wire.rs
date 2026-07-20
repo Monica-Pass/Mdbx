@@ -206,76 +206,153 @@ struct WirePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireMessage {
-    Hello(HelloRequest),
-    HelloAck(HelloResponse),
-    WantCommits(WantRequest),
-    CommitInventoryPageRequest(CommitInventoryPageRequest),
-    CommitInventoryPageResponse(CommitInventoryPageResponse),
-    DeltaInventoryPageRequest(DeltaInventoryPageRequest),
-    DeltaInventoryPageResponse(DeltaInventoryPageResponse),
-    BlobManifestPageRequest(BlobManifestPageRequest),
-    BlobManifestPageResponse(BlobManifestPageResponse),
-    BlobChunkRequest(BlobChunkRequest),
-    BlobChunkResponse(BlobChunkResponse),
-    CommitBatch(CommitBatch),
-    BatchAck(BatchAck),
-    Done(SyncDone),
-    Error(SyncErrorMessage),
+    Json(Vec<u8>),
+    BlobManifestPageRequest(WireBlobManifestPageRequest),
+    BlobManifestPageResponse(WireBlobManifestPageResponse),
+    BlobChunkRequest(WireBlobChunkRequest),
+    BlobChunkResponse(WireBlobChunkResponse),
 }
 
-impl From<SyncMessage> for WireMessage {
-    fn from(value: SyncMessage) -> Self {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireBlobManifestPageRequest {
+    namespace_id: String,
+    checkpoint: Option<String>,
+    cursor: Option<String>,
+    page_size: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireBlobManifestPageResponse {
+    namespace_id: String,
+    checkpoint: String,
+    items: Vec<WireBlobManifestEntry>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireBlobManifestEntry {
+    blob_id: String,
+    total_size: Option<u64>,
+    state: BlobManifestEntryState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireBlobChunkRequest {
+    namespace_id: String,
+    blob_id: String,
+    total_size: u64,
+    offset: u64,
+    max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireBlobChunkResponse {
+    namespace_id: String,
+    blob_id: String,
+    total_size: u64,
+    offset: u64,
+    ciphertext: Vec<u8>,
+    is_last: bool,
+}
+
+impl WireMessage {
+    fn from_sync(value: SyncMessage) -> SyncResult<Self> {
         match value {
-            SyncMessage::Hello(value) => Self::Hello(value),
-            SyncMessage::HelloAck(value) => Self::HelloAck(value),
-            SyncMessage::WantCommits(value) => Self::WantCommits(value),
-            SyncMessage::CommitInventoryPageRequest(value) => {
-                Self::CommitInventoryPageRequest(value)
+            SyncMessage::BlobManifestPageRequest(value) => {
+                Ok(Self::BlobManifestPageRequest(WireBlobManifestPageRequest {
+                    namespace_id: value.namespace_id,
+                    checkpoint: value.checkpoint,
+                    cursor: value.cursor,
+                    page_size: value.page_size,
+                }))
             }
-            SyncMessage::CommitInventoryPageResponse(value) => {
-                Self::CommitInventoryPageResponse(value)
+            SyncMessage::BlobManifestPageResponse(value) => Ok(Self::BlobManifestPageResponse(
+                WireBlobManifestPageResponse {
+                    namespace_id: value.namespace_id,
+                    checkpoint: value.checkpoint,
+                    items: value
+                        .items
+                        .into_iter()
+                        .map(|item| WireBlobManifestEntry {
+                            blob_id: item.blob_id,
+                            total_size: item.total_size,
+                            state: item.state,
+                        })
+                        .collect(),
+                    next_cursor: value.next_cursor,
+                },
+            )),
+            SyncMessage::BlobChunkRequest(value) => {
+                Ok(Self::BlobChunkRequest(WireBlobChunkRequest {
+                    namespace_id: value.namespace_id,
+                    blob_id: value.blob_id,
+                    total_size: value.total_size,
+                    offset: value.offset,
+                    max_bytes: value.max_bytes,
+                }))
             }
-            SyncMessage::DeltaInventoryPageRequest(value) => Self::DeltaInventoryPageRequest(value),
-            SyncMessage::DeltaInventoryPageResponse(value) => {
-                Self::DeltaInventoryPageResponse(value)
+            SyncMessage::BlobChunkResponse(value) => {
+                Ok(Self::BlobChunkResponse(WireBlobChunkResponse {
+                    namespace_id: value.namespace_id,
+                    blob_id: value.blob_id,
+                    total_size: value.total_size,
+                    offset: value.offset,
+                    ciphertext: value.ciphertext,
+                    is_last: value.is_last,
+                }))
             }
-            SyncMessage::BlobManifestPageRequest(value) => Self::BlobManifestPageRequest(value),
-            SyncMessage::BlobManifestPageResponse(value) => Self::BlobManifestPageResponse(value),
-            SyncMessage::BlobChunkRequest(value) => Self::BlobChunkRequest(value),
-            SyncMessage::BlobChunkResponse(value) => Self::BlobChunkResponse(value),
-            SyncMessage::CommitBatch(value) => Self::CommitBatch(value),
-            SyncMessage::BatchAck(value) => Self::BatchAck(value),
-            SyncMessage::Done(value) => Self::Done(value),
-            SyncMessage::Error(value) => Self::Error(value),
+            other => serde_json::to_vec(&other)
+                .map(Self::Json)
+                .map_err(|error| SyncError::Serialization(error.to_string())),
         }
     }
-}
 
-impl From<WireMessage> for SyncMessage {
-    fn from(value: WireMessage) -> Self {
-        match value {
-            WireMessage::Hello(value) => Self::Hello(value),
-            WireMessage::HelloAck(value) => Self::HelloAck(value),
-            WireMessage::WantCommits(value) => Self::WantCommits(value),
-            WireMessage::CommitInventoryPageRequest(value) => {
-                Self::CommitInventoryPageRequest(value)
+    fn into_sync(self) -> SyncResult<SyncMessage> {
+        let message = match self {
+            Self::Json(bytes) => SyncMessage::from_bytes(&bytes)
+                .map_err(|error| SyncError::Serialization(error.to_string()))?,
+            Self::BlobManifestPageRequest(value) => {
+                SyncMessage::BlobManifestPageRequest(BlobManifestPageRequest {
+                    namespace_id: value.namespace_id,
+                    checkpoint: value.checkpoint,
+                    cursor: value.cursor,
+                    page_size: value.page_size,
+                })
             }
-            WireMessage::CommitInventoryPageResponse(value) => {
-                Self::CommitInventoryPageResponse(value)
+            Self::BlobManifestPageResponse(value) => {
+                SyncMessage::BlobManifestPageResponse(BlobManifestPageResponse {
+                    namespace_id: value.namespace_id,
+                    checkpoint: value.checkpoint,
+                    items: value
+                        .items
+                        .into_iter()
+                        .map(|item| BlobManifestEntry {
+                            blob_id: item.blob_id,
+                            total_size: item.total_size,
+                            state: item.state,
+                        })
+                        .collect(),
+                    next_cursor: value.next_cursor,
+                })
             }
-            WireMessage::DeltaInventoryPageRequest(value) => Self::DeltaInventoryPageRequest(value),
-            WireMessage::DeltaInventoryPageResponse(value) => {
-                Self::DeltaInventoryPageResponse(value)
-            }
-            WireMessage::BlobManifestPageRequest(value) => Self::BlobManifestPageRequest(value),
-            WireMessage::BlobManifestPageResponse(value) => Self::BlobManifestPageResponse(value),
-            WireMessage::BlobChunkRequest(value) => Self::BlobChunkRequest(value),
-            WireMessage::BlobChunkResponse(value) => Self::BlobChunkResponse(value),
-            WireMessage::CommitBatch(value) => Self::CommitBatch(value),
-            WireMessage::BatchAck(value) => Self::BatchAck(value),
-            WireMessage::Done(value) => Self::Done(value),
-            WireMessage::Error(value) => Self::Error(value),
-        }
+            Self::BlobChunkRequest(value) => SyncMessage::BlobChunkRequest(BlobChunkRequest {
+                namespace_id: value.namespace_id,
+                blob_id: value.blob_id,
+                total_size: value.total_size,
+                offset: value.offset,
+                max_bytes: value.max_bytes,
+            }),
+            Self::BlobChunkResponse(value) => SyncMessage::BlobChunkResponse(BlobChunkResponse {
+                namespace_id: value.namespace_id,
+                blob_id: value.blob_id,
+                total_size: value.total_size,
+                offset: value.offset,
+                ciphertext: value.ciphertext,
+                is_last: value.is_last,
+            }),
+        };
+        message.validate()?;
+        Ok(message)
     }
 }
 
@@ -344,7 +421,7 @@ pub fn write_wire_frame(
         session_id: frame.session_id.clone(),
         sequence: frame.sequence,
         in_reply_to: frame.in_reply_to,
-        message: frame.message.clone().into(),
+        message: WireMessage::from_sync(frame.message.clone())?,
     };
     bincode::serde::encode_into_std_write(&wire_payload, &mut payload, bincode::config::standard())
         .map_err(|error| payload.map_encode_error(error, limits.max_payload_bytes))?;
@@ -435,7 +512,7 @@ pub fn read_wire_frame(
         session_id: decoded.session_id,
         sequence: decoded.sequence,
         in_reply_to: decoded.in_reply_to,
-        message: decoded.message.into(),
+        message: decoded.message.into_sync()?,
     };
     frame.validate()?;
     Ok(frame)
