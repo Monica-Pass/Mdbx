@@ -42,7 +42,7 @@ impl Default for BlobLifecycleLimits {
 }
 
 impl BlobLifecycleLimits {
-    fn validate(self) -> StorageResult<()> {
+    pub(crate) fn validate(self) -> StorageResult<()> {
         if !(1..=MAX_BLOB_PAGE_SIZE).contains(&self.provider_page_size) {
             return Err(StorageError::Validation(format!(
                 "provider_page_size must be between 1 and {MAX_BLOB_PAGE_SIZE}"
@@ -122,10 +122,10 @@ impl BlobGcResult {
     }
 }
 
-#[derive(Debug)]
-struct ReferenceInventory {
-    raw_count: usize,
-    blobs: BTreeMap<String, usize>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalBlobReferenceInventory {
+    pub raw_reference_count: usize,
+    pub blobs: BTreeMap<String, usize>,
 }
 
 pub struct BlobLifecycleService;
@@ -148,7 +148,7 @@ impl BlobLifecycleService {
                 "Blob Provider namespace ID must contain 1 to 4096 bytes".to_string(),
             ));
         }
-        let references = collect_references(conn, options.limits)?;
+        let references = collect_external_blob_references(conn, options.limits)?;
         let provider = collect_provider_inventory(blob_store, options.limits)?;
         build_report(
             conn,
@@ -247,10 +247,16 @@ impl BlobLifecycleService {
     }
 }
 
-fn collect_references(
+pub fn collect_external_blob_references(
     conn: &VaultConnection,
     limits: BlobLifecycleLimits,
-) -> StorageResult<ReferenceInventory> {
+) -> StorageResult<ExternalBlobReferenceInventory> {
+    limits.validate()?;
+    if conn.keyring().is_none() {
+        return Err(StorageError::Validation(
+            "external Blob reference inventory requires an unlocked encrypted vault".to_string(),
+        ));
+    }
     let mut blobs = BTreeMap::<String, usize>::new();
     let mut raw_count = 0usize;
     let mut stmt = conn.inner().prepare(
@@ -323,7 +329,10 @@ fn collect_references(
             stored_size,
         )?;
     }
-    Ok(ReferenceInventory { raw_count, blobs })
+    Ok(ExternalBlobReferenceInventory {
+        raw_reference_count: raw_count,
+        blobs,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,7 +373,7 @@ fn add_reference(
     Ok(())
 }
 
-fn collect_provider_inventory(
+pub(crate) fn collect_provider_inventory(
     blob_store: &dyn ManageableEncryptedBlobStore,
     limits: BlobLifecycleLimits,
 ) -> StorageResult<BTreeMap<String, EncryptedBlobMetadata>> {
@@ -426,7 +435,7 @@ fn build_report(
     conn: &VaultConnection,
     blob_store: &dyn ManageableEncryptedBlobStore,
     namespace_id: String,
-    references: ReferenceInventory,
+    references: ExternalBlobReferenceInventory,
     provider: BTreeMap<String, EncryptedBlobMetadata>,
     options: BlobAuditOptions,
 ) -> StorageResult<BlobAuditReport> {
@@ -511,7 +520,7 @@ fn build_report(
     );
     Ok(BlobAuditReport {
         namespace_id,
-        raw_reference_count: references.raw_count,
+        raw_reference_count: references.raw_reference_count,
         unique_reference_count: references.blobs.len(),
         provider_blob_count: provider.len(),
         healthy_reference_count,
