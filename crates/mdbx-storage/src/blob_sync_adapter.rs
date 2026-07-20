@@ -451,6 +451,255 @@ fn now_unix_secs() -> StorageResult<i64> {
         .map_err(|_| StorageError::Validation("system clock exceeds SQLite range".to_string()))
 }
 
+/// Transport-neutral request/response boundary. A network client can
+/// implement this trait without exposing Provider internals to mdbx-sync.
+pub trait BlobSyncRemote {
+    fn manifest_page(
+        &mut self,
+        request: BlobManifestPageRequest,
+    ) -> StorageResult<BlobManifestPageResponse>;
+
+    fn blob_chunk(&mut self, request: BlobChunkRequest) -> StorageResult<BlobChunkResponse>;
+}
+
+pub struct LocalBlobSyncRemote<'a, S: BlobSyncSourceStore + ?Sized> {
+    conn: &'a VaultConnection,
+    source: &'a S,
+    limits: BlobSyncSourceLimits,
+}
+
+impl<'a, S: BlobSyncSourceStore + ?Sized> LocalBlobSyncRemote<'a, S> {
+    pub fn new(conn: &'a VaultConnection, source: &'a S, limits: BlobSyncSourceLimits) -> Self {
+        Self {
+            conn,
+            source,
+            limits,
+        }
+    }
+}
+
+impl<S: BlobSyncSourceStore + ?Sized> BlobSyncRemote for LocalBlobSyncRemote<'_, S> {
+    fn manifest_page(
+        &mut self,
+        request: BlobManifestPageRequest,
+    ) -> StorageResult<BlobManifestPageResponse> {
+        BlobSyncSourceAdapter::manifest_page(self.conn, self.source, request, self.limits)
+    }
+
+    fn blob_chunk(&mut self, request: BlobChunkRequest) -> StorageResult<BlobChunkResponse> {
+        BlobSyncSourceAdapter::chunk(self.source, request, self.limits)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSyncRunLimits {
+    pub page_size: usize,
+    pub max_items_per_run: usize,
+    pub max_chunks_per_run: usize,
+    pub chunk_size: usize,
+    pub destination: BlobSyncDestinationLimits,
+}
+
+impl Default for BlobSyncRunLimits {
+    fn default() -> Self {
+        Self {
+            page_size: 64,
+            max_items_per_run: 64,
+            max_chunks_per_run: 256,
+            chunk_size: 1024 * 1024,
+            destination: BlobSyncDestinationLimits::default(),
+        }
+    }
+}
+
+impl BlobSyncRunLimits {
+    fn validate(self) -> StorageResult<()> {
+        if !(1..=mdbx_sync::MAX_BLOB_MANIFEST_PAGE_ITEMS).contains(&self.page_size) {
+            return Err(StorageError::Validation(format!(
+                "Blob sync run page size must be between 1 and {}",
+                mdbx_sync::MAX_BLOB_MANIFEST_PAGE_ITEMS
+            )));
+        }
+        if self.max_items_per_run == 0 || self.max_chunks_per_run == 0 {
+            return Err(StorageError::Validation(
+                "Blob sync run item and chunk limits must be positive".to_string(),
+            ));
+        }
+        if !(1..=mdbx_sync::MAX_BLOB_CHUNK_BYTES).contains(&self.chunk_size) {
+            return Err(StorageError::Validation(format!(
+                "Blob sync run chunk size must be between 1 and {}",
+                mdbx_sync::MAX_BLOB_CHUNK_BYTES
+            )));
+        }
+        self.destination.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSyncRunResult {
+    pub completed: bool,
+    pub transferred_items: usize,
+    pub chunks_applied: usize,
+    pub blocked_items: Vec<BlobSyncDestinationItem>,
+}
+
+pub struct BlobSyncDriver;
+
+impl BlobSyncDriver {
+    /// Execute one bounded run. The caller may persist the client's
+    /// BlobSyncResume after every return and invoke this method again after
+    /// interruption or process restart.
+    pub fn run<S, R>(
+        client: &mut mdbx_sync::SyncClient,
+        remote: &mut R,
+        destination: &S,
+        owner_id: &str,
+        limits: BlobSyncRunLimits,
+    ) -> StorageResult<BlobSyncRunResult>
+    where
+        S: BlobSyncDestinationStore + ?Sized,
+        R: BlobSyncRemote,
+    {
+        limits.validate()?;
+        if !client.blob_replication_is_negotiated() {
+            return Err(StorageError::ConstraintViolation(
+                "Blob sync driver requires the complete negotiated Blob contract".to_string(),
+            ));
+        }
+        validate_owner_id(owner_id)?;
+        let mut result = BlobSyncRunResult {
+            completed: false,
+            transferred_items: 0,
+            chunks_applied: 0,
+            blocked_items: Vec::new(),
+        };
+
+        while result.chunks_applied < limits.max_chunks_per_run {
+            if let Some(resume) = client.blob_resume().cloned() {
+                if let Some(blob_id) = resume.current_blob_id {
+                    let request = client
+                        .blob_chunk_request(blob_id, resume.total_size, limits.chunk_size)
+                        .map_err(|error| StorageError::Validation(error.to_string()))?;
+                    let response = remote.blob_chunk(request)?;
+                    BlobSyncDestinationAdapter::apply_chunk(
+                        destination,
+                        client,
+                        &response,
+                        owner_id,
+                        limits.destination,
+                    )?;
+                    result.chunks_applied += 1;
+                    if client
+                        .blob_resume()
+                        .and_then(|resume| resume.current_blob_id.as_ref())
+                        .is_none()
+                    {
+                        result.transferred_items += 1;
+                    }
+                    continue;
+                }
+                if resume.manifest_complete {
+                    result.completed = true;
+                    return Ok(result);
+                }
+            } else {
+                return Err(StorageError::ConstraintViolation(
+                    "Blob sync driver has no configured durable resume state".to_string(),
+                ));
+            }
+
+            let request = client
+                .blob_manifest_request(limits.page_size)
+                .map_err(|error| StorageError::Validation(error.to_string()))?;
+            let response = remote.manifest_page(request)?;
+            client
+                .validate_blob_manifest_response(&response)
+                .map_err(|error| StorageError::Validation(error.to_string()))?;
+            let inspection = BlobSyncDestinationAdapter::inspect_manifest(
+                destination,
+                &response,
+                limits.destination,
+            )?;
+            if !inspection.items.iter().all(|item| {
+                matches!(
+                    item.state,
+                    BlobSyncDestinationState::AlreadyPresent
+                        | BlobSyncDestinationState::TransferRequired
+                )
+            }) {
+                result.blocked_items = inspection
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        !matches!(
+                            item.state,
+                            BlobSyncDestinationState::AlreadyPresent
+                                | BlobSyncDestinationState::TransferRequired
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(result);
+            }
+
+            if result.transferred_items >= limits.max_items_per_run {
+                return Ok(result);
+            }
+
+            for item in inspection.transfer_required() {
+                if result.transferred_items >= limits.max_items_per_run {
+                    return Ok(result);
+                }
+                let total_size = item.total_size.ok_or_else(|| {
+                    StorageError::ConstraintViolation(
+                        "transfer-required Blob has no declared total size".to_string(),
+                    )
+                })?;
+                loop {
+                    if result.chunks_applied >= limits.max_chunks_per_run {
+                        return Ok(result);
+                    }
+                    let request = client
+                        .blob_chunk_request(item.blob_id.clone(), total_size, limits.chunk_size)
+                        .map_err(|error| StorageError::Validation(error.to_string()))?;
+                    let response = remote.blob_chunk(request)?;
+                    BlobSyncDestinationAdapter::apply_chunk(
+                        destination,
+                        client,
+                        &response,
+                        owner_id,
+                        limits.destination,
+                    )?;
+                    result.chunks_applied += 1;
+                    let still_active = client
+                        .blob_resume()
+                        .and_then(|resume| resume.current_blob_id.as_deref())
+                        .is_some_and(|active| active == item.blob_id);
+                    if !still_active {
+                        break;
+                    }
+                }
+                result.transferred_items += 1;
+            }
+
+            BlobSyncDestinationAdapter::acknowledge_manifest_page(
+                destination,
+                client,
+                &response,
+                limits.destination,
+            )?;
+            if client.blob_sync_phase() == mdbx_sync::BlobSyncPhase::Complete {
+                result.completed = true;
+                return Ok(result);
+            }
+            if result.chunks_applied >= limits.max_chunks_per_run {
+                return Ok(result);
+            }
+        }
+        Ok(result)
+    }
+}
+
 fn manifest_entry(
     blob_id: &str,
     declared_max_bytes: u64,
@@ -852,5 +1101,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(destination.get(&blob_id, payload.len()).unwrap(), payload);
+    }
+
+    #[test]
+    fn driver_resumes_from_serialized_state_and_converges_with_bounded_runs() {
+        let (conn, context, project_id) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = FileSystemBlobStore::new(source_dir.path().join("source.blobs"));
+        let destination =
+            FileSystemBlobStore::new(destination_dir.path().join("destination.blobs"));
+        add_external(&conn, &context, &project_id, &source);
+        let namespace = EncryptedBlobTransferStore::namespace_id(&source).unwrap();
+        let mut client = negotiated_client(&namespace);
+        let mut remote = LocalBlobSyncRemote::new(&conn, &source, BlobSyncSourceLimits::default());
+        let limits = BlobSyncRunLimits {
+            page_size: 1,
+            max_items_per_run: 1,
+            max_chunks_per_run: 1,
+            chunk_size: 4,
+            destination: BlobSyncDestinationLimits::default(),
+        };
+
+        let first = BlobSyncDriver::run(
+            &mut client,
+            &mut remote,
+            &destination,
+            "driver-owner",
+            limits,
+        )
+        .unwrap();
+        assert!(!first.completed);
+        assert_eq!(first.chunks_applied, 1);
+        let serialized = serde_json::to_vec(client.blob_resume().unwrap()).unwrap();
+        let saved: mdbx_sync::BlobSyncResume = serde_json::from_slice(&serialized).unwrap();
+        let mut resumed = negotiated_client(&namespace);
+        resumed.restore_blob_sync(saved).unwrap();
+
+        let mut completed = false;
+        for _ in 0..256 {
+            let run = BlobSyncDriver::run(
+                &mut resumed,
+                &mut remote,
+                &destination,
+                "driver-owner",
+                limits,
+            )
+            .unwrap();
+            if run.completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(resumed.blob_sync_phase(), BlobSyncPhase::Complete);
+        let source_inventory =
+            collect_provider_inventory(&source, BlobLifecycleLimits::default()).unwrap();
+        let destination_inventory =
+            collect_provider_inventory(&destination, BlobLifecycleLimits::default()).unwrap();
+        assert_eq!(
+            source_inventory.keys().collect::<Vec<_>>(),
+            destination_inventory.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn driver_reports_source_blockers_without_advancing_manifest() {
+        let (conn, context, project_id) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = FileSystemBlobStore::new(source_dir.path().join("source.blobs"));
+        let destination =
+            FileSystemBlobStore::new(destination_dir.path().join("destination.blobs"));
+        add_external(&conn, &context, &project_id, &source);
+        let page = ManageableEncryptedBlobStore::list(&source, None, 1).unwrap();
+        ManageableEncryptedBlobStore::delete(&source, &page.blobs[0].blob_id).unwrap();
+        let namespace = EncryptedBlobTransferStore::namespace_id(&source).unwrap();
+        let mut client = negotiated_client(&namespace);
+        let mut remote = LocalBlobSyncRemote::new(&conn, &source, BlobSyncSourceLimits::default());
+        let run = BlobSyncDriver::run(
+            &mut client,
+            &mut remote,
+            &destination,
+            "driver-owner",
+            BlobSyncRunLimits::default(),
+        )
+        .unwrap();
+        assert!(!run.completed);
+        assert_eq!(run.blocked_items.len(), 1);
+        assert_eq!(
+            run.blocked_items[0].state,
+            BlobSyncDestinationState::SourceMissing
+        );
+        assert!(client.blob_resume().unwrap().manifest_checkpoint.is_none());
     }
 }
