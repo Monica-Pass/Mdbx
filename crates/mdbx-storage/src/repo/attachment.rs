@@ -1297,7 +1297,7 @@ impl AttachmentRepo {
     // ENCRYPTION HELPERS
     // -----------------------------------------------------------------------
 
-    fn encrypt_attachment_field(
+    pub(crate) fn encrypt_attachment_field(
         conn: &VaultConnection,
         id: &str,
         field: &str,

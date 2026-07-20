@@ -333,7 +333,7 @@ impl ProjectRepo {
     // ENCRYPTION HELPERS
     // -----------------------------------------------------------------------
 
-    fn encrypt_metadata(
+    pub(crate) fn encrypt_metadata(
         conn: &VaultConnection,
         id: &str,
         field: &str,

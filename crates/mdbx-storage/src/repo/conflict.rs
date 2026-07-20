@@ -3,8 +3,8 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use mdbx_core::model::{
-    Conflict, ConflictObjectType, ConflictResolution, ObjectLabel, ObjectLabelAssignment,
-    ObjectRelation, RelationKindId,
+    Attachment, Conflict, ConflictObjectType, ConflictResolution, ObjectLabel,
+    ObjectLabelAssignment, ObjectRelation, Project, RelationKindId,
 };
 
 use crate::connection::VaultConnection;
@@ -13,7 +13,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::CollectionProfileRepo;
+use crate::repo::{AttachmentRepo, CollectionProfileRepo, ProjectRepo};
 use crate::sync_state::{
     AttachmentRow, EntryRow, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
     ProjectRow,
@@ -343,6 +343,78 @@ impl ConflictRepo {
         })
     }
 
+    /// Resolve a project conflict from a decrypted, client-facing project.
+    ///
+    /// Storage-owned fields and policy metadata are preserved from the current
+    /// row. Only user-editable presentation and lifecycle fields are merged,
+    /// and plaintext metadata is encrypted again before the row is applied.
+    pub fn resolve_project_custom(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &Project,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Project,
+                "resolve_project_custom",
+            )?;
+            if merged.project_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom project does not match conflict object".to_string(),
+                ));
+            }
+
+            let current = ObjectVersionRepo::current_project_row(conn, &conflict.object_id)?;
+            let merged_tiga_mode = merged.tiga_mode_override.as_ref().map(ToString::to_string);
+            if merged_tiga_mode != current.tiga_mode_override
+                || merged.attachment_count != current.attachment_count
+            {
+                return Err(StorageError::ConstraintViolation(
+                    "custom project resolution cannot change policy or derived counters"
+                        .to_string(),
+                ));
+            }
+            let row = ProjectRow {
+                project_id: current.project_id.clone(),
+                title_ct: ProjectRepo::encrypt_metadata(
+                    conn,
+                    &current.project_id,
+                    "title",
+                    &merged.title_ct,
+                )?,
+                summary_ct: merged
+                    .summary_ct
+                    .as_ref()
+                    .map(|value| {
+                        ProjectRepo::encrypt_metadata(conn, &current.project_id, "summary", value)
+                    })
+                    .transpose()?,
+                group_id: merged.group_id.clone(),
+                icon_ref: merged.icon_ref.clone(),
+                favorite: merged.favorite,
+                archived: merged.archived,
+                deleted: merged.deleted,
+                tiga_mode_override: current.tiga_mode_override.clone(),
+                object_clock: current.object_clock.clone(),
+                head_commit_id: current.head_commit_id.clone(),
+                attachment_count: current.attachment_count,
+                created_at: current.created_at.clone(),
+                updated_at: current.updated_at.clone(),
+                created_by_device_id: current.created_by_device_id.clone(),
+                updated_by_device_id: current.updated_by_device_id.clone(),
+                collection_profile: current.collection_profile.clone(),
+            };
+
+            Self::write_project_custom_row_resolution(conn, ctx, &conflict, &row)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
     /// Resolve an attachment conflict and write the chosen metadata back.
     ///
     /// Incoming-wins refuses to point metadata at attachment content that is
@@ -410,6 +482,84 @@ impl ConflictRepo {
 
             Self::ensure_attachment_content_material_is_local(conn, &conflict, merged)?;
             Self::write_attachment_custom_row_resolution(conn, ctx, &conflict, merged)?;
+            Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
+            Self::get_by_id(conn, conflict_id)?
+                .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
+        })
+    }
+
+    /// Resolve attachment metadata from a decrypted, client-facing record.
+    ///
+    /// The current content identity remains authoritative. This method cannot
+    /// manufacture a content hash or chunk set; callers must transfer content
+    /// through the attachment/blob APIs before choosing a different body.
+    pub fn resolve_attachment_custom(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        conflict_id: &str,
+        merged: &Attachment,
+    ) -> StorageResult<Conflict> {
+        conn.with_immediate_transaction(|| {
+            let conflict = Self::load_unresolved_typed_conflict(
+                conn,
+                conflict_id,
+                ConflictObjectType::Attachment,
+                "resolve_attachment_custom",
+            )?;
+            if merged.attachment_id != conflict.object_id {
+                return Err(StorageError::ConstraintViolation(
+                    "custom attachment does not match conflict object".to_string(),
+                ));
+            }
+
+            let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+            if merged.storage_mode.to_string() != current.storage_mode
+                || merged.content_hash != current.content_hash
+                || merged.original_size != current.original_size
+                || merged.stored_size != current.stored_size
+                || merged.chunk_count != current.chunk_count
+            {
+                return Err(StorageError::ConstraintViolation(
+                    "custom attachment metadata resolution cannot change content identity"
+                        .to_string(),
+                ));
+            }
+            let row = AttachmentRow {
+                attachment_id: current.attachment_id.clone(),
+                project_id: merged.project_id.clone(),
+                entry_id: merged.entry_id.clone(),
+                file_name_ct: AttachmentRepo::encrypt_attachment_field(
+                    conn,
+                    &current.attachment_id,
+                    "file_name",
+                    &merged.file_name_ct,
+                )?,
+                media_type_ct: merged
+                    .media_type_ct
+                    .as_ref()
+                    .map(|value| {
+                        AttachmentRepo::encrypt_attachment_field(
+                            conn,
+                            &current.attachment_id,
+                            "media_type",
+                            value,
+                        )
+                    })
+                    .transpose()?,
+                storage_mode: current.storage_mode.clone(),
+                content_hash: current.content_hash.clone(),
+                original_size: current.original_size,
+                stored_size: current.stored_size,
+                chunk_count: current.chunk_count,
+                head_commit_id: current.head_commit_id.clone(),
+                deleted: merged.deleted,
+                created_at: current.created_at.clone(),
+                updated_at: current.updated_at.clone(),
+                created_by_device_id: current.created_by_device_id.clone(),
+                updated_by_device_id: current.updated_by_device_id.clone(),
+            };
+
+            Self::write_attachment_custom_row_resolution(conn, ctx, &conflict, &row)?;
             Self::mark_resolved(conn, conflict_id, ConflictResolution::Custom)?;
             Self::get_by_id(conn, conflict_id)?
                 .ok_or_else(|| StorageError::NotFound(conflict_id.to_string()))
@@ -882,6 +1032,7 @@ impl ConflictRepo {
         conflict: &Conflict,
     ) -> StorageResult<()> {
         let current = ObjectVersionRepo::current_project_row(conn, &conflict.object_id)?;
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &current.project_id)?;
         let commit_id =
             Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -965,6 +1116,8 @@ impl ConflictRepo {
         conflict: &Conflict,
     ) -> StorageResult<()> {
         let current = ObjectVersionRepo::current_attachment_row(conn, &conflict.object_id)?;
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &current.project_id)?;
+        Self::ensure_attachment_parent_is_valid(conn, &current)?;
         let commit_id =
             Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -1530,6 +1683,51 @@ impl ConflictRepo {
         ))
     }
 
+    fn ensure_attachment_parent_is_valid(
+        conn: &VaultConnection,
+        row: &AttachmentRow,
+    ) -> StorageResult<()> {
+        let project_deleted = conn
+            .inner()
+            .query_row(
+                "SELECT deleted FROM projects WHERE project_id = ?1",
+                params![row.project_id],
+                |db_row| db_row.get::<_, i32>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("project {}", row.project_id)))?;
+        if !row.deleted && project_deleted != 0 {
+            return Err(StorageError::ConstraintViolation(format!(
+                "attachment cannot be restored under deleted project {}",
+                row.project_id
+            )));
+        }
+
+        if let Some(entry_id) = row.entry_id.as_deref() {
+            let (entry_project_id, entry_deleted) = conn
+                .inner()
+                .query_row(
+                    "SELECT project_id, deleted FROM entries WHERE entry_id = ?1",
+                    params![entry_id],
+                    |db_row| Ok((db_row.get::<_, String>(0)?, db_row.get::<_, i32>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::NotFound(format!("entry {entry_id}")))?;
+            if entry_project_id != row.project_id {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "entry {entry_id} does not belong to project {}",
+                    row.project_id
+                )));
+            }
+            if !row.deleted && entry_deleted != 0 {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "attachment cannot be restored under deleted entry {entry_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn create_resolution_commit(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -1649,6 +1847,8 @@ impl ConflictRepo {
         row: &AttachmentRow,
         commit_id: &str,
     ) -> StorageResult<()> {
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &row.project_id)?;
+        Self::ensure_attachment_parent_is_valid(conn, row)?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.inner().execute(
             "UPDATE attachments SET project_id = ?2, entry_id = ?3,
@@ -2569,6 +2769,196 @@ mod tests {
                 .unwrap()
                 .deleted
         );
+    }
+
+    #[test]
+    fn client_project_custom_resolution_reencrypts_fields_and_rejects_policy_changes() {
+        let mut conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let vault_key = mdbx_crypto::aead::generate_key().unwrap();
+        let keyring =
+            mdbx_crypto::keyring::Keyring::from_vault_key(&vault_key, b"project-custom-resolution")
+                .unwrap();
+        conn.attach_keyring(keyring);
+        let ctx = CommitContext::new("project-custom-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Local", None, None).unwrap();
+        let current = ObjectVersionRepo::current_project_row(&conn, &project.project_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "project",
+            &project.project_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_project_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["title_ct".to_string()],
+        )
+        .unwrap();
+
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut invalid = project.clone();
+        invalid.tiga_mode_override = Some(mdbx_core::tiga::TigaMode::Power);
+        assert!(
+            ConflictRepo::resolve_project_custom(&conn, &ctx, &conflict.conflict_id, &invalid)
+                .is_err()
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count_before
+        );
+        assert_eq!(
+            ConflictRepo::get_by_id(&conn, &conflict.conflict_id)
+                .unwrap()
+                .unwrap()
+                .resolution,
+            ConflictResolution::Unresolved
+        );
+
+        let mut merged = project;
+        merged.title_ct = b"Merged".to_vec();
+        merged.summary_ct = Some(b"Client-selected summary".to_vec());
+        merged.favorite = true;
+        let resolved =
+            ConflictRepo::resolve_project_custom(&conn, &ctx, &conflict.conflict_id, &merged)
+                .unwrap();
+        let stored = ProjectRepo::get_by_id(&conn, &merged.project_id)
+            .unwrap()
+            .unwrap();
+        let raw_title: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT title_ct FROM projects WHERE project_id = ?1",
+                params![merged.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parent_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_parents WHERE commit_id = ?1",
+                params![stored.head_commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::Custom);
+        assert_eq!(stored.title_ct, b"Merged");
+        assert_eq!(
+            stored.summary_ct.as_deref(),
+            Some(b"Client-selected summary".as_slice())
+        );
+        assert!(stored.favorite);
+        assert_ne!(raw_title, b"Merged");
+        assert_eq!(parent_count, 2);
+    }
+
+    #[test]
+    fn client_attachment_custom_resolution_preserves_content_identity_and_reencrypts_metadata() {
+        let mut conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let vault_key = mdbx_crypto::aead::generate_key().unwrap();
+        let keyring = mdbx_crypto::keyring::Keyring::from_vault_key(
+            &vault_key,
+            b"attachment-custom-resolution",
+        )
+        .unwrap();
+        conn.attach_keyring(keyring);
+        let ctx = CommitContext::new("attachment-custom-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Steam", None, None).unwrap();
+        let content_hash = "a".repeat(64);
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "local.mafile",
+            Some("application/json"),
+            &content_hash,
+            128,
+        )
+        .unwrap();
+        let current =
+            ObjectVersionRepo::current_attachment_row(&conn, &attachment.attachment_id).unwrap();
+        let incoming_commit = create_incoming_commit(
+            &conn,
+            &ctx,
+            "attachment",
+            &attachment.attachment_id,
+            &current.head_commit_id,
+        );
+        let mut incoming = current.clone();
+        incoming.head_commit_id = incoming_commit.clone();
+        ObjectVersionRepo::record_attachment_row(&conn, &incoming_commit, &incoming).unwrap();
+        let conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &current.head_commit_id,
+            &current.head_commit_id,
+            &incoming_commit,
+            &["file_name_ct".to_string()],
+        )
+        .unwrap();
+
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut forged = attachment.clone();
+        forged.content_hash = "b".repeat(64);
+        assert!(ConflictRepo::resolve_attachment_custom(
+            &conn,
+            &ctx,
+            &conflict.conflict_id,
+            &forged
+        )
+        .is_err());
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count_before
+        );
+
+        let mut merged = attachment;
+        merged.file_name_ct = b"merged.mafile".to_vec();
+        merged.media_type_ct = Some(b"application/vnd.monica.mafile+json".to_vec());
+        let resolved =
+            ConflictRepo::resolve_attachment_custom(&conn, &ctx, &conflict.conflict_id, &merged)
+                .unwrap();
+        let stored = AttachmentRepo::get_by_id(&conn, &merged.attachment_id)
+            .unwrap()
+            .unwrap();
+        let raw_file_name: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT file_name_ct FROM attachments WHERE attachment_id = ?1",
+                params![merged.attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(resolved.resolution, ConflictResolution::Custom);
+        assert_eq!(stored.file_name_ct, b"merged.mafile");
+        assert_eq!(stored.content_hash, content_hash);
+        assert_eq!(stored.original_size, 128);
+        assert_ne!(raw_file_name, b"merged.mafile");
     }
 
     #[test]
