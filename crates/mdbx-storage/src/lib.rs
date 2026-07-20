@@ -20,6 +20,7 @@ pub mod schema;
 #[cfg(feature = "derived-search-index")]
 pub mod search;
 pub mod sync_apply;
+pub mod sync_delta;
 pub mod sync_state;
 pub mod tiga;
 pub mod tiga_policy;

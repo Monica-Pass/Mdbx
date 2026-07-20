@@ -65,6 +65,8 @@ schema 5 随后以增量迁移升级到 schema 6，增加可空的 `commit_opera
 
 schema 6 到 schema 11 继续采用顺序附加迁移：schema 7 增加通用关系、标签和标签分配；schema 8 增加 tombstone 删除证明与设备确认；schema 9 增加永久清理凭证；schema 10 将 Attachment 纳入 Tiga scope；schema 11 增加一对一 `collection_profiles`。这些迁移均保留 `projects`、`entries` 和旧公开接口。
 
+schema 12 增加本地稳定 commit 库存，迁移过程保持 commit 身份不变，并按照 parent-before-child 顺序回填。schema 13 增加状态 delta 批次库存、规范化 commit 关联、有界版本化信封规则，以及固定在迁移 commit 水位的 bootstrap floor。迁移过程不会虚构历史 delta；早于 floor 的 checkpoint 继续使用有界完整状态完成首次同步。这些表不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。在事务采集和原子 delta 应用完成前，CLI 同步继续使用完整状态。
+
 ## 4. Schema 演进规则
 
 - 新字段 SHOULD 可空或带安全默认值。

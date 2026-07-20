@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v11, v12, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v12, v13, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -23,6 +23,7 @@ pub const MIGRATION_PURGE_RECEIPTS: &str = "mdbx-2-purge-receipts-v1";
 pub const MIGRATION_TIGA_ATTACHMENT_SCOPE: &str = "mdbx-2-tiga-attachment-scope-v1";
 pub const MIGRATION_COLLECTION_PROFILES: &str = "mdbx-2-collection-profiles-v1";
 pub const MIGRATION_COMMIT_INVENTORY: &str = "mdbx-2-commit-inventory-v1";
+pub const MIGRATION_SYNC_DELTA_BATCHES: &str = "mdbx-2-sync-delta-batches-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -286,14 +287,23 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v10::create_extensions(conn)?;
         v11::create_extensions(conn)?;
         v12::create_extensions(conn)?;
+        v13::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
+        v13::initialize_bootstrap_floor(conn, &now)?;
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations
              (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![MIGRATION_V1_TO_V2, from_format, FORMAT_V2, now],
+        )
+        .map_err(StorageError::Database)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![MIGRATION_SYNC_DELTA_BATCHES, from_format, FORMAT_V2, now],
         )
         .map_err(StorageError::Database)?;
         conn.execute(
@@ -361,7 +371,9 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v10::create_extensions(conn)?;
         v11::create_extensions(conn)?;
         v12::create_extensions(conn)?;
+        v13::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
+        v13::initialize_bootstrap_floor(conn, &now)?;
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations
@@ -422,6 +434,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_COMMIT_INVENTORY, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_SYNC_DELTA_BATCHES, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -626,6 +644,9 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "purge_receipts",
         "collection_profiles",
         "commit_inventory",
+        "sync_delta_meta",
+        "sync_delta_batches",
+        "sync_delta_batch_commits",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -634,6 +655,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         }
     }
     v12::validate_commit_inventory(conn)?;
+    v13::validate_sync_delta_schema(conn)?;
     for column in [
         "operation_id",
         "commit_id",
@@ -915,7 +937,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         let inventory_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -924,6 +946,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inventory_migration_count, 1);
+        let delta_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SYNC_DELTA_BATCHES],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delta_migration_count, 1);
         let policy_state: (i64, String) = conn
             .query_row(
                 "SELECT tiga_policy_version, tiga_compliance_status FROM vault_meta",
@@ -1007,7 +1037,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -1524,6 +1554,14 @@ mod tests {
             )
             .unwrap();
         assert!(sequences.0 < sequences.1);
+        let bootstrap_floor: i64 = conn
+            .query_row(
+                "SELECT bootstrap_commit_inventory_seq FROM sync_delta_meta",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bootstrap_floor, sequences.1);
 
         let after: Vec<(String, String, i64, String)> = {
             let mut stmt = conn

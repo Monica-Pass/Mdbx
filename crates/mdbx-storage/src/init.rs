@@ -146,6 +146,8 @@ pub fn initialize_vault(
             ],
         )?;
 
+        crate::schema::v13::initialize_bootstrap_floor(db, &now)?;
+
         Ok(VaultInitResult {
             vault_id,
             commit_id,
