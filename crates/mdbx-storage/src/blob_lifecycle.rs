@@ -373,10 +373,13 @@ fn add_reference(
     Ok(())
 }
 
-pub(crate) fn collect_provider_inventory(
-    blob_store: &dyn ManageableEncryptedBlobStore,
+pub(crate) fn collect_provider_inventory<S>(
+    blob_store: &S,
     limits: BlobLifecycleLimits,
-) -> StorageResult<BTreeMap<String, EncryptedBlobMetadata>> {
+) -> StorageResult<BTreeMap<String, EncryptedBlobMetadata>>
+where
+    S: ManageableEncryptedBlobStore + ?Sized,
+{
     let mut inventory = BTreeMap::new();
     let mut cursor: Option<String> = None;
     loop {

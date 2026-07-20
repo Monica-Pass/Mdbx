@@ -4,6 +4,7 @@ pub mod benchmark;
 pub mod blob_lifecycle;
 pub mod blob_replica;
 pub mod blob_store;
+pub mod blob_sync_adapter;
 pub mod blob_transfer;
 pub mod capability;
 pub(crate) mod commit_integrity;
