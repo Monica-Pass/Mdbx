@@ -3,6 +3,7 @@ pub mod branch;
 pub mod collection_profile;
 pub mod commit_ctx;
 pub mod commit_history;
+pub mod commit_inventory;
 pub mod conflict;
 pub mod entry;
 pub mod object_label;
@@ -21,6 +22,10 @@ pub use branch::BranchRepo;
 pub use collection_profile::{CollectionProfileRepo, CollectionProfileSpec};
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
+pub use commit_inventory::{
+    CommitInventoryItem, CommitInventoryPage, CommitInventoryRepo, MAX_COMMIT_INVENTORY_PAGE_SIZE,
+    MAX_COMMIT_INVENTORY_TOKEN_BYTES,
+};
 pub use conflict::{ConflictCreateRequest, ConflictRepo};
 pub use entry::{EntryCreateRequest, EntryRepo};
 pub use object_label::{
