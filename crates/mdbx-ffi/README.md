@@ -28,6 +28,7 @@ The exported boundary covers:
 - list and remove unlock methods through authorized storage APIs
 - rotate the data-key epoch through Tiga authorization and return the old epoch, new active epoch, rotation commit, and timestamp
 - create projects
+- register extension capabilities actually present in the client and read or set Collection Profiles
 - create, list, update, soft-delete, restore, and move generic entries
 - create, query, update, and delete generic relations, labels, and label assignments
 - list unresolved conflicts and resolve project, entry, attachment, relation, label, and assignment conflicts with local-wins or incoming-wins
@@ -65,6 +66,10 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 
 - `project_id`
 - `title`
+
+`MdbxCollectionProfile` contains the Collection's namespaced type, versioned binary encrypted configuration, allowed ObjectTypeIds, required ExtensionCapabilityIds, and creation/update device metadata.
+
+Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
 
 `EntryRecord` contains:
 
@@ -152,6 +157,8 @@ All exported functions return `Result<_, MdbxFfiError>`.
 - `Storage { message }`: storage, unlock, constraint, or repository failure
 - `Serialization { message }`: invalid JSON input or invalid stored JSON
 - `InvalidEntryType { entry_type }`: unknown entry type string
+- `InvalidCollectionTypeId { collection_type_id }`: invalid or non-namespaced Collection type
+- `InvalidExtensionCapabilityId { capability_id }`: invalid extension capability identifier
 - `LockPoisoned`: the internal vault mutex was poisoned
 
 Common constraint errors include updating a deleted entry, deleting an already deleted entry, restoring an active entry, moving a deleted entry, or using an entry ID that does not belong to the supplied project ID.

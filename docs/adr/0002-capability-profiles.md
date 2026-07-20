@@ -11,13 +11,13 @@ Compile-time trimming must preserve MDBX1 upgrades and the security meaning of a
 
 ## Decision
 
-Every supported build compiles the mandatory database core. The mandatory core contains MDBX1 migration, authenticated encryption, TIGA policy and audit, key epochs, generic objects and metadata, commits, conflicts, snapshots, recovery, backup, and synchronization.
+Every supported build compiles the mandatory database core. The mandatory core contains MDBX1 migration, authenticated encryption, TIGA policy and audit, key epochs, generic objects and metadata, versioned Collection Profiles, commits, conflicts, snapshots, recovery, backup, and synchronization.
 
 `mdbx-storage` defines additive Cargo features for `kdbx-import`, `kdbx-export`, `derived-search-index`, and `benchmarks`. Default features enable all current behavior. The explicit core profile uses `--no-default-features --features core`. The `benchmarks` feature enables `derived-search-index` because the benchmark suite measures search behavior.
 
 `mdbx-cli` forwards the same optional capabilities. Commands backed by an excluded capability are omitted at compile time. `mdbx-ffi` depends on the mandatory core profile because its exported interface currently contains no KDBX, benchmark, or derived-search methods.
 
-`CapabilitySet::current()` provides runtime introspection for compiled capabilities. Domain records remain opaque and durable when their interpreting adapter is absent. Their exact ObjectTypeIds, payload schema versions, ciphertext, relationships, labels, history, and synchronization state remain available to the core.
+`CapabilitySet::current()` provides runtime introspection for compiled capabilities. Domain records remain opaque and durable when their interpreting adapter is absent. Their exact CollectionTypeIds, Collection Profiles, ObjectTypeIds, payload schema versions, ciphertext, relationships, labels, history, and synchronization state remain available to the core.
 
 ## Safety Rules
 

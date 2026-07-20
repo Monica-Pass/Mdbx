@@ -8,6 +8,7 @@ use mdbx_ffi::{
     MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxPolicyCompliance, MdbxTigaMode,
     MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
 };
+use mdbx_storage::migration::CURRENT_SCHEMA_VERSION;
 use uuid::Uuid;
 
 struct TempVaultPath {
@@ -1055,7 +1056,7 @@ fn clients_can_inspect_and_explicitly_upgrade_legacy_vault() {
 
     let upgraded = upgrade_vault(vault_path.as_path_string()).unwrap();
     assert_eq!(upgraded.format_version.as_deref(), Some("MDBX-2"));
-    assert_eq!(upgraded.schema_version, Some(10));
+    assert_eq!(upgraded.schema_version, Some(CURRENT_SCHEMA_VERSION));
     assert!(!upgraded.requires_upgrade);
 
     let stored_format: String = rusqlite::Connection::open(vault_path.path())

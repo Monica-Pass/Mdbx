@@ -25,6 +25,14 @@ pub enum StorageError {
     #[error("encrypted blob store error: {0}")]
     BlobStore(String),
 
+    #[error(
+        "collection {collection_id} requires unavailable extension capabilities: {capabilities:?}"
+    )]
+    MissingExtensionCapabilities {
+        collection_id: String,
+        capabilities: Vec<String>,
+    },
+
     #[error("attachment {attachment_id} requires an encrypted blob store")]
     EncryptedBlobStoreRequired { attachment_id: String },
 

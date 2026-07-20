@@ -493,3 +493,16 @@ vault
 - 能表达多种 unlock method，包括 `password_security_key`
 - 能确认全文搜索不会把解密标题持久化
 - 能支持后续 KDBX 导入映射
+
+## 9. MDBX2 Collection Profile 附加结构
+
+schema 11 增加 `collection_profiles`，以 `project_id` 一对一引用 `projects`。该表不替代 `projects`，只保存 MDBX2 Collection 的领域描述：
+
+- `collection_type_id TEXT NOT NULL`
+- `payload_ct BLOB NOT NULL`
+- `payload_schema_version INTEGER NOT NULL`
+- `allowed_object_type_ids_json TEXT NOT NULL`
+- `required_capability_ids_json TEXT NOT NULL`
+- 创建、更新的时间和设备字段
+
+CollectionTypeId 建立后保持不可变，Profile 不提供删除操作。Profile payload 使用独立加密上下文；允许对象类型和能力标识采用有界、排序、去重的命名空间列表。Profile mutation 与对应 project 的 commit、object clock、head 和 ObjectVersion 位于同一事务。

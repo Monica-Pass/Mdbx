@@ -10,7 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::TombstoneRepo;
+use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 
 /// Project 的持久化仓库。
 ///
@@ -230,6 +230,7 @@ impl ProjectRepo {
         ctx: &CommitContext,
         project: &Project,
     ) -> StorageResult<Project> {
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &project.project_id)?;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -305,6 +306,7 @@ impl ProjectRepo {
                     "project is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, project_id)?;
 
             let now = chrono::Utc::now().to_rfc3339();
 

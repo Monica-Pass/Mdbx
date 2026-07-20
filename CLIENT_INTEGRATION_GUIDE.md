@@ -125,7 +125,7 @@ The Rust workspace is split by responsibility:
 
 Clients should prefer storage / repository APIs over hand-written SQL.
 
-When using `mdbx-ffi`, treat it as the client boundary for generic vault/project/entry operations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
+When using `mdbx-ffi`, treat it as the client boundary for Vault, Collection Profile, and ObjectRecord operations. A domain Adapter registers the ExtensionCapabilityIds actually present in the current process before mutating a profiled Collection. Missing Adapters preserve unknown ciphertext and must not be bypassed by false capability declarations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
 
 See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
 
@@ -143,6 +143,7 @@ Unless you are implementing the low-level storage library itself, client code sh
 - `device_heads`
 - `branches`
 - `project_tags`
+- `collection_profiles`
 
 Direct writes to these tables often produce vaults that appear to save correctly but disagree across clients, lose delete history, explode history size, or fail snapshot recovery.
 

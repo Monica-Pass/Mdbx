@@ -16,6 +16,20 @@ A `Vault` is one encrypted MDBX database with a stable vault identity, unlock me
 
 A `Collection` is a stable container for object records. Password projects, bookmark folders, mailboxes, and Steam account groups are domain presentations of this concept. MDBX1 stores collections in the physical `projects` table; the generic Module hides that compatibility implementation from new callers.
 
+### CollectionProfile
+
+A `CollectionProfile` is the optional versioned semantic description attached to one Collection. It declares a stable namespaced CollectionTypeId, an encrypted adapter-owned payload, the ObjectTypeIds accepted by the Collection, and the ExtensionCapabilityIds required for user-visible writes. MDBX1 Collections have no profile and retain legacy behavior.
+
+Profile existence is monotonic and CollectionTypeId is immutable. Payload schema versions and declarations can advance through one tracked Collection mutation. A missing profile field in a legacy object version or synchronization payload means that producer made no assertion about the profile; it does not delete a profile already known by the receiver.
+
+### CollectionTypeId
+
+A `CollectionTypeId` is the exact namespaced identity of a Collection contract, such as `com.monica.mail`, `com.monica.bookmark`, or `com.monica.steam`. It is separate from ObjectTypeId because one Collection can accept several related object contracts.
+
+### ExtensionCapabilityId
+
+An `ExtensionCapabilityId` identifies adapter code available in the current client process, such as `com.monica.mail.store`. Capability declarations are not persisted as authority and do not grant key access. A connection registers the capabilities its adapters actually provide; the Generic Object Module rejects user-visible writes when a CollectionProfile requires capabilities absent from that connection. Locked synchronization, backup, snapshot, health inspection, and opaque preservation remain available without the adapter.
+
 ### ObjectRecord
 
 An `ObjectRecord` is one encrypted, versioned item inside a collection. Password entries, bookmarks, mail messages, mail contacts, and `mafile` documents are ObjectRecords. MDBX1 stores ObjectRecords in the physical `entries` table.
@@ -114,12 +128,16 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 22. Every path-based migration plan, automatic compatibility open, explicit upgrade, and direct storage-core upgrade verifies database integrity before the first migration write. A failed verification preserves the previous format generation.
 23. Untrusted sync input must have a byte limit before allocation and deserialization. New offline bundles declare their payload length, while legacy bundles are read through a bounded adapter.
 24. Collection listing uses bounded ObjectSummary pages when payloads are not required. Existing MDBX1 complete-record list APIs remain available for callers that intentionally consume payloads.
+25. A CollectionProfile is additive to the MDBX1 project row. Establishing or changing it advances the Collection commit, object clock, head, and ObjectVersion atomically.
+26. CollectionProfile existence is monotonic and CollectionTypeId is immutable. Legacy payloads that omit the profile preserve the receiver's current profile.
+27. User-visible writes to a profiled Collection require every declared ExtensionCapabilityId and must use an allowed ObjectTypeId. Synchronization and recovery preserve unknown profiled data without requiring its adapter.
+28. New synchronization producers emit `mdbx-storage-sync-state-v2`. Readers continue to accept state-v1; older readers encounter an unsupported format instead of silently discarding CollectionProfile semantics.
 
 ## Module Architecture
 
 ### Generic Object Module
 
-The Generic Object Module is the primary Interface for Collection, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
+The Generic Object Module is the primary Interface for Collection, CollectionProfile, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, capability checks, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
 
 ### Legacy Password Adapter
 

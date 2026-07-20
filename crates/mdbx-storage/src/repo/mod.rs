@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod branch;
+pub mod collection_profile;
 pub mod commit_ctx;
 pub mod commit_history;
 pub mod conflict;
@@ -16,6 +17,7 @@ pub use attachment::{
     AttachmentCreateRequest, AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions,
 };
 pub use branch::BranchRepo;
+pub use collection_profile::{CollectionProfileRepo, CollectionProfileSpec};
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use conflict::{ConflictCreateRequest, ConflictRepo};

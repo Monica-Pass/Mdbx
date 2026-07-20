@@ -1,9 +1,9 @@
 use rusqlite::{Connection, OpenFlags};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use mdbx_core::model::VaultSession;
+use mdbx_core::model::{ExtensionCapabilityId, VaultSession};
 use mdbx_crypto::keyring::Keyring;
 
 use crate::error::{StorageError, StorageResult};
@@ -24,6 +24,7 @@ pub struct VaultConnection {
     pub(crate) active_key_epoch_id: Option<String>,
     pub(crate) epoch_keyrings: HashMap<String, Keyring>,
     pub(crate) active_session: Option<VaultSession>,
+    pub(crate) extension_capabilities: BTreeSet<ExtensionCapabilityId>,
 }
 
 /// A newly reserved vault file that is removed unless creation is committed.
@@ -90,6 +91,7 @@ impl VaultConnection {
             active_key_epoch_id: None,
             epoch_keyrings: HashMap::new(),
             active_session: None,
+            extension_capabilities: BTreeSet::new(),
         })
     }
 
@@ -113,6 +115,7 @@ impl VaultConnection {
                 active_key_epoch_id: None,
                 epoch_keyrings: HashMap::new(),
                 active_session: None,
+                extension_capabilities: BTreeSet::new(),
             })
         })();
         if result.is_err() {
@@ -134,6 +137,7 @@ impl VaultConnection {
             active_key_epoch_id: None,
             epoch_keyrings: HashMap::new(),
             active_session: None,
+            extension_capabilities: BTreeSet::new(),
         })
     }
 
@@ -249,6 +253,21 @@ impl VaultConnection {
 
     pub fn active_session(&self) -> Option<&VaultSession> {
         self.active_session.as_ref()
+    }
+
+    /// Replaces the domain Adapter capabilities available to this connection.
+    ///
+    /// Capabilities describe code present in the current client. They are not
+    /// persisted in the vault and do not grant access to encryption keys.
+    pub fn set_extension_capabilities<I>(&mut self, capabilities: I)
+    where
+        I: IntoIterator<Item = ExtensionCapabilityId>,
+    {
+        self.extension_capabilities = capabilities.into_iter().collect();
+    }
+
+    pub fn extension_capabilities(&self) -> &BTreeSet<ExtensionCapabilityId> {
+        &self.extension_capabilities
     }
 
     pub(crate) fn touch_active_session(&mut self, now_unix_secs: i64) {

@@ -1,16 +1,18 @@
 use mdbx_sync::ObjectPayload;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
+use crate::repo::CollectionProfileRepo;
 use crate::tiga_policy::{optional_integrity_tag, verify_optional_integrity_tag};
 
 pub const SYNC_STATE_OBJECT_TYPE: &str = "mdbx-storage/state-v1";
 pub const LEGACY_CLI_SYNC_STATE_OBJECT_TYPE: &str = "mdbx-cli/state-v1";
 pub const SYNC_STATE_OBJECT_ID: &str = "state";
-const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v1";
+const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v2";
+const PREVIOUS_SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v1";
 const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +163,22 @@ pub struct ProjectRow {
     pub object_clock: String,
     pub head_commit_id: String,
     pub attachment_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_profile: Option<CollectionProfileRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionProfileRow {
+    pub project_id: String,
+    pub collection_type_id: String,
+    pub payload_ct: Vec<u8>,
+    pub payload_schema_version: u32,
+    pub allowed_object_type_ids: Vec<String>,
+    pub required_capability_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     pub created_by_device_id: String,
@@ -519,7 +537,10 @@ pub fn decode_sync_state_payload(
 
     let state: SyncStatePayload = serde_json::from_slice(&payload.ciphertext)
         .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
-    if state.format != SYNC_STATE_FORMAT && state.format != LEGACY_CLI_SYNC_STATE_FORMAT {
+    if state.format != SYNC_STATE_FORMAT
+        && state.format != PREVIOUS_SYNC_STATE_FORMAT
+        && state.format != LEGACY_CLI_SYNC_STATE_FORMAT
+    {
         return Err(StorageError::Validation(format!(
             "unsupported sync state format: {}",
             state.format
@@ -529,6 +550,10 @@ pub fn decode_sync_state_payload(
 }
 
 fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
+    let mut profiles = CollectionProfileRepo::load_all_stored(conn)?
+        .into_iter()
+        .map(|profile| (profile.project_id.clone(), profile))
+        .collect::<HashMap<_, _>>();
     let mut stmt = conn.inner().prepare(
         "SELECT project_id, title_ct, summary_ct, group_id, icon_ref,
                 favorite, archived, deleted, tiga_mode_override, object_clock,
@@ -538,8 +563,10 @@ fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
          ORDER BY updated_at ASC, project_id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
+        let project_id: String = row.get(0)?;
+        let collection_profile = profiles.remove(&project_id);
         Ok(ProjectRow {
-            project_id: row.get(0)?,
+            project_id,
             title_ct: row.get(1)?,
             summary_ct: row.get(2)?,
             group_id: row.get(3)?,
@@ -555,6 +582,7 @@ fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
             updated_at: row.get(13)?,
             created_by_device_id: row.get(14)?,
             updated_by_device_id: row.get(15)?,
+            collection_profile,
         })
     })?;
 
@@ -958,5 +986,44 @@ mod tests {
         assert!(decoded.tombstones.is_none());
         assert!(decoded.tombstone_acknowledgements.is_none());
         assert!(decoded.purge_receipts.is_none());
+    }
+
+    #[test]
+    fn previous_v1_sync_state_without_collection_profiles_still_deserializes() {
+        let payload = ObjectPayload {
+            object_type: SYNC_STATE_OBJECT_TYPE.to_string(),
+            object_id: SYNC_STATE_OBJECT_ID.to_string(),
+            ciphertext: serde_json::to_vec(&serde_json::json!({
+                "format": PREVIOUS_SYNC_STATE_FORMAT,
+                "projects": [{
+                    "project_id": "project-1",
+                    "title_ct": [1],
+                    "summary_ct": null,
+                    "group_id": null,
+                    "icon_ref": null,
+                    "favorite": false,
+                    "archived": false,
+                    "deleted": false,
+                    "tiga_mode_override": null,
+                    "object_clock": "{}",
+                    "head_commit_id": "head-1",
+                    "attachment_count": 0,
+                    "created_at": "2026-07-20T00:00:00Z",
+                    "updated_at": "2026-07-20T00:00:00Z",
+                    "created_by_device_id": "device-1",
+                    "updated_by_device_id": "device-1"
+                }],
+                "entries": [],
+                "attachments": [],
+                "attachment_chunks": [],
+                "branches": []
+            }))
+            .unwrap(),
+            associated_data: SYNC_STATE_OBJECT_TYPE.as_bytes().to_vec(),
+        };
+
+        let decoded = decode_sync_state_payload(&payload).unwrap().unwrap();
+        assert_eq!(decoded.projects.len(), 1);
+        assert!(decoded.projects[0].collection_profile.is_none());
     }
 }

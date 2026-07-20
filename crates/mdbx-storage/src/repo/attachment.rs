@@ -18,6 +18,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::CollectionProfileRepo;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
 
@@ -162,6 +163,7 @@ impl AttachmentRepo {
                     project_id
                 )));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, project_id)?;
 
             // 验证 entry（如果指定）存在且未删除
             if let Some(eid) = entry_id {
@@ -473,6 +475,7 @@ impl AttachmentRepo {
                     "attachment is deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, &att.project_id)?;
 
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -537,6 +540,7 @@ impl AttachmentRepo {
                     "attachment is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, &att.project_id)?;
 
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -600,6 +604,7 @@ impl AttachmentRepo {
                     "attachment is deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, &att.project_id)?;
 
             let content_hash = compute_sha256_hex(data);
             let now = chrono::Utc::now().to_rfc3339();
@@ -976,6 +981,7 @@ impl AttachmentRepo {
                     "attachment is deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, &att.project_id)?;
 
             let now = chrono::Utc::now().to_rfc3339();
             let commit_id = ctx.commit_object_change(

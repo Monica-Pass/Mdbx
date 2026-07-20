@@ -10,6 +10,7 @@ pub struct CapabilitySet {
     pub key_epochs: bool,
     pub generic_objects: bool,
     pub generic_metadata: bool,
+    pub collection_profiles: bool,
     pub commit_history: bool,
     pub conflicts: bool,
     pub snapshots: bool,
@@ -34,6 +35,7 @@ impl CapabilitySet {
             key_epochs: true,
             generic_objects: true,
             generic_metadata: true,
+            collection_profiles: true,
             commit_history: true,
             conflicts: true,
             snapshots: true,
@@ -63,6 +65,7 @@ mod tests {
         assert!(capabilities.key_epochs);
         assert!(capabilities.generic_objects);
         assert!(capabilities.generic_metadata);
+        assert!(capabilities.collection_profiles);
         assert!(capabilities.commit_history);
         assert!(capabilities.conflicts);
         assert!(capabilities.snapshots);

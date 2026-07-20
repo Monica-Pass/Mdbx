@@ -6,11 +6,10 @@ This document uses `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`, and `MAY` in the 
 
 ## 1. Abstract
 
-MDBX is a local-first encrypted password database format and implementation architecture.
-It is designed to replace the weak points of KDBX in cloud-drive sync, conflict handling, large libraries, attachment scaling, and long-term maintainability.
+MDBX is a local-first advanced encrypted database format and implementation architecture. Password management is its first domain Adapter; the MDBX2 core also serves bookmarks, mail, Steam `mafile`, and future applications.
+It provides durable authenticated storage for generic Collections, ObjectRecords, and binary content while addressing the weak points of KDBX in cloud-drive sync, conflict handling, large libraries, attachment scaling, and long-term maintainability.
 
-MDBX MUST organize passwords by `project` and MUST provide native database-level support for attachments.
-These two properties are baseline architecture constraints.
+MDBX2 MUST use Collection as the stable primary container and MUST provide native database-level Attachment support. MDBX1 physical `project` and `entry` structures remain the compatibility implementation for Collection and ObjectRecord; the password Adapter continues to organize passwords by project.
 
 ## 2. Product Goals
 

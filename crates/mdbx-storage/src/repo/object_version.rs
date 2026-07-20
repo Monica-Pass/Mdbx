@@ -3,6 +3,7 @@ use rusqlite::OptionalExtension;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::repo::CollectionProfileRepo;
 use crate::sync_state::{
     AttachmentRow, EntryRow, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
     ProjectRow,
@@ -325,7 +326,8 @@ impl ObjectVersionRepo {
         conn: &VaultConnection,
         project_id: &str,
     ) -> StorageResult<ProjectRow> {
-        conn.inner()
+        let mut project = conn
+            .inner()
             .query_row(
                 "SELECT project_id, title_ct, summary_ct, group_id, icon_ref,
                         favorite, archived, deleted, tiga_mode_override, object_clock,
@@ -351,11 +353,15 @@ impl ObjectVersionRepo {
                         updated_at: row.get(13)?,
                         created_by_device_id: row.get(14)?,
                         updated_by_device_id: row.get(15)?,
+                        collection_profile: None,
                     })
                 },
             )
             .optional()?
-            .ok_or_else(|| StorageError::NotFound(project_id.to_string()))
+            .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+        project.collection_profile =
+            CollectionProfileRepo::stored_by_collection_id(conn, project_id)?;
+        Ok(project)
     }
 
     pub fn current_attachment_row(

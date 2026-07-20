@@ -10,7 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::TombstoneRepo;
+use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 
 #[derive(Debug, Clone)]
 pub struct ObjectLabelCreateRequest {
@@ -88,6 +88,10 @@ impl ObjectLabelRepo {
         }
         conn.with_immediate_transaction(|| {
             ensure_active_collection(conn, &request.collection_id)?;
+            CollectionProfileRepo::ensure_collection_write_capabilities(
+                conn,
+                &request.collection_id,
+            )?;
             let now = chrono::Utc::now().to_rfc3339();
             let commit_id = ctx.create_commit(
                 conn,
@@ -189,6 +193,10 @@ impl ObjectLabelRepo {
                     "object label collection cannot change".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(
+                conn,
+                &label.collection_id,
+            )?;
             let commit_id = ctx.commit_object_change_with_id_column(
                 conn,
                 "object_labels",
@@ -248,6 +256,10 @@ impl ObjectLabelRepo {
                     "object label is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_collection_write_capabilities(
+                conn,
+                &label.collection_id,
+            )?;
             let active_assignments: i64 = conn.inner().query_row(
                 "SELECT COUNT(*) FROM object_label_assignments
                  WHERE label_id = ?1 AND deleted = 0",
@@ -307,6 +319,7 @@ impl ObjectLabelAssignmentRepo {
         }
         conn.with_immediate_transaction(|| {
             let object_collection = active_object_collection(conn, &request.object_id)?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(conn, &request.object_id)?;
             let label = ObjectLabelRepo::get_by_id(conn, &request.label_id)?
                 .ok_or_else(|| StorageError::NotFound(request.label_id.clone()))?;
             if label.deleted {
@@ -415,6 +428,7 @@ impl ObjectLabelAssignmentRepo {
                     "object label assignment is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_entry_write_capabilities(conn, &assignment.object_id)?;
             let commit_id = ctx.commit_object_change_with_id_column(
                 conn,
                 "object_label_assignments",

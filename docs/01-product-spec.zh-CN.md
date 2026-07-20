@@ -6,11 +6,10 @@
 
 ## 1. 摘要
 
-MDBX 是一种本地优先的加密密码数据库格式与实现架构。
-它的目标是解决 KDBX 在网盘同步、冲突处理、大库性能、附件膨胀、长期维护性方面的痛点。
+MDBX 是一种本地优先的高级加密数据库格式与实现架构。密码管理是首个领域 Adapter；MDBX2 核心同时服务网页收藏、邮件、Steam `mafile` 和未来应用。
+它的目标是为通用 Collection、ObjectRecord 与二进制内容提供长期认证存储，并解决 KDBX 在网盘同步、冲突处理、大库性能、附件膨胀、长期维护性方面的痛点。
 
-MDBX 必须以 `project` 作为密码组织主容器，并且必须在数据库层原生支持附件。
-这两个属性属于基础架构约束，不是可选增强项。
+MDBX2 必须以 Collection 作为稳定主容器，并且必须在数据库层原生支持 Attachment。MDBX1 的 `project` 和 `entry` 物理结构继续作为 Collection 与 ObjectRecord 的兼容实现；密码 Adapter 仍以 project 组织密码。
 
 ## 2. 产品目标
 

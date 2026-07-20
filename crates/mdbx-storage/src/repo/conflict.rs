@@ -13,6 +13,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::CollectionProfileRepo;
 use crate::sync_state::{
     AttachmentRow, EntryRow, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
     ProjectRow,
@@ -1061,6 +1062,8 @@ impl ConflictRepo {
         selected: &ObjectRelationRow,
     ) -> StorageResult<()> {
         Self::validate_object_relation_resolution_row(conn, conflict, selected)?;
+        CollectionProfileRepo::ensure_entry_write_capabilities(conn, &selected.source_object_id)?;
+        CollectionProfileRepo::ensure_entry_write_capabilities(conn, &selected.target_object_id)?;
         let commit_id =
             Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
         let affected = conn.inner().execute(
@@ -1132,6 +1135,7 @@ impl ConflictRepo {
         selected: &ObjectLabelRow,
     ) -> StorageResult<()> {
         Self::validate_object_label_resolution_row(conn, conflict, current, selected)?;
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &selected.collection_id)?;
         let commit_id =
             Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
         let affected = conn.inner().execute(
@@ -1202,6 +1206,7 @@ impl ConflictRepo {
         selected: &ObjectLabelAssignmentRow,
     ) -> StorageResult<()> {
         Self::validate_object_label_assignment_resolution_row(conn, conflict, current, selected)?;
+        CollectionProfileRepo::ensure_entry_write_capabilities(conn, &selected.object_id)?;
         let commit_id =
             Self::create_resolution_commit(conn, ctx, conflict, &current.head_commit_id)?;
         let affected = conn.inner().execute(
@@ -1551,6 +1556,8 @@ impl ConflictRepo {
         commit_id: &str,
         object_clock: &str,
     ) -> StorageResult<()> {
+        let object_type = row.entry_type.parse().map_err(StorageError::Validation)?;
+        CollectionProfileRepo::ensure_object_write_allowed(conn, &row.project_id, &object_type)?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.inner().execute(
             "UPDATE entries SET project_id = ?2, entry_type = ?3, title_ct = ?4,
@@ -1591,6 +1598,7 @@ impl ConflictRepo {
         commit_id: &str,
         object_clock: &str,
     ) -> StorageResult<()> {
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, &row.project_id)?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.inner().execute(
             "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
@@ -1615,6 +1623,15 @@ impl ConflictRepo {
                 ctx.device_id,
             ],
         )?;
+        if let Some(profile) = &row.collection_profile {
+            if profile.project_id != row.project_id {
+                return Err(StorageError::ConstraintViolation(
+                    "collection profile project ID does not match project resolution row"
+                        .to_string(),
+                ));
+            }
+            CollectionProfileRepo::apply_synced_row(conn, profile)?;
+        }
         Self::reconcile_resolution_tombstone(
             conn,
             ctx,

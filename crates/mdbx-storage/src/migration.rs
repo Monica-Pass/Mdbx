@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -21,6 +21,7 @@ pub const MIGRATION_GENERIC_METADATA: &str = "mdbx-2-generic-metadata-v1";
 pub const MIGRATION_TOMBSTONE_DELETE_PROOF: &str = "mdbx-2-tombstone-delete-proof-v1";
 pub const MIGRATION_PURGE_RECEIPTS: &str = "mdbx-2-purge-receipts-v1";
 pub const MIGRATION_TIGA_ATTACHMENT_SCOPE: &str = "mdbx-2-tiga-attachment-scope-v1";
+pub const MIGRATION_COLLECTION_PROFILES: &str = "mdbx-2-collection-profiles-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -282,6 +283,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v8::create_extensions(conn)?;
         v9::create_extensions(conn)?;
         v10::create_extensions(conn)?;
+        v11::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -348,6 +350,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v8::create_extensions(conn)?;
         v9::create_extensions(conn)?;
         v10::create_extensions(conn)?;
+        v11::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
@@ -397,6 +400,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_TIGA_ATTACHMENT_SCOPE, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_COLLECTION_PROFILES, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -599,6 +608,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "object_label_assignments",
         "tombstone_acknowledgements",
         "purge_receipts",
+        "collection_profiles",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -816,6 +826,43 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_10_upgrades_add_collection_profiles_without_rewriting_projects() {
+        let conn = v1_database();
+        upgrade_to_latest(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects
+                (project_id, title_ct, object_clock, head_commit_id,
+                 created_at, updated_at, created_by_device_id, updated_by_device_id)
+             VALUES ('project-1', X'01', '{}', 'head-1',
+                     '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z',
+                     'device-1', 'device-1');
+             DROP TABLE collection_profiles;
+             UPDATE vault_meta SET schema_version = 10;",
+        )
+        .unwrap();
+
+        let info = upgrade_to_latest(&conn).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&conn, "collection_profiles").unwrap());
+        let project_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE project_id = 'project-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_count, 1);
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_COLLECTION_PROFILES],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 
     fn insert_legacy_password(conn: &Connection) -> Vec<u8> {

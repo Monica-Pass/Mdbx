@@ -4,7 +4,7 @@ Language: [简体中文](README.md) | [English](README.en.md)
 
 This directory contains the Rust workspace and implementation notes for Monica MDBX.
 
-MDBX is Monica's local-first encrypted vault format. It is designed around stable long-term storage, Git-like logical history, sync conflict handling, native attachments, snapshots, and Tiga security modes.
+MDBX is Monica's local-first advanced encrypted database core. It provides durable authenticated storage, Git-like logical history, synchronization conflict handling, snapshots, and Tiga security policy for versioned Collections, ObjectRecords, and binary content. Passwords, bookmarks, mail, Steam `mafile`, and future domains are trimmable domain Adapters.
 
 The current format generation is **MDBX2**, stored as `MDBX-2`. MDBX2 automatically and transactionally upgrades `MDBX-1` and `MDBX-1-DRAFT` vaults. See `docs/09-mdbx2-compatibility.md` for the compatibility contract.
 
@@ -23,7 +23,7 @@ The MDBX rule is **4ever And 4ever**: old vaults must remain readable, compatibi
 - `crates/mdbx-storage`
   - SQLite schema, vault initialization, repositories, search, snapshots, conflicts, recovery, and sync state.
 - `crates/mdbx-ffi`
-  - Generic UniFFI boundary exposing vault, project, and generic entry operations; client-specific payload semantics remain owned by each client.
+  - Generic UniFFI boundary exposing Vault, Collection Profile, and ObjectRecord operations; domain payload semantics remain owned by each Adapter.
 - `crates/mdbx-cli`
   - CLI entry point for local testing and development.
 - crate-local `tests/`

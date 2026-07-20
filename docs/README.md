@@ -2,7 +2,7 @@
 
 This folder contains the canonical specification set for the MDBX project.
 
-MDBX is a local-first encrypted password database format and reference architecture.
+MDBX is a local-first advanced encrypted database format and reference architecture. Password management is one domain Adapter alongside bookmarks, mail, Steam `mafile`, and future applications.
 Its design goals are:
 
 - local-first operation
@@ -10,7 +10,7 @@ Its design goals are:
 - Git-like conflict prevention and recovery
 - significantly better sync behavior than KDBX in cloud-drive workflows
 - security modes through the Tiga model
-- project-oriented password organization
+- stable generic Collections containing authenticated ObjectRecords
 - native attachment support
 - 4ever And 4ever compatibility: old vaults stay readable and data safety wins over convenience
 
@@ -101,7 +101,7 @@ Every implementation and every design choice MUST preserve all of the following:
 - 4ever And 4ever: new versions must read older vaults; old implementations should preserve unknown non-critical data where possible
 - Data safety before convenience
 - No mandatory central server
-- Project-oriented password storage
+- Generic Collection and ObjectRecord semantics independent from password products
 - Native attachment capability
 - Safer sync and conflict behavior than KDBX
 - Better cloud-drive performance than KDBX
@@ -111,14 +111,17 @@ Every implementation and every design choice MUST preserve all of the following:
 - `vault`
   - One MDBX database file.
 
-- `project`
-  - The top-level logical container for a real-world account, service, website, app, organization, identity set, or working set of secrets.
+- `Collection`
+  - A stable generic container. MDBX1 stores it in the physical `projects` table; password projects, bookmark folders, mailboxes, and Steam account groups are domain presentations.
 
-- `entry`
-  - A concrete secret-bearing record inside a project, such as login, note, card, identity fragment, key, or token.
+- `ObjectRecord`
+  - An encrypted versioned record inside a Collection. MDBX1 stores it in the physical `entries` table; logins, messages, bookmarks, contacts, and `mafile` documents are ObjectRecords.
 
-- `attachment`
-  - A file or binary payload referenced by a project or entry.
+- `CollectionProfile`
+  - An optional versioned semantic description containing a namespaced Collection type, encrypted configuration, allowed ObjectTypeIds, and required ExtensionCapabilityIds.
+
+- `Attachment`
+  - Authenticated binary content or an external encrypted reference owned by a Collection or ObjectRecord.
 
 - `tiga mode`
   - One of `power`, `multi`, or `sky` in stored values and APIs.

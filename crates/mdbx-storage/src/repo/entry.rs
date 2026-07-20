@@ -10,6 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::CollectionProfileRepo;
 use crate::repo::TombstoneRepo;
 
 /// Entry 的持久化仓库。
@@ -145,6 +146,7 @@ impl EntryRepo {
                     project_id
                 )));
             }
+            CollectionProfileRepo::ensure_object_write_allowed(conn, project_id, &entry_type)?;
 
             let commit_id =
                 ctx.create_commit(conn, "change", "entry", &[entry_id.to_string()], &[])?;
@@ -393,6 +395,11 @@ impl EntryRepo {
                 "payload_schema_version must be greater than zero".to_string(),
             ));
         }
+        CollectionProfileRepo::ensure_object_write_allowed(
+            conn,
+            &entry.project_id,
+            &entry.entry_type,
+        )?;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -457,7 +464,17 @@ impl EntryRepo {
                     "entry is deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                &entry.project_id,
+                &entry.entry_type,
+            )?;
             ensure_active_project(conn, target_project_id)?;
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                target_project_id,
+                &entry.entry_type,
+            )?;
 
             let now = chrono::Utc::now().to_rfc3339();
             let commit_id = ctx.commit_object_change(conn, "entries", entry_id, "move", "entry")?;
@@ -499,7 +516,17 @@ impl EntryRepo {
                     "entry is deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                &source.project_id,
+                &source.entry_type,
+            )?;
             ensure_active_project(conn, target_project_id)?;
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                target_project_id,
+                &source.entry_type,
+            )?;
 
             let now = chrono::Utc::now().to_rfc3339();
             let new_entry_id = Uuid::new_v4().to_string();
@@ -564,6 +591,11 @@ impl EntryRepo {
                     "entry is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                &entry.project_id,
+                &entry.entry_type,
+            )?;
 
             let now = chrono::Utc::now().to_rfc3339();
 
@@ -601,6 +633,11 @@ impl EntryRepo {
                 ));
             }
             ensure_active_project(conn, &entry.project_id)?;
+            CollectionProfileRepo::ensure_object_write_allowed(
+                conn,
+                &entry.project_id,
+                &entry.entry_type,
+            )?;
 
             let now = chrono::Utc::now().to_rfc3339();
             let commit_id =

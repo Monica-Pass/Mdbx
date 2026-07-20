@@ -125,7 +125,7 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
 
 客户端 SHOULD 优先通过 storage / repo API 写入，而不是直接拼 SQL。
 
-使用 `mdbx-ffi` 时，应把它视为 generic vault/project/entry 操作的客户端边界。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该新增明确的 facade 方法和测试，而不是让客户端直接写对应 SQLite 表。
+使用 `mdbx-ffi` 时，应把它视为 Vault、Collection Profile 和 ObjectRecord 操作的客户端边界。领域 Adapter 在修改 profiled Collection 前注册当前进程实际提供的 ExtensionCapabilityId；缺少 Adapter 时继续保留未知密文，不得伪造能力绕过写入限制。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该新增明确的 facade 方法和测试，而不是让客户端直接写对应 SQLite 表。
 
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
@@ -143,6 +143,7 @@ Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN
 - `device_heads`
 - `branches`
 - `project_tags`
+- `collection_profiles`
 
 直接写这些表很容易制造“看起来保存成功，但其他客户端数量不一致、删除链路错误、历史爆炸、快照不可回滚”的问题。
 

@@ -4,7 +4,7 @@
 
 这个目录包含 Monica MDBX 的 Rust workspace 和实现接入说明。
 
-MDBX 是 Monica 的本地优先加密 vault 格式。它的目标不是简单替代某张密码表，而是提供长期可维护的本地数据库、类 Git 的逻辑历史、同步冲突处理、原生附件、快照恢复和 Tiga 安全模式。
+MDBX 是 Monica 的本地优先高级加密数据库核心。它为经过认证和版本化的 Collection、ObjectRecord 与二进制内容提供长期存储、类 Git 逻辑历史、同步冲突处理、快照恢复和 Tiga 安全策略。密码管理、网页收藏、邮件、Steam `mafile` 等属于可裁剪的领域 Adapter。
 
 当前格式代际为 **MDBX2**，存储值为 `MDBX-2`。MDBX2 可自动、事务性地升级 `MDBX-1` 与 `MDBX-1-DRAFT` vault；兼容契约见 `docs/09-mdbx2-compatibility.zh-CN.md`。
 
@@ -23,7 +23,7 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
 - `crates/mdbx-storage`
   - SQLite schema、vault 初始化、repo、搜索、快照、冲突、恢复、sync state。
 - `crates/mdbx-ffi`
-  - 基于 UniFFI 的通用跨语言边界，暴露 vault、project 和 generic entry 操作；客户端特定 payload 语义仍由各客户端负责。
+  - 基于 UniFFI 的通用跨语言边界，暴露 Vault、Collection Profile 和 ObjectRecord 操作；客户端特定 payload 语义仍由各领域 Adapter 负责。
 - `crates/mdbx-cli`
   - 本地测试和开发用 CLI。
 - crate-local `tests/`

@@ -4,7 +4,7 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
-use crate::repo::TombstoneRepo;
+use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 
 /// 数据库健康检查结果。
 #[derive(Debug, Clone)]
@@ -91,6 +91,15 @@ impl RecoveryVerifier {
                 severity: IssueSeverity::Warning,
                 category: "orphans".to_string(),
                 description: format!("orphan check failed: {}", e),
+            }),
+        }
+
+        match Self::check_collection_profiles(conn) {
+            Ok(profile_issues) => issues.extend(profile_issues),
+            Err(e) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "collection-profiles".to_string(),
+                description: format!("collection profile check failed: {}", e),
             }),
         }
 
@@ -451,6 +460,84 @@ impl RecoveryVerifier {
             });
         }
 
+        Ok(issues)
+    }
+
+    pub fn check_collection_profiles(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
+        let mut issues = Vec::new();
+        let mut stmt = conn.inner().prepare(
+            "SELECT cp.project_id, p.project_id
+             FROM collection_profiles cp
+             LEFT JOIN projects p ON p.project_id = cp.project_id
+             ORDER BY cp.project_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (collection_id, project_id) = row?;
+            if project_id.is_none() {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "collection-profiles".to_string(),
+                    description: format!(
+                        "collection profile {} has no owning project",
+                        collection_id
+                    ),
+                });
+                continue;
+            }
+            let profile = match CollectionProfileRepo::get_by_collection_id(conn, &collection_id) {
+                Ok(Some(profile)) => profile,
+                Ok(None) => continue,
+                Err(error) => {
+                    issues.push(HealthIssue {
+                        severity: IssueSeverity::Error,
+                        category: "collection-profiles".to_string(),
+                        description: format!(
+                            "collection profile {} is invalid: {}",
+                            collection_id, error
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            let mut entry_stmt = conn.inner().prepare(
+                "SELECT entry_id, entry_type FROM entries
+                 WHERE project_id = ?1 AND deleted = 0 ORDER BY entry_id",
+            )?;
+            let entries = entry_stmt.query_map([&collection_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for entry in entries {
+                let (entry_id, object_type) = entry?;
+                let object_type = match object_type.parse() {
+                    Ok(object_type) => object_type,
+                    Err(error) => {
+                        issues.push(HealthIssue {
+                            severity: IssueSeverity::Error,
+                            category: "collection-profiles".to_string(),
+                            description: format!(
+                                "object {} has invalid type in collection {}: {}",
+                                entry_id, collection_id, error
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                if !profile.allows_object_type(&object_type) {
+                    issues.push(HealthIssue {
+                        severity: IssueSeverity::Error,
+                        category: "collection-profiles".to_string(),
+                        description: format!(
+                            "object {} type {} is outside collection {} profile",
+                            entry_id, object_type, collection_id
+                        ),
+                    });
+                }
+            }
+        }
         Ok(issues)
     }
 

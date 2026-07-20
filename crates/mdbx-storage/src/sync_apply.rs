@@ -2,7 +2,7 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use std::collections::{BTreeMap, HashSet};
 
-use mdbx_core::model::ConflictObjectType;
+use mdbx_core::model::{ConflictObjectType, ObjectTypeId};
 use mdbx_core::tiga::{
     AuthorizationConstraint, AuthorizationReason, PolicyException, TigaMode, TigaPolicyOverride,
     TigaScope,
@@ -16,8 +16,8 @@ use crate::error::{StorageError, StorageResult};
 use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
 use crate::migration::FIELD_KEY_EPOCHS_EXTENSION;
 use crate::repo::{
-    BranchRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo, PermanentPurgeReceipt,
-    TombstoneRepo,
+    BranchRepo, CollectionProfileRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo,
+    PermanentPurgeReceipt, TombstoneRepo,
 };
 use crate::sync_state::{
     decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
@@ -984,7 +984,20 @@ impl SyncApplyRepo {
                             row.updated_by_device_id,
                         ],
                     )?;
-                    ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
+                    if let Some(profile) = &row.collection_profile {
+                        if profile.project_id != row.project_id {
+                            return Err(StorageError::ConstraintViolation(
+                                "collection profile project ID does not match project row"
+                                    .to_string(),
+                            ));
+                        }
+                        CollectionProfileRepo::apply_synced_row(conn, profile)?;
+                    }
+                    ObjectVersionRepo::record_project_current(
+                        conn,
+                        &row.head_commit_id,
+                        &row.project_id,
+                    )?;
                 }
                 ObjectDecision::FastForward => {
                     conn.inner().execute(
@@ -1013,7 +1026,20 @@ impl SyncApplyRepo {
                             row.updated_by_device_id,
                         ],
                     )?;
-                    ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
+                    if let Some(profile) = &row.collection_profile {
+                        if profile.project_id != row.project_id {
+                            return Err(StorageError::ConstraintViolation(
+                                "collection profile project ID does not match project row"
+                                    .to_string(),
+                            ));
+                        }
+                        CollectionProfileRepo::apply_synced_row(conn, profile)?;
+                    }
+                    ObjectVersionRepo::record_project_current(
+                        conn,
+                        &row.head_commit_id,
+                        &row.project_id,
+                    )?;
                 }
                 ObjectDecision::Conflict { local_head } => {
                     conflicts +=
@@ -1036,6 +1062,9 @@ impl SyncApplyRepo {
             if TombstoneRepo::is_permanently_purged(conn, "entry", &row.entry_id)? {
                 continue;
             }
+            let object_type: ObjectTypeId =
+                row.entry_type.parse().map_err(StorageError::Validation)?;
+            CollectionProfileRepo::ensure_object_sync_allowed(conn, &row.project_id, &object_type)?;
             if Self::commit_exists(conn, &row.head_commit_id)? {
                 ObjectVersionRepo::record_entry_row(conn, &row.head_commit_id, row)?;
             }
@@ -2044,6 +2073,15 @@ impl SyncApplyRepo {
                 None => ObjectVersionRepo::current_project_row(conn, &incoming.project_id)?,
             };
 
+        let local_profile = local_row
+            .collection_profile
+            .clone()
+            .or_else(|| base_row.collection_profile.clone());
+        let incoming_profile = incoming
+            .collection_profile
+            .clone()
+            .or_else(|| base_row.collection_profile.clone());
+
         let mut structural_conflicts = Vec::new();
         if local_row.deleted != incoming.deleted {
             structural_conflicts.push("deleted".to_string());
@@ -2080,6 +2118,15 @@ impl SyncApplyRepo {
         .is_none()
         {
             structural_conflicts.push("tiga_mode_override".to_string());
+        }
+        if merge_value(
+            &base_row.collection_profile,
+            &local_profile,
+            &incoming_profile,
+        )
+        .is_none()
+        {
+            structural_conflicts.push("collection_profile".to_string());
         }
 
         if !structural_conflicts.is_empty() {
@@ -2133,6 +2180,17 @@ impl SyncApplyRepo {
             &incoming.attachment_count,
         )
         .unwrap_or_else(|| std::cmp::max(local.attachment_count, incoming.attachment_count));
+        let local_profile = local
+            .collection_profile
+            .clone()
+            .or_else(|| base.collection_profile.clone());
+        let incoming_profile = incoming
+            .collection_profile
+            .clone()
+            .or_else(|| base.collection_profile.clone());
+        let collection_profile =
+            merge_value(&base.collection_profile, &local_profile, &incoming_profile)
+                .unwrap_or(local_profile);
 
         conn.inner().execute(
             "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
@@ -2168,6 +2226,9 @@ impl SyncApplyRepo {
                 ctx.device_id,
             ],
         )?;
+        if let Some(profile) = &collection_profile {
+            CollectionProfileRepo::apply_synced_row(conn, profile)?;
+        }
         ObjectVersionRepo::record_project_current(conn, &commit_id, &incoming.project_id)?;
         Ok(())
     }
@@ -3030,18 +3091,19 @@ mod tests {
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::key_epoch::{KeyEpochRotationResult, KeyEpochService};
     use crate::repo::{
-        AttachmentRepo, CommitChange, CommitOperation, EntryRepo,
-        ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
-        ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ObjectVersionRepo,
-        ProjectRepo, TombstoneRepo,
+        AttachmentRepo, CollectionProfileRepo, CollectionProfileSpec, CommitChange,
+        CommitOperation, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
+        ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
+        ObjectVersionRepo, ProjectRepo, TombstoneRepo,
     };
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
     use crate::unlock::UnlockService;
     use mdbx_core::model::{
-        ChangeScope, Commit, CommitKind, ConflictObjectType, ConflictResolution, EntryType,
-        RelationKindId, UnlockMethodType, VaultSession,
+        ChangeScope, CollectionTypeId, Commit, CommitKind, ConflictObjectType, ConflictResolution,
+        EntryType, ExtensionCapabilityId, ObjectTypeId, RelationKindId, UnlockMethodType,
+        VaultSession,
     };
     use mdbx_core::tiga::{
         DeviceAssurance, DeviceContext, SessionAssurance, TigaScope, TIGA_POLICY_VERSION,
@@ -4134,6 +4196,86 @@ mod tests {
         drop(target);
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn collection_profile_and_opaque_object_survive_sync_without_target_adapter() {
+        let source_path = temp_vault_path("profile-source");
+        let target_path = temp_vault_path("profile-target");
+
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("profile-sync-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        source.set_extension_capabilities([
+            ExtensionCapabilityId::new("com.monica.mail.store").unwrap()
+        ]);
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+
+        let project = ProjectRepo::create(&source, &source_ctx, "Mail", None, None).unwrap();
+        CollectionProfileRepo::set(
+            &source,
+            &source_ctx,
+            CollectionProfileSpec {
+                collection_id: project.project_id.clone(),
+                collection_type_id: CollectionTypeId::new("com.monica.mail").unwrap(),
+                payload: br#"{"account":"primary"}"#.to_vec(),
+                payload_schema_version: 1,
+                allowed_object_type_ids: vec![
+                    ObjectTypeId::custom("com.monica.mail.message").unwrap()
+                ],
+                required_capability_ids: vec![
+                    ExtensionCapabilityId::new("com.monica.mail.store").unwrap()
+                ],
+            },
+        )
+        .unwrap();
+        let entry = EntryRepo::create(
+            &source,
+            &source_ctx,
+            &project.project_id,
+            ObjectTypeId::custom("com.monica.mail.message").unwrap(),
+            Some("Message"),
+            &serde_json::json!({"body":"opaque"}),
+        )
+        .unwrap();
+        checkpoint(&source);
+
+        let mut commits = serialized_commits_from(&source);
+        attach_state_payload_to_commit(&source, &mut commits, &entry.head_commit_id);
+        let result =
+            SyncApplyRepo::apply_batch(&target, &target_ctx, &CommitBatch::new(commits, 0, true))
+                .unwrap();
+        assert_eq!(result.conflict_count, 0);
+
+        let profile = CollectionProfileRepo::get_by_collection_id(&target, &project.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.collection_type_id.as_str(), "com.monica.mail");
+        assert_eq!(profile.payload_ct, br#"{"account":"primary"}"#);
+        let synced = EntryRepo::get_by_id(&target, &entry.entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced.entry_type.as_str(), "com.monica.mail.message");
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
     }
 
     #[test]

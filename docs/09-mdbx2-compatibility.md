@@ -20,7 +20,7 @@ An upgraded vault records:
 
 ```text
 format_version     = MDBX-2
-schema_version     = 6
+schema_version     = 11
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -35,6 +35,8 @@ On writable open, MDBX2 reads format metadata, rejects unsupported critical exte
 Tiga1 profiles are mapped to Tiga policy version 2 in the same transaction. Existing weaker project or entry profiles become deterministic remediation exceptions. An unlock configuration that does not yet satisfy the new profile is marked `remediation-required`; migration never rewrites KDF parameters or wrapped vault-key bytes and does not deny access solely because remediation is pending.
 
 Early MDBX2 vaults with schema versions 2 or 3 upgrade in place to schema version 4 without changing the `MDBX-2` format marker. Schema 4 adds operation-level commit metadata and atomic per-device sequence state while retaining the original `commits` table and DAG as the MDBX1-compatible projection. Schema 4 vaults then upgrade additively to schema 5, which adds nullable Tiga audit correlation and policy-evidence fields. Existing audit rows remain valid with null values. Schema 5 vaults upgrade additively to schema 6, which adds a nullable `commit_operations.branch_id` and its lookup index. Existing operation rows retain a null branch ID because their V1 request hashes and integrity tags authenticate only `branch_name`.
+
+Schemas 6 through 11 continue as ordered additive migrations. Schema 7 adds generic relations, labels, and assignments; schema 8 adds tombstone delete proof and device acknowledgements; schema 9 adds permanent purge receipts; schema 10 adds Attachment Tiga scopes; schema 11 adds one-to-one Collection Profiles. These migrations preserve the physical `projects` and `entries` tables and the legacy public interfaces.
 
 Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 executes `MDBX-1 -> MDBX-2 -> MDBX-3`.
 

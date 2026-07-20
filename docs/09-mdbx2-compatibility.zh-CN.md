@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；稳定分支身份使用 `6`。
+  - 当前内部 schema 序号；Collection Profile 使用 `11`。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 6
+schema_version    = 11
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -62,6 +62,8 @@ tiga_policy_version = 2
 Tiga 审计关联与策略证据字段；旧审计记录继续以空值读取。
 
 schema 5 随后以增量迁移升级到 schema 6，增加可空的 `commit_operations.branch_id` 与查询索引。旧 operation 行继续保留空的分支 ID，因为其 V1 请求哈希与完整性标签只认证 `branch_name`，迁移过程不得推断并回填该字段。
+
+schema 6 到 schema 11 继续采用顺序附加迁移：schema 7 增加通用关系、标签和标签分配；schema 8 增加 tombstone 删除证明与设备确认；schema 9 增加永久清理凭证；schema 10 将 Attachment 纳入 Tiga scope；schema 11 增加一对一 `collection_profiles`。这些迁移均保留 `projects`、`entries` 和旧公开接口。
 
 ## 4. Schema 演进规则
 

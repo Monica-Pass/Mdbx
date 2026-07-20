@@ -2,7 +2,7 @@
 
 这个文件夹是 MDBX 项目的规范主目录。
 
-MDBX 是一种本地优先的加密密码数据库格式与参考架构。
+MDBX 是一种本地优先的高级加密数据库格式与参考架构。密码管理只是领域 Adapter 之一，网页收藏、邮件、Steam `mafile` 和未来应用共享同一加密核心。
 它的核心设计目标是：
 
 - 本地优先
@@ -10,7 +10,7 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - 类 Git 的冲突防止与恢复能力
 - 在网盘工作流中显著优于 KDBX 的同步表现
 - 通过 Tiga 模型提供三档安全状态
-- 以 `project` 为中心组织密码
+- 以 Collection 为稳定容器组织经过认证的通用 ObjectRecord
 - 原生支持附件
 - 4ever And 4ever：旧 vault 长期可读，数据安全优先于一时方便
 
@@ -101,7 +101,7 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - 4ever And 4ever：新版本必须能读旧 vault；旧实现应尽量保留未知但非关键的数据
 - 数据安全优先于便利性
 - 不依赖中心服务器
-- 以 `project` 为中心组织密码
+- 通用 Collection 与 ObjectRecord 语义独立于密码领域
 - 原生附件能力
 - 比 KDBX 更安全的同步与冲突处理
 - 比 KDBX 更好的网盘同步性能
@@ -111,14 +111,17 @@ MDBX 是一种本地优先的加密密码数据库格式与参考架构。
 - `vault`
   - 一个 MDBX 数据库文件。
 
-- `project`
-  - 一个现实世界中的账号、网站、应用、组织、身份集合、工作环境、服务集合的主容器。
+- `Collection`
+  - 通用稳定容器。MDBX1 物理上存储在 `projects` 表中；密码 project、书签目录、邮箱和 Steam 账号组都是领域呈现。
 
-- `entry`
-  - `project` 内部的具体记录，例如登录项、笔记、卡片、令牌、密钥等。
+- `ObjectRecord`
+  - Collection 内部的加密版本化记录。MDBX1 物理上存储在 `entries` 表中；登录项、邮件、书签、联系人和 `mafile` 都属于 ObjectRecord。
 
-- `attachment`
-  - 归属于 `project` 或 `entry` 的文件或二进制内容。
+- `CollectionProfile`
+  - Collection 的可选版本化领域描述，包含命名空间类型、加密配置、允许的 ObjectTypeId 和写入所需 ExtensionCapabilityId。
+
+- `Attachment`
+  - 归属于 Collection 或 ObjectRecord 的认证二进制内容及外部加密引用。
 
 - `tiga mode`
   - 存储值和 API 使用三档之一：`power`、`multi`、`sky`。

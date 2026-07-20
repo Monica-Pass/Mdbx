@@ -10,7 +10,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::TombstoneRepo;
+use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 
 #[derive(Debug, Clone)]
 pub struct ObjectRelationCreateRequest {
@@ -68,6 +68,14 @@ impl ObjectRelationRepo {
         conn.with_immediate_transaction(|| {
             ensure_active_object(conn, &request.source_object_id)?;
             ensure_active_object(conn, &request.target_object_id)?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &request.source_object_id,
+            )?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &request.target_object_id,
+            )?;
 
             let now = chrono::Utc::now().to_rfc3339();
             let commit_id = ctx.create_commit(
@@ -182,6 +190,14 @@ impl ObjectRelationRepo {
         conn.with_immediate_transaction(|| {
             ensure_active_object(conn, &relation.source_object_id)?;
             ensure_active_object(conn, &relation.target_object_id)?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &relation.source_object_id,
+            )?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &relation.target_object_id,
+            )?;
             let stored = Self::get_by_id(conn, &relation.relation_id)?
                 .ok_or_else(|| StorageError::NotFound(relation.relation_id.clone()))?;
             if stored.deleted {
@@ -249,6 +265,14 @@ impl ObjectRelationRepo {
                     "object relation is already deleted".to_string(),
                 ));
             }
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &relation.source_object_id,
+            )?;
+            CollectionProfileRepo::ensure_entry_write_capabilities(
+                conn,
+                &relation.target_object_id,
+            )?;
             let commit_id = ctx.commit_object_change_with_id_column(
                 conn,
                 "object_relations",

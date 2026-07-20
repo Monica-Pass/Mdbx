@@ -10,7 +10,7 @@ MDBX 必须坚持：
 
 - 本地优先：所有创建、修改、删除、搜索、冲突处理都能离线完成。
 - 4ever：格式公开、自描述、自校验、长期可读，新增能力必须保留兼容路径。
-- project 优先：`project` 是一等主容器，entry 不允许退化成无归属平铺密码。
+- Collection 优先：MDBX1 的 `project` 保持一等物理主容器；MDBX2 通过 Collection Interface 服务密码、邮件、收藏和文件领域，ObjectRecord 不允许退化成无归属平铺记录。
 - attachment 一等化：附件从 v1 起进入 schema、历史、恢复和完整性模型。
 - 类 Git 历史：每个本地变更必须产生 commit，commit DAG、device head、tombstone、conflict 都是核心格式的一部分。
 - 因果冲突检测：不能只靠时间戳；同一秘密字段并发修改必须显式冲突。
@@ -63,6 +63,8 @@ MDBX 必须坚持：
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - `external-hash-ref` 已通过通用 `EncryptedBlobStore` 接口实现；默认 CLI 使用 `<vault>.blobs` 内容寻址目录，core 裁剪构建保留引用格式和 Provider 接口并移除文件系统实现。数据库、snapshot 和同步状态携带加密引用，Blob 本体由 Provider 负责传输与保留。
 - 外部 Blob 生命周期管理已包含分页 Provider 清单、现行附件与 snapshot 引用审计、缺失与损坏检测、固定时间边界、计划凭证、TIGA 授权和可重试垃圾回收。维护请求写入单条安全审计，不产生逐 Blob commit。
+- schema 11 已增加 `collection_profiles`：Collection 可声明不可变的命名空间类型、版本化加密配置、允许的 ObjectTypeId 和写入所需 ExtensionCapabilityId。MDBX1 project 没有 profile 时保持旧行为；Profile mutation 原子推进 project commit、clock、head 和 ObjectVersion。
+- 连接级扩展能力只存在于当前进程。缺少领域适配器时仍可读取、同步、快照、恢复和检查未知密文；Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改会返回缺失能力。同步状态升级到 v2，同时继续读取 v1。
 - project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
 - project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
 - project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
@@ -98,6 +100,7 @@ MDBX 必须坚持：
 - 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
 - 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
 - external-hash-ref 的 Provider 间 Blob 传输尚未实现；跨进程清理与导入的强协调仍需 Provider lease 协议。
+- CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。
 
 ### 3.5 安全
 
@@ -248,6 +251,7 @@ MDBX 必须坚持：
 - Rust core 支持 `custom` merged payload 写回，用于后续 Android 手动合并编辑器。
 - 删除/修改并发会生成 `deleted` conflict：远端 tombstone 不丢，本地删除不会被远端修改复活。
 - snapshot 已恢复 attachment chunks；初始化 key epoch marker 与 active epoch wrapping 边界已收紧。
+- CollectionProfile 已进入 schema migration、Project ObjectVersion、sync state v2、snapshot、health 和 UniFFI；旧 sync state v1 缺少 profile 时保留接收端现有描述。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：

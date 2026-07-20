@@ -7,8 +7,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
-    Conflict, ConflictObjectType, ConflictResolution, EntryType, ObjectSummary, ObjectTypeId,
-    RelationKindId, Tombstone, UnlockMethodType,
+    CollectionProfile, CollectionTypeId, Conflict, ConflictObjectType, ConflictResolution,
+    EntryType, ExtensionCapabilityId, ObjectSummary, ObjectTypeId, RelationKindId, Tombstone,
+    UnlockMethodType,
 };
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
@@ -23,12 +24,12 @@ use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
-    BranchRepo, CommitChange, CommitContext, CommitHistoryItem, CommitHistoryPage,
-    CommitHistoryRepo, CommitOperation, ConflictRepo, EntryRepo,
-    ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
-    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ObjectSummaryRepo,
-    OperationExecution, PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker,
-    TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
+    BranchRepo, CollectionProfileRepo, CollectionProfileSpec, CommitChange, CommitContext,
+    CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo, CommitOperation, ConflictRepo,
+    EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
+    ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
+    ObjectSummaryRepo, OperationExecution, PermanentPurgeReceipt, ProjectRepo,
+    TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -51,6 +52,10 @@ pub enum MdbxFfiError {
     InvalidObjectTypeId { object_type_id: String },
     #[error("invalid relation kind: {relation_kind}")]
     InvalidRelationKind { relation_kind: String },
+    #[error("invalid collection type ID: {collection_type_id}")]
+    InvalidCollectionTypeId { collection_type_id: String },
+    #[error("invalid extension capability ID: {capability_id}")]
+    InvalidExtensionCapabilityId { capability_id: String },
     #[error("vault lock poisoned")]
     LockPoisoned,
 }
@@ -331,6 +336,20 @@ impl From<MigrationInfo> for MdbxMigrationInfo {
 pub struct ProjectRecord {
     pub project_id: String,
     pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxCollectionProfile {
+    pub collection_id: String,
+    pub collection_type_id: String,
+    pub payload: Vec<u8>,
+    pub payload_schema_version: u32,
+    pub allowed_object_type_ids: Vec<String>,
+    pub required_capability_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1363,6 +1382,64 @@ impl MdbxVault {
             project_id: project.project_id,
             title: String::from_utf8_lossy(&project.title_ct).to_string(),
         })
+    }
+
+    pub fn set_extension_capabilities(
+        &self,
+        capability_ids: Vec<String>,
+    ) -> Result<(), MdbxFfiError> {
+        let capabilities = capability_ids
+            .iter()
+            .map(|capability_id| parse_extension_capability_id(capability_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        conn.set_extension_capabilities(capabilities);
+        Ok(())
+    }
+
+    pub fn get_collection_profile(
+        &self,
+        collection_id: String,
+    ) -> Result<Option<MdbxCollectionProfile>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(
+            CollectionProfileRepo::get_by_collection_id(&conn, &collection_id)?
+                .map(collection_profile_from_core),
+        )
+    }
+
+    pub fn set_collection_profile(
+        &self,
+        collection_id: String,
+        collection_type_id: String,
+        payload: Vec<u8>,
+        payload_schema_version: u32,
+        allowed_object_type_ids: Vec<String>,
+        required_capability_ids: Vec<String>,
+    ) -> Result<MdbxCollectionProfile, MdbxFfiError> {
+        let allowed_object_type_ids = allowed_object_type_ids
+            .iter()
+            .map(|object_type_id| parse_object_type_id(object_type_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let required_capability_ids = required_capability_ids
+            .iter()
+            .map(|capability_id| parse_extension_capability_id(capability_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let profile = CollectionProfileRepo::set(
+            &conn,
+            &ctx,
+            CollectionProfileSpec {
+                collection_id,
+                collection_type_id: parse_collection_type_id(&collection_type_id)?,
+                payload,
+                payload_schema_version,
+                allowed_object_type_ids,
+                required_capability_ids,
+            },
+        )?;
+        Ok(collection_profile_from_core(profile))
     }
 
     pub fn execute_write_operation(
@@ -2718,8 +2795,49 @@ fn parse_relation_kind(relation_kind: &str) -> Result<RelationKindId, MdbxFfiErr
         })
 }
 
+fn parse_collection_type_id(collection_type_id: &str) -> Result<CollectionTypeId, MdbxFfiError> {
+    collection_type_id
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidCollectionTypeId {
+            collection_type_id: collection_type_id.to_string(),
+        })
+}
+
+fn parse_extension_capability_id(
+    capability_id: &str,
+) -> Result<ExtensionCapabilityId, MdbxFfiError> {
+    capability_id
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidExtensionCapabilityId {
+            capability_id: capability_id.to_string(),
+        })
+}
+
 fn parse_payload_json(payload_json: &str) -> Result<serde_json::Value, MdbxFfiError> {
     serde_json::from_str(payload_json).map_err(MdbxFfiError::from)
+}
+
+fn collection_profile_from_core(profile: CollectionProfile) -> MdbxCollectionProfile {
+    MdbxCollectionProfile {
+        collection_id: profile.collection_id,
+        collection_type_id: profile.collection_type_id.to_string(),
+        payload: profile.payload_ct,
+        payload_schema_version: profile.payload_schema_version,
+        allowed_object_type_ids: profile
+            .allowed_object_type_ids
+            .into_iter()
+            .map(|object_type| object_type.to_string())
+            .collect(),
+        required_capability_ids: profile
+            .required_capability_ids
+            .into_iter()
+            .map(|capability| capability.to_string())
+            .collect(),
+        created_at: profile.created_at,
+        updated_at: profile.updated_at,
+        created_by_device_id: profile.created_by_device_id,
+        updated_by_device_id: profile.updated_by_device_id,
+    }
 }
 
 fn entry_record_from_entry(entry: &mdbx_core::model::Entry) -> Result<EntryRecord, MdbxFfiError> {
@@ -2868,6 +2986,59 @@ mod tests {
                 scope_id: Some("attachment-1".to_string())
             }
         );
+    }
+
+    #[test]
+    fn collection_profile_facade_registers_capabilities_and_guards_object_types() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-profile-device".to_string(),
+            vault_id: "ffi-profile-vault".to_string(),
+        };
+        let collection = vault.create_project("Mail".to_string()).unwrap();
+        vault
+            .set_extension_capabilities(vec!["com.monica.mail.store".to_string()])
+            .unwrap();
+        let profile = vault
+            .set_collection_profile(
+                collection.project_id.clone(),
+                "com.monica.mail".to_string(),
+                b"opaque-profile".to_vec(),
+                1,
+                vec!["com.monica.mail.message".to_string()],
+                vec!["com.monica.mail.store".to_string()],
+            )
+            .unwrap();
+        assert_eq!(profile.collection_type_id, "com.monica.mail");
+        assert_eq!(
+            vault
+                .get_collection_profile(collection.project_id.clone())
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"opaque-profile"
+        );
+
+        vault
+            .create_object(
+                collection.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                "Message".to_string(),
+                r#"{"body":"hello"}"#.to_string(),
+                1,
+            )
+            .unwrap();
+        assert!(vault
+            .create_object(
+                collection.project_id,
+                "login".to_string(),
+                "Login".to_string(),
+                "{}".to_string(),
+                1,
+            )
+            .is_err());
     }
 
     #[test]

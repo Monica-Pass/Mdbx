@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
 use mdbx_core::model::{
-    Attachment, Entry, ObjectLabel, ObjectLabelAssignment, ObjectRelation, Project, Snapshot,
+    Attachment, CollectionProfile, Entry, ObjectLabel, ObjectLabelAssignment, ObjectRelation,
+    Project, Snapshot,
 };
 use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
@@ -16,7 +17,7 @@ use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::TombstoneRepo;
+use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 use crate::sync_state::ProjectTagSetRow;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
@@ -30,6 +31,8 @@ struct SnapshotPayload {
     format_version: String,
     snapshot_created_at: String,
     projects: Vec<Project>,
+    #[serde(default)]
+    collection_profiles: Option<Vec<CollectionProfile>>,
     entries: Vec<Entry>,
     #[serde(default)]
     object_relations: Option<Vec<ObjectRelation>>,
@@ -82,6 +85,7 @@ impl SnapshotRepo {
                 format_version,
                 snapshot_created_at: now.clone(),
                 projects: read_all_active_projects(conn)?,
+                collection_profiles: Some(CollectionProfileRepo::list_active(conn)?),
                 entries: read_all_active_entries(conn)?,
                 object_relations: Some(read_all_active_object_relations(conn)?),
                 object_labels: Some(read_all_active_object_labels(conn)?),
@@ -241,9 +245,45 @@ impl SnapshotRepo {
                 &[snap.base_commit_id.clone()],
             )?;
 
+            let snapshot_profiles = payload
+                .collection_profiles
+                .as_ref()
+                .map(|profiles| {
+                    profiles
+                        .iter()
+                        .map(|profile| (profile.collection_id.as_str(), profile))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            if payload
+                .collection_profiles
+                .as_ref()
+                .is_some_and(|profiles| profiles.len() != snapshot_profiles.len())
+            {
+                return Err(StorageError::Validation(
+                    "snapshot contains duplicate collection profiles".to_string(),
+                ));
+            }
+            if snapshot_profiles
+                .keys()
+                .any(|collection_id| !snapshot_projects.contains(*collection_id))
+            {
+                return Err(StorageError::Validation(
+                    "snapshot contains a profile for an unavailable collection".to_string(),
+                ));
+            }
+
             // Restore in dependency order, but give every row a new causal head.
             for project in &payload.projects {
                 if upsert_project(conn, project, &restore_commit_id, &now, &ctx.device_id)? {
+                    if let Some(profile) = snapshot_profiles.get(project.project_id.as_str()) {
+                        CollectionProfileRepo::restore_profile(
+                            conn,
+                            profile,
+                            &now,
+                            &ctx.device_id,
+                        )?;
+                    }
                     ObjectVersionRepo::record_project_current(
                         conn,
                         &restore_commit_id,
@@ -950,6 +990,7 @@ fn upsert_entry(
     if TombstoneRepo::is_permanently_purged(conn, "entry", &e.entry_id)? {
         return Ok(false);
     }
+    CollectionProfileRepo::ensure_object_sync_allowed(conn, &e.project_id, &e.entry_type)?;
     conn.inner().execute(
         "INSERT INTO entries (entry_id, project_id, entry_type, title_ct,
          payload_ct, payload_schema_version, tiga_mode_override, object_clock,
@@ -1368,10 +1409,14 @@ mod tests {
     };
     use crate::repo::object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
     use crate::repo::project::ProjectRepo;
+    use crate::repo::{CollectionProfileRepo, CollectionProfileSpec};
     #[cfg(feature = "derived-search-index")]
     use crate::search::SearchService;
     use crate::tiga::TigaService;
-    use mdbx_core::model::{EntryType, RelationKindId, UnlockMethodType, VaultSession};
+    use mdbx_core::model::{
+        CollectionTypeId, EntryType, ExtensionCapabilityId, ObjectTypeId, RelationKindId,
+        UnlockMethodType, VaultSession,
+    };
     use mdbx_core::tiga::{AuthorizationOutcome, DeviceAssurance, DeviceContext, SessionAssurance};
 
     fn setup() -> (VaultConnection, CommitContext) {
@@ -1429,6 +1474,48 @@ mod tests {
         assert!(payload.entries.is_empty());
         assert!(payload.attachments.is_empty());
         assert!(payload.attachment_chunks.unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_versioned_collection_profile() {
+        let (mut conn, ctx) = setup();
+        conn.set_extension_capabilities([
+            ExtensionCapabilityId::new("com.monica.mail.store").unwrap()
+        ]);
+        let project = ProjectRepo::create(&conn, &ctx, "Mail", None, None).unwrap();
+        let profile_spec = |payload: &[u8], version| CollectionProfileSpec {
+            collection_id: project.project_id.clone(),
+            collection_type_id: CollectionTypeId::new("com.monica.mail").unwrap(),
+            payload: payload.to_vec(),
+            payload_schema_version: version,
+            allowed_object_type_ids: vec![ObjectTypeId::custom("com.monica.mail.message").unwrap()],
+            required_capability_ids: vec![
+                ExtensionCapabilityId::new("com.monica.mail.store").unwrap()
+            ],
+        };
+        CollectionProfileRepo::set(&conn, &ctx, profile_spec(b"profile-v1", 1)).unwrap();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        CollectionProfileRepo::set(&conn, &ctx, profile_spec(b"profile-v2", 2)).unwrap();
+
+        let session = restore_session(1_000);
+        let device = restore_device();
+        SnapshotRepo::restore_snapshot_authorized(
+            &conn,
+            &ctx,
+            &snapshot.snapshot_id,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_010,
+            },
+        )
+        .unwrap();
+
+        let restored = CollectionProfileRepo::get_by_collection_id(&conn, &project.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.payload_ct, b"profile-v1");
+        assert_eq!(restored.payload_schema_version, 1);
     }
 
     #[test]
