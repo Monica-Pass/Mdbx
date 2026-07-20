@@ -198,6 +198,9 @@ impl BlobTransferService {
             while current.transferred_bytes < total_size
                 && chunks_transferred < limits.max_chunks_per_run
             {
+                let renew_now = now_unix_secs();
+                source.renew_lease(blob_id, owner_id, renew_now, limits.lease_ttl_secs)?;
+                destination.renew_lease(blob_id, owner_id, renew_now, limits.lease_ttl_secs)?;
                 let remaining = total_size - current.transferred_bytes;
                 let requested = remaining.min(limits.chunk_size as u64) as usize;
                 let chunk = source.read_chunk(blob_id, current.transferred_bytes, requested)?;
