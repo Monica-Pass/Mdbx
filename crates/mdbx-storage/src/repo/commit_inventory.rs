@@ -160,6 +160,33 @@ impl CommitInventoryRepo {
             anchor: latest_anchor(conn)?,
         })
     }
+
+    /// Return a durable checkpoint positioned immediately after `item`.
+    ///
+    /// Unlike [`checkpoint`], this does not advance to the current inventory
+    /// head. It is used by bounded transfer segments to resume after the last
+    /// item that was durably applied.
+    pub fn checkpoint_after(
+        conn: &VaultConnection,
+        item: Option<&CommitInventoryItem>,
+    ) -> StorageResult<String> {
+        let vault_id = vault_id(conn)?;
+        let anchor = if let Some(item) = item {
+            let anchor = InventoryAnchor {
+                sequence: item.inventory_seq,
+                commit_id: item.commit_id.clone(),
+            };
+            validate_anchor(conn, Some(&anchor), "checkpoint")?;
+            Some(anchor)
+        } else {
+            None
+        };
+        encode_checkpoint(&InventoryCheckpoint {
+            version: COMMIT_INVENTORY_TOKEN_VERSION,
+            vault_id,
+            anchor,
+        })
+    }
 }
 
 fn vault_id(conn: &VaultConnection) -> StorageResult<String> {
@@ -411,6 +438,27 @@ mod tests {
                 .map(|item| item.commit_id.as_str())
                 .collect::<Vec<_>>(),
             ["new-commit"]
+        );
+    }
+
+    #[test]
+    fn partial_checkpoint_resumes_after_the_last_transferred_commit() {
+        let conn = setup();
+        let base = CommitInventoryRepo::checkpoint(&conn).unwrap();
+        insert_commit(&conn, "segment-commit-1", 1, None);
+        insert_commit(&conn, "segment-commit-2", 2, Some("segment-commit-1"));
+
+        let first = CommitInventoryRepo::list(&conn, Some(&base), 1, None).unwrap();
+        assert!(first.next_cursor.is_some());
+        let partial = CommitInventoryRepo::checkpoint_after(&conn, first.items.last()).unwrap();
+        let resumed = CommitInventoryRepo::list(&conn, Some(&partial), 10, None).unwrap();
+        assert_eq!(
+            resumed
+                .items
+                .iter()
+                .map(|item| item.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["segment-commit-2"]
         );
     }
 

@@ -106,6 +106,7 @@ produces one Commit2 commit and one complete attachment delta.
 
 The stable commit inventory remains necessary for causal commit exchange, but it is not a complete
 state-change inventory by itself. Schema capture, bounded envelopes, and atomic storage apply are
-implemented. Bundle v4 and the synchronization client must still carry checkpoints for both commit
-inventory and state delta batches. Until those checkpoint classes are exchanged end to end, the
-complete `SyncStatePayload` remains the CLI convergence mechanism.
+implemented. Bundle v4 and the offline CLI now carry both checkpoint classes, resume bounded
+segments through a digest-bound transfer chain, and apply each segment atomically. Complete
+`SyncStatePayload` remains the bootstrap and old-peer fallback. The reusable synchronization client
+must still negotiate this capability before selecting v4 automatically.

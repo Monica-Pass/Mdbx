@@ -174,7 +174,7 @@ The receiver MUST authenticate vault and batch identity, payload digest, row cou
 
 Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones. Device revocation merges monotonically. Physical object or tombstone deletion requires a matching authenticated permanent-purge receipt. Key epoch changes require the mutable verified-unlocked apply path; the immutable compatibility path rejects them atomically.
 
-Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats; a client MUST NOT claim incremental convergence until it exchanges both commit-inventory and auxiliary-delta checkpoints.
+Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats. Bundle v4 carries bounded commit and delta inventories after a paired checkpoint, binds resumed segments by transfer ID, segment index, and the previous payload digest, and advances the receiver checkpoint only after one segment is durably applied. Commit-associated and auxiliary deltas in a segment share one database transaction. A client MUST NOT claim incremental convergence until it exchanges both checkpoint classes and preserves the segment resume state.
 
 ## 10. Merge Model
 

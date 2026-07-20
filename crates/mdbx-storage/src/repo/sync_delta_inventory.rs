@@ -161,6 +161,31 @@ impl SyncDeltaInventoryRepo {
         })
     }
 
+    /// Return a durable checkpoint positioned immediately after `item`.
+    ///
+    /// This preserves the bootstrap floor while advancing only to the last
+    /// batch included in a bounded transfer segment.
+    pub fn checkpoint_after(
+        conn: &VaultConnection,
+        item: Option<&SyncDeltaInventoryItem>,
+    ) -> StorageResult<String> {
+        let vault_id = vault_id(conn)?;
+        let bootstrap_floor = bootstrap_commit_inventory_seq(conn)?;
+        let anchor = if let Some(item) = item {
+            let anchor = anchor_for_item(conn, item)?;
+            validate_anchor(conn, Some(&anchor), "checkpoint")?;
+            Some(anchor)
+        } else {
+            None
+        };
+        encode_checkpoint(&DeltaInventoryCheckpoint {
+            version: SYNC_DELTA_INVENTORY_TOKEN_VERSION,
+            vault_id,
+            bootstrap_commit_inventory_seq: bootstrap_floor,
+            anchor,
+        })
+    }
+
     pub fn bootstrap_commit_inventory_seq(conn: &VaultConnection) -> StorageResult<u64> {
         bootstrap_commit_inventory_seq(conn)
     }
@@ -472,6 +497,27 @@ mod tests {
                 .map(|item| item.batch_id.as_str())
                 .collect::<Vec<_>>(),
             ["after-checkpoint"]
+        );
+    }
+
+    #[test]
+    fn partial_checkpoint_resumes_after_the_last_transferred_batch() {
+        let conn = setup("delta-inventory-partial-resume");
+        let base = SyncDeltaInventoryRepo::checkpoint(&conn).unwrap();
+        insert_batch(&conn, "segment-batch-1");
+        insert_batch(&conn, "segment-batch-2");
+
+        let first = SyncDeltaInventoryRepo::list(&conn, Some(&base), 1, None).unwrap();
+        assert!(first.next_cursor.is_some());
+        let partial = SyncDeltaInventoryRepo::checkpoint_after(&conn, first.items.last()).unwrap();
+        let resumed = SyncDeltaInventoryRepo::list(&conn, Some(&partial), 10, None).unwrap();
+        assert_eq!(
+            resumed
+                .items
+                .iter()
+                .map(|item| item.batch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["segment-batch-2"]
         );
     }
 

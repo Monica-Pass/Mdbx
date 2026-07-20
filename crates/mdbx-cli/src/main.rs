@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -21,22 +23,35 @@ use mdbx_storage::import::KdbxExporter;
 use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
+#[cfg(not(test))]
+use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
 use mdbx_storage::repo::{
     AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, EntryRepo,
     ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
 };
-use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
+use mdbx_storage::repo::{
+    CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
+    SyncDeltaInventoryItem, SyncDeltaInventoryRepo, MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE,
+};
 #[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
 use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
+use mdbx_storage::sync_delta::{
+    decode_sync_delta_object_payload, load_sync_delta_envelope, sync_delta_object_payload,
+    SyncDeltaBatchKind, SyncDeltaLimits,
+};
 use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_state_payload;
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
-    build_bundle, read_bundle_with_limits, write_bundle, BundleReadLimits, CommitBatch,
-    CommitOperationMetadata, SerializedCommit, TombstoneRecord,
+    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits, write_bundle,
+    write_incremental_bundle, BundleReadLimits, CommitBatch, CommitOperationMetadata,
+    IncrementalBundleCheckpoint, IncrementalBundleManifest, IncrementalCommitInventoryEntry,
+    IncrementalDeltaInventoryEntry, IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit,
+    SyncBundleFile, TombstoneRecord, INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
 };
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 fn prompt(prompt_text: &str) -> String {
     eprint!("{}", prompt_text);
@@ -345,11 +360,20 @@ enum SyncAction {
         /// 输出文件路径
         #[arg(short, long, default_value = "sync-bundle.mdbx-sync")]
         output: PathBuf,
+        /// 由接收端返回的上一次成功 checkpoint；存在时导出 bundle v4
+        #[arg(long)]
+        base_checkpoint: Option<PathBuf>,
+        /// 保存本次导出的结果 checkpoint，供接收端确认后返回
+        #[arg(long)]
+        result_checkpoint: Option<PathBuf>,
     },
     /// 导入同步包
     Apply {
         /// 输入文件路径
         file: PathBuf,
+        /// v4 peer checkpoint 文件；成功应用后原子更新
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
     },
 }
 
@@ -1486,26 +1510,112 @@ fn cmd_search(
 // SYNC
 // ---------------------------------------------------------------------------
 
+const CLI_SYNC_CHECKPOINT_FORMAT: &str = "mdbx-cli-sync-checkpoint-v1";
+#[cfg(not(test))]
+const CLI_INCREMENTAL_SEGMENT_PAGE_SIZE: usize = MAX_COMMIT_INVENTORY_PAGE_SIZE;
+#[cfg(test)]
+const CLI_INCREMENTAL_SEGMENT_PAGE_SIZE: usize = 2;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CliSyncResume {
+    transfer_id: String,
+    next_segment_index: u32,
+    previous_segment_sha256: Vec<u8>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliSyncCheckpointFile {
+    format: String,
+    vault_id: String,
+    checkpoint: IncrementalBundleCheckpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<CliSyncResume>,
+}
+
 fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String> {
     match action {
-        SyncAction::Bundle { output } => {
-            let bundle = export_sync_bundle(conn)?;
+        SyncAction::Bundle {
+            output,
+            base_checkpoint,
+            result_checkpoint,
+        } => {
             let mut file = std::fs::File::create(&output)
                 .map_err(|e| format!("failed to create bundle '{}': {}", output.display(), e))?;
-            write_bundle(&bundle, &mut file).map_err(|e| format!("bundle write failed: {}", e))?;
-            println!(
-                "Exported {} commits to {}",
-                bundle.commits.len(),
-                output.display()
-            );
+            if let Some(base_path) = base_checkpoint {
+                let base = read_cli_sync_checkpoint(&base_path, &vault_id(conn)?)?;
+                let bundle =
+                    export_incremental_sync_segment(conn, &base.checkpoint, base.resume.as_ref())?;
+                write_incremental_bundle(&bundle, &mut file)
+                    .map_err(|e| format!("incremental bundle write failed: {e}"))?;
+                file.sync_all()
+                    .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
+                if let Some(path) = result_checkpoint {
+                    let resume = next_cli_sync_resume(&bundle)?;
+                    write_cli_sync_checkpoint(
+                        &path,
+                        &bundle.manifest.vault_id,
+                        &bundle.manifest.result,
+                        resume,
+                    )?;
+                }
+                println!(
+                    "Exported incremental bundle segment {}: commits={} deltas={} complete={} -> {}",
+                    bundle.manifest.segment_index,
+                    bundle.commits.len(),
+                    bundle.manifest.delta_inventory.len(),
+                    bundle.manifest.is_last,
+                    output.display()
+                );
+            } else {
+                let bundle = export_sync_bundle(conn)?;
+                write_bundle(&bundle, &mut file)
+                    .map_err(|e| format!("bundle write failed: {e}"))?;
+                file.sync_all()
+                    .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
+                if let Some(path) = result_checkpoint {
+                    let checkpoint = current_incremental_checkpoint(conn)?;
+                    write_cli_sync_checkpoint(&path, &bundle.vault_id, &checkpoint, None)?;
+                }
+                println!(
+                    "Exported complete bootstrap bundle: commits={} -> {}",
+                    bundle.commits.len(),
+                    output.display()
+                );
+            }
             Ok(())
         }
-        SyncAction::Apply { file } => {
+        SyncAction::Apply { file, checkpoint } => {
             let mut input = std::fs::File::open(&file)
                 .map_err(|e| format!("failed to open bundle '{}': {}", file.display(), e))?;
-            let bundle = read_bundle_with_limits(&mut input, BundleReadLimits::desktop())
+            let bundle = read_bundle_file_with_limits(&mut input, BundleReadLimits::desktop())
                 .map_err(|e| format!("bundle read failed: {}", e))?;
-            let summary = apply_sync_bundle(conn, &bundle)?;
+            let summary = match bundle {
+                SyncBundleFile::Complete(bundle) => apply_sync_bundle(conn, &bundle)?,
+                SyncBundleFile::Incremental(bundle) => {
+                    let checkpoint_path = checkpoint.ok_or_else(|| {
+                        "incremental bundle apply requires --checkpoint with the peer base"
+                            .to_string()
+                    })?;
+                    let expected =
+                        read_cli_sync_checkpoint(&checkpoint_path, &bundle.manifest.vault_id)?;
+                    let summary = apply_incremental_sync_segment(
+                        conn,
+                        &bundle,
+                        &expected.checkpoint,
+                        expected.resume.as_ref(),
+                    )?;
+                    let resume = next_cli_sync_resume(&bundle)?;
+                    write_cli_sync_checkpoint(
+                        &checkpoint_path,
+                        &bundle.manifest.vault_id,
+                        &bundle.manifest.result,
+                        resume,
+                    )?;
+                    summary
+                }
+            };
             println!(
                 "Applied bundle: applied={} skipped={} conflicts={} missing-parents={}",
                 summary.applied_commits,
@@ -1664,6 +1774,386 @@ fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, S
     Ok(build_bundle(&vault_id, &source_device_id, commits))
 }
 
+#[cfg(test)]
+fn export_incremental_sync_bundle(
+    conn: &VaultConnection,
+    base: &IncrementalBundleCheckpoint,
+) -> Result<IncrementalSyncBundle, String> {
+    export_incremental_sync_segment(conn, base, None)
+}
+
+fn export_incremental_sync_segment(
+    conn: &VaultConnection,
+    base: &IncrementalBundleCheckpoint,
+    resume: Option<&CliSyncResume>,
+) -> Result<IncrementalSyncBundle, String> {
+    if base.commit_inventory.is_none() || base.delta_inventory.is_none() {
+        return Err(
+            "incremental export requires a completed bootstrap checkpoint pair".to_string(),
+        );
+    }
+    let vault_id = vault_id(conn)?;
+    let source_device_id = latest_device_id(conn)?.unwrap_or_else(|| "cli-device".to_string());
+    let (commit_items, commit_checkpoint, more_commits) =
+        load_commit_inventory_after(conn, base.commit_inventory.as_deref())?;
+    let (delta_items, delta_checkpoint, more_deltas) =
+        load_delta_inventory_after(conn, base.delta_inventory.as_deref())?;
+
+    let mut transported = Vec::with_capacity(commit_items.len());
+    for item in commit_items {
+        let commit = load_serialized_commit(conn, &item.commit_id)?;
+        transported.push((item, commit));
+    }
+    let mut transported_ids = transported
+        .iter()
+        .map(|(_, commit)| commit.commit.commit_id.clone())
+        .collect::<HashSet<_>>();
+    let mut delta_inventory = Vec::with_capacity(delta_items.len());
+    let mut auxiliary_deltas = Vec::new();
+
+    for item in delta_items {
+        let envelope = load_sync_delta_envelope(conn, &item.batch_id, SyncDeltaLimits::default())
+            .map_err(|error| format!("failed to load sync delta {}: {error}", item.batch_id))?
+            .ok_or_else(|| {
+                format!(
+                    "sync delta batch {} disappeared during export",
+                    item.batch_id
+                )
+            })?;
+        let payload = sync_delta_object_payload(&envelope, SyncDeltaLimits::default())
+            .map_err(|error| format!("failed to encode sync delta {}: {error}", item.batch_id))?;
+        let payload_digest = Sha256::digest(&payload.ciphertext).to_vec();
+        match envelope.batch_kind {
+            SyncDeltaBatchKind::Commit => {
+                let final_commit_id = envelope.commit_ids.last().ok_or_else(|| {
+                    format!("commit delta batch {} has no final commit", item.batch_id)
+                })?;
+                if transported_ids.insert(final_commit_id.clone()) {
+                    let inventory_seq = commit_inventory_sequence(conn, final_commit_id)?;
+                    transported.push((
+                        CommitInventoryItem {
+                            inventory_seq,
+                            commit_id: final_commit_id.clone(),
+                        },
+                        load_serialized_commit(conn, final_commit_id)?,
+                    ));
+                }
+                let final_commit = transported
+                    .iter_mut()
+                    .find(|(_, commit)| commit.commit.commit_id == *final_commit_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "commit delta batch {} final commit could not be loaded",
+                            item.batch_id
+                        )
+                    })?;
+                final_commit.1.object_payloads.push(payload);
+                delta_inventory.push(IncrementalDeltaInventoryEntry {
+                    batch_seq: item.batch_seq,
+                    batch_id: item.batch_id,
+                    batch_kind: IncrementalDeltaKind::Commit,
+                    commit_ids: envelope.commit_ids,
+                    object_payload_sha256: payload_digest,
+                });
+            }
+            SyncDeltaBatchKind::Auxiliary => {
+                auxiliary_deltas.push(payload);
+                delta_inventory.push(IncrementalDeltaInventoryEntry {
+                    batch_seq: item.batch_seq,
+                    batch_id: item.batch_id,
+                    batch_kind: IncrementalDeltaKind::Auxiliary,
+                    commit_ids: Vec::new(),
+                    object_payload_sha256: payload_digest,
+                });
+            }
+        }
+    }
+
+    transported.sort_by_key(|(inventory, _)| inventory.inventory_seq);
+    if transported.len() > MAX_INCREMENTAL_BUNDLE_COMMITS {
+        return Err(format!(
+            "incremental export requires {} commits; maximum per bundle is {}",
+            transported.len(),
+            MAX_INCREMENTAL_BUNDLE_COMMITS
+        ));
+    }
+    let (commit_inventory, commits): (Vec<_>, Vec<_>) = transported
+        .into_iter()
+        .map(|(inventory, commit)| {
+            (
+                IncrementalCommitInventoryEntry {
+                    inventory_seq: inventory.inventory_seq,
+                    commit_id: inventory.commit_id,
+                },
+                commit,
+            )
+        })
+        .unzip();
+    let (transfer_id, segment_index, previous_segment_sha256) = match resume {
+        Some(resume) => (
+            resume.transfer_id.clone(),
+            resume.next_segment_index,
+            Some(resume.previous_segment_sha256.clone()),
+        ),
+        None => (uuid::Uuid::new_v4().to_string(), 0, None),
+    };
+    let bundle = IncrementalSyncBundle {
+        manifest: IncrementalBundleManifest {
+            format: INCREMENTAL_BUNDLE_FORMAT.to_string(),
+            vault_id,
+            source_device_id,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            transfer_id,
+            segment_index,
+            previous_segment_sha256,
+            is_last: !more_commits && !more_deltas,
+            base: base.clone(),
+            result: IncrementalBundleCheckpoint {
+                commit_inventory: Some(commit_checkpoint),
+                delta_inventory: Some(delta_checkpoint),
+            },
+            commit_inventory,
+            delta_inventory,
+        },
+        commits,
+        auxiliary_deltas,
+    };
+    bundle
+        .validate()
+        .map_err(|error| format!("invalid incremental bundle export: {error}"))?;
+    Ok(bundle)
+}
+
+fn current_incremental_checkpoint(
+    conn: &VaultConnection,
+) -> Result<IncrementalBundleCheckpoint, String> {
+    Ok(IncrementalBundleCheckpoint {
+        commit_inventory: Some(
+            CommitInventoryRepo::checkpoint(conn)
+                .map_err(|error| format!("failed to create commit checkpoint: {error}"))?,
+        ),
+        delta_inventory: Some(
+            SyncDeltaInventoryRepo::checkpoint(conn)
+                .map_err(|error| format!("failed to create delta checkpoint: {error}"))?,
+        ),
+    })
+}
+
+fn load_commit_inventory_after(
+    conn: &VaultConnection,
+    checkpoint: Option<&str>,
+) -> Result<(Vec<CommitInventoryItem>, String, bool), String> {
+    let page = CommitInventoryRepo::list(conn, checkpoint, CLI_INCREMENTAL_SEGMENT_PAGE_SIZE, None)
+        .map_err(|error| format!("failed to page commit inventory: {error}"))?;
+    let has_more = page.next_cursor.is_some();
+    let result_checkpoint = if has_more {
+        CommitInventoryRepo::checkpoint_after(conn, page.items.last())
+            .map_err(|error| format!("failed to checkpoint commit segment: {error}"))?
+    } else {
+        page.checkpoint
+    };
+    Ok((page.items, result_checkpoint, has_more))
+}
+
+fn load_delta_inventory_after(
+    conn: &VaultConnection,
+    checkpoint: Option<&str>,
+) -> Result<(Vec<SyncDeltaInventoryItem>, String, bool), String> {
+    let page = SyncDeltaInventoryRepo::list(
+        conn,
+        checkpoint,
+        CLI_INCREMENTAL_SEGMENT_PAGE_SIZE.min(MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE),
+        None,
+    )
+    .map_err(|error| format!("failed to page sync delta inventory: {error}"))?;
+    let has_more = page.next_cursor.is_some();
+    let result_checkpoint = if has_more {
+        SyncDeltaInventoryRepo::checkpoint_after(conn, page.items.last())
+            .map_err(|error| format!("failed to checkpoint sync delta segment: {error}"))?
+    } else {
+        page.checkpoint
+    };
+    Ok((page.items, result_checkpoint, has_more))
+}
+
+fn commit_inventory_sequence(conn: &VaultConnection, commit_id: &str) -> Result<u64, String> {
+    let sequence = conn
+        .inner()
+        .query_row(
+            "SELECT inventory_seq FROM commit_inventory WHERE commit_id = ?1",
+            [commit_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("failed to locate commit {commit_id} in inventory: {error}"))?;
+    u64::try_from(sequence)
+        .map_err(|error| format!("invalid inventory sequence for commit {commit_id}: {error}"))
+}
+
+#[cfg(test)]
+fn apply_incremental_sync_bundle(
+    conn: &mut VaultConnection,
+    bundle: &IncrementalSyncBundle,
+    expected_base: &IncrementalBundleCheckpoint,
+) -> Result<ApplyBatchResult, String> {
+    apply_incremental_sync_segment(conn, bundle, expected_base, None)
+}
+
+fn apply_incremental_sync_segment(
+    conn: &mut VaultConnection,
+    bundle: &IncrementalSyncBundle,
+    expected_base: &IncrementalBundleCheckpoint,
+    expected_resume: Option<&CliSyncResume>,
+) -> Result<ApplyBatchResult, String> {
+    bundle
+        .validate()
+        .map_err(|error| format!("invalid incremental bundle: {error}"))?;
+    let local_vault_id = vault_id(conn)?;
+    if bundle.manifest.vault_id != local_vault_id {
+        return Err(format!(
+            "bundle vault_id {} does not match local vault_id {}",
+            bundle.manifest.vault_id, local_vault_id
+        ));
+    }
+    if &bundle.manifest.base != expected_base {
+        return Err(
+            "incremental bundle base checkpoint does not match local peer state".to_string(),
+        );
+    }
+    if bundle.manifest.base.commit_inventory.is_none() {
+        return Err("incremental bundle cannot replace complete-state bootstrap".to_string());
+    }
+    match expected_resume {
+        Some(resume)
+            if resume.transfer_id == bundle.manifest.transfer_id
+                && resume.next_segment_index == bundle.manifest.segment_index
+                && bundle.manifest.previous_segment_sha256.as_deref()
+                    == Some(resume.previous_segment_sha256.as_slice()) => {}
+        Some(_) => {
+            return Err(
+                "incremental bundle does not match the saved transfer resume state".to_string(),
+            )
+        }
+        None if bundle.manifest.segment_index == 0
+            && bundle.manifest.previous_segment_sha256.is_none() => {}
+        None => {
+            return Err("resumed incremental bundle requires matching transfer state".to_string())
+        }
+    }
+
+    let device_id = latest_device_id(conn)?.unwrap_or_else(|| "mdbx-cli-sync".to_string());
+    let ctx = CommitContext::new(device_id);
+    let mut auxiliary_envelopes = Vec::with_capacity(bundle.auxiliary_deltas.len());
+    for delta in &bundle.manifest.delta_inventory {
+        if delta.batch_kind != IncrementalDeltaKind::Auxiliary {
+            continue;
+        }
+        let payload = bundle
+            .auxiliary_deltas
+            .iter()
+            .find(|payload| payload.object_id == delta.batch_id)
+            .ok_or_else(|| format!("missing auxiliary delta payload {}", delta.batch_id))?;
+        let envelope = decode_sync_delta_object_payload(conn, payload, SyncDeltaLimits::default())
+            .map_err(|error| format!("invalid auxiliary delta {}: {error}", delta.batch_id))?
+            .ok_or_else(|| format!("unrecognized auxiliary delta payload {}", delta.batch_id))?;
+        auxiliary_envelopes.push(envelope);
+    }
+    SyncApplyRepo::apply_incremental_batch_mut(
+        conn,
+        &ctx,
+        &CommitBatch::new(bundle.commits.clone(), 0, true),
+        &auxiliary_envelopes,
+    )
+    .map_err(|error| format!("storage-core incremental segment apply failed: {error}"))
+}
+
+fn next_cli_sync_resume(bundle: &IncrementalSyncBundle) -> Result<Option<CliSyncResume>, String> {
+    if bundle.manifest.is_last {
+        return Ok(None);
+    }
+    let next_segment_index = bundle
+        .manifest
+        .segment_index
+        .checked_add(1)
+        .ok_or_else(|| "incremental segment index overflow".to_string())?;
+    Ok(Some(CliSyncResume {
+        transfer_id: bundle.manifest.transfer_id.clone(),
+        next_segment_index,
+        previous_segment_sha256: incremental_bundle_payload_sha256(bundle)
+            .map_err(|error| format!("failed to digest incremental segment: {error}"))?,
+    }))
+}
+
+fn read_cli_sync_checkpoint(
+    path: &Path,
+    expected_vault_id: &str,
+) -> Result<CliSyncCheckpointFile, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read checkpoint '{}': {error}", path.display()))?;
+    let checkpoint: CliSyncCheckpointFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid checkpoint '{}': {error}", path.display()))?;
+    if checkpoint.format != CLI_SYNC_CHECKPOINT_FORMAT {
+        return Err(format!(
+            "unsupported checkpoint format: {}",
+            checkpoint.format
+        ));
+    }
+    if checkpoint.vault_id != expected_vault_id {
+        return Err(format!(
+            "checkpoint vault_id {} does not match {}",
+            checkpoint.vault_id, expected_vault_id
+        ));
+    }
+    if checkpoint.checkpoint.commit_inventory.is_none()
+        || checkpoint.checkpoint.delta_inventory.is_none()
+    {
+        return Err("checkpoint does not represent a completed bootstrap".to_string());
+    }
+    if let Some(resume) = &checkpoint.resume {
+        if resume.transfer_id.is_empty()
+            || resume.next_segment_index == 0
+            || resume.previous_segment_sha256.len() != 32
+        {
+            return Err("checkpoint contains invalid transfer resume state".to_string());
+        }
+    }
+    Ok(checkpoint)
+}
+
+fn write_cli_sync_checkpoint(
+    path: &Path,
+    vault_id: &str,
+    checkpoint: &IncrementalBundleCheckpoint,
+    resume: Option<CliSyncResume>,
+) -> Result<(), String> {
+    let value = CliSyncCheckpointFile {
+        format: CLI_SYNC_CHECKPOINT_FORMAT.to_string(),
+        vault_id: vault_id.to_string(),
+        checkpoint: checkpoint.clone(),
+        resume,
+    };
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("failed to serialize sync checkpoint: {error}"))?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mdbx-sync-checkpoint-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to create temporary checkpoint: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| format!("failed to write temporary checkpoint: {error}"))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("failed to synchronize temporary checkpoint: {error}"))?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("failed to publish checkpoint: {}", error.error))?;
+    Ok(())
+}
+
 fn apply_sync_bundle(
     conn: &mut VaultConnection,
     bundle: &mdbx_sync::SyncBundle,
@@ -1756,6 +2246,43 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
         first.tombstones = tombstones;
     }
     Ok(commits)
+}
+
+fn load_serialized_commit(
+    conn: &VaultConnection,
+    commit_id: &str,
+) -> Result<SerializedCommit, String> {
+    let commit = conn
+        .inner()
+        .query_row(
+            "SELECT commit_id, device_id, local_seq, commit_kind, change_scope,
+                    changed_object_ids_ct, vector_clock, message_ct, created_at, integrity_tag
+             FROM commits WHERE commit_id = ?1",
+            [commit_id],
+            |row| {
+                Ok(Commit {
+                    commit_id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    local_seq: row.get::<_, i64>(2)? as u64,
+                    commit_kind: parse_commit_kind(&row.get::<_, String>(3)?),
+                    change_scope: parse_change_scope(&row.get::<_, String>(4)?),
+                    changed_object_ids_ct: row.get(5)?,
+                    vector_clock: row.get(6)?,
+                    message_ct: row.get(7)?,
+                    created_at: row.get(8)?,
+                    integrity_tag: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|error| format!("failed to read commit {commit_id}: {error}"))?;
+    Ok(SerializedCommit {
+        operation: operation_for_commit(conn, commit_id)
+            .map_err(|error| format!("failed to read operation for {commit_id}: {error}"))?,
+        parent_ids: parent_ids_for_commit(conn, commit_id)?,
+        tombstones: Vec::new(),
+        object_payloads: Vec::new(),
+        commit,
+    })
 }
 
 fn operation_for_commit(
@@ -3087,6 +3614,8 @@ mod tests {
             Commands::Sync {
                 action: SyncAction::Bundle {
                     output: bundle_path.clone(),
+                    base_checkpoint: None,
+                    result_checkpoint: None,
                 },
             },
         ))
@@ -3119,6 +3648,7 @@ mod tests {
             Commands::Sync {
                 action: SyncAction::Apply {
                     file: bundle_path.clone(),
+                    checkpoint: None,
                 },
             },
         ))
@@ -3152,6 +3682,220 @@ mod tests {
         assert_eq!(entry_title(&core_entries[0]), "Synced Login");
 
         let _ = std::fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn incremental_sync_bootstraps_once_then_transfers_only_new_state() {
+        let source = TempVault::new();
+        let target = TempVault::new();
+        let source_path = source.path();
+        let target_path = target.path();
+
+        run(init_cli(&source_path)).unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let base = current_incremental_checkpoint(&source_conn).unwrap();
+        drop(source_conn);
+        backup_vault(&source_path, &target_path);
+
+        run(cli(
+            &source_path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Incremental One".to_string(),
+                    group: Some("round-one".to_string()),
+                },
+            },
+        ))
+        .unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let device = cli_device_context();
+        TigaService::authorize_operation(
+            &source_conn,
+            &mdbx_core::tiga::TigaScope::Vault,
+            mdbx_core::tiga::TigaOperation::ChangeSecurityPolicy,
+            TigaAuthorizationContext {
+                session: None,
+                device: &device,
+                now_unix_secs: 1_000,
+            },
+        )
+        .unwrap();
+        let auxiliary_audit_id = TigaService::list_security_audit_events(&source_conn, 10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.operation == mdbx_core::tiga::TigaOperation::ChangeSecurityPolicy)
+            .unwrap()
+            .event_id;
+        let first = export_incremental_sync_bundle(&source_conn, &base).unwrap();
+        assert!(!first.commits.is_empty());
+        assert!(first
+            .commits
+            .iter()
+            .flat_map(|commit| &commit.object_payloads)
+            .all(|payload| payload.object_type != SYNC_STATE_OBJECT_TYPE));
+        assert!(first
+            .manifest
+            .delta_inventory
+            .iter()
+            .any(|delta| delta.batch_kind == IncrementalDeltaKind::Commit));
+        assert!(first
+            .manifest
+            .delta_inventory
+            .iter()
+            .any(|delta| delta.batch_kind == IncrementalDeltaKind::Auxiliary));
+        let first_commit_ids = first
+            .commits
+            .iter()
+            .map(|commit| commit.commit.commit_id.clone())
+            .collect::<HashSet<_>>();
+        let first_result = first.manifest.result.clone();
+        drop(source_conn);
+
+        let mut target_conn = open_unlocked(&target_path);
+        let first_apply = apply_incremental_sync_bundle(&mut target_conn, &first, &base).unwrap();
+        assert_eq!(first_apply.missing_parent_count, 0);
+        assert!(ProjectRepo::list_all(&target_conn)
+            .unwrap()
+            .iter()
+            .any(|project| project_title(project) == "Incremental One"));
+        let target_audits = TigaService::list_security_audit_events(&target_conn, 10).unwrap();
+        assert!(target_audits
+            .iter()
+            .any(|event| event.event_id == auxiliary_audit_id));
+
+        run(cli(
+            &source_path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Incremental Two".to_string(),
+                    group: Some("round-two".to_string()),
+                },
+            },
+        ))
+        .unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let second = export_incremental_sync_bundle(&source_conn, &first_result).unwrap();
+        assert!(!second.commits.is_empty());
+        assert!(second
+            .commits
+            .iter()
+            .all(|commit| !first_commit_ids.contains(&commit.commit.commit_id)));
+        drop(source_conn);
+
+        let stale_error =
+            apply_incremental_sync_bundle(&mut target_conn, &second, &base).unwrap_err();
+        assert!(stale_error.contains("base checkpoint does not match"));
+        assert!(!ProjectRepo::list_all(&target_conn)
+            .unwrap()
+            .iter()
+            .any(|project| project_title(project) == "Incremental Two"));
+
+        apply_incremental_sync_bundle(&mut target_conn, &second, &first_result).unwrap();
+        assert!(ProjectRepo::list_all(&target_conn)
+            .unwrap()
+            .iter()
+            .any(|project| project_title(project) == "Incremental Two"));
+    }
+
+    #[test]
+    fn incremental_sync_resumes_bounded_segments_and_retries_invalid_tail_atomically() {
+        let source = TempVault::new();
+        let target = TempVault::new();
+        let source_path = source.path();
+        let target_path = target.path();
+
+        run(init_cli(&source_path)).unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let base = current_incremental_checkpoint(&source_conn).unwrap();
+        drop(source_conn);
+        backup_vault(&source_path, &target_path);
+
+        for title in ["Segment One", "Segment Two", "Segment Three"] {
+            run(cli(
+                &source_path,
+                Commands::Project {
+                    action: ProjectAction::Create {
+                        title: title.to_string(),
+                        group: Some("segmented".to_string()),
+                    },
+                },
+            ))
+            .unwrap();
+        }
+        let source_conn = open_unlocked(&source_path);
+        let device = cli_device_context();
+        TigaService::authorize_operation(
+            &source_conn,
+            &mdbx_core::tiga::TigaScope::Vault,
+            mdbx_core::tiga::TigaOperation::ChangeSecurityPolicy,
+            TigaAuthorizationContext {
+                session: None,
+                device: &device,
+                now_unix_secs: 2_000,
+            },
+        )
+        .unwrap();
+        let audit_id = TigaService::list_security_audit_events(&source_conn, 10).unwrap()[0]
+            .event_id
+            .clone();
+
+        let first = export_incremental_sync_segment(&source_conn, &base, None).unwrap();
+        assert!(!first.manifest.is_last);
+        assert_eq!(first.manifest.segment_index, 0);
+        let resume = next_cli_sync_resume(&first).unwrap().unwrap();
+
+        let mut target_conn = open_unlocked(&target_path);
+        apply_incremental_sync_segment(&mut target_conn, &first, &base, None).unwrap();
+        assert_eq!(ProjectRepo::list_all(&target_conn).unwrap().len(), 2);
+
+        let second =
+            export_incremental_sync_segment(&source_conn, &first.manifest.result, Some(&resume))
+                .unwrap();
+        assert!(second.manifest.is_last);
+        assert_eq!(second.manifest.segment_index, 1);
+        assert_eq!(second.manifest.transfer_id, first.manifest.transfer_id);
+        assert_eq!(
+            second.manifest.previous_segment_sha256.as_deref(),
+            Some(resume.previous_segment_sha256.as_slice())
+        );
+        drop(source_conn);
+
+        let mut wrong_resume = resume.clone();
+        wrong_resume.previous_segment_sha256 = vec![0; 32];
+        let chain_error = apply_incremental_sync_segment(
+            &mut target_conn,
+            &second,
+            &first.manifest.result,
+            Some(&wrong_resume),
+        )
+        .unwrap_err();
+        assert!(chain_error.contains("does not match the saved transfer resume state"));
+
+        let mut invalid = second.clone();
+        invalid.auxiliary_deltas[0].object_type = "unsupported-auxiliary".to_string();
+        let invalid_error = apply_incremental_sync_segment(
+            &mut target_conn,
+            &invalid,
+            &first.manifest.result,
+            Some(&resume),
+        )
+        .unwrap_err();
+        assert!(invalid_error.contains("unrecognized auxiliary delta payload"));
+        assert_eq!(ProjectRepo::list_all(&target_conn).unwrap().len(), 2);
+
+        apply_incremental_sync_segment(
+            &mut target_conn,
+            &second,
+            &first.manifest.result,
+            Some(&resume),
+        )
+        .unwrap();
+        assert_eq!(ProjectRepo::list_all(&target_conn).unwrap().len(), 3);
+        assert!(TigaService::list_security_audit_events(&target_conn, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_id == audit_id));
+        assert!(next_cli_sync_resume(&second).unwrap().is_none());
     }
 
     #[test]

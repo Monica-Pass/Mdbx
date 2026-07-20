@@ -157,6 +157,62 @@ impl SyncApplyRepo {
         Ok(result)
     }
 
+    /// Atomically apply one incremental transfer segment.
+    ///
+    /// Commit-associated deltas are carried by `batch`; audit-only and other
+    /// auxiliary deltas are applied in the same SQLite transaction. A failure
+    /// anywhere in the segment leaves no partially applied domain state.
+    pub fn apply_incremental_batch_mut(
+        conn: &mut VaultConnection,
+        ctx: &CommitContext,
+        batch: &CommitBatch,
+        auxiliary_deltas: &[SyncDeltaEnvelope],
+    ) -> StorageResult<ApplyBatchResult> {
+        let delta_limits = SyncDeltaLimits::default();
+        for envelope in auxiliary_deltas {
+            envelope.verify(conn, delta_limits)?;
+            if envelope.batch_kind != SyncDeltaBatchKind::Auxiliary {
+                return Err(StorageError::Validation(
+                    "incremental auxiliary payload contains a commit delta".to_string(),
+                ));
+            }
+        }
+
+        let mut result = conn.with_immediate_transaction_mut(|conn| {
+            let mut result =
+                Self::apply_batch_inner(conn, ctx, batch, true, SyncStateLimits::default())?;
+            if result.missing_parent_count != 0 {
+                return Err(StorageError::Validation(format!(
+                    "incremental segment is missing {} commit parent(s)",
+                    result.missing_parent_count
+                )));
+            }
+            for envelope in auxiliary_deltas {
+                result.conflict_count = result
+                    .conflict_count
+                    .checked_add(Self::apply_auxiliary_delta_with_limits(
+                        conn,
+                        ctx,
+                        envelope,
+                        delta_limits,
+                    )?)
+                    .ok_or_else(|| {
+                        StorageError::Validation("incremental conflict count overflow".to_string())
+                    })?;
+            }
+            Ok(result)
+        })?;
+
+        if conn.active_key_epoch_id().is_some() {
+            if let Err(error) = UnlockService::refresh_verified_keyring(conn) {
+                conn.clear_session();
+                return Err(error);
+            }
+        }
+        result.missing_parent_count = 0;
+        Ok(result)
+    }
+
     fn apply_batch_inner(
         conn: &VaultConnection,
         ctx: &CommitContext,
@@ -234,8 +290,7 @@ impl SyncApplyRepo {
             .map(|head| serialized.parent_ids.iter().any(|parent| parent == head))
             .unwrap_or(true);
 
-        conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
-        let tx_result: StorageResult<ApplyOutcome> = (|| {
+        conn.with_immediate_transaction(|| {
             Self::insert_commit(conn, serialized)?;
             Self::acknowledge_received_tombstones(conn, ctx, serialized)?;
             if fast_forward {
@@ -284,25 +339,7 @@ impl SyncApplyRepo {
                     ApplyOutcome::Conflict
                 })
             }
-        })();
-
-        match tx_result {
-            Ok(outcome) => {
-                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
-                    conn,
-                    crate::sync_delta::SyncDeltaLimits::default(),
-                ) {
-                    let _ = conn.inner().execute_batch("ROLLBACK;");
-                    return Err(error);
-                }
-                conn.inner().execute_batch("COMMIT;")?;
-                Ok(outcome)
-            }
-            Err(err) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                Err(err)
-            }
-        }
+        })
     }
 
     fn insert_commit(conn: &VaultConnection, serialized: &SerializedCommit) -> StorageResult<()> {
@@ -4522,6 +4559,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(batch_count, 1);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn incremental_segment_rolls_back_commits_when_auxiliary_decode_fails() {
+        let source_path = temp_vault_path("incremental-atomic-source");
+        let target_path = temp_vault_path("incremental-atomic-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("incremental-atomic-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let project = ProjectRepo::create(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            "Atomic project",
+            None,
+            None,
+        )
+        .unwrap();
+        let commit_envelope = latest_delta_envelope_for_test(&source);
+        let mut commits = serialized_commits_from(&source)
+            .into_iter()
+            .filter(|commit| commit.commit.commit_id == project.head_commit_id)
+            .collect::<Vec<_>>();
+        attach_delta_payload_to_commits(&source, &mut commits, &commit_envelope);
+        let malformed_auxiliary = crate::sync_delta::SyncDeltaEnvelope::new(
+            &source,
+            crate::sync_delta::NewSyncDeltaEnvelope {
+                batch_id: "malformed-auxiliary".to_string(),
+                batch_kind: SyncDeltaBatchKind::Auxiliary,
+                commit_ids: Vec::new(),
+                logical_row_count: 0,
+                payload: b"not-a-sync-delta-body".to_vec(),
+                created_at: "2026-07-21T00:00:00Z".to_string(),
+            },
+            SyncDeltaLimits::default(),
+        )
+        .unwrap();
+
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        let error = SyncApplyRepo::apply_incremental_batch_mut(
+            &mut target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(commits, 0, true),
+            &[malformed_auxiliary],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("schema creation failed"));
+        assert!(!SyncApplyRepo::commit_exists(&target, &project.head_commit_id).unwrap());
+        assert!(ProjectRepo::get_by_id(&target, &project.project_id)
+            .unwrap()
+            .is_none());
+        assert!(load_sync_delta_envelope(
+            &target,
+            &commit_envelope.batch_id,
+            SyncDeltaLimits::default()
+        )
+        .unwrap()
+        .is_none());
 
         drop(source);
         drop(target);

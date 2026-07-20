@@ -52,7 +52,7 @@ pub struct SyncBundle {
     pub commits: Vec<SerializedCommit>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IncrementalBundleCheckpoint {
     /// Opaque source-owned commit inventory checkpoint. `None` means bootstrap.
@@ -470,6 +470,29 @@ pub fn write_incremental_bundle(
 ) -> SyncResult<()> {
     bundle.validate()?;
     write_versioned_payload(INCREMENTAL_BUNDLE_VERSION, bundle, writer)
+}
+
+/// Return the SHA-256 digest written in a v4 bundle trailer.
+///
+/// Segment checkpoints use this digest to bind the next segment to the exact
+/// payload that was previously exported and durably applied.
+pub fn incremental_bundle_payload_sha256(bundle: &IncrementalSyncBundle) -> SyncResult<Vec<u8>> {
+    bundle.validate()?;
+    let mut counter = LimitedCountingWriter::new(HARD_MAX_BUNDLE_PAYLOAD_BYTES);
+    let mut hashing_writer = HashingWriter::new(&mut counter);
+    bincode::serde::encode_into_std_write(bundle, &mut hashing_writer, bincode::config::standard())
+        .map_err(|error| {
+            if let Some(actual) = hashing_writer.inner.exceeded_at() {
+                SyncError::ResourceLimit {
+                    resource: "sync bundle payload".to_string(),
+                    actual,
+                    limit: HARD_MAX_BUNDLE_PAYLOAD_BYTES,
+                }
+            } else {
+                map_bundle_encode_error(error)
+            }
+        })?;
+    Ok(hashing_writer.finalize().to_vec())
 }
 
 fn write_versioned_payload<T: Serialize>(
@@ -1038,6 +1061,10 @@ mod tests {
             INCREMENTAL_BUNDLE_VERSION
         );
         assert_eq!(declared_payload_len(&bytes) as usize, bytes.len() - 64);
+        assert_eq!(
+            incremental_bundle_payload_sha256(&bundle).unwrap(),
+            bytes[bytes.len() - BUNDLE_HASH_BYTES..]
+        );
 
         let restored = bundle_file_from_bytes(&bytes).unwrap();
         match restored {

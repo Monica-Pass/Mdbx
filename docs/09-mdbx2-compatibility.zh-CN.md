@@ -67,7 +67,9 @@ schema 6 到 schema 11 继续采用顺序附加迁移：schema 7 增加通用关
 
 schema 12 增加本地稳定 commit 库存，迁移过程保持 commit 身份不变，并按照 parent-before-child 顺序回填。schema 13 增加状态 delta 批次库存、规范化 commit 关联、有界版本化信封规则，以及固定在迁移 commit 水位的 bootstrap floor。schema 14 为所有参与同步的核心状态族增加事务级逻辑变更采集；每个外层写事务提交前，MDBX 会对逻辑键去重，物化有界状态体，并将 commit 关联批次或 auxiliary 批次与业务行原子保存。创建或升级 vault 时产生的 bootstrap 变更会在同一事务中清除，因为这些状态已经由 floor 覆盖。迁移过程不会虚构历史 delta；早于 floor 的 checkpoint 继续使用有界完整状态完成首次同步。
 
-storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。auxiliary 批次通过独立原子入口应用，绝不创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。当前 CLI 与 bundle v3 exporter 仍发送有界完整状态；真正的增量 bundle 选择与 checkpoint 属于 bundle v4。
+storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。
+
+CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4。未完成的 v4 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。自动 peer 能力协商与可复用同步客户端 facade 仍属于后续协议层工作。
 
 ## 4. Schema 演进规则
 
