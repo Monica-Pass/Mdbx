@@ -749,6 +749,7 @@ version = "0.2.0"
 dependencies = [
  "mdbx-core",
  "mdbx-storage",
+ "mdbx-sync",
  "rusqlite",
  "serde",
  "serde_json",
