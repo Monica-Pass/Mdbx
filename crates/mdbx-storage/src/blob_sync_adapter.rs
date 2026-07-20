@@ -12,7 +12,7 @@ use crate::blob_lifecycle::{
 };
 use crate::blob_store::{
     validate_blob_id, EncryptedBlobMetadata, EncryptedBlobTransferStore,
-    ManageableEncryptedBlobStore,
+    ManageableEncryptedBlobStore, RecoverableEncryptedBlobTransferStore,
 };
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
@@ -202,6 +202,255 @@ impl BlobSyncSourceAdapter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobSyncDestinationState {
+    AlreadyPresent,
+    TransferRequired,
+    SourceMissing,
+    SourceSizeInvalid,
+    DestinationConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSyncDestinationItem {
+    pub blob_id: String,
+    pub total_size: Option<u64>,
+    pub destination_size: Option<u64>,
+    pub state: BlobSyncDestinationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSyncManifestInspection {
+    pub source_namespace_id: String,
+    pub destination_namespace_id: String,
+    pub checkpoint: String,
+    pub items: Vec<BlobSyncDestinationItem>,
+}
+
+impl BlobSyncManifestInspection {
+    pub fn is_converged(&self) -> bool {
+        self.items
+            .iter()
+            .all(|item| item.state == BlobSyncDestinationState::AlreadyPresent)
+    }
+
+    pub fn transfer_required(&self) -> impl Iterator<Item = &BlobSyncDestinationItem> {
+        self.items
+            .iter()
+            .filter(|item| item.state == BlobSyncDestinationState::TransferRequired)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSyncDestinationLimits {
+    pub lifecycle: BlobLifecycleLimits,
+    pub lease_ttl_secs: i64,
+}
+
+impl Default for BlobSyncDestinationLimits {
+    fn default() -> Self {
+        Self {
+            lifecycle: BlobLifecycleLimits::default(),
+            lease_ttl_secs: 5 * 60,
+        }
+    }
+}
+
+impl BlobSyncDestinationLimits {
+    fn validate(self) -> StorageResult<()> {
+        self.lifecycle.validate()?;
+        if !(1..=crate::blob_store::MAX_BLOB_LEASE_TTL_SECS).contains(&self.lease_ttl_secs) {
+            return Err(StorageError::Validation(format!(
+                "Blob sync destination lease TTL must be between 1 and {} seconds",
+                crate::blob_store::MAX_BLOB_LEASE_TTL_SECS
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub struct BlobSyncDestinationAdapter;
+
+impl BlobSyncDestinationAdapter {
+    pub fn inspect_manifest<S>(
+        destination: &S,
+        response: &BlobManifestPageResponse,
+        limits: BlobSyncDestinationLimits,
+    ) -> StorageResult<BlobSyncManifestInspection>
+    where
+        S: BlobSyncDestinationStore + ?Sized,
+    {
+        limits.validate()?;
+        response
+            .validate()
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        let destination_namespace_id = EncryptedBlobTransferStore::namespace_id(destination)?;
+        validate_namespace(&destination_namespace_id)?;
+        if destination_namespace_id == response.namespace_id {
+            return Err(StorageError::ConstraintViolation(
+                "Blob sync source and destination namespaces must differ".to_string(),
+            ));
+        }
+        let inventory = collect_provider_inventory(destination, limits.lifecycle)?;
+        let items = response
+            .items
+            .iter()
+            .map(|item| inspect_item(item, inventory.get(&item.blob_id)))
+            .collect();
+        Ok(BlobSyncManifestInspection {
+            source_namespace_id: response.namespace_id.clone(),
+            destination_namespace_id,
+            checkpoint: response.checkpoint.clone(),
+            items,
+        })
+    }
+
+    /// A manifest page is acknowledged only after every available item is
+    /// already present with the declared size. Missing/invalid source entries
+    /// and destination conflicts remain visible to the caller as blockers.
+    pub fn acknowledge_manifest_page<S>(
+        destination: &S,
+        client: &mut mdbx_sync::SyncClient,
+        response: &BlobManifestPageResponse,
+        limits: BlobSyncDestinationLimits,
+    ) -> StorageResult<BlobSyncManifestInspection>
+    where
+        S: BlobSyncDestinationStore + ?Sized,
+    {
+        let inspection = Self::inspect_manifest(destination, response, limits)?;
+        if !inspection.is_converged() {
+            return Err(StorageError::ConstraintViolation(
+                "Blob sync manifest page still has transfer or blocked items".to_string(),
+            ));
+        }
+        client
+            .acknowledge_blob_manifest_page(response)
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        Ok(inspection)
+    }
+
+    /// Durably write one validated chunk before advancing the SyncClient
+    /// offset. Failed final verification abandons the staged bytes and resets
+    /// the client so a retry cannot remain poisoned by bad ciphertext.
+    pub fn apply_chunk<S>(
+        destination: &S,
+        client: &mut mdbx_sync::SyncClient,
+        response: &BlobChunkResponse,
+        owner_id: &str,
+        limits: BlobSyncDestinationLimits,
+    ) -> StorageResult<()>
+    where
+        S: RecoverableEncryptedBlobTransferStore + ManageableEncryptedBlobStore + ?Sized,
+    {
+        limits.validate()?;
+        validate_owner_id(owner_id)?;
+        client
+            .validate_blob_chunk_response(response)
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        let destination_namespace_id = EncryptedBlobTransferStore::namespace_id(destination)?;
+        validate_namespace(&destination_namespace_id)?;
+        if destination_namespace_id == response.namespace_id {
+            return Err(StorageError::ConstraintViolation(
+                "Blob chunk source and destination namespaces must differ".to_string(),
+            ));
+        }
+        let now = now_unix_secs()?;
+        EncryptedBlobTransferStore::acquire_lease(
+            destination,
+            &response.blob_id,
+            owner_id,
+            now,
+            limits.lease_ttl_secs,
+        )?;
+        let write_result = EncryptedBlobTransferStore::write_chunk(
+            destination,
+            &response.blob_id,
+            response.total_size,
+            response.offset,
+            &response.ciphertext,
+            response.is_last,
+        );
+        if let Err(error) = write_result {
+            let reset_result = RecoverableEncryptedBlobTransferStore::abort_transfer(
+                destination,
+                &response.blob_id,
+                owner_id,
+            );
+            let _ =
+                EncryptedBlobTransferStore::release_lease(destination, &response.blob_id, owner_id);
+            if reset_result.is_ok() {
+                client
+                    .restart_blob_transfer_after_abort(&response.blob_id, response.total_size)
+                    .map_err(|reset_error| StorageError::Validation(reset_error.to_string()))?;
+            }
+            return Err(error);
+        }
+        let acknowledge_result = client.acknowledge_blob_chunk(response).map_err(|error| {
+            StorageError::Validation(format!(
+                "Blob chunk was durable but client acknowledgement failed: {error}"
+            ))
+        });
+        let release_result =
+            EncryptedBlobTransferStore::release_lease(destination, &response.blob_id, owner_id);
+        acknowledge_result?;
+        release_result
+    }
+}
+
+pub trait BlobSyncDestinationStore:
+    RecoverableEncryptedBlobTransferStore + ManageableEncryptedBlobStore
+{
+}
+
+impl<T> BlobSyncDestinationStore for T where
+    T: RecoverableEncryptedBlobTransferStore + ManageableEncryptedBlobStore
+{
+}
+
+fn inspect_item(
+    item: &BlobManifestEntry,
+    destination: Option<&EncryptedBlobMetadata>,
+) -> BlobSyncDestinationItem {
+    let destination_size = destination.map(|metadata| metadata.stored_size);
+    let state = match item.state {
+        BlobManifestEntryState::SourceMissing => BlobSyncDestinationState::SourceMissing,
+        BlobManifestEntryState::SourceSizeInvalid => BlobSyncDestinationState::SourceSizeInvalid,
+        BlobManifestEntryState::Available => match (item.total_size, destination) {
+            (Some(_total_size), None) => BlobSyncDestinationState::TransferRequired,
+            (Some(total_size), Some(metadata)) if metadata.stored_size == total_size => {
+                BlobSyncDestinationState::AlreadyPresent
+            }
+            (Some(_), Some(_)) => BlobSyncDestinationState::DestinationConflict,
+            (None, _) => BlobSyncDestinationState::SourceSizeInvalid,
+        },
+    };
+    BlobSyncDestinationItem {
+        blob_id: item.blob_id.clone(),
+        total_size: item.total_size,
+        destination_size,
+        state,
+    }
+}
+
+fn validate_owner_id(owner_id: &str) -> StorageResult<()> {
+    if owner_id.is_empty() || owner_id.len() > 512 || owner_id.contains('\n') {
+        return Err(StorageError::Validation(
+            "Blob sync owner ID must contain 1 to 512 bytes without newlines".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn now_unix_secs() -> StorageResult<i64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::Validation("system clock is before Unix epoch".to_string()))?
+        .as_secs()
+        .try_into()
+        .map_err(|_| StorageError::Validation("system clock exceeds SQLite range".to_string()))
+}
+
 fn manifest_entry(
     blob_id: &str,
     declared_max_bytes: u64,
@@ -286,9 +535,12 @@ mod tests {
     use std::io::Cursor;
 
     use mdbx_crypto::keyring::Keyring;
-    use mdbx_sync::MAX_BLOB_ID_BYTES;
+    use mdbx_sync::{
+        BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState, BlobManifestPageResponse,
+        BlobSyncPhase, SyncClient, SyncNegotiator, MAX_BLOB_ID_BYTES,
+    };
 
-    use crate::blob_store::{EncryptedBlobStore, FileSystemBlobStore};
+    use crate::blob_store::{compute_blob_id, EncryptedBlobStore, FileSystemBlobStore};
     use crate::connection::VaultConnection;
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::{AttachmentRepo, AttachmentWriteOptions, CommitContext, ProjectRepo};
@@ -330,6 +582,37 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+
+    fn negotiated_client(namespace_id: &str) -> SyncClient {
+        let mut local = SyncNegotiator::new("destination", Vec::new(), Vec::new());
+        local.enable_blob_replication_capabilities().unwrap();
+        let mut client = SyncClient::new(local, None, None);
+        client.begin_blob_sync(namespace_id.to_string()).unwrap();
+        let hello = client.hello().unwrap();
+        let mut peer = SyncNegotiator::new("source", Vec::new(), Vec::new());
+        peer.enable_blob_replication_capabilities().unwrap();
+        let ack = peer.on_hello(&hello).unwrap();
+        client.on_hello_ack(&ack).unwrap();
+        client
+    }
+
+    fn response_for(
+        blob_id: &str,
+        total_size: u64,
+        offset: u64,
+        ciphertext: Vec<u8>,
+    ) -> BlobChunkResponse {
+        let is_last = offset + ciphertext.len() as u64 == total_size;
+        BlobChunkResponse::new(
+            "source-namespace".to_string(),
+            blob_id.to_string(),
+            total_size,
+            offset,
+            ciphertext,
+            is_last,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -412,5 +695,162 @@ mod tests {
             BlobSyncSourceLimits::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn destination_writes_chunks_before_advancing_and_acknowledges_convergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = FileSystemBlobStore::new(directory.path().join("destination.blobs"));
+        let payload = b"destination payload".to_vec();
+        let blob_id = compute_blob_id(&payload);
+        let manifest = BlobManifestPageResponse::new(
+            "source-namespace".to_string(),
+            "checkpoint".to_string(),
+            vec![BlobManifestEntry {
+                blob_id: blob_id.clone(),
+                total_size: Some(payload.len() as u64),
+                state: BlobManifestEntryState::Available,
+            }],
+            None,
+        )
+        .unwrap();
+        let mut client = negotiated_client("source-namespace");
+        client.blob_manifest_request(8).unwrap();
+        client.validate_blob_manifest_response(&manifest).unwrap();
+        let inspection = BlobSyncDestinationAdapter::inspect_manifest(
+            &destination,
+            &manifest,
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            inspection.items[0].state,
+            BlobSyncDestinationState::TransferRequired
+        );
+
+        let first_request = client
+            .blob_chunk_request(blob_id.clone(), payload.len() as u64, 5)
+            .unwrap();
+        let first = response_for(
+            &blob_id,
+            payload.len() as u64,
+            first_request.offset,
+            payload[..5].to_vec(),
+        );
+        BlobSyncDestinationAdapter::apply_chunk(
+            &destination,
+            &mut client,
+            &first,
+            "destination-owner",
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(client.blob_resume().unwrap().next_durable_offset, 5);
+
+        let second_request = client
+            .blob_chunk_request(blob_id.clone(), payload.len() as u64, 64)
+            .unwrap();
+        let second = response_for(
+            &blob_id,
+            payload.len() as u64,
+            second_request.offset,
+            payload[5..].to_vec(),
+        );
+        BlobSyncDestinationAdapter::apply_chunk(
+            &destination,
+            &mut client,
+            &second,
+            "destination-owner",
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(destination.get(&blob_id, payload.len()).unwrap(), payload);
+        let final_inspection = BlobSyncDestinationAdapter::acknowledge_manifest_page(
+            &destination,
+            &mut client,
+            &manifest,
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert!(final_inspection.is_converged());
+        assert_eq!(client.blob_sync_phase(), BlobSyncPhase::Complete);
+    }
+
+    #[test]
+    fn destination_aborts_bad_final_verification_and_restarts_from_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = FileSystemBlobStore::new(directory.path().join("destination.blobs"));
+        let payload = b"0123456789".to_vec();
+        let blob_id = compute_blob_id(&payload);
+        let manifest = BlobManifestPageResponse::new(
+            "source-namespace".to_string(),
+            "checkpoint".to_string(),
+            vec![BlobManifestEntry {
+                blob_id: blob_id.clone(),
+                total_size: Some(payload.len() as u64),
+                state: BlobManifestEntryState::Available,
+            }],
+            None,
+        )
+        .unwrap();
+        let mut client = negotiated_client("source-namespace");
+        client.blob_manifest_request(8).unwrap();
+        client.validate_blob_manifest_response(&manifest).unwrap();
+        let first_request = client
+            .blob_chunk_request(blob_id.clone(), payload.len() as u64, 5)
+            .unwrap();
+        let bad_first = response_for(
+            &blob_id,
+            payload.len() as u64,
+            first_request.offset,
+            b"xxxxx".to_vec(),
+        );
+        BlobSyncDestinationAdapter::apply_chunk(
+            &destination,
+            &mut client,
+            &bad_first,
+            "destination-owner",
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(client.blob_resume().unwrap().next_durable_offset, 5);
+
+        let final_request = client
+            .blob_chunk_request(blob_id.clone(), payload.len() as u64, 64)
+            .unwrap();
+        let bad_final = response_for(
+            &blob_id,
+            payload.len() as u64,
+            final_request.offset,
+            payload[5..].to_vec(),
+        );
+        assert!(BlobSyncDestinationAdapter::apply_chunk(
+            &destination,
+            &mut client,
+            &bad_final,
+            "destination-owner",
+            BlobSyncDestinationLimits::default()
+        )
+        .is_err());
+        assert_eq!(client.blob_resume().unwrap().next_durable_offset, 0);
+
+        let retry_request = client
+            .blob_chunk_request(blob_id.clone(), payload.len() as u64, 64)
+            .unwrap();
+        let retry = response_for(
+            &blob_id,
+            payload.len() as u64,
+            retry_request.offset,
+            payload.clone(),
+        );
+        BlobSyncDestinationAdapter::apply_chunk(
+            &destination,
+            &mut client,
+            &retry,
+            "destination-owner",
+            BlobSyncDestinationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(destination.get(&blob_id, payload.len()).unwrap(), payload);
     }
 }

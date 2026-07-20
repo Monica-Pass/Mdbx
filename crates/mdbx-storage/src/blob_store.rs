@@ -95,6 +95,13 @@ pub trait EncryptedBlobTransferStore: EncryptedBlobStore {
     fn release_lease(&self, blob_id: &str, owner_id: &str) -> StorageResult<()>;
 }
 
+/// Optional recovery capability for untrusted or interrupted remote
+/// transfers. Implementations remove only incomplete staged bytes and must
+/// never delete an already published content-addressed object.
+pub trait RecoverableEncryptedBlobTransferStore: EncryptedBlobTransferStore {
+    fn abort_transfer(&self, blob_id: &str, owner_id: &str) -> StorageResult<()>;
+}
+
 pub fn validate_blob_id(blob_id: &str) -> StorageResult<()> {
     if blob_id.len() != 64
         || !blob_id
@@ -126,7 +133,8 @@ mod filesystem {
     use super::{
         compute_blob_id, validate_blob_id, BlobLease, EncryptedBlobMetadata, EncryptedBlobPage,
         EncryptedBlobStore, EncryptedBlobTransferStore, ManageableEncryptedBlobStore,
-        MAX_BLOB_LEASE_TTL_SECS, MAX_BLOB_PAGE_SIZE, MAX_BLOB_TRANSFER_CHUNK_SIZE,
+        RecoverableEncryptedBlobTransferStore, MAX_BLOB_LEASE_TTL_SECS, MAX_BLOB_PAGE_SIZE,
+        MAX_BLOB_TRANSFER_CHUNK_SIZE,
     };
     use crate::error::{StorageError, StorageResult};
 
@@ -775,6 +783,31 @@ mod filesystem {
                 let _ = fs::remove_file(path);
             }
             Ok(())
+        }
+    }
+
+    impl RecoverableEncryptedBlobTransferStore for FileSystemBlobStore {
+        fn abort_transfer(&self, blob_id: &str, owner_id: &str) -> StorageResult<()> {
+            validate_blob_id(blob_id)?;
+            Self::validate_lease_inputs(owner_id, 0, 1)?;
+            let lease_path = self.lease_path(blob_id)?;
+            if let Some((lease_owner, _)) = Self::read_lease(&lease_path)? {
+                if lease_owner != owner_id {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob {blob_id} transfer is leased by another owner"
+                    )));
+                }
+            } else {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob {blob_id} transfer has no owner lease"
+                )));
+            }
+            let partial = self.transfer_path(blob_id)?;
+            match fs::remove_file(partial) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(StorageError::Io(error)),
+            }
         }
     }
 }

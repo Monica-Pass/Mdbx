@@ -707,6 +707,41 @@ impl SyncClient {
         Ok(())
     }
 
+    /// Reset an active Blob to offset zero after the storage Provider has
+    /// durably abandoned its partial bytes. This is the recovery path for a
+    /// final content-address verification failure.
+    pub fn restart_blob_transfer_after_abort(
+        &mut self,
+        blob_id: &str,
+        total_size: u64,
+    ) -> SyncResult<()> {
+        self.require_blob_replication()?;
+        let resume = self.blob_resume.as_mut().ok_or_else(|| {
+            SyncError::InvalidMessage(
+                "Blob synchronization has no durable resume state".to_string(),
+            )
+        })?;
+        match resume.current_blob_id.as_deref() {
+            Some(current) if current == blob_id && resume.total_size == total_size => {
+                resume.next_durable_offset = 0;
+            }
+            None if resume.total_size == 0 && resume.next_durable_offset == 0 => {}
+            _ => {
+                return Err(SyncError::InvalidMessage(
+                    "aborted Blob does not match the durable transfer state".to_string(),
+                ))
+            }
+        }
+        self.pending_blob_chunk_request = None;
+        self.pending_blob_chunk_response = None;
+        self.blob_phase = if self.pending_blob_manifest_response.is_some() {
+            BlobSyncPhase::AwaitingManifestAcknowledgement
+        } else {
+            BlobSyncPhase::Chunk
+        };
+        Ok(())
+    }
+
     /// Record a completed complete-state bootstrap. The storage adapter must
     /// call this only after the bootstrap transaction is durable.
     pub fn acknowledge_complete_bootstrap(
