@@ -18,6 +18,14 @@ pub const MAX_COMMIT_ID_BYTES: usize = 256;
 pub const CAPABILITY_DELTA_INVENTORY_PAGING_V1: &str = "delta-inventory-paging-v1";
 pub const CAPABILITY_INCREMENTAL_BUNDLE_V4: &str = "incremental-bundle-v4";
 pub const CAPABILITY_INCREMENTAL_RESUME_V1: &str = "incremental-resume-v1";
+pub const CAPABILITY_BLOB_MANIFEST_PAGING_V1: &str = "blob-manifest-paging-v1";
+pub const CAPABILITY_BLOB_CHUNK_TRANSFER_V1: &str = "blob-chunk-transfer-v1";
+pub const CAPABILITY_BLOB_TRANSFER_RESUME_V1: &str = "blob-transfer-resume-v1";
+pub const MAX_BLOB_MANIFEST_PAGE_ITEMS: usize = 512;
+pub const MAX_BLOB_TRANSFER_TOKEN_BYTES: usize = 4096;
+pub const MAX_BLOB_ID_BYTES: usize = 64;
+pub const MAX_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BLOB_TOTAL_SIZE: u64 = 1 << 40;
 pub const INCREMENTAL_SYNC_CAPABILITIES: [&str; 4] = [
     CAPABILITY_COMMIT_INVENTORY_PAGING_V1,
     CAPABILITY_DELTA_INVENTORY_PAGING_V1,
@@ -56,6 +64,18 @@ pub enum SyncMessage {
 
     /// Return a bounded, ordered state-delta inventory page.
     DeltaInventoryPageResponse(DeltaInventoryPageResponse),
+
+    /// Request a bounded page from the source Blob manifest.
+    BlobManifestPageRequest(BlobManifestPageRequest),
+
+    /// Return a bounded, ordered source Blob manifest page.
+    BlobManifestPageResponse(BlobManifestPageResponse),
+
+    /// Request one bounded ciphertext range from a source Blob.
+    BlobChunkRequest(BlobChunkRequest),
+
+    /// Return one durable-resume-compatible ciphertext range.
+    BlobChunkResponse(BlobChunkResponse),
 
     /// 发送一组合并 commit。
     CommitBatch(CommitBatch),
@@ -177,6 +197,68 @@ pub struct DeltaInventoryPageResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub checkpoint: String,
+}
+
+// ---------------------------------------------------------------------------
+// Blob manifest and ciphertext transfer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobManifestEntryState {
+    Available,
+    SourceMissing,
+    SourceSizeInvalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobManifestPageRequest {
+    pub namespace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub page_size: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobManifestPageResponse {
+    pub namespace_id: String,
+    pub checkpoint: String,
+    pub items: Vec<BlobManifestEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobManifestEntry {
+    pub blob_id: String,
+    pub total_size: Option<u64>,
+    pub state: BlobManifestEntryState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobChunkRequest {
+    pub namespace_id: String,
+    pub blob_id: String,
+    pub total_size: u64,
+    pub offset: u64,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobChunkResponse {
+    pub namespace_id: String,
+    pub blob_id: String,
+    pub total_size: u64,
+    pub offset: u64,
+    pub ciphertext: Vec<u8>,
+    pub is_last: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +424,10 @@ impl SyncMessage {
             Self::CommitInventoryPageResponse(response) => response.validate(),
             Self::DeltaInventoryPageRequest(request) => request.validate(),
             Self::DeltaInventoryPageResponse(response) => response.validate(),
+            Self::BlobManifestPageRequest(request) => request.validate(),
+            Self::BlobManifestPageResponse(response) => response.validate(),
+            Self::BlobChunkRequest(request) => request.validate(),
+            Self::BlobChunkResponse(response) => response.validate(),
             _ => Ok(()),
         }
     }
@@ -539,6 +625,207 @@ impl DeltaInventoryPageResponse {
     }
 }
 
+impl BlobManifestPageRequest {
+    pub fn new(
+        namespace_id: String,
+        checkpoint: Option<String>,
+        cursor: Option<String>,
+        page_size: usize,
+    ) -> SyncResult<Self> {
+        let page_size = u16::try_from(page_size).map_err(|_| {
+            SyncError::InvalidMessage(format!(
+                "Blob manifest page size must be between 1 and {MAX_BLOB_MANIFEST_PAGE_ITEMS}"
+            ))
+        })?;
+        let request = Self {
+            namespace_id,
+            checkpoint,
+            cursor,
+            page_size,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_blob_namespace(&self.namespace_id)?;
+        let page_size = usize::from(self.page_size);
+        if page_size == 0 || page_size > MAX_BLOB_MANIFEST_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "Blob manifest page size must be between 1 and {MAX_BLOB_MANIFEST_PAGE_ITEMS}"
+            )));
+        }
+        validate_optional_blob_token(self.checkpoint.as_deref(), "checkpoint")?;
+        validate_optional_blob_token(self.cursor.as_deref(), "cursor")
+    }
+}
+
+impl BlobManifestPageResponse {
+    pub fn new(
+        namespace_id: String,
+        checkpoint: String,
+        items: Vec<BlobManifestEntry>,
+        next_cursor: Option<String>,
+    ) -> SyncResult<Self> {
+        let response = Self {
+            namespace_id,
+            checkpoint,
+            items,
+            next_cursor,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_blob_namespace(&self.namespace_id)?;
+        validate_blob_token(&self.checkpoint, "checkpoint")?;
+        validate_optional_blob_token(self.next_cursor.as_deref(), "cursor")?;
+        if self.items.len() > MAX_BLOB_MANIFEST_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "Blob manifest page exceeds {MAX_BLOB_MANIFEST_PAGE_ITEMS} items"
+            )));
+        }
+        if self.items.is_empty() && self.next_cursor.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest page cannot continue without a position".to_string(),
+            ));
+        }
+        let mut previous = None;
+        for item in &self.items {
+            item.validate()?;
+            if previous.is_some_and(|value: &str| value >= item.blob_id.as_str()) {
+                return Err(SyncError::InvalidMessage(
+                    "Blob manifest IDs must be strictly increasing".to_string(),
+                ));
+            }
+            previous = Some(item.blob_id.as_str());
+        }
+        Ok(())
+    }
+}
+
+impl BlobManifestEntry {
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_blob_id(&self.blob_id)?;
+        match self.state {
+            BlobManifestEntryState::Available => {
+                let total_size = self.total_size.ok_or_else(|| {
+                    SyncError::InvalidMessage(
+                        "available Blob manifest entries require a total size".to_string(),
+                    )
+                })?;
+                validate_blob_total_size(total_size)?;
+            }
+            BlobManifestEntryState::SourceMissing | BlobManifestEntryState::SourceSizeInvalid => {
+                if let Some(total_size) = self.total_size {
+                    if total_size > MAX_BLOB_TOTAL_SIZE {
+                        return Err(SyncError::InvalidMessage(format!(
+                            "Blob total size exceeds {MAX_BLOB_TOTAL_SIZE} bytes"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BlobChunkRequest {
+    pub fn new(
+        namespace_id: String,
+        blob_id: String,
+        total_size: u64,
+        offset: u64,
+        max_bytes: usize,
+    ) -> SyncResult<Self> {
+        let max_bytes = u32::try_from(max_bytes).map_err(|_| {
+            SyncError::InvalidMessage(format!(
+                "Blob chunk size must be between 1 and {MAX_BLOB_CHUNK_BYTES} bytes"
+            ))
+        })?;
+        let request = Self {
+            namespace_id,
+            blob_id,
+            total_size,
+            offset,
+            max_bytes,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_blob_namespace(&self.namespace_id)?;
+        validate_blob_id(&self.blob_id)?;
+        validate_blob_total_size(self.total_size)?;
+        if self.offset >= self.total_size {
+            return Err(SyncError::InvalidMessage(
+                "Blob chunk offset must be below the total size".to_string(),
+            ));
+        }
+        let max_bytes = usize::try_from(self.max_bytes).map_err(|_| {
+            SyncError::InvalidMessage("Blob chunk size cannot be represented locally".to_string())
+        })?;
+        if max_bytes == 0 || max_bytes > MAX_BLOB_CHUNK_BYTES {
+            return Err(SyncError::InvalidMessage(format!(
+                "Blob chunk size must be between 1 and {MAX_BLOB_CHUNK_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl BlobChunkResponse {
+    pub fn new(
+        namespace_id: String,
+        blob_id: String,
+        total_size: u64,
+        offset: u64,
+        ciphertext: Vec<u8>,
+        is_last: bool,
+    ) -> SyncResult<Self> {
+        let response = Self {
+            namespace_id,
+            blob_id,
+            total_size,
+            offset,
+            ciphertext,
+            is_last,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_blob_namespace(&self.namespace_id)?;
+        validate_blob_id(&self.blob_id)?;
+        validate_blob_total_size(self.total_size)?;
+        if self.ciphertext.is_empty() || self.ciphertext.len() > MAX_BLOB_CHUNK_BYTES {
+            return Err(SyncError::InvalidMessage(format!(
+                "Blob chunk payload must be between 1 and {MAX_BLOB_CHUNK_BYTES} bytes"
+            )));
+        }
+        let chunk_len = u64::try_from(self.ciphertext.len()).map_err(|_| {
+            SyncError::InvalidMessage("Blob chunk length cannot be represented".to_string())
+        })?;
+        let end = self.offset.checked_add(chunk_len).ok_or_else(|| {
+            SyncError::InvalidMessage("Blob chunk offset overflows total size".to_string())
+        })?;
+        if self.offset >= self.total_size || end > self.total_size {
+            return Err(SyncError::InvalidMessage(
+                "Blob chunk range exceeds the total size".to_string(),
+            ));
+        }
+        if self.is_last != (end == self.total_size) {
+            return Err(SyncError::InvalidMessage(
+                "Blob chunk is_last flag does not match its range".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_capabilities(capabilities: &[String]) -> SyncResult<()> {
     if capabilities.len() > MAX_SYNC_CAPABILITIES {
         return Err(SyncError::InvalidMessage(format!(
@@ -591,6 +878,53 @@ fn validate_commit_id(commit_id: &str) -> SyncResult<()> {
     if commit_id.is_empty() || commit_id.len() > MAX_COMMIT_ID_BYTES {
         return Err(SyncError::InvalidMessage(format!(
             "commit ID must be between 1 and {MAX_COMMIT_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_blob_namespace(namespace_id: &str) -> SyncResult<()> {
+    if namespace_id.is_empty() || namespace_id.len() > MAX_BLOB_TRANSFER_TOKEN_BYTES {
+        return Err(SyncError::InvalidMessage(format!(
+            "Blob namespace ID must be between 1 and {MAX_BLOB_TRANSFER_TOKEN_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_blob_token(value: Option<&str>, kind: &str) -> SyncResult<()> {
+    if let Some(value) = value {
+        validate_blob_token(value, kind)?;
+    }
+    Ok(())
+}
+
+fn validate_blob_token(value: &str, kind: &str) -> SyncResult<()> {
+    if value.is_empty() || value.len() > MAX_BLOB_TRANSFER_TOKEN_BYTES {
+        return Err(SyncError::InvalidMessage(format!(
+            "Blob {kind} must be between 1 and {MAX_BLOB_TRANSFER_TOKEN_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_blob_id(blob_id: &str) -> SyncResult<()> {
+    if blob_id.len() != MAX_BLOB_ID_BYTES
+        || !blob_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SyncError::InvalidMessage(
+            "Blob ID must be exactly 64 lowercase SHA-256 hex characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_blob_total_size(total_size: u64) -> SyncResult<()> {
+    if total_size == 0 || total_size > MAX_BLOB_TOTAL_SIZE {
+        return Err(SyncError::InvalidMessage(format!(
+            "Blob total size must be between 1 and {MAX_BLOB_TOTAL_SIZE} bytes"
         )));
     }
     Ok(())
@@ -772,5 +1106,138 @@ mod tests {
             "x".repeat(MAX_COMMIT_INVENTORY_TOKEN_BYTES + 1)
         );
         assert!(SyncMessage::from_bytes(invalid_wire_message.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn blob_manifest_and_chunks_roundtrip_with_strict_bounds() {
+        let first_id = "0".repeat(MAX_BLOB_ID_BYTES);
+        let second_id = "1".repeat(MAX_BLOB_ID_BYTES);
+        let request = BlobManifestPageRequest::new(
+            "attachments".to_string(),
+            Some("manifest-checkpoint".to_string()),
+            None,
+            128,
+        )
+        .unwrap();
+        let message = SyncMessage::BlobManifestPageRequest(request.clone());
+        let restored = SyncMessage::from_bytes(&message.to_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            restored,
+            SyncMessage::BlobManifestPageRequest(value) if value == request
+        ));
+
+        let response = BlobManifestPageResponse::new(
+            "attachments".to_string(),
+            "manifest-checkpoint".to_string(),
+            vec![
+                BlobManifestEntry {
+                    blob_id: first_id,
+                    total_size: Some(8),
+                    state: BlobManifestEntryState::Available,
+                },
+                BlobManifestEntry {
+                    blob_id: second_id,
+                    total_size: Some(9),
+                    state: BlobManifestEntryState::Available,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        let message = SyncMessage::BlobManifestPageResponse(response.clone());
+        let restored = SyncMessage::from_bytes(&message.to_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            restored,
+            SyncMessage::BlobManifestPageResponse(value) if value == response
+        ));
+
+        let request = BlobChunkRequest::new(
+            "attachments".to_string(),
+            "a".repeat(MAX_BLOB_ID_BYTES),
+            8,
+            4,
+            4,
+        )
+        .unwrap();
+        assert!(request.validate().is_ok());
+        let response = BlobChunkResponse::new(
+            "attachments".to_string(),
+            "a".repeat(MAX_BLOB_ID_BYTES),
+            8,
+            4,
+            vec![1, 2, 3, 4],
+            true,
+        )
+        .unwrap();
+        assert!(response.validate().is_ok());
+    }
+
+    #[test]
+    fn blob_messages_reject_invalid_ids_ranges_and_order() {
+        assert!(BlobManifestPageRequest::new("ns".to_string(), None, None, 0).is_err());
+        assert!(BlobManifestPageRequest::new(
+            "ns".to_string(),
+            Some("x".repeat(MAX_BLOB_TRANSFER_TOKEN_BYTES + 1)),
+            None,
+            1,
+        )
+        .is_err());
+        assert!(BlobManifestPageResponse::new(
+            "ns".to_string(),
+            "checkpoint".to_string(),
+            vec![BlobManifestEntry {
+                blob_id: "A".repeat(MAX_BLOB_ID_BYTES),
+                total_size: Some(1),
+                state: BlobManifestEntryState::Available,
+            }],
+            None,
+        )
+        .is_err());
+        assert!(BlobManifestPageResponse::new(
+            "ns".to_string(),
+            "checkpoint".to_string(),
+            vec![BlobManifestEntry {
+                blob_id: "a".repeat(MAX_BLOB_ID_BYTES),
+                total_size: None,
+                state: BlobManifestEntryState::Available,
+            }],
+            Some("cursor".to_string()),
+        )
+        .is_err());
+        assert!(BlobChunkRequest::new(
+            "ns".to_string(),
+            "a".repeat(MAX_BLOB_ID_BYTES),
+            8,
+            8,
+            1,
+        )
+        .is_err());
+        assert!(BlobChunkResponse::new(
+            "ns".to_string(),
+            "a".repeat(MAX_BLOB_ID_BYTES),
+            8,
+            0,
+            vec![1, 2],
+            true,
+        )
+        .is_err());
+        assert!(BlobManifestPageResponse::new(
+            "ns".to_string(),
+            "checkpoint".to_string(),
+            vec![
+                BlobManifestEntry {
+                    blob_id: "b".repeat(MAX_BLOB_ID_BYTES),
+                    total_size: Some(1),
+                    state: BlobManifestEntryState::Available,
+                },
+                BlobManifestEntry {
+                    blob_id: "a".repeat(MAX_BLOB_ID_BYTES),
+                    total_size: Some(1),
+                    state: BlobManifestEntryState::Available,
+                },
+            ],
+            None,
+        )
+        .is_err());
     }
 }
