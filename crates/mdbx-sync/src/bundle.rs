@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 use crate::error::{SyncError, SyncResult};
@@ -9,6 +10,7 @@ use crate::message::{ObjectPayload, SerializedCommit, TombstoneRecord};
 const BUNDLE_MAGIC: &[u8; 8] = b"MDBXSYNC";
 /// 当前格式版本
 const BUNDLE_VERSION: u32 = 3;
+const INCREMENTAL_BUNDLE_VERSION: u32 = 4;
 const PREVIOUS_BUNDLE_VERSION: u32 = 2;
 const LEGACY_BUNDLE_VERSION: u32 = 1;
 const BUNDLE_RESERVED_BYTES: usize = 20;
@@ -17,6 +19,11 @@ pub const DEFAULT_MAX_BUNDLE_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
 pub const DESKTOP_MAX_BUNDLE_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const HARD_MAX_BUNDLE_PAYLOAD_BYTES: u64 = DESKTOP_MAX_BUNDLE_PAYLOAD_BYTES;
 const HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE: usize = HARD_MAX_BUNDLE_PAYLOAD_BYTES as usize;
+pub const INCREMENTAL_BUNDLE_FORMAT: &str = "mdbx-sync-incremental-v1";
+pub const MAX_INCREMENTAL_BUNDLE_COMMITS: usize = 4096;
+pub const MAX_INCREMENTAL_BUNDLE_DELTAS: usize = 4096;
+pub const MAX_INCREMENTAL_BUNDLE_TOKEN_BYTES: usize = 4096;
+const MAX_INCREMENTAL_BUNDLE_ID_BYTES: usize = 256;
 
 /// 离线同步包。
 ///
@@ -43,6 +50,319 @@ pub struct SyncBundle {
     pub vault_id: String,
     /// 包含的 commits 列表
     pub commits: Vec<SerializedCommit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalBundleCheckpoint {
+    /// Opaque source-owned commit inventory checkpoint. `None` means bootstrap.
+    pub commit_inventory: Option<String>,
+    /// Opaque source-owned state-delta inventory checkpoint. `None` means bootstrap.
+    pub delta_inventory: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalCommitInventoryEntry {
+    pub inventory_seq: u64,
+    pub commit_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IncrementalDeltaKind {
+    Commit,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalDeltaInventoryEntry {
+    pub batch_seq: u64,
+    pub batch_id: String,
+    pub batch_kind: IncrementalDeltaKind,
+    pub commit_ids: Vec<String>,
+    /// SHA-256 of the transported `ObjectPayload.ciphertext` bytes.
+    pub object_payload_sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalBundleManifest {
+    pub format: String,
+    pub vault_id: String,
+    pub source_device_id: String,
+    pub exported_at: String,
+    pub transfer_id: String,
+    pub segment_index: u32,
+    pub previous_segment_sha256: Option<Vec<u8>>,
+    pub is_last: bool,
+    pub base: IncrementalBundleCheckpoint,
+    pub result: IncrementalBundleCheckpoint,
+    pub commit_inventory: Vec<IncrementalCommitInventoryEntry>,
+    pub delta_inventory: Vec<IncrementalDeltaInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalSyncBundle {
+    pub manifest: IncrementalBundleManifest,
+    pub commits: Vec<SerializedCommit>,
+    /// Commit-associated delta payloads remain attached to their final commit.
+    /// This vector contains only auxiliary batches.
+    pub auxiliary_deltas: Vec<ObjectPayload>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncBundleFile {
+    Complete(SyncBundle),
+    Incremental(Box<IncrementalSyncBundle>),
+}
+
+impl IncrementalSyncBundle {
+    pub fn validate(&self) -> SyncResult<()> {
+        let manifest = &self.manifest;
+        if manifest.format != INCREMENTAL_BUNDLE_FORMAT {
+            return Err(SyncError::BundleFormat(format!(
+                "unsupported incremental bundle format: {}",
+                manifest.format
+            )));
+        }
+        validate_identifier("vault ID", &manifest.vault_id)?;
+        validate_identifier("source device ID", &manifest.source_device_id)?;
+        validate_identifier("export timestamp", &manifest.exported_at)?;
+        validate_identifier("transfer ID", &manifest.transfer_id)?;
+        validate_segment_chain(manifest)?;
+        validate_checkpoint(&manifest.base, true, "base")?;
+        validate_checkpoint(&manifest.result, false, "result")?;
+        validate_count(
+            "incremental bundle commits",
+            manifest.commit_inventory.len(),
+            MAX_INCREMENTAL_BUNDLE_COMMITS,
+        )?;
+        validate_count(
+            "incremental bundle deltas",
+            manifest.delta_inventory.len(),
+            MAX_INCREMENTAL_BUNDLE_DELTAS,
+        )?;
+        if manifest.commit_inventory.len() != self.commits.len() {
+            return Err(SyncError::BundleFormat(
+                "incremental commit inventory does not match transported commits".to_string(),
+            ));
+        }
+
+        let mut commit_ids = HashSet::with_capacity(self.commits.len());
+        let mut previous_commit_seq = None;
+        for (inventory, serialized) in manifest.commit_inventory.iter().zip(&self.commits) {
+            validate_identifier("commit ID", &inventory.commit_id)?;
+            if inventory.commit_id != serialized.commit.commit_id {
+                return Err(SyncError::BundleFormat(
+                    "incremental commit inventory order does not match commit payloads".to_string(),
+                ));
+            }
+            validate_strict_sequence(
+                "commit inventory",
+                previous_commit_seq,
+                inventory.inventory_seq,
+            )?;
+            previous_commit_seq = Some(inventory.inventory_seq);
+            if !commit_ids.insert(inventory.commit_id.as_str()) {
+                return Err(SyncError::BundleFormat(
+                    "incremental bundle contains duplicate commit IDs".to_string(),
+                ));
+            }
+        }
+
+        let mut batch_ids = HashSet::with_capacity(manifest.delta_inventory.len());
+        let mut previous_batch_seq = None;
+        let mut expected_auxiliary = HashSet::new();
+        for delta in &manifest.delta_inventory {
+            validate_identifier("delta batch ID", &delta.batch_id)?;
+            validate_strict_sequence("delta inventory", previous_batch_seq, delta.batch_seq)?;
+            previous_batch_seq = Some(delta.batch_seq);
+            if !batch_ids.insert(delta.batch_id.as_str()) {
+                return Err(SyncError::BundleFormat(
+                    "incremental bundle contains duplicate delta batch IDs".to_string(),
+                ));
+            }
+            if delta.object_payload_sha256.len() != 32 {
+                return Err(SyncError::BundleFormat(format!(
+                    "delta batch {} payload digest must be 32 bytes",
+                    delta.batch_id
+                )));
+            }
+            validate_count(
+                "incremental delta commit associations",
+                delta.commit_ids.len(),
+                MAX_INCREMENTAL_BUNDLE_COMMITS,
+            )?;
+            let mut associated_commits = HashSet::with_capacity(delta.commit_ids.len());
+            for commit_id in &delta.commit_ids {
+                validate_identifier("delta commit ID", commit_id)?;
+                if !associated_commits.insert(commit_id.as_str()) {
+                    return Err(SyncError::BundleFormat(format!(
+                        "delta batch {} contains duplicate commit IDs",
+                        delta.batch_id
+                    )));
+                }
+            }
+            match delta.batch_kind {
+                IncrementalDeltaKind::Commit => {
+                    let final_commit_id = delta.commit_ids.last().ok_or_else(|| {
+                        SyncError::BundleFormat(format!(
+                            "commit delta batch {} has no associated commits",
+                            delta.batch_id
+                        ))
+                    })?;
+                    let final_commit = self
+                        .commits
+                        .iter()
+                        .find(|commit| &commit.commit.commit_id == final_commit_id)
+                        .ok_or_else(|| {
+                            SyncError::BundleFormat(format!(
+                                "commit delta batch {} is missing its final commit",
+                                delta.batch_id
+                            ))
+                        })?;
+                    validate_delta_payload(
+                        &delta.batch_id,
+                        &delta.object_payload_sha256,
+                        final_commit
+                            .object_payloads
+                            .iter()
+                            .filter(|payload| payload.object_id == delta.batch_id),
+                    )?;
+                }
+                IncrementalDeltaKind::Auxiliary => {
+                    if !delta.commit_ids.is_empty() {
+                        return Err(SyncError::BundleFormat(format!(
+                            "auxiliary delta batch {} cannot reference commits",
+                            delta.batch_id
+                        )));
+                    }
+                    expected_auxiliary.insert(delta.batch_id.as_str());
+                    validate_delta_payload(
+                        &delta.batch_id,
+                        &delta.object_payload_sha256,
+                        self.auxiliary_deltas
+                            .iter()
+                            .filter(|payload| payload.object_id == delta.batch_id),
+                    )?;
+                }
+            }
+        }
+
+        if self.auxiliary_deltas.len() != expected_auxiliary.len()
+            || self
+                .auxiliary_deltas
+                .iter()
+                .any(|payload| !expected_auxiliary.contains(payload.object_id.as_str()))
+        {
+            return Err(SyncError::BundleFormat(
+                "incremental bundle has unlisted auxiliary delta payloads".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_identifier(name: &str, value: &str) -> SyncResult<()> {
+    if value.trim().is_empty() || value.len() > MAX_INCREMENTAL_BUNDLE_ID_BYTES {
+        return Err(SyncError::BundleFormat(format!(
+            "incremental bundle {name} must contain between 1 and {MAX_INCREMENTAL_BUNDLE_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_count(name: &str, actual: usize, limit: usize) -> SyncResult<()> {
+    if actual > limit {
+        return Err(SyncError::ResourceLimit {
+            resource: name.to_string(),
+            actual: actual as u64,
+            limit: limit as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_checkpoint(
+    checkpoint: &IncrementalBundleCheckpoint,
+    allow_bootstrap: bool,
+    name: &str,
+) -> SyncResult<()> {
+    if checkpoint.commit_inventory.is_some() != checkpoint.delta_inventory.is_some() {
+        return Err(SyncError::BundleFormat(format!(
+            "incremental bundle {name} checkpoint is incomplete"
+        )));
+    }
+    if !allow_bootstrap && checkpoint.commit_inventory.is_none() {
+        return Err(SyncError::BundleFormat(
+            "incremental bundle result checkpoint is missing".to_string(),
+        ));
+    }
+    for token in [
+        checkpoint.commit_inventory.as_deref(),
+        checkpoint.delta_inventory.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if token.is_empty() || token.len() > MAX_INCREMENTAL_BUNDLE_TOKEN_BYTES {
+            return Err(SyncError::BundleFormat(format!(
+                "incremental bundle {name} checkpoint token must contain between 1 and {MAX_INCREMENTAL_BUNDLE_TOKEN_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_segment_chain(manifest: &IncrementalBundleManifest) -> SyncResult<()> {
+    match (manifest.segment_index, &manifest.previous_segment_sha256) {
+        (0, None) => Ok(()),
+        (0, Some(_)) => Err(SyncError::BundleFormat(
+            "first incremental segment cannot reference a previous segment".to_string(),
+        )),
+        (_, Some(digest)) if digest.len() == 32 => Ok(()),
+        (_, Some(_)) => Err(SyncError::BundleFormat(
+            "incremental previous-segment digest must be 32 bytes".to_string(),
+        )),
+        (_, None) => Err(SyncError::BundleFormat(
+            "resumed incremental segment is missing its previous-segment digest".to_string(),
+        )),
+    }
+}
+
+fn validate_strict_sequence(name: &str, previous: Option<u64>, current: u64) -> SyncResult<()> {
+    if current == 0 || previous.is_some_and(|value| current <= value) {
+        return Err(SyncError::BundleFormat(format!(
+            "incremental {name} sequences must be positive and strictly increasing"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_delta_payload<'a>(
+    batch_id: &str,
+    expected_digest: &[u8],
+    mut payloads: impl Iterator<Item = &'a ObjectPayload>,
+) -> SyncResult<()> {
+    let payload = payloads.next().ok_or_else(|| {
+        SyncError::BundleFormat(format!(
+            "incremental delta batch {batch_id} is missing its object payload"
+        ))
+    })?;
+    if payloads.next().is_some() {
+        return Err(SyncError::BundleFormat(format!(
+            "incremental delta batch {batch_id} has multiple object payloads"
+        )));
+    }
+    if Sha256::digest(&payload.ciphertext).as_slice() != expected_digest {
+        return Err(SyncError::BundleIntegrity(format!(
+            "incremental delta batch {batch_id} payload digest mismatch"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +460,26 @@ pub fn build_bundle(
 
 /// 将 SyncBundle 写入文件。
 pub fn write_bundle(bundle: &SyncBundle, writer: &mut impl Write) -> SyncResult<()> {
+    write_versioned_payload(BUNDLE_VERSION, bundle, writer)
+}
+
+/// 将有界、可恢复的增量 bundle v4 写入文件。
+pub fn write_incremental_bundle(
+    bundle: &IncrementalSyncBundle,
+    writer: &mut impl Write,
+) -> SyncResult<()> {
+    bundle.validate()?;
+    write_versioned_payload(INCREMENTAL_BUNDLE_VERSION, bundle, writer)
+}
+
+fn write_versioned_payload<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+) -> SyncResult<()> {
     let mut counter = LimitedCountingWriter::new(HARD_MAX_BUNDLE_PAYLOAD_BYTES);
     let encoded_len =
-        bincode::serde::encode_into_std_write(bundle, &mut counter, bincode::config::standard())
+        bincode::serde::encode_into_std_write(value, &mut counter, bincode::config::standard())
             .map_err(|error| {
                 if let Some(actual) = counter.exceeded_at() {
                     SyncError::ResourceLimit {
@@ -163,13 +500,13 @@ pub fn write_bundle(bundle: &SyncBundle, writer: &mut impl Write) -> SyncResult<
 
     // 写入 header
     writer.write_all(BUNDLE_MAGIC)?;
-    writer.write_all(&BUNDLE_VERSION.to_le_bytes())?;
+    writer.write_all(&version.to_le_bytes())?;
     let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
     reserved[..8].copy_from_slice(&payload_len.to_le_bytes());
     writer.write_all(&reserved)?;
     let mut hashing_writer = HashingWriter::new(writer);
     let written = bincode::serde::encode_into_std_write(
-        bundle,
+        value,
         &mut hashing_writer,
         bincode::config::standard(),
     )
@@ -273,6 +610,12 @@ pub fn bundle_to_bytes(bundle: &SyncBundle) -> SyncResult<Vec<u8>> {
     Ok(buf)
 }
 
+pub fn incremental_bundle_to_bytes(bundle: &IncrementalSyncBundle) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_incremental_bundle(bundle, &mut buf)?;
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // 文件读取
 // ---------------------------------------------------------------------------
@@ -286,6 +629,76 @@ pub fn read_bundle_with_limits(
     reader: &mut impl Read,
     limits: BundleReadLimits,
 ) -> SyncResult<SyncBundle> {
+    match read_bundle_file_with_limits(reader, limits)? {
+        SyncBundleFile::Complete(bundle) => Ok(bundle),
+        SyncBundleFile::Incremental(_) => Err(SyncError::BundleFormat(
+            "incremental bundle v4 requires read_bundle_file_with_limits".to_string(),
+        )),
+    }
+}
+
+/// Reads complete v1-v3 or incremental v4 bundles without changing the legacy API.
+pub fn read_bundle_file(reader: &mut impl Read) -> SyncResult<SyncBundleFile> {
+    read_bundle_file_with_limits(reader, BundleReadLimits::default())
+}
+
+pub fn read_bundle_file_with_limits(
+    reader: &mut impl Read,
+    limits: BundleReadLimits,
+) -> SyncResult<SyncBundleFile> {
+    let (version, payload_data) = read_bundle_payload(reader, limits)?;
+
+    let bundle = if version == INCREMENTAL_BUNDLE_VERSION {
+        let (bundle, bytes_read): (IncrementalSyncBundle, usize) =
+            bincode::serde::decode_from_slice(
+                &payload_data,
+                bincode::config::standard().with_limit::<HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE>(),
+            )
+            .map_err(|e| {
+                SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+        if bytes_read != payload_data.len() {
+            return Err(SyncError::BundleFormat(format!(
+                "trailing payload bytes: {}",
+                payload_data.len() - bytes_read
+            )));
+        }
+        bundle.validate()?;
+        return Ok(SyncBundleFile::Incremental(Box::new(bundle)));
+    } else if version == LEGACY_BUNDLE_VERSION {
+        let (legacy, bytes_read): (LegacySyncBundleV1, usize) = bincode::serde::decode_from_slice(
+            &payload_data,
+            bincode::config::standard().with_limit::<HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE>(),
+        )
+        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        if bytes_read != payload_data.len() {
+            return Err(SyncError::BundleFormat(format!(
+                "trailing payload bytes: {}",
+                payload_data.len() - bytes_read
+            )));
+        }
+        SyncBundleFile::Complete(legacy.into())
+    } else {
+        let (bundle, bytes_read): (SyncBundle, usize) = bincode::serde::decode_from_slice(
+            &payload_data,
+            bincode::config::standard().with_limit::<HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE>(),
+        )
+        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        if bytes_read != payload_data.len() {
+            return Err(SyncError::BundleFormat(format!(
+                "trailing payload bytes: {}",
+                payload_data.len() - bytes_read
+            )));
+        }
+        SyncBundleFile::Complete(bundle)
+    };
+    Ok(bundle)
+}
+
+fn read_bundle_payload(
+    reader: &mut impl Read,
+    limits: BundleReadLimits,
+) -> SyncResult<(u32, Vec<u8>)> {
     // 读取 magic
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
@@ -300,20 +713,22 @@ pub fn read_bundle_with_limits(
     if version != BUNDLE_VERSION
         && version != PREVIOUS_BUNDLE_VERSION
         && version != LEGACY_BUNDLE_VERSION
+        && version != INCREMENTAL_BUNDLE_VERSION
     {
         return Err(SyncError::BundleFormat(format!(
-            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION}, {PREVIOUS_BUNDLE_VERSION}, and {BUNDLE_VERSION}"
+            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION}, {PREVIOUS_BUNDLE_VERSION}, {BUNDLE_VERSION}, and {INCREMENTAL_BUNDLE_VERSION}"
         )));
     }
 
     let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
     reader.read_exact(&mut reserved)?;
 
-    let (payload_data, stored_hash) = if version == BUNDLE_VERSION {
-        read_length_prefixed_body(reader, &reserved, limits)?
-    } else {
-        read_legacy_body(reader, limits)?
-    };
+    let (payload_data, stored_hash) =
+        if version == BUNDLE_VERSION || version == INCREMENTAL_BUNDLE_VERSION {
+            read_length_prefixed_body(reader, &reserved, limits)?
+        } else {
+            read_legacy_body(reader, limits)?
+        };
 
     // 验证 hash
     let computed = {
@@ -327,29 +742,7 @@ pub fn read_bundle_with_limits(
         ));
     }
 
-    // 反序列化
-    let (bundle, bytes_read) = if version == LEGACY_BUNDLE_VERSION {
-        let (legacy, bytes_read): (LegacySyncBundleV1, usize) = bincode::serde::decode_from_slice(
-            &payload_data,
-            bincode::config::standard().with_limit::<HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE>(),
-        )
-        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        (legacy.into(), bytes_read)
-    } else {
-        bincode::serde::decode_from_slice(
-            &payload_data,
-            bincode::config::standard().with_limit::<HARD_MAX_BUNDLE_PAYLOAD_BYTES_USIZE>(),
-        )
-        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?
-    };
-    if bytes_read != payload_data.len() {
-        return Err(SyncError::BundleFormat(format!(
-            "trailing payload bytes: {}",
-            payload_data.len() - bytes_read
-        )));
-    }
-
-    Ok(bundle)
+    Ok((version, payload_data))
 }
 
 fn read_length_prefixed_body(
@@ -443,6 +836,11 @@ pub fn bundle_from_bytes(data: &[u8]) -> SyncResult<SyncBundle> {
     read_bundle(&mut cursor)
 }
 
+pub fn bundle_file_from_bytes(data: &[u8]) -> SyncResult<SyncBundleFile> {
+    let mut cursor = std::io::Cursor::new(data);
+    read_bundle_file(&mut cursor)
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -507,6 +905,68 @@ mod tests {
         }
     }
 
+    fn sample_incremental_bundle() -> IncrementalSyncBundle {
+        let mut commit = sample_bundle().commits.remove(0);
+        let commit_delta = ObjectPayload {
+            object_type: "mdbx-storage/state-delta-v1".to_string(),
+            object_id: "delta-commit-1".to_string(),
+            ciphertext: b"commit-delta-envelope".to_vec(),
+            associated_data: b"delta-commit-1".to_vec(),
+        };
+        let auxiliary_delta = ObjectPayload {
+            object_type: "mdbx-storage/state-delta-v1".to_string(),
+            object_id: "delta-aux-1".to_string(),
+            ciphertext: b"auxiliary-delta-envelope".to_vec(),
+            associated_data: b"delta-aux-1".to_vec(),
+        };
+        let commit_digest = Sha256::digest(&commit_delta.ciphertext).to_vec();
+        let auxiliary_digest = Sha256::digest(&auxiliary_delta.ciphertext).to_vec();
+        commit.object_payloads.push(commit_delta);
+
+        IncrementalSyncBundle {
+            manifest: IncrementalBundleManifest {
+                format: INCREMENTAL_BUNDLE_FORMAT.to_string(),
+                vault_id: "test-vault".to_string(),
+                source_device_id: "test-device".to_string(),
+                exported_at: "2026-07-21T00:00:00Z".to_string(),
+                transfer_id: "transfer-1".to_string(),
+                segment_index: 0,
+                previous_segment_sha256: None,
+                is_last: true,
+                base: IncrementalBundleCheckpoint {
+                    commit_inventory: None,
+                    delta_inventory: None,
+                },
+                result: IncrementalBundleCheckpoint {
+                    commit_inventory: Some("commit-checkpoint-result".to_string()),
+                    delta_inventory: Some("delta-checkpoint-result".to_string()),
+                },
+                commit_inventory: vec![IncrementalCommitInventoryEntry {
+                    inventory_seq: 2,
+                    commit_id: "commit-1".to_string(),
+                }],
+                delta_inventory: vec![
+                    IncrementalDeltaInventoryEntry {
+                        batch_seq: 1,
+                        batch_id: "delta-commit-1".to_string(),
+                        batch_kind: IncrementalDeltaKind::Commit,
+                        commit_ids: vec!["commit-1".to_string()],
+                        object_payload_sha256: commit_digest,
+                    },
+                    IncrementalDeltaInventoryEntry {
+                        batch_seq: 2,
+                        batch_id: "delta-aux-1".to_string(),
+                        batch_kind: IncrementalDeltaKind::Auxiliary,
+                        commit_ids: vec![],
+                        object_payload_sha256: auxiliary_digest,
+                    },
+                ],
+            },
+            commits: vec![commit],
+            auxiliary_deltas: vec![auxiliary_delta],
+        }
+    }
+
     fn legacy_bundle_bytes() -> Vec<u8> {
         let current = sample_bundle();
         let legacy = LegacySyncBundleV1 {
@@ -567,6 +1027,112 @@ mod tests {
         assert_eq!(restored.source_device_id, bundle.source_device_id);
         assert_eq!(restored.commits.len(), 1);
         assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+    }
+
+    #[test]
+    fn bundle_v4_round_trips_with_manifest_and_keeps_legacy_reader_explicit() {
+        let bundle = sample_incremental_bundle();
+        let bytes = incremental_bundle_to_bytes(&bundle).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            INCREMENTAL_BUNDLE_VERSION
+        );
+        assert_eq!(declared_payload_len(&bytes) as usize, bytes.len() - 64);
+
+        let restored = bundle_file_from_bytes(&bytes).unwrap();
+        match restored {
+            SyncBundleFile::Incremental(restored) => {
+                assert_eq!(restored.manifest.transfer_id, "transfer-1");
+                assert_eq!(restored.manifest.commit_inventory.len(), 1);
+                assert_eq!(restored.manifest.delta_inventory.len(), 2);
+                assert_eq!(restored.auxiliary_deltas.len(), 1);
+            }
+            SyncBundleFile::Complete(_) => panic!("v4 decoded as a complete bundle"),
+        }
+        assert!(bundle_from_bytes(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("read_bundle_file_with_limits"));
+
+        match bundle_file_from_bytes(&bundle_to_bytes(&sample_bundle()).unwrap()).unwrap() {
+            SyncBundleFile::Complete(restored) => assert_eq!(restored.commits.len(), 1),
+            SyncBundleFile::Incremental(_) => panic!("v3 decoded as incremental"),
+        }
+    }
+
+    #[test]
+    fn bundle_v4_rejects_inventory_reordering_and_delta_tampering() {
+        let mut bundle = sample_incremental_bundle();
+        bundle.manifest.delta_inventory.swap(0, 1);
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("strictly increasing"));
+
+        let mut bundle = sample_incremental_bundle();
+        bundle.commits[0]
+            .object_payloads
+            .iter_mut()
+            .find(|payload| payload.object_id == "delta-commit-1")
+            .unwrap()
+            .ciphertext[0] ^= 1;
+        assert!(matches!(
+            bundle.validate(),
+            Err(SyncError::BundleIntegrity(_))
+        ));
+
+        let mut bundle = sample_incremental_bundle();
+        bundle.auxiliary_deltas.clear();
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("missing its object payload"));
+    }
+
+    #[test]
+    fn bundle_v4_validates_checkpoint_pairs_resume_chain_and_counts() {
+        let mut bundle = sample_incremental_bundle();
+        bundle.manifest.base.commit_inventory = Some("commit-base".to_string());
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("base checkpoint is incomplete"));
+
+        let mut bundle = sample_incremental_bundle();
+        bundle.manifest.segment_index = 1;
+        assert!(bundle
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("previous-segment digest"));
+        bundle.manifest.previous_segment_sha256 = Some(vec![7; 32]);
+        bundle.validate().unwrap();
+
+        let mut bundle = sample_incremental_bundle();
+        bundle.manifest.commit_inventory = (1..=MAX_INCREMENTAL_BUNDLE_COMMITS + 1)
+            .map(|index| IncrementalCommitInventoryEntry {
+                inventory_seq: index as u64,
+                commit_id: format!("commit-{index}"),
+            })
+            .collect();
+        assert!(matches!(
+            bundle.validate(),
+            Err(SyncError::ResourceLimit { ref resource, .. })
+                if resource == "incremental bundle commits"
+        ));
+
+        let mut bundle = sample_incremental_bundle();
+        bundle.manifest.delta_inventory[0].commit_ids = (0..=MAX_INCREMENTAL_BUNDLE_COMMITS)
+            .map(|index| format!("associated-{index}"))
+            .collect();
+        assert!(matches!(
+            bundle.validate(),
+            Err(SyncError::ResourceLimit { ref resource, .. })
+                if resource == "incremental delta commit associations"
+        ));
     }
 
     #[test]
