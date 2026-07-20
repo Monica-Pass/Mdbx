@@ -209,6 +209,13 @@ impl SyncApplyRepo {
 
         match tx_result {
             Ok(outcome) => {
+                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
+                    conn,
+                    crate::sync_delta::SyncDeltaLimits::default(),
+                ) {
+                    let _ = conn.inner().execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
                 conn.inner().execute_batch("COMMIT;")?;
                 Ok(outcome)
             }

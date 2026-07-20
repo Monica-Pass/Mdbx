@@ -356,6 +356,7 @@ mod tests {
         assert_eq!(initial, 0);
 
         let ctx = CommitContext::new("device-1".to_string());
+        conn.inner().execute_batch("BEGIN IMMEDIATE;").unwrap();
         let project = ProjectRepo::create(&conn, &ctx, "Captured", None, None).unwrap();
         let mut stmt = conn
             .inner()
@@ -379,6 +380,7 @@ mod tests {
         assert!(rows.iter().any(|(kind, _)| kind == "device-head"));
         assert!(rows.iter().any(|(kind, _)| kind == "branch"));
         validate_sync_delta_capture(conn.inner()).unwrap();
+        conn.inner().execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -399,6 +401,7 @@ mod tests {
         )
         .unwrap();
         discard_bootstrap_mutations(conn.inner()).unwrap();
+        conn.inner().execute_batch("BEGIN IMMEDIATE;").unwrap();
         AttachmentRepo::write_inline_content(
             &conn,
             &ctx,
@@ -417,7 +420,7 @@ mod tests {
             .unwrap();
         assert!(attachment_changes >= 2);
 
-        discard_bootstrap_mutations(conn.inner()).unwrap();
+        conn.inner().execute_batch("ROLLBACK;").unwrap();
         conn.inner()
             .execute(
                 "INSERT INTO security_audit_events

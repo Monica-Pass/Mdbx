@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 96 * 1024 * 1024;
 pub const DEFAULT_MAX_SYNC_STATE_ROWS: usize = 250_000;
 pub const HARD_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 pub const HARD_MAX_SYNC_STATE_ROWS: usize = 2_000_000;
-const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v2";
+pub(crate) const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v2";
 const PREVIOUS_SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v1";
 const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
 
@@ -419,7 +419,7 @@ pub fn collect_sync_state_with_limits(
     Ok(state)
 }
 
-fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
+pub(crate) fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
     let active_key_epoch_id: String = conn
         .inner()
         .query_row(
@@ -466,7 +466,7 @@ fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> 
     })
 }
 
-fn load_tiga_vault_state(conn: &VaultConnection) -> StorageResult<TigaVaultStateRow> {
+pub(crate) fn load_tiga_vault_state(conn: &VaultConnection) -> StorageResult<TigaVaultStateRow> {
     conn.inner()
         .query_row(
             "SELECT default_tiga_mode, tiga_policy_version, tiga_compliance_status, updated_at
@@ -484,7 +484,7 @@ fn load_tiga_vault_state(conn: &VaultConnection) -> StorageResult<TigaVaultState
         .map_err(StorageError::Database)
 }
 
-fn load_tiga_policy_override_rows(
+pub(crate) fn load_tiga_policy_override_rows(
     conn: &VaultConnection,
 ) -> StorageResult<Vec<TigaPolicyOverrideRow>> {
     let mut stmt = conn.inner().prepare(
@@ -506,7 +506,7 @@ fn load_tiga_policy_override_rows(
     collect_rows(rows)
 }
 
-fn load_tiga_policy_exception_rows(
+pub(crate) fn load_tiga_policy_exception_rows(
     conn: &VaultConnection,
 ) -> StorageResult<Vec<TigaPolicyExceptionRow>> {
     let mut stmt = conn.inner().prepare(
@@ -532,7 +532,7 @@ fn load_tiga_policy_exception_rows(
     collect_rows(rows)
 }
 
-fn load_security_audit_event_rows(
+pub(crate) fn load_security_audit_event_rows(
     conn: &VaultConnection,
 ) -> StorageResult<Vec<SecurityAuditEventRow>> {
     let mut stmt = conn.inner().prepare(
@@ -642,7 +642,7 @@ impl SyncStatePayload {
         validate_row_limit(self.total_rows()?, limits)
     }
 
-    fn total_rows(&self) -> StorageResult<usize> {
+    pub(crate) fn total_rows(&self) -> StorageResult<usize> {
         let mut total = 0usize;
         let mut add = |count: usize| -> StorageResult<()> {
             total = total
@@ -822,7 +822,7 @@ impl Write for LimitedVecWriter {
     }
 }
 
-fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
+pub(crate) fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
     let mut profiles = CollectionProfileRepo::load_all_stored(conn)?
         .into_iter()
         .map(|profile| (profile.project_id.clone(), profile))
@@ -866,7 +866,7 @@ fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
     Ok(out)
 }
 
-fn load_entry_rows(conn: &VaultConnection) -> StorageResult<Vec<EntryRow>> {
+pub(crate) fn load_entry_rows(conn: &VaultConnection) -> StorageResult<Vec<EntryRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT entry_id, project_id, entry_type, title_ct, payload_ct,
                 payload_schema_version, tiga_mode_override, object_clock,
@@ -910,7 +910,9 @@ fn load_entry_rows(conn: &VaultConnection) -> StorageResult<Vec<EntryRow>> {
     Ok(out)
 }
 
-fn load_object_relation_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectRelationRow>> {
+pub(crate) fn load_object_relation_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<ObjectRelationRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT relation_id, source_object_id, target_object_id, relation_kind,
                 payload_ct, payload_schema_version, object_clock, head_commit_id,
@@ -938,7 +940,7 @@ fn load_object_relation_rows(conn: &VaultConnection) -> StorageResult<Vec<Object
     collect_rows(rows)
 }
 
-fn load_object_label_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectLabelRow>> {
+pub(crate) fn load_object_label_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectLabelRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT label_id, collection_id, name_ct, payload_ct, payload_schema_version,
                 object_clock, head_commit_id, deleted, created_at, updated_at,
@@ -964,7 +966,7 @@ fn load_object_label_rows(conn: &VaultConnection) -> StorageResult<Vec<ObjectLab
     collect_rows(rows)
 }
 
-fn load_object_label_assignment_rows(
+pub(crate) fn load_object_label_assignment_rows(
     conn: &VaultConnection,
 ) -> StorageResult<Vec<ObjectLabelAssignmentRow>> {
     let mut stmt = conn.inner().prepare(
@@ -990,7 +992,7 @@ fn load_object_label_assignment_rows(
     collect_rows(rows)
 }
 
-fn load_attachment_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentRow>> {
+pub(crate) fn load_attachment_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT attachment_id, project_id, entry_id, file_name_ct,
                 media_type_ct, storage_mode, content_hash,
@@ -1039,7 +1041,9 @@ fn read_u32(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {
     })
 }
 
-fn load_attachment_chunk_rows(conn: &VaultConnection) -> StorageResult<Vec<AttachmentChunkRow>> {
+pub(crate) fn load_attachment_chunk_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<AttachmentChunkRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT attachment_id, chunk_index, chunk_hash, chunk_ct,
                 external_uri_ct, stored_size, created_at
@@ -1065,7 +1069,9 @@ fn load_attachment_chunk_rows(conn: &VaultConnection) -> StorageResult<Vec<Attac
     Ok(out)
 }
 
-fn load_project_tag_set_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectTagSetRow>> {
+pub(crate) fn load_project_tag_set_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<ProjectTagSetRow>> {
     let mut out = BTreeMap::<String, Vec<String>>::new();
     let mut project_stmt = conn
         .inner()
@@ -1093,7 +1099,7 @@ fn load_project_tag_set_rows(conn: &VaultConnection) -> StorageResult<Vec<Projec
         .collect())
 }
 
-fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow>> {
+pub(crate) fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT tombstone_id, target_object_type, target_object_id, delete_clock,
                 deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id
@@ -1115,7 +1121,7 @@ fn load_tombstone_rows(conn: &VaultConnection) -> StorageResult<Vec<TombstoneRow
     collect_rows(rows)
 }
 
-fn load_tombstone_acknowledgement_rows(
+pub(crate) fn load_tombstone_acknowledgement_rows(
     conn: &VaultConnection,
 ) -> StorageResult<Vec<TombstoneAcknowledgementRow>> {
     let mut stmt = conn.inner().prepare(
@@ -1134,7 +1140,9 @@ fn load_tombstone_acknowledgement_rows(
     collect_rows(rows)
 }
 
-fn load_purge_receipt_rows(conn: &VaultConnection) -> StorageResult<Vec<PurgeReceiptRow>> {
+pub(crate) fn load_purge_receipt_rows(
+    conn: &VaultConnection,
+) -> StorageResult<Vec<PurgeReceiptRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT purge_id, tombstone_id, target_object_type, target_object_id,
                 delete_commit_id, purge_commit_id, delete_clock,
@@ -1160,7 +1168,7 @@ fn load_purge_receipt_rows(conn: &VaultConnection) -> StorageResult<Vec<PurgeRec
     collect_rows(rows)
 }
 
-fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
+pub(crate) fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<BranchRow>> {
     let mut stmt = conn.inner().prepare(
         "SELECT branch_id, branch_name, head_commit_id, created_at, updated_at
          FROM branches

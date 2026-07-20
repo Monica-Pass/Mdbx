@@ -232,6 +232,13 @@ impl CommitContext {
                         "operation produced no commit".to_string(),
                     ));
                 };
+                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
+                    conn,
+                    crate::sync_delta::SyncDeltaLimits::default(),
+                ) {
+                    let _ = conn.inner().execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
                 if let Err(error) = conn.inner().execute_batch("COMMIT;") {
                     let _ = conn.inner().execute_batch("ROLLBACK;");
                     return Err(StorageError::Database(error));

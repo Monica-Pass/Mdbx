@@ -176,6 +176,17 @@ impl VaultConnection {
         &self,
         f: impl FnOnce() -> StorageResult<T>,
     ) -> StorageResult<T> {
+        self.with_immediate_transaction_and_sync_limits(
+            crate::sync_delta::SyncDeltaLimits::default(),
+            f,
+        )
+    }
+
+    pub(crate) fn with_immediate_transaction_and_sync_limits<T>(
+        &self,
+        sync_limits: crate::sync_delta::SyncDeltaLimits,
+        f: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<T> {
         if !self.conn.is_autocommit() {
             return f();
         }
@@ -186,6 +197,12 @@ impl VaultConnection {
 
         match f() {
             Ok(value) => {
+                if let Err(error) =
+                    crate::sync_delta::materialize_pending_sync_delta(self, sync_limits)
+                {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
                 if let Err(e) = self.conn.execute_batch("COMMIT;") {
                     let _ = self.conn.execute_batch("ROLLBACK;");
                     Err(StorageError::Database(e))
@@ -241,6 +258,13 @@ impl VaultConnection {
             .map_err(StorageError::Database)?;
         match f(self) {
             Ok(value) => {
+                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
+                    self,
+                    crate::sync_delta::SyncDeltaLimits::default(),
+                ) {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
                 if let Err(error) = self.conn.execute_batch("COMMIT;") {
                     let _ = self.conn.execute_batch("ROLLBACK;");
                     Err(StorageError::Database(error))
