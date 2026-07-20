@@ -37,6 +37,11 @@ use mdbx_storage::repo::{
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
+use mdbx_sync::{
+    BlobChunkRequest, BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState,
+    BlobManifestPageRequest, BlobManifestPageResponse, BlobSyncPhase, BlobSyncResume, BranchHead,
+    HelloRequest, HelloResponse, SyncClient, SyncNegotiator,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -54,6 +59,8 @@ pub enum MdbxFfiError {
     Storage { message: String },
     #[error("serialization error: {message}")]
     Serialization { message: String },
+    #[error("sync protocol error: {message}")]
+    SyncProtocol { message: String },
     #[error("invalid entry type: {entry_type}")]
     InvalidEntryType { entry_type: String },
     #[error("invalid object type ID: {object_type_id}")]
@@ -79,6 +86,14 @@ impl From<StorageError> for MdbxFfiError {
 impl From<serde_json::Error> for MdbxFfiError {
     fn from(value: serde_json::Error) -> Self {
         MdbxFfiError::Serialization {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<mdbx_sync::SyncError> for MdbxFfiError {
+    fn from(value: mdbx_sync::SyncError) -> Self {
+        MdbxFfiError::SyncProtocol {
             message: value.to_string(),
         }
     }
@@ -1331,6 +1346,442 @@ impl From<SecurityAuditEvent> for MdbxSecurityAuditEventV2 {
             policy_version: value.policy_version,
             policy_fingerprint: value.policy_fingerprint,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncBranchHead {
+    pub branch_id: Option<String>,
+    pub branch_name: String,
+    pub head_commit_id: String,
+}
+
+impl From<BranchHead> for MdbxSyncBranchHead {
+    fn from(value: BranchHead) -> Self {
+        Self {
+            branch_id: value.branch_id,
+            branch_name: value.branch_name,
+            head_commit_id: value.head_commit_id,
+        }
+    }
+}
+
+impl From<MdbxSyncBranchHead> for BranchHead {
+    fn from(value: MdbxSyncBranchHead) -> Self {
+        Self {
+            branch_id: value.branch_id,
+            branch_name: value.branch_name,
+            head_commit_id: value.head_commit_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncHello {
+    pub device_id: String,
+    pub protocol_version: u32,
+    pub heads: Vec<MdbxSyncBranchHead>,
+    pub known_commit_ids: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl From<HelloRequest> for MdbxSyncHello {
+    fn from(value: HelloRequest) -> Self {
+        Self {
+            device_id: value.device_id,
+            protocol_version: value.protocol_version,
+            heads: value.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: value.known_commit_ids,
+            capabilities: value.capabilities,
+        }
+    }
+}
+
+impl From<HelloResponse> for MdbxSyncHello {
+    fn from(value: HelloResponse) -> Self {
+        Self {
+            device_id: value.device_id,
+            protocol_version: value.protocol_version,
+            heads: value.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: value.known_commit_ids,
+            capabilities: value.capabilities,
+        }
+    }
+}
+
+impl MdbxSyncHello {
+    fn into_request(self) -> HelloRequest {
+        HelloRequest {
+            device_id: self.device_id,
+            protocol_version: self.protocol_version,
+            heads: self.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: self.known_commit_ids,
+            capabilities: self.capabilities,
+        }
+    }
+
+    fn into_response(self) -> HelloResponse {
+        HelloResponse {
+            device_id: self.device_id,
+            protocol_version: self.protocol_version,
+            heads: self.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: self.known_commit_ids,
+            capabilities: self.capabilities,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxBlobManifestEntryState {
+    Available,
+    SourceMissing,
+    SourceSizeInvalid,
+}
+
+impl From<BlobManifestEntryState> for MdbxBlobManifestEntryState {
+    fn from(value: BlobManifestEntryState) -> Self {
+        match value {
+            BlobManifestEntryState::Available => Self::Available,
+            BlobManifestEntryState::SourceMissing => Self::SourceMissing,
+            BlobManifestEntryState::SourceSizeInvalid => Self::SourceSizeInvalid,
+        }
+    }
+}
+
+impl From<MdbxBlobManifestEntryState> for BlobManifestEntryState {
+    fn from(value: MdbxBlobManifestEntryState) -> Self {
+        match value {
+            MdbxBlobManifestEntryState::Available => Self::Available,
+            MdbxBlobManifestEntryState::SourceMissing => Self::SourceMissing,
+            MdbxBlobManifestEntryState::SourceSizeInvalid => Self::SourceSizeInvalid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobManifestEntry {
+    pub blob_id: String,
+    pub total_size: Option<u64>,
+    pub state: MdbxBlobManifestEntryState,
+}
+
+impl From<BlobManifestEntry> for MdbxBlobManifestEntry {
+    fn from(value: BlobManifestEntry) -> Self {
+        Self {
+            blob_id: value.blob_id,
+            total_size: value.total_size,
+            state: value.state.into(),
+        }
+    }
+}
+
+impl From<MdbxBlobManifestEntry> for BlobManifestEntry {
+    fn from(value: MdbxBlobManifestEntry) -> Self {
+        Self {
+            blob_id: value.blob_id,
+            total_size: value.total_size,
+            state: value.state.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobManifestPageRequest {
+    pub namespace_id: String,
+    pub checkpoint: Option<String>,
+    pub cursor: Option<String>,
+    pub page_size: u32,
+}
+
+impl From<BlobManifestPageRequest> for MdbxBlobManifestPageRequest {
+    fn from(value: BlobManifestPageRequest) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            checkpoint: value.checkpoint,
+            cursor: value.cursor,
+            page_size: u32::from(value.page_size),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobManifestPageResponse {
+    pub namespace_id: String,
+    pub checkpoint: String,
+    pub items: Vec<MdbxBlobManifestEntry>,
+    pub next_cursor: Option<String>,
+}
+
+impl From<BlobManifestPageResponse> for MdbxBlobManifestPageResponse {
+    fn from(value: BlobManifestPageResponse) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            checkpoint: value.checkpoint,
+            items: value.items.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor,
+        }
+    }
+}
+
+impl From<MdbxBlobManifestPageResponse> for BlobManifestPageResponse {
+    fn from(value: MdbxBlobManifestPageResponse) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            checkpoint: value.checkpoint,
+            items: value.items.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobChunkRequest {
+    pub namespace_id: String,
+    pub blob_id: String,
+    pub total_size: u64,
+    pub offset: u64,
+    pub max_bytes: u32,
+}
+
+impl From<BlobChunkRequest> for MdbxBlobChunkRequest {
+    fn from(value: BlobChunkRequest) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            blob_id: value.blob_id,
+            total_size: value.total_size,
+            offset: value.offset,
+            max_bytes: value.max_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobChunkResponse {
+    pub namespace_id: String,
+    pub blob_id: String,
+    pub total_size: u64,
+    pub offset: u64,
+    pub ciphertext: Vec<u8>,
+    pub is_last: bool,
+}
+
+impl From<BlobChunkResponse> for MdbxBlobChunkResponse {
+    fn from(value: BlobChunkResponse) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            blob_id: value.blob_id,
+            total_size: value.total_size,
+            offset: value.offset,
+            ciphertext: value.ciphertext,
+            is_last: value.is_last,
+        }
+    }
+}
+
+impl From<MdbxBlobChunkResponse> for BlobChunkResponse {
+    fn from(value: MdbxBlobChunkResponse) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            blob_id: value.blob_id,
+            total_size: value.total_size,
+            offset: value.offset,
+            ciphertext: value.ciphertext,
+            is_last: value.is_last,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxBlobSyncResume {
+    pub namespace_id: String,
+    pub manifest_checkpoint: Option<String>,
+    pub manifest_cursor: Option<String>,
+    pub current_blob_id: Option<String>,
+    pub total_size: u64,
+    pub next_durable_offset: u64,
+    pub manifest_complete: bool,
+}
+
+impl From<BlobSyncResume> for MdbxBlobSyncResume {
+    fn from(value: BlobSyncResume) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            manifest_checkpoint: value.manifest_checkpoint,
+            manifest_cursor: value.manifest_cursor,
+            current_blob_id: value.current_blob_id,
+            total_size: value.total_size,
+            next_durable_offset: value.next_durable_offset,
+            manifest_complete: value.manifest_complete,
+        }
+    }
+}
+
+impl From<MdbxBlobSyncResume> for BlobSyncResume {
+    fn from(value: MdbxBlobSyncResume) -> Self {
+        Self {
+            namespace_id: value.namespace_id,
+            manifest_checkpoint: value.manifest_checkpoint,
+            manifest_cursor: value.manifest_cursor,
+            current_blob_id: value.current_blob_id,
+            total_size: value.total_size,
+            next_durable_offset: value.next_durable_offset,
+            manifest_complete: value.manifest_complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxBlobSyncPhase {
+    Disabled,
+    Idle,
+    Manifest,
+    AwaitingManifestAcknowledgement,
+    Chunk,
+    AwaitingChunkAcknowledgement,
+    Complete,
+}
+
+impl From<BlobSyncPhase> for MdbxBlobSyncPhase {
+    fn from(value: BlobSyncPhase) -> Self {
+        match value {
+            BlobSyncPhase::Disabled => Self::Disabled,
+            BlobSyncPhase::Idle => Self::Idle,
+            BlobSyncPhase::Manifest => Self::Manifest,
+            BlobSyncPhase::AwaitingManifestAcknowledgement => Self::AwaitingManifestAcknowledgement,
+            BlobSyncPhase::Chunk => Self::Chunk,
+            BlobSyncPhase::AwaitingChunkAcknowledgement => Self::AwaitingChunkAcknowledgement,
+            BlobSyncPhase::Complete => Self::Complete,
+        }
+    }
+}
+
+/// Protocol-only Blob synchronization state for generated clients. The
+/// application owns transport and Provider I/O, then calls acknowledgement
+/// methods only after durable storage succeeds.
+#[derive(uniffi::Object)]
+pub struct MdbxBlobSyncSession {
+    client: Mutex<SyncClient>,
+}
+
+#[uniffi::export]
+impl MdbxBlobSyncSession {
+    pub fn hello(&self) -> Result<MdbxSyncHello, MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.hello()?.into())
+    }
+
+    pub fn accept_hello(&self, hello: MdbxSyncHello) -> Result<MdbxSyncHello, MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.on_hello(&hello.into_request())?.into())
+    }
+
+    pub fn accept_hello_ack(&self, hello: MdbxSyncHello) -> Result<(), MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.on_hello_ack(&hello.into_response())?;
+        Ok(())
+    }
+
+    pub fn blob_replication_is_negotiated(&self) -> Result<bool, MdbxFfiError> {
+        let client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.blob_replication_is_negotiated())
+    }
+
+    pub fn begin_blob_sync(&self, namespace_id: String) -> Result<(), MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.begin_blob_sync(namespace_id)?;
+        Ok(())
+    }
+
+    pub fn restore_blob_sync(&self, resume: MdbxBlobSyncResume) -> Result<(), MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.restore_blob_sync(resume.into())?;
+        Ok(())
+    }
+
+    pub fn blob_resume(&self) -> Result<Option<MdbxBlobSyncResume>, MdbxFfiError> {
+        let client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.blob_resume().cloned().map(Into::into))
+    }
+
+    pub fn blob_sync_phase(&self) -> Result<MdbxBlobSyncPhase, MdbxFfiError> {
+        let client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.blob_sync_phase().into())
+    }
+
+    pub fn blob_manifest_request(
+        &self,
+        page_size: u32,
+    ) -> Result<MdbxBlobManifestPageRequest, MdbxFfiError> {
+        let page_size = usize::try_from(page_size).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "Blob manifest page size cannot be represented locally".to_string(),
+        })?;
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client.blob_manifest_request(page_size)?.into())
+    }
+
+    pub fn validate_blob_manifest_response(
+        &self,
+        response: MdbxBlobManifestPageResponse,
+    ) -> Result<(), MdbxFfiError> {
+        let response: BlobManifestPageResponse = response.into();
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.validate_blob_manifest_response(&response)?;
+        Ok(())
+    }
+
+    pub fn acknowledge_blob_manifest_page(
+        &self,
+        response: MdbxBlobManifestPageResponse,
+    ) -> Result<(), MdbxFfiError> {
+        let response: BlobManifestPageResponse = response.into();
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.acknowledge_blob_manifest_page(&response)?;
+        Ok(())
+    }
+
+    pub fn blob_chunk_request(
+        &self,
+        blob_id: String,
+        total_size: u64,
+        max_bytes: u32,
+    ) -> Result<MdbxBlobChunkRequest, MdbxFfiError> {
+        let max_bytes = usize::try_from(max_bytes).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "Blob chunk size cannot be represented locally".to_string(),
+        })?;
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(client
+            .blob_chunk_request(blob_id, total_size, max_bytes)?
+            .into())
+    }
+
+    pub fn validate_blob_chunk_response(
+        &self,
+        response: MdbxBlobChunkResponse,
+    ) -> Result<(), MdbxFfiError> {
+        let response: BlobChunkResponse = response.into();
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.validate_blob_chunk_response(&response)?;
+        Ok(())
+    }
+
+    pub fn acknowledge_blob_chunk(
+        &self,
+        response: MdbxBlobChunkResponse,
+    ) -> Result<(), MdbxFfiError> {
+        let response: BlobChunkResponse = response.into();
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.acknowledge_blob_chunk(&response)?;
+        Ok(())
+    }
+
+    pub fn restart_blob_transfer_after_abort(
+        &self,
+        blob_id: String,
+        total_size: u64,
+    ) -> Result<(), MdbxFfiError> {
+        let mut client = self.client.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        client.restart_blob_transfer_after_abort(&blob_id, total_size)?;
+        Ok(())
     }
 }
 
@@ -2610,6 +3061,17 @@ fn unix_now() -> i64 {
 }
 
 #[uniffi::export]
+pub fn create_blob_sync_session(
+    device_id: String,
+) -> Result<Arc<MdbxBlobSyncSession>, MdbxFfiError> {
+    let mut negotiator = SyncNegotiator::new(&device_id, Vec::new(), Vec::new());
+    negotiator.enable_blob_replication_capabilities()?;
+    Ok(Arc::new(MdbxBlobSyncSession {
+        client: Mutex::new(SyncClient::new(negotiator, None, None)),
+    }))
+}
+
+#[uniffi::export]
 pub fn create_vault(
     path: String,
     password: String,
@@ -3389,6 +3851,114 @@ fn object_label_assignment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffi_blob_sync_session_negotiates_and_advances_only_after_ack() {
+        let local = create_blob_sync_session("ffi-local".to_string()).unwrap();
+        let remote = create_blob_sync_session("ffi-remote".to_string()).unwrap();
+        local
+            .begin_blob_sync("source-namespace".to_string())
+            .unwrap();
+        let hello = local.hello().unwrap();
+        assert_eq!(hello.capabilities.len(), 3);
+        let ack = remote.accept_hello(hello).unwrap();
+        local.accept_hello_ack(ack).unwrap();
+        assert!(local.blob_replication_is_negotiated().unwrap());
+        assert_eq!(
+            local.blob_sync_phase().unwrap(),
+            MdbxBlobSyncPhase::Manifest
+        );
+
+        let blob_id = "a".repeat(64);
+        local.blob_manifest_request(8).unwrap();
+        let manifest = MdbxBlobManifestPageResponse {
+            namespace_id: "source-namespace".to_string(),
+            checkpoint: "checkpoint".to_string(),
+            items: vec![MdbxBlobManifestEntry {
+                blob_id: blob_id.clone(),
+                total_size: Some(8),
+                state: MdbxBlobManifestEntryState::Available,
+            }],
+            next_cursor: None,
+        };
+        local
+            .validate_blob_manifest_response(manifest.clone())
+            .unwrap();
+        assert!(local
+            .blob_resume()
+            .unwrap()
+            .unwrap()
+            .manifest_checkpoint
+            .is_none());
+
+        let first_request = local.blob_chunk_request(blob_id.clone(), 8, 4).unwrap();
+        let first = MdbxBlobChunkResponse {
+            namespace_id: "source-namespace".to_string(),
+            blob_id: blob_id.clone(),
+            total_size: 8,
+            offset: first_request.offset,
+            ciphertext: vec![1, 2, 3, 4],
+            is_last: false,
+        };
+        local.validate_blob_chunk_response(first.clone()).unwrap();
+        assert_eq!(local.blob_resume().unwrap().unwrap().next_durable_offset, 0);
+        local.acknowledge_blob_chunk(first).unwrap();
+        assert_eq!(local.blob_resume().unwrap().unwrap().next_durable_offset, 4);
+
+        let second_request = local.blob_chunk_request(blob_id.clone(), 8, 4).unwrap();
+        let second = MdbxBlobChunkResponse {
+            namespace_id: "source-namespace".to_string(),
+            blob_id,
+            total_size: 8,
+            offset: second_request.offset,
+            ciphertext: vec![5, 6, 7, 8],
+            is_last: true,
+        };
+        local.acknowledge_blob_chunk(second).unwrap();
+        local.acknowledge_blob_manifest_page(manifest).unwrap();
+        assert_eq!(
+            local.blob_sync_phase().unwrap(),
+            MdbxBlobSyncPhase::Complete
+        );
+    }
+
+    #[test]
+    fn ffi_blob_sync_session_restores_resume_and_rejects_partial_negotiation() {
+        let local = create_blob_sync_session("ffi-local".to_string()).unwrap();
+        let remote = create_blob_sync_session("ffi-remote".to_string()).unwrap();
+        local
+            .begin_blob_sync("source-namespace".to_string())
+            .unwrap();
+        let hello = local.hello().unwrap();
+        let mut ack = remote.accept_hello(hello).unwrap();
+        ack.capabilities.pop();
+        local.accept_hello_ack(ack).unwrap();
+        assert!(!local.blob_replication_is_negotiated().unwrap());
+        assert!(matches!(
+            local.blob_manifest_request(1),
+            Err(MdbxFfiError::SyncProtocol { .. })
+        ));
+
+        let restored = MdbxBlobSyncResume {
+            namespace_id: "source-namespace".to_string(),
+            manifest_checkpoint: Some("checkpoint".to_string()),
+            manifest_cursor: None,
+            current_blob_id: Some("b".repeat(64)),
+            total_size: 8,
+            next_durable_offset: 4,
+            manifest_complete: false,
+        };
+        let resumed = create_blob_sync_session("ffi-resumed".to_string()).unwrap();
+        let peer = create_blob_sync_session("ffi-peer".to_string()).unwrap();
+        resumed
+            .begin_blob_sync("source-namespace".to_string())
+            .unwrap();
+        let hello = resumed.hello().unwrap();
+        let ack = peer.accept_hello(hello).unwrap();
+        resumed.accept_hello_ack(ack).unwrap();
+        resumed.restore_blob_sync(restored.clone()).unwrap();
+        assert_eq!(resumed.blob_resume().unwrap().unwrap(), restored);
+    }
 
     #[test]
     fn attachment_tiga_scope_roundtrips_through_ffi_types() {
