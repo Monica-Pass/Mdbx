@@ -2,11 +2,19 @@ use serde::{Deserialize, Serialize};
 
 use mdbx_core::model::Commit;
 
+use crate::error::{SyncError, SyncResult};
+
 /// 同步协议版本。
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 单次批量传输的最大 commit 数。
 pub const MAX_COMMITS_PER_BATCH: usize = 256;
+pub const CAPABILITY_COMMIT_INVENTORY_PAGING_V1: &str = "commit-inventory-paging-v1";
+pub const MAX_SYNC_CAPABILITIES: usize = 32;
+pub const MAX_SYNC_CAPABILITY_ID_BYTES: usize = 128;
+pub const MAX_COMMIT_INVENTORY_PAGE_ITEMS: usize = 512;
+pub const MAX_COMMIT_INVENTORY_TOKEN_BYTES: usize = 4096;
+pub const MAX_COMMIT_ID_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // 顶层消息容器
@@ -27,6 +35,12 @@ pub enum SyncMessage {
 
     /// 请求对方发送缺失的 commit。
     WantCommits(WantRequest),
+
+    /// 请求一个固定 watermark 内的 commit inventory 页面。
+    CommitInventoryPageRequest(CommitInventoryPageRequest),
+
+    /// 返回一个有界、因果有序的 commit inventory 页面。
+    CommitInventoryPageResponse(CommitInventoryPageResponse),
 
     /// 发送一组合并 commit。
     CommitBatch(CommitBatch),
@@ -60,6 +74,10 @@ pub struct HelloRequest {
 
     /// 此设备已知的全部 commit ID（用于 skip 已存在的 commit）。
     pub known_commit_ids: Vec<String>,
+
+    /// 可选扩展能力。空列表不序列化，保持旧 protocol-v2 JSON 形状。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// 单个分支的 head 信息。
@@ -78,6 +96,38 @@ pub struct HelloResponse {
     pub protocol_version: u32,
     pub heads: Vec<BranchHead>,
     pub known_commit_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Commit inventory paging
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitInventoryPageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub page_size: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitInventoryPageResponse {
+    pub items: Vec<CommitInventoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub checkpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitInventoryEntry {
+    pub inventory_seq: u64,
+    pub commit_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +278,21 @@ impl SyncMessage {
 
     /// 从 JSON 字节反序列化。
     pub fn from_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(data)
+        let message: Self = serde_json::from_slice(data)?;
+        message
+            .validate()
+            .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))?;
+        Ok(message)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        match self {
+            Self::Hello(hello) => validate_capabilities(&hello.capabilities),
+            Self::HelloAck(hello) => validate_capabilities(&hello.capabilities),
+            Self::CommitInventoryPageRequest(request) => request.validate(),
+            Self::CommitInventoryPageResponse(response) => response.validate(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -239,7 +303,18 @@ impl HelloRequest {
             protocol_version: PROTOCOL_VERSION,
             heads,
             known_commit_ids,
+            capabilities: Vec::new(),
         }
+    }
+
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> SyncResult<Self> {
+        validate_capabilities(&capabilities)?;
+        self.capabilities = canonical_capabilities(capabilities);
+        Ok(self)
+    }
+
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|value| value == capability)
     }
 }
 
@@ -250,8 +325,150 @@ impl HelloResponse {
             protocol_version: PROTOCOL_VERSION,
             heads,
             known_commit_ids,
+            capabilities: Vec::new(),
         }
     }
+
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> SyncResult<Self> {
+        validate_capabilities(&capabilities)?;
+        self.capabilities = canonical_capabilities(capabilities);
+        Ok(self)
+    }
+
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|value| value == capability)
+    }
+}
+
+impl CommitInventoryPageRequest {
+    pub fn new(
+        checkpoint: Option<String>,
+        cursor: Option<String>,
+        page_size: usize,
+    ) -> SyncResult<Self> {
+        let page_size = u16::try_from(page_size).map_err(|_| {
+            SyncError::InvalidMessage(format!(
+                "commit inventory page size must be between 1 and {MAX_COMMIT_INVENTORY_PAGE_ITEMS}"
+            ))
+        })?;
+        let request = Self {
+            checkpoint,
+            cursor,
+            page_size,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        let page_size = usize::from(self.page_size);
+        if page_size == 0 || page_size > MAX_COMMIT_INVENTORY_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "commit inventory page size must be between 1 and {MAX_COMMIT_INVENTORY_PAGE_ITEMS}"
+            )));
+        }
+        validate_optional_inventory_token(self.checkpoint.as_deref(), "checkpoint")?;
+        validate_optional_inventory_token(self.cursor.as_deref(), "cursor")
+    }
+}
+
+impl CommitInventoryPageResponse {
+    pub fn new(
+        items: Vec<CommitInventoryEntry>,
+        next_cursor: Option<String>,
+        checkpoint: String,
+    ) -> SyncResult<Self> {
+        let response = Self {
+            items,
+            next_cursor,
+            checkpoint,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        if self.items.len() > MAX_COMMIT_INVENTORY_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "commit inventory page exceeds {MAX_COMMIT_INVENTORY_PAGE_ITEMS} items"
+            )));
+        }
+        validate_inventory_token(&self.checkpoint, "checkpoint")?;
+        validate_optional_inventory_token(self.next_cursor.as_deref(), "cursor")?;
+        if self.items.is_empty() && self.next_cursor.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "commit inventory page cannot continue without a position".to_string(),
+            ));
+        }
+        let mut previous = 0_u64;
+        for item in &self.items {
+            if item.inventory_seq == 0 || item.inventory_seq <= previous {
+                return Err(SyncError::InvalidMessage(
+                    "commit inventory sequences must be strictly increasing".to_string(),
+                ));
+            }
+            validate_commit_id(&item.commit_id)?;
+            previous = item.inventory_seq;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_capabilities(capabilities: &[String]) -> SyncResult<()> {
+    if capabilities.len() > MAX_SYNC_CAPABILITIES {
+        return Err(SyncError::InvalidMessage(format!(
+            "sync capability list exceeds {MAX_SYNC_CAPABILITIES} items"
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(capabilities.len());
+    for capability in capabilities {
+        if capability.is_empty()
+            || capability.len() > MAX_SYNC_CAPABILITY_ID_BYTES
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+        {
+            return Err(SyncError::InvalidMessage(format!(
+                "invalid sync capability identifier: {capability}"
+            )));
+        }
+        if !seen.insert(capability.as_str()) {
+            return Err(SyncError::InvalidMessage(format!(
+                "duplicate sync capability identifier: {capability}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_capabilities(mut capabilities: Vec<String>) -> Vec<String> {
+    capabilities.sort_unstable();
+    capabilities
+}
+
+fn validate_optional_inventory_token(value: Option<&str>, kind: &str) -> SyncResult<()> {
+    if let Some(value) = value {
+        validate_inventory_token(value, kind)?;
+    }
+    Ok(())
+}
+
+fn validate_inventory_token(value: &str, kind: &str) -> SyncResult<()> {
+    if value.is_empty() || value.len() > MAX_COMMIT_INVENTORY_TOKEN_BYTES {
+        return Err(SyncError::InvalidMessage(format!(
+            "commit inventory {kind} must be between 1 and {MAX_COMMIT_INVENTORY_TOKEN_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_commit_id(commit_id: &str) -> SyncResult<()> {
+    if commit_id.is_empty() || commit_id.len() > MAX_COMMIT_ID_BYTES {
+        return Err(SyncError::InvalidMessage(format!(
+            "commit ID must be between 1 and {MAX_COMMIT_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 impl CommitBatch {
@@ -287,5 +504,148 @@ mod tests {
         assert_eq!(head.branch_id, None);
         assert_eq!(operation.branch_id, None);
         assert_eq!(operation.branch_name, "main");
+    }
+
+    #[test]
+    fn legacy_protocol_v2_hello_json_and_constructors_remain_unchanged() {
+        let request_json = r#"{
+            "device_id":"legacy-request",
+            "protocol_version":2,
+            "heads":[],
+            "known_commit_ids":["commit-1"]
+        }"#;
+        let response_json = r#"{
+            "device_id":"legacy-response",
+            "protocol_version":2,
+            "heads":[],
+            "known_commit_ids":["commit-1"]
+        }"#;
+        let request: HelloRequest = serde_json::from_str(request_json).unwrap();
+        let response: HelloResponse = serde_json::from_str(response_json).unwrap();
+        assert!(request.capabilities.is_empty());
+        assert!(response.capabilities.is_empty());
+
+        let request_value = serde_json::to_value(HelloRequest::new(
+            "legacy-request",
+            Vec::new(),
+            vec!["commit-1".to_string()],
+        ))
+        .unwrap();
+        let response_value = serde_json::to_value(HelloResponse::new(
+            "legacy-response",
+            Vec::new(),
+            vec!["commit-1".to_string()],
+        ))
+        .unwrap();
+        assert!(request_value.get("capabilities").is_none());
+        assert!(response_value.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn paged_inventory_capability_and_messages_roundtrip_additively() {
+        let hello = HelloRequest::new("device-1", Vec::new(), Vec::new())
+            .with_capabilities(vec![
+                "future-extension-v1".to_string(),
+                CAPABILITY_COMMIT_INVENTORY_PAGING_V1.to_string(),
+            ])
+            .unwrap();
+        assert!(hello.supports(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+        assert_eq!(
+            hello.capabilities,
+            [CAPABILITY_COMMIT_INVENTORY_PAGING_V1, "future-extension-v1"]
+        );
+
+        let request = CommitInventoryPageRequest::new(
+            Some("base-checkpoint".to_string()),
+            Some("page-cursor".to_string()),
+            128,
+        )
+        .unwrap();
+        let message = SyncMessage::CommitInventoryPageRequest(request.clone());
+        let restored = SyncMessage::from_bytes(&message.to_bytes().unwrap()).unwrap();
+        match restored {
+            SyncMessage::CommitInventoryPageRequest(restored) => assert_eq!(restored, request),
+            _ => panic!("expected commit inventory page request"),
+        }
+
+        let response = CommitInventoryPageResponse::new(
+            vec![
+                CommitInventoryEntry {
+                    inventory_seq: 10,
+                    commit_id: "commit-10".to_string(),
+                },
+                CommitInventoryEntry {
+                    inventory_seq: 11,
+                    commit_id: "commit-11".to_string(),
+                },
+            ],
+            None,
+            "watermark-checkpoint".to_string(),
+        )
+        .unwrap();
+        let message = SyncMessage::CommitInventoryPageResponse(response.clone());
+        let restored = SyncMessage::from_bytes(&message.to_bytes().unwrap()).unwrap();
+        match restored {
+            SyncMessage::CommitInventoryPageResponse(restored) => assert_eq!(restored, response),
+            _ => panic!("expected commit inventory page response"),
+        }
+    }
+
+    #[test]
+    fn paged_inventory_dtos_enforce_hard_bounds_and_causal_order() {
+        assert!(CommitInventoryPageRequest::new(None, None, 0).is_err());
+        assert!(
+            CommitInventoryPageRequest::new(None, None, MAX_COMMIT_INVENTORY_PAGE_ITEMS + 1,)
+                .is_err()
+        );
+        assert!(CommitInventoryPageRequest::new(
+            Some("x".repeat(MAX_COMMIT_INVENTORY_TOKEN_BYTES + 1)),
+            None,
+            1,
+        )
+        .is_err());
+
+        let too_many = (1..=MAX_COMMIT_INVENTORY_PAGE_ITEMS + 1)
+            .map(|sequence| CommitInventoryEntry {
+                inventory_seq: sequence as u64,
+                commit_id: format!("commit-{sequence}"),
+            })
+            .collect();
+        assert!(
+            CommitInventoryPageResponse::new(too_many, None, "checkpoint".to_string(),).is_err()
+        );
+        assert!(CommitInventoryPageResponse::new(
+            vec![
+                CommitInventoryEntry {
+                    inventory_seq: 2,
+                    commit_id: "commit-2".to_string(),
+                },
+                CommitInventoryEntry {
+                    inventory_seq: 1,
+                    commit_id: "commit-1".to_string(),
+                },
+            ],
+            None,
+            "checkpoint".to_string(),
+        )
+        .is_err());
+        assert!(CommitInventoryPageResponse::new(
+            vec![CommitInventoryEntry {
+                inventory_seq: 1,
+                commit_id: String::new(),
+            }],
+            None,
+            "checkpoint".to_string(),
+        )
+        .is_err());
+        assert!(serde_json::from_str::<CommitInventoryPageRequest>(
+            r#"{"page_size":1,"unknown":true}"#
+        )
+        .is_err());
+        let invalid_wire_message = format!(
+            r#"{{"type":"commit-inventory-page-request","page_size":1,"cursor":"{}"}}"#,
+            "x".repeat(MAX_COMMIT_INVENTORY_TOKEN_BYTES + 1)
+        );
+        assert!(SyncMessage::from_bytes(invalid_wire_message.as_bytes()).is_err());
     }
 }

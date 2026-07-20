@@ -37,6 +37,10 @@ pub struct SyncNegotiator {
     /// 对方已知的 commit ID（从 Hello 获得）。
     remote_known_commit_ids: HashSet<String>,
 
+    /// 本方与对方声明的可选协议能力。
+    local_capabilities: HashSet<String>,
+    remote_capabilities: HashSet<String>,
+
     /// 本地分支 head。
     local_heads: Vec<BranchHead>,
 
@@ -55,6 +59,8 @@ impl SyncNegotiator {
             device_id: device_id.to_string(),
             known_commit_ids: local_commit_ids.into_iter().collect(),
             remote_known_commit_ids: HashSet::new(),
+            local_capabilities: HashSet::new(),
+            remote_capabilities: HashSet::new(),
             local_heads,
             remote_heads: Vec::new(),
         }
@@ -68,15 +74,24 @@ impl SyncNegotiator {
                 remote: hello.protocol_version,
             });
         }
+        validate_capabilities(&hello.capabilities)?;
 
         self.remote_heads = hello.heads.clone();
         self.remote_known_commit_ids = hello.known_commit_ids.iter().cloned().collect();
 
-        Ok(HelloResponse::new(
+        self.remote_capabilities = hello.capabilities.iter().cloned().collect();
+        let negotiated = self
+            .local_capabilities
+            .intersection(&self.remote_capabilities)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        HelloResponse::new(
             &self.device_id,
             self.local_heads.clone(),
             self.known_commit_ids.iter().cloned().collect(),
-        ))
+        )
+        .with_capabilities(negotiated)
     }
 
     /// 处理对方的 Hello 响应。
@@ -87,9 +102,11 @@ impl SyncNegotiator {
                 remote: response.protocol_version,
             });
         }
+        validate_capabilities(&response.capabilities)?;
 
         self.remote_heads = response.heads.clone();
         self.remote_known_commit_ids = response.known_commit_ids.iter().cloned().collect();
+        self.remote_capabilities = response.capabilities.iter().cloned().collect();
         Ok(())
     }
 
@@ -165,6 +182,33 @@ impl SyncNegotiator {
 
     pub fn remote_known_commit_ids(&self) -> &HashSet<String> {
         &self.remote_known_commit_ids
+    }
+
+    pub fn enable_capability(&mut self, capability: &str) -> SyncResult<()> {
+        let candidate = vec![capability.to_string()];
+        validate_capabilities(&candidate)?;
+        if self.local_capabilities.len() >= MAX_SYNC_CAPABILITIES
+            && !self.local_capabilities.contains(capability)
+        {
+            return Err(SyncError::InvalidMessage(format!(
+                "sync capability list exceeds {MAX_SYNC_CAPABILITIES} items"
+            )));
+        }
+        self.local_capabilities.insert(capability.to_string());
+        Ok(())
+    }
+
+    pub fn local_capabilities(&self) -> &HashSet<String> {
+        &self.local_capabilities
+    }
+
+    pub fn remote_capabilities(&self) -> &HashSet<String> {
+        &self.remote_capabilities
+    }
+
+    pub fn capability_is_negotiated(&self, capability: &str) -> bool {
+        self.local_capabilities.contains(capability)
+            && self.remote_capabilities.contains(capability)
     }
 }
 
@@ -301,6 +345,34 @@ mod tests {
 
         let result = negotiator.on_hello(&hello);
         assert!(matches!(result, Err(SyncError::VersionMismatch { .. })));
+    }
+
+    #[test]
+    fn inventory_paging_is_enabled_only_when_both_peers_advertise_it() {
+        let mut responder = SyncNegotiator::new("device-a", Vec::new(), Vec::new());
+        responder
+            .enable_capability(CAPABILITY_COMMIT_INVENTORY_PAGING_V1)
+            .unwrap();
+        let hello = HelloRequest::new("device-b", Vec::new(), Vec::new())
+            .with_capabilities(vec![CAPABILITY_COMMIT_INVENTORY_PAGING_V1.to_string()])
+            .unwrap();
+
+        let response = responder.on_hello(&hello).unwrap();
+
+        assert!(response.supports(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+        assert!(responder.capability_is_negotiated(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+
+        let mut initiator = SyncNegotiator::new("device-b", Vec::new(), Vec::new());
+        initiator
+            .enable_capability(CAPABILITY_COMMIT_INVENTORY_PAGING_V1)
+            .unwrap();
+        initiator.on_hello_ack(&response).unwrap();
+        assert!(initiator.capability_is_negotiated(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+
+        let legacy_hello = HelloRequest::new("legacy", Vec::new(), Vec::new());
+        let legacy_response = responder.on_hello(&legacy_hello).unwrap();
+        assert!(legacy_response.capabilities.is_empty());
+        assert!(!responder.capability_is_negotiated(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
     }
 
     #[test]
