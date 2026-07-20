@@ -2,6 +2,7 @@ pub mod backup;
 #[cfg(feature = "benchmarks")]
 pub mod benchmark;
 pub mod blob_lifecycle;
+pub mod blob_replica;
 pub mod blob_store;
 pub mod blob_transfer;
 pub mod capability;
