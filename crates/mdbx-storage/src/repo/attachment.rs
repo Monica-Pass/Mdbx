@@ -12,6 +12,7 @@ use mdbx_core::tiga::{
     AuthorizationDecision, AuthorizationOutcome, DeviceContext, TigaOperation, TigaScope,
 };
 
+use crate::blob_store::{compute_blob_id, validate_blob_id, EncryptedBlobStore};
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
@@ -25,6 +26,14 @@ use crate::tiga_policy::TigaAuthorizationContext;
 /// 附件属于一等结构，支持 project 级和 entry 级归属。
 /// 改名只改元数据，不改变 content_hash。
 pub struct AttachmentRepo;
+
+#[derive(Clone, Copy)]
+enum AttachmentContentTarget<'a> {
+    Embedded { force_chunked_mode: bool },
+    External(&'a dyn EncryptedBlobStore),
+}
+
+const MAX_EXTERNAL_BLOB_ENVELOPE_OVERHEAD: u64 = 128 * 1024;
 
 /// 附件明文的使用目的。持久化导出与内存解密采用不同的 TIGA 操作语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,7 +355,7 @@ impl AttachmentRepo {
                             .transpose()?,
                         storage_mode: {
                             let s: String = row.get(5)?;
-                            s.parse().unwrap_or(StorageMode::EmbeddedInline)
+                            parse_storage_mode(5, &s)?
                         },
                         content_hash: row.get(6)?,
                         original_size: row.get::<_, i64>(7)? as u64,
@@ -422,7 +431,7 @@ impl AttachmentRepo {
                     .transpose()?,
                 storage_mode: {
                     let s: String = row.get(5)?;
-                    s.parse().unwrap_or(StorageMode::EmbeddedInline)
+                    parse_storage_mode(5, &s)?
                 },
                 content_hash: row.get(6)?,
                 original_size: row.get::<_, i64>(7)? as u64,
@@ -605,15 +614,15 @@ impl AttachmentRepo {
                 "attachment",
             )?;
 
-            // upsert chunk
+            // 内容替换必须先清除旧分块，避免 chunked/external 模式残留额外行。
+            conn.inner().execute(
+                "DELETE FROM attachment_chunks WHERE attachment_id = ?1",
+                params![attachment_id],
+            )?;
             conn.inner().execute(
                 "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
              chunk_ct, stored_size, created_at)
-             VALUES (?1, 0, ?2, ?3, ?4, ?5)
-             ON CONFLICT(attachment_id, chunk_index) DO UPDATE SET
-                chunk_hash = excluded.chunk_hash,
-                chunk_ct = excluded.chunk_ct,
-                stored_size = excluded.stored_size",
+             VALUES (?1, 0, ?2, ?3, ?4, ?5)",
                 params![
                     attachment_id,
                     content_hash,
@@ -655,6 +664,17 @@ impl AttachmentRepo {
         Ok(data)
     }
 
+    /// 使用调用方提供的加密 Blob Provider 读取内嵌或外部附件。
+    pub fn read_content_with_blob_store(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: &dyn EncryptedBlobStore,
+    ) -> StorageResult<Vec<u8>> {
+        let mut data = Vec::new();
+        Self::read_content_to_writer_with_blob_store(conn, attachment_id, blob_store, &mut data)?;
+        Ok(data)
+    }
+
     /// 将附件明文流式写入目标，并验证结构、分块和整体内容完整性。
     ///
     /// 内存占用与单个已加密分块大小相关，不随附件总大小增长。返回写入的明文字节数。
@@ -663,12 +683,23 @@ impl AttachmentRepo {
         attachment_id: &str,
         writer: &mut dyn Write,
     ) -> StorageResult<u64> {
-        Self::read_content_to_writer_inner(conn, attachment_id, writer, true)
+        Self::read_content_to_writer_inner(conn, attachment_id, None, writer, true)
+    }
+
+    /// 将内嵌或外部附件流式写入目标，并验证完整性。
+    pub fn read_content_to_writer_with_blob_store(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: &dyn EncryptedBlobStore,
+        writer: &mut dyn Write,
+    ) -> StorageResult<u64> {
+        Self::read_content_to_writer_inner(conn, attachment_id, Some(blob_store), writer, true)
     }
 
     fn read_content_to_writer_inner(
         conn: &VaultConnection,
         attachment_id: &str,
+        blob_store: Option<&dyn EncryptedBlobStore>,
         writer: &mut dyn Write,
         reject_deleted: bool,
     ) -> StorageResult<u64> {
@@ -680,6 +711,7 @@ impl AttachmentRepo {
                 "attachment is deleted".to_string(),
             ));
         }
+        Self::require_blob_store_for_mode(&att.storage_mode, attachment_id, blob_store)?;
 
         let (actual_count, declared_size, min_index, max_index): (
             i64,
@@ -715,7 +747,7 @@ impl AttachmentRepo {
         }
 
         let mut stmt = conn.inner().prepare(
-            "SELECT chunk_index, chunk_hash, chunk_ct, stored_size
+            "SELECT chunk_index, chunk_hash, chunk_ct, external_uri_ct, stored_size
              FROM attachment_chunks
              WHERE attachment_id = ?1
              ORDER BY chunk_index",
@@ -724,23 +756,32 @@ impl AttachmentRepo {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
         let mut overall_hasher = Sha256::new();
         let mut total_size = 0u64;
         for (expected_index, row) in rows.enumerate() {
-            let (chunk_index, expected_hash, encrypted, stored_size) = row?;
+            let (chunk_index, expected_hash, chunk_ct, external_uri_ct, stored_size) = row?;
             if chunk_index != expected_index as i64 {
                 return Err(StorageError::ConstraintViolation(format!(
                     "attachment chunk index mismatch: expected {}, got {}",
                     expected_index, chunk_index
                 )));
             }
-            let plaintext =
-                Self::decrypt_attachment_field(conn, attachment_id, "chunk", &encrypted)?;
+            let plaintext = Self::load_chunk_plaintext(
+                conn,
+                attachment_id,
+                &att.storage_mode,
+                chunk_index,
+                stored_size,
+                chunk_ct,
+                external_uri_ct,
+                blob_store,
+            )?;
             if stored_size < 0 || stored_size as usize != plaintext.len() {
                 return Err(StorageError::ConstraintViolation(format!(
                     "attachment chunk {} size mismatch",
@@ -783,13 +824,34 @@ impl AttachmentRepo {
 
     /// 校验附件完整性，不返回内容。
     pub fn verify_integrity(conn: &VaultConnection, attachment_id: &str) -> StorageResult<bool> {
+        Self::verify_integrity_inner(conn, attachment_id, None)
+    }
+
+    /// 使用调用方提供的加密 Blob Provider 校验内嵌或外部附件。
+    pub fn verify_integrity_with_blob_store(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: &dyn EncryptedBlobStore,
+    ) -> StorageResult<bool> {
+        Self::verify_integrity_inner(conn, attachment_id, Some(blob_store))
+    }
+
+    fn verify_integrity_inner(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: Option<&dyn EncryptedBlobStore>,
+    ) -> StorageResult<bool> {
         let att = AttachmentRepo::get_by_id(conn, attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        Self::require_blob_store_for_mode(&att.storage_mode, attachment_id, blob_store)?;
         if att.chunk_count == 0 {
             return Ok(true);
         }
         let mut sink = std::io::sink();
-        Ok(Self::read_content_to_writer_inner(conn, attachment_id, &mut sink, false).is_ok())
+        Ok(
+            Self::read_content_to_writer_inner(conn, attachment_id, blob_store, &mut sink, false)
+                .is_ok(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -815,7 +877,9 @@ impl AttachmentRepo {
             attachment_id,
             &mut reader,
             AttachmentWriteOptions::exact(chunk_size, data.len() as u64),
-            true,
+            AttachmentContentTarget::Embedded {
+                force_chunked_mode: true,
+            },
         )
     }
 
@@ -847,7 +911,42 @@ impl AttachmentRepo {
         reader: &mut dyn Read,
         options: AttachmentWriteOptions,
     ) -> StorageResult<String> {
-        Self::write_content_from_reader_inner(conn, ctx, attachment_id, reader, options, false)
+        Self::write_content_from_reader_inner(
+            conn,
+            ctx,
+            attachment_id,
+            reader,
+            options,
+            AttachmentContentTarget::Embedded {
+                force_chunked_mode: false,
+            },
+        )
+    }
+
+    /// 将明文流加密为独立分块，并把密文保存到外部 Blob Provider。
+    ///
+    /// Provider 中只保存认证密文，数据库中只保存再次加密的密文摘要引用。
+    pub fn write_external_content_from_reader_with_options(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        reader: &mut dyn Read,
+        options: AttachmentWriteOptions,
+        blob_store: &dyn EncryptedBlobStore,
+    ) -> StorageResult<String> {
+        if !conn.is_encrypted() {
+            return Err(StorageError::Validation(
+                "external blob storage requires an unlocked encrypted vault".to_string(),
+            ));
+        }
+        Self::write_content_from_reader_inner(
+            conn,
+            ctx,
+            attachment_id,
+            reader,
+            options,
+            AttachmentContentTarget::External(blob_store),
+        )
     }
 
     fn write_content_from_reader_inner(
@@ -856,7 +955,7 @@ impl AttachmentRepo {
         attachment_id: &str,
         reader: &mut dyn Read,
         options: AttachmentWriteOptions,
-        force_chunked_mode: bool,
+        target: AttachmentContentTarget<'_>,
     ) -> StorageResult<String> {
         Self::validate_write_options(options)?;
         let maximum_buffer_size = usize::try_from(options.max_plaintext_size.saturating_add(1))
@@ -917,20 +1016,57 @@ impl AttachmentRepo {
                 }
                 let chunk = &buffer[..bytes_read];
                 let chunk_hash = compute_sha256_hex(chunk);
-                let chunk_ct = Self::encrypt_attachment_field(conn, attachment_id, "chunk", chunk)?;
-                conn.inner().execute(
-                    "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
-                 chunk_ct, stored_size, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        attachment_id,
-                        i64::from(chunk_count),
-                        chunk_hash,
-                        chunk_ct,
-                        chunk.len() as i64,
-                        now,
-                    ],
-                )?;
+                match target {
+                    AttachmentContentTarget::Embedded { .. } => {
+                        let chunk_ct =
+                            Self::encrypt_attachment_field(conn, attachment_id, "chunk", chunk)?;
+                        conn.inner().execute(
+                            "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
+                         chunk_ct, external_uri_ct, stored_size, created_at)
+                         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                            params![
+                                attachment_id,
+                                i64::from(chunk_count),
+                                chunk_hash,
+                                chunk_ct,
+                                chunk.len() as i64,
+                                now,
+                            ],
+                        )?;
+                    }
+                    AttachmentContentTarget::External(blob_store) => {
+                        let chunk_index = i64::from(chunk_count);
+                        let chunk_field = external_chunk_field(chunk_index);
+                        let encrypted_blob = Self::encrypt_attachment_field(
+                            conn,
+                            attachment_id,
+                            &chunk_field,
+                            chunk,
+                        )?;
+                        let blob_id = compute_blob_id(&encrypted_blob);
+                        blob_store.put(&blob_id, &encrypted_blob)?;
+                        let reference_field = external_reference_field(chunk_index);
+                        let external_uri_ct = Self::encrypt_attachment_field(
+                            conn,
+                            attachment_id,
+                            &reference_field,
+                            blob_id.as_bytes(),
+                        )?;
+                        conn.inner().execute(
+                            "INSERT INTO attachment_chunks (attachment_id, chunk_index, chunk_hash,
+                         chunk_ct, external_uri_ct, stored_size, created_at)
+                         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                            params![
+                                attachment_id,
+                                chunk_index,
+                                chunk_hash,
+                                external_uri_ct,
+                                chunk.len() as i64,
+                                now,
+                            ],
+                        )?;
+                    }
+                }
                 content_hasher.update(chunk);
                 total_size = next_total;
                 chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
@@ -948,10 +1084,17 @@ impl AttachmentRepo {
             }
 
             let content_hash = format!("{:x}", content_hasher.finalize());
-            let storage_mode = if force_chunked_mode || chunk_count > 1 {
-                "embedded-chunked"
-            } else {
-                "embedded-inline"
+            let storage_mode = match target {
+                AttachmentContentTarget::External(_) => "external-hash-ref",
+                AttachmentContentTarget::Embedded {
+                    force_chunked_mode: true,
+                } => "embedded-chunked",
+                AttachmentContentTarget::Embedded {
+                    force_chunked_mode: false,
+                } if chunk_count > 1 => "embedded-chunked",
+                AttachmentContentTarget::Embedded {
+                    force_chunked_mode: false,
+                } => "embedded-inline",
             };
 
             // 更新 attachments 元数据
@@ -1005,15 +1148,33 @@ impl AttachmentRepo {
         conn: &VaultConnection,
         attachment_id: &str,
     ) -> StorageResult<bool> {
+        Self::verify_chunks_integrity_inner(conn, attachment_id, None)
+    }
+
+    /// 使用调用方提供的 Blob Provider 校验每个外部或内嵌分块。
+    pub fn verify_chunks_integrity_with_blob_store(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: &dyn EncryptedBlobStore,
+    ) -> StorageResult<bool> {
+        Self::verify_chunks_integrity_inner(conn, attachment_id, Some(blob_store))
+    }
+
+    fn verify_chunks_integrity_inner(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        blob_store: Option<&dyn EncryptedBlobStore>,
+    ) -> StorageResult<bool> {
         let att = AttachmentRepo::get_by_id(conn, attachment_id)?
             .ok_or_else(|| StorageError::NotFound(attachment_id.to_string()))?;
+        Self::require_blob_store_for_mode(&att.storage_mode, attachment_id, blob_store)?;
 
         if att.chunk_count == 0 {
             return Ok(true);
         }
 
         let mut stmt = conn.inner().prepare(
-            "SELECT chunk_index, chunk_hash, chunk_ct
+            "SELECT chunk_index, chunk_hash, chunk_ct, external_uri_ct, stored_size
              FROM attachment_chunks
              WHERE attachment_id = ?1
              ORDER BY chunk_index",
@@ -1023,17 +1184,27 @@ impl AttachmentRepo {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
         for row in rows {
-            let (_index, expected_hash, chunk_data): (i64, String, Vec<u8>) = row?;
-            let plaintext =
-                match Self::decrypt_attachment_field(conn, attachment_id, "chunk", &chunk_data) {
-                    Ok(plaintext) => plaintext,
-                    Err(_) => return Ok(false),
-                };
+            let (index, expected_hash, chunk_ct, external_uri_ct, stored_size) = row?;
+            let plaintext = match Self::load_chunk_plaintext(
+                conn,
+                attachment_id,
+                &att.storage_mode,
+                index,
+                stored_size,
+                chunk_ct,
+                external_uri_ct,
+                blob_store,
+            ) {
+                Ok(plaintext) => plaintext,
+                Err(_) => return Ok(false),
+            };
             let computed = compute_sha256_hex(&plaintext);
             if computed != expected_hash {
                 return Ok(false);
@@ -1041,6 +1212,90 @@ impl AttachmentRepo {
         }
 
         Ok(true)
+    }
+
+    fn require_blob_store_for_mode(
+        storage_mode: &StorageMode,
+        attachment_id: &str,
+        blob_store: Option<&dyn EncryptedBlobStore>,
+    ) -> StorageResult<()> {
+        if matches!(storage_mode, StorageMode::ExternalHashRef) && blob_store.is_none() {
+            return Err(StorageError::EncryptedBlobStoreRequired {
+                attachment_id: attachment_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_chunk_plaintext(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        storage_mode: &StorageMode,
+        chunk_index: i64,
+        stored_size: i64,
+        chunk_ct: Option<Vec<u8>>,
+        external_uri_ct: Option<Vec<u8>>,
+        blob_store: Option<&dyn EncryptedBlobStore>,
+    ) -> StorageResult<Vec<u8>> {
+        match storage_mode {
+            StorageMode::EmbeddedInline | StorageMode::EmbeddedChunked => {
+                let encrypted = match (chunk_ct, external_uri_ct) {
+                    (Some(encrypted), None) => encrypted,
+                    _ => {
+                        return Err(StorageError::ConstraintViolation(format!(
+                            "embedded attachment chunk {chunk_index} has invalid storage columns"
+                        )))
+                    }
+                };
+                Self::decrypt_attachment_field(conn, attachment_id, "chunk", &encrypted)
+            }
+            StorageMode::ExternalHashRef => {
+                let encrypted_reference = match (chunk_ct, external_uri_ct) {
+                    (None, Some(reference)) => reference,
+                    _ => {
+                        return Err(StorageError::ConstraintViolation(format!(
+                            "external attachment chunk {chunk_index} has invalid storage columns"
+                        )))
+                    }
+                };
+                let reference_field = external_reference_field(chunk_index);
+                let reference = Self::decrypt_attachment_field(
+                    conn,
+                    attachment_id,
+                    &reference_field,
+                    &encrypted_reference,
+                )?;
+                let blob_id = std::str::from_utf8(&reference).map_err(|_| {
+                    StorageError::ConstraintViolation(format!(
+                        "external attachment chunk {chunk_index} has a non-UTF-8 blob ID"
+                    ))
+                })?;
+                validate_blob_id(blob_id).map_err(|error| {
+                    StorageError::ConstraintViolation(format!(
+                        "external attachment chunk {chunk_index} has an invalid blob ID: {error}"
+                    ))
+                })?;
+                let blob_store =
+                    blob_store.ok_or_else(|| StorageError::EncryptedBlobStoreRequired {
+                        attachment_id: attachment_id.to_string(),
+                    })?;
+                let max_bytes = external_blob_read_limit(stored_size)?;
+                let encrypted_blob = blob_store.get(blob_id, max_bytes)?;
+                if encrypted_blob.len() > max_bytes {
+                    return Err(StorageError::BlobStore(format!(
+                        "blob {blob_id} exceeded the repository read limit"
+                    )));
+                }
+                if compute_blob_id(&encrypted_blob) != blob_id {
+                    return Err(StorageError::BlobStore(format!(
+                        "blob {blob_id} failed repository SHA-256 verification"
+                    )));
+                }
+                let chunk_field = external_chunk_field(chunk_index);
+                Self::decrypt_attachment_field(conn, attachment_id, &chunk_field, &encrypted_blob)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1109,6 +1364,39 @@ fn compute_sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn external_chunk_field(chunk_index: i64) -> String {
+    format!("external_chunk:{chunk_index}")
+}
+
+fn external_reference_field(chunk_index: i64) -> String {
+    format!("external_uri:{chunk_index}")
+}
+
+fn external_blob_read_limit(stored_size: i64) -> StorageResult<usize> {
+    let plaintext_size = u64::try_from(stored_size).map_err(|_| {
+        StorageError::ConstraintViolation("external chunk has a negative stored size".to_string())
+    })?;
+    let maximum = plaintext_size
+        .checked_add(MAX_EXTERNAL_BLOB_ENVELOPE_OVERHEAD)
+        .ok_or_else(|| StorageError::Validation("external blob size limit overflow".to_string()))?;
+    usize::try_from(maximum).map_err(|_| {
+        StorageError::Validation("external blob size exceeds platform limits".to_string())
+    })
+}
+
+fn parse_storage_mode(column: usize, value: &str) -> rusqlite::Result<StorageMode> {
+    value.parse().map_err(|message: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -1116,8 +1404,12 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::{Cursor, ErrorKind};
+    use std::sync::Mutex;
 
+    #[cfg(feature = "filesystem-blob-store")]
+    use crate::blob_store::FileSystemBlobStore;
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::entry::EntryRepo;
     use crate::repo::project::ProjectRepo;
@@ -1129,6 +1421,16 @@ mod tests {
         let ctx = CommitContext::new("test-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Parent Project", None, None).unwrap();
         (conn, ctx, project.project_id)
+    }
+
+    fn setup_encrypted() -> (VaultConnection, CommitContext, String) {
+        let (mut conn, ctx, project_id) = setup();
+        let vault_key = mdbx_crypto::aead::generate_key().unwrap();
+        let keyring =
+            mdbx_crypto::keyring::Keyring::from_vault_key(&vault_key, b"external-blob-tests")
+                .unwrap();
+        conn.attach_keyring(keyring);
+        (conn, ctx, project_id)
     }
 
     fn login_payload() -> serde_json::Value {
@@ -2373,5 +2675,506 @@ mod tests {
 
         assert!(AttachmentRepo::read_content(&conn, &att.attachment_id).is_err());
         assert!(!AttachmentRepo::verify_chunks_integrity(&conn, &att.attachment_id).unwrap());
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn external_content_roundtrip_keeps_only_encrypted_references_in_database() {
+        let (conn, ctx, project_id) = setup_encrypted();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path());
+        let data = b"external secret payload ".repeat(20);
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "mail.eml",
+            Some("message/rfc822"),
+            "",
+            data.len() as u64,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(&data);
+
+        let hash = AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(64, data.len() as u64),
+            &store,
+        )
+        .unwrap();
+
+        let refreshed = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.storage_mode, StorageMode::ExternalHashRef);
+        assert_eq!(refreshed.chunk_count, data.len().div_ceil(64) as u32);
+        assert_eq!(hash, compute_sha256_hex(&data));
+        let (embedded_count, external_count): (i64, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(chunk_ct), COUNT(external_uri_ct)
+                 FROM attachment_chunks WHERE attachment_id = ?1",
+                params![att.attachment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(embedded_count, 0);
+        assert_eq!(external_count, i64::from(refreshed.chunk_count));
+
+        let encrypted_reference: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT external_uri_ct FROM attachment_chunks
+                 WHERE attachment_id = ?1 AND chunk_index = 0",
+                params![att.attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let reference = AttachmentRepo::decrypt_attachment_field(
+            &conn,
+            &att.attachment_id,
+            &external_reference_field(0),
+            &encrypted_reference,
+        )
+        .unwrap();
+        assert_ne!(encrypted_reference, reference);
+        let blob_id = std::str::from_utf8(&reference).unwrap();
+        let encrypted_blob = store
+            .get(blob_id, 64 + MAX_EXTERNAL_BLOB_ENVELOPE_OVERHEAD as usize)
+            .unwrap();
+        assert_ne!(encrypted_blob, data[..64]);
+
+        assert_eq!(
+            AttachmentRepo::read_content_with_blob_store(&conn, &att.attachment_id, &store)
+                .unwrap(),
+            data
+        );
+        assert!(AttachmentRepo::verify_integrity_with_blob_store(
+            &conn,
+            &att.attachment_id,
+            &store
+        )
+        .unwrap());
+        assert!(AttachmentRepo::verify_chunks_integrity_with_blob_store(
+            &conn,
+            &att.attachment_id,
+            &store
+        )
+        .unwrap());
+        assert!(matches!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id),
+            Err(StorageError::EncryptedBlobStoreRequired { .. })
+        ));
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn external_content_rejects_missing_corrupt_and_mixed_blob_material() {
+        let (conn, ctx, project_id) = setup_encrypted();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path());
+        let data = b"encrypted external data".repeat(8);
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "external.bin",
+            None,
+            "",
+            data.len() as u64,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(&data);
+        AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(64, data.len() as u64),
+            &store,
+        )
+        .unwrap();
+
+        let encrypted_reference: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT external_uri_ct FROM attachment_chunks
+                 WHERE attachment_id = ?1 AND chunk_index = 0",
+                params![att.attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let reference = AttachmentRepo::decrypt_attachment_field(
+            &conn,
+            &att.attachment_id,
+            &external_reference_field(0),
+            &encrypted_reference,
+        )
+        .unwrap();
+        let blob_id = std::str::from_utf8(&reference).unwrap();
+        let path = store.blob_path(blob_id).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            AttachmentRepo::read_content_with_blob_store(&conn, &att.attachment_id, &store),
+            Err(StorageError::BlobStore(_))
+        ));
+        std::fs::write(&path, b"corrupt ciphertext").unwrap();
+        assert!(matches!(
+            AttachmentRepo::read_content_with_blob_store(&conn, &att.attachment_id, &store),
+            Err(StorageError::BlobStore(_))
+        ));
+
+        conn.inner()
+            .execute(
+                "UPDATE attachment_chunks SET chunk_ct = ?1
+                 WHERE attachment_id = ?2 AND chunk_index = 0",
+                params![b"unexpected".as_slice(), att.attachment_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            AttachmentRepo::read_content_with_blob_store(&conn, &att.attachment_id, &store),
+            Err(StorageError::ConstraintViolation(_))
+        ));
+    }
+
+    #[test]
+    fn external_content_requires_encryption_before_provider_access() {
+        struct PanicStore;
+
+        impl EncryptedBlobStore for PanicStore {
+            fn put(&self, _blob_id: &str, _encrypted_blob: &[u8]) -> StorageResult<()> {
+                panic!("unencrypted vault must be rejected before provider access")
+            }
+
+            fn get(&self, _blob_id: &str, _max_bytes: usize) -> StorageResult<Vec<u8>> {
+                panic!("get must not be called")
+            }
+        }
+
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(&conn, &ctx, &project_id, None, "plaintext.bin", None, "", 3)
+            .unwrap();
+        let mut reader = Cursor::new(b"raw");
+        let error = AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(3, 3),
+            &PanicStore,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn external_reader_failure_rolls_back_database_and_may_leave_encrypted_orphans() {
+        #[derive(Default)]
+        struct RecordingStore {
+            blobs: Mutex<HashMap<String, Vec<u8>>>,
+        }
+
+        impl EncryptedBlobStore for RecordingStore {
+            fn put(&self, blob_id: &str, encrypted_blob: &[u8]) -> StorageResult<()> {
+                self.blobs
+                    .lock()
+                    .unwrap()
+                    .insert(blob_id.to_string(), encrypted_blob.to_vec());
+                Ok(())
+            }
+
+            fn get(&self, blob_id: &str, max_bytes: usize) -> StorageResult<Vec<u8>> {
+                let blob = self
+                    .blobs
+                    .lock()
+                    .unwrap()
+                    .get(blob_id)
+                    .cloned()
+                    .ok_or_else(|| StorageError::BlobStore("missing test blob".to_string()))?;
+                if blob.len() > max_bytes {
+                    return Err(StorageError::BlobStore("oversized test blob".to_string()));
+                }
+                Ok(blob)
+            }
+        }
+
+        struct FailingReader {
+            data: Vec<u8>,
+            position: usize,
+            fail_after: usize,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.position >= self.fail_after {
+                    return Err(std::io::Error::new(ErrorKind::Other, "reader failed"));
+                }
+                let available = self.fail_after.min(self.data.len()) - self.position;
+                let read = available.min(buffer.len());
+                buffer[..read].copy_from_slice(&self.data[self.position..self.position + read]);
+                self.position += read;
+                Ok(read)
+            }
+        }
+
+        let (conn, ctx, project_id) = setup_encrypted();
+        let store = RecordingStore::default();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "rollback-external.bin",
+            None,
+            "",
+            8,
+        )
+        .unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"original").unwrap();
+        let before = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut reader = FailingReader {
+            data: vec![7; 256],
+            position: 0,
+            fail_after: 100,
+        };
+
+        let error = AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::new(64, 256),
+            &store,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::Io(ref io) if io.kind() == ErrorKind::Other));
+        let after = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let commit_count_after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after.storage_mode, StorageMode::EmbeddedInline);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.head_commit_id, before.head_commit_id);
+        assert_eq!(commit_count_after, commit_count_before);
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap(),
+            b"original"
+        );
+        let orphaned_blobs = store.blobs.lock().unwrap();
+        assert_eq!(orphaned_blobs.len(), 1);
+        assert_ne!(orphaned_blobs.values().next().unwrap(), &vec![7; 64]);
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn external_repository_rejects_provider_output_beyond_declared_limit() {
+        struct OversizedStore;
+
+        impl EncryptedBlobStore for OversizedStore {
+            fn put(&self, _blob_id: &str, _encrypted_blob: &[u8]) -> StorageResult<()> {
+                Ok(())
+            }
+
+            fn get(&self, _blob_id: &str, max_bytes: usize) -> StorageResult<Vec<u8>> {
+                Ok(vec![0; max_bytes + 1])
+            }
+        }
+
+        let (conn, ctx, project_id) = setup_encrypted();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path());
+        let data = b"bounded blob".repeat(8);
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "bounded-external.bin",
+            None,
+            "",
+            data.len() as u64,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(&data);
+        AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(32, data.len() as u64),
+            &store,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            AttachmentRepo::read_content_with_blob_store(
+                &conn,
+                &att.attachment_id,
+                &OversizedStore
+            ),
+            Err(StorageError::BlobStore(_))
+        ));
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn external_references_survive_snapshot_and_sync_state_serialization() {
+        let (conn, ctx, project_id) = setup_encrypted();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path());
+        let data = b"snapshot and synchronization keep encrypted references".repeat(4);
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "portable-external.bin",
+            None,
+            "",
+            data.len() as u64,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(&data);
+        AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(48, data.len() as u64),
+            &store,
+        )
+        .unwrap();
+
+        let payload = crate::sync_state::collect_sync_state_payload(&conn).unwrap();
+        let state = crate::sync_state::decode_sync_state_payload(&payload)
+            .unwrap()
+            .unwrap();
+        let synced_attachment = state
+            .attachments
+            .iter()
+            .find(|row| row.attachment_id == att.attachment_id)
+            .unwrap();
+        assert_eq!(synced_attachment.storage_mode, "external-hash-ref");
+        let synced_chunks: Vec<_> = state
+            .attachment_chunks
+            .iter()
+            .filter(|row| row.attachment_id == att.attachment_id)
+            .collect();
+        assert!(!synced_chunks.is_empty());
+        assert!(synced_chunks
+            .iter()
+            .all(|row| row.chunk_ct.is_none() && row.external_uri_ct.is_some()));
+
+        let snapshot = crate::repo::snapshot::SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"replacement")
+            .unwrap();
+        crate::repo::snapshot::SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id)
+            .unwrap();
+
+        let restored = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.storage_mode, StorageMode::ExternalHashRef);
+        assert_eq!(
+            AttachmentRepo::read_content_with_blob_store(&conn, &att.attachment_id, &store)
+                .unwrap(),
+            data
+        );
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn inline_replacement_removes_all_external_chunk_references() {
+        let (conn, ctx, project_id) = setup_encrypted();
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path());
+        let data = vec![8; 160];
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "replace-external.bin",
+            None,
+            "",
+            data.len() as u64,
+        )
+        .unwrap();
+        let mut reader = Cursor::new(&data);
+        AttachmentRepo::write_external_content_from_reader_with_options(
+            &conn,
+            &ctx,
+            &att.attachment_id,
+            &mut reader,
+            AttachmentWriteOptions::exact(32, data.len() as u64),
+            &store,
+        )
+        .unwrap();
+
+        AttachmentRepo::write_inline_content(&conn, &ctx, &att.attachment_id, b"inline").unwrap();
+
+        let refreshed = AttachmentRepo::get_by_id(&conn, &att.attachment_id)
+            .unwrap()
+            .unwrap();
+        let row_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM attachment_chunks WHERE attachment_id = ?1",
+                params![att.attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refreshed.storage_mode, StorageMode::EmbeddedInline);
+        assert_eq!(refreshed.chunk_count, 1);
+        assert_eq!(row_count, 1);
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, &att.attachment_id).unwrap(),
+            b"inline"
+        );
+    }
+
+    #[test]
+    fn unknown_attachment_storage_mode_is_rejected() {
+        let (conn, ctx, project_id) = setup();
+        let att = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project_id,
+            None,
+            "unknown-mode.bin",
+            None,
+            "",
+            0,
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE attachments SET storage_mode = 'future-mode' WHERE attachment_id = ?1",
+                params![att.attachment_id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            AttachmentRepo::get_by_id(&conn, &att.attachment_id),
+            Err(StorageError::Database(
+                rusqlite::Error::FromSqlConversionFailure(..)
+            ))
+        ));
     }
 }

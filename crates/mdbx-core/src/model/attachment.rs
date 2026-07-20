@@ -83,9 +83,9 @@ pub struct AttachmentChunk {
     pub chunk_index: u32,
     /// chunk 内容 hash
     pub chunk_hash: ChunkHash,
-    /// 加密的 chunk 内容（与 external_uri_ct 至少一个存在）
+    /// 内嵌模式的加密 chunk 内容；外部模式必须为空。
     pub chunk_ct: Option<CipherText>,
-    /// 加密的外部 URI（与 chunk_ct 至少一个存在）
+    /// 外部模式的加密内容寻址引用；内嵌模式必须为空。
     pub external_uri_ct: Option<CipherText>,
     /// 存储大小
     pub stored_size: u64,

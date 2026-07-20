@@ -61,6 +61,7 @@ MDBX 必须坚持：
 - `mdbx-ffi` 已进入 workspace，作为非 Rust 客户端的通用 UniFFI 边界；当前覆盖 vault/project/generic entry、完整 Tiga2 策略读取与逐操作授权、真实设备能力、迁移检查/显式升级、显式 Tiga 创建、安全密钥材料解锁、组合因素整改和已解锁状态下重设主密码，后续 tag、attachment、sync、conflict、snapshot、diagnostics 等跨语言能力应继续扩展 facade，而不是让客户端直接写表。
 - 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
+- `external-hash-ref` 已通过通用 `EncryptedBlobStore` 接口实现；默认 CLI 使用 `<vault>.blobs` 内容寻址目录，core 裁剪构建保留引用格式和 Provider 接口并移除文件系统实现。数据库、snapshot 和同步状态携带加密引用，Blob 本体由 Provider 负责传输与保留。
 - project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
 - project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
 - project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
@@ -95,7 +96,7 @@ MDBX 必须坚持：
 - benchmark harness 已有，但还没有形成可发布报告。
 - 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
 - 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
-- external-hash-ref 附件模式尚未实现。
+- external-hash-ref 的引用扫描、加密孤儿回收和 Provider 间 Blob 传输尚未实现。
 
 ### 3.5 安全
 
@@ -173,8 +174,9 @@ MDBX 必须坚持：
 
 任务：
 
-- external-hash-ref 模式。
-- 附件 blob 内容寻址目录或可插拔 blob provider。
+- external-hash-ref 模式已完成。
+- 附件 Blob 内容寻址目录和可插拔加密 Blob Provider 已完成。
+- 增加显式引用扫描、加密孤儿回收和 Provider 间 Blob 传输。
 - metadata-only 更新不触碰 chunk。
 - benchmark 输出 delta size 和时延报告。
 - 可选 zstd 压缩和二进制 payload 序列化。

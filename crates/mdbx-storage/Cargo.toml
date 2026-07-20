@@ -10,8 +10,10 @@ default = [
     "kdbx-export",
     "benchmarks",
     "derived-search-index",
+    "filesystem-blob-store",
 ]
 core = []
+filesystem-blob-store = []
 kdbx-import = []
 kdbx-export = []
 derived-search-index = []

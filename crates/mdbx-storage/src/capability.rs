@@ -15,6 +15,8 @@ pub struct CapabilitySet {
     pub snapshots: bool,
     pub recovery: bool,
     pub synchronization: bool,
+    pub external_blob_references: bool,
+    pub filesystem_blob_store: bool,
     pub kdbx_import: bool,
     pub kdbx_export: bool,
     pub benchmarks: bool,
@@ -36,6 +38,8 @@ impl CapabilitySet {
             snapshots: true,
             recovery: true,
             synchronization: true,
+            external_blob_references: true,
+            filesystem_blob_store: cfg!(feature = "filesystem-blob-store"),
             kdbx_import: cfg!(feature = "kdbx-import"),
             kdbx_export: cfg!(feature = "kdbx-export"),
             benchmarks: cfg!(feature = "benchmarks"),
@@ -62,11 +66,16 @@ mod tests {
         assert!(capabilities.snapshots);
         assert!(capabilities.recovery);
         assert!(capabilities.synchronization);
+        assert!(capabilities.external_blob_references);
     }
 
     #[test]
     fn optional_capabilities_match_cargo_features() {
         let capabilities = CapabilitySet::current();
+        assert_eq!(
+            capabilities.filesystem_blob_store,
+            cfg!(feature = "filesystem-blob-store")
+        );
         assert_eq!(capabilities.kdbx_import, cfg!(feature = "kdbx-import"));
         assert_eq!(capabilities.kdbx_export, cfg!(feature = "kdbx-export"));
         assert_eq!(capabilities.benchmarks, cfg!(feature = "benchmarks"));

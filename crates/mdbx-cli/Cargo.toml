@@ -5,8 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["search", "benchmark", "kdbx-import", "kdbx-export"]
+default = [
+    "search",
+    "benchmark",
+    "kdbx-import",
+    "kdbx-export",
+    "external-blob-store",
+]
 core = ["mdbx-storage/core"]
+external-blob-store = ["mdbx-storage/filesystem-blob-store"]
 search = ["mdbx-storage/derived-search-index"]
 benchmark = ["mdbx-storage/benchmarks"]
 kdbx-import = ["mdbx-storage/kdbx-import"]

@@ -22,6 +22,12 @@ pub enum StorageError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    #[error("encrypted blob store error: {0}")]
+    BlobStore(String),
+
+    #[error("attachment {attachment_id} requires an encrypted blob store")]
+    EncryptedBlobStoreRequired { attachment_id: String },
+
     #[error("Tiga authorization did not allow the operation: {0:?}")]
     Authorization(AuthorizationDecision),
 

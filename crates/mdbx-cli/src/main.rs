@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+#[cfg(any(not(feature = "external-blob-store"), test))]
+use mdbx_core::model::attachment::StorageMode;
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
 use mdbx_storage::benchmark::BenchmarkRunner;
+#[cfg(feature = "external-blob-store")]
+use mdbx_storage::blob_store::FileSystemBlobStore;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 use mdbx_storage::import::KdbxEntry;
@@ -262,6 +266,9 @@ enum AttachAction {
         entry_id: Option<String>,
         /// 附件文件路径
         file: PathBuf,
+        /// 将加密分块保存到 `<vault>.blobs` 内容寻址目录
+        #[arg(long)]
+        external: bool,
     },
     /// 导出附件内容
     Get {
@@ -352,7 +359,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Attach { action } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
-            cmd_attach(&mut conn, action)
+            cmd_attach(&mut conn, &cli.vault, action)
         }
         Commands::Snapshot { action } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -424,6 +431,7 @@ const ATTACHMENT_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 fn export_attachment_to_path(
     conn: &mut VaultConnection,
     attachment_id: &str,
+    vault_path: &Path,
     output: &Path,
 ) -> Result<u64, String> {
     let device = cli_device_context();
@@ -444,8 +452,7 @@ fn export_attachment_to_path(
         .tempfile_in(parent)
         .map_err(|error| format!("cannot create temporary output file: {error}"))?;
     let written =
-        AttachmentRepo::read_content_to_writer(conn, attachment_id, temporary.as_file_mut())
-            .map_err(|error| format!("{error}"))?;
+        read_attachment_to_writer(conn, attachment_id, vault_path, temporary.as_file_mut())?;
     temporary
         .as_file_mut()
         .sync_all()
@@ -454,6 +461,92 @@ fn export_attachment_to_path(
         .persist(output)
         .map_err(|error| format!("cannot replace output file: {}", error.error))?;
     Ok(written)
+}
+
+fn default_blob_store_path(vault_path: &Path) -> PathBuf {
+    let mut path = vault_path.as_os_str().to_os_string();
+    path.push(".blobs");
+    PathBuf::from(path)
+}
+
+fn read_attachment_to_writer(
+    conn: &VaultConnection,
+    attachment_id: &str,
+    _vault_path: &Path,
+    writer: &mut dyn std::io::Write,
+) -> Result<u64, String> {
+    #[cfg(feature = "external-blob-store")]
+    {
+        let store = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+        AttachmentRepo::read_content_to_writer_with_blob_store(conn, attachment_id, &store, writer)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "external-blob-store"))]
+    {
+        let attachment = AttachmentRepo::get_by_id(conn, attachment_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("attachment {attachment_id} not found"))?;
+        if attachment.storage_mode == StorageMode::ExternalHashRef {
+            return Err(
+                "this MDBX build does not include the filesystem encrypted Blob Provider"
+                    .to_string(),
+            );
+        }
+        AttachmentRepo::read_content_to_writer(conn, attachment_id, writer)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn read_attachment_content(
+    conn: &VaultConnection,
+    attachment_id: &str,
+    _vault_path: &Path,
+) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "external-blob-store")]
+    {
+        let store = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+        AttachmentRepo::read_content_with_blob_store(conn, attachment_id, &store)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "external-blob-store"))]
+    {
+        let attachment = AttachmentRepo::get_by_id(conn, attachment_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("attachment {attachment_id} not found"))?;
+        if attachment.storage_mode == StorageMode::ExternalHashRef {
+            return Err(
+                "this MDBX build does not include the filesystem encrypted Blob Provider"
+                    .to_string(),
+            );
+        }
+        AttachmentRepo::read_content(conn, attachment_id).map_err(|error| error.to_string())
+    }
+}
+
+fn verify_attachment_content(
+    conn: &VaultConnection,
+    attachment_id: &str,
+    _vault_path: &Path,
+) -> Result<bool, String> {
+    #[cfg(feature = "external-blob-store")]
+    {
+        let store = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+        AttachmentRepo::verify_integrity_with_blob_store(conn, attachment_id, &store)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "external-blob-store"))]
+    {
+        let attachment = AttachmentRepo::get_by_id(conn, attachment_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("attachment {attachment_id} not found"))?;
+        if attachment.storage_mode == StorageMode::ExternalHashRef {
+            return Err(
+                "this MDBX build does not include the filesystem encrypted Blob Provider"
+                    .to_string(),
+            );
+        }
+        AttachmentRepo::verify_integrity(conn, attachment_id).map_err(|error| error.to_string())
+    }
 }
 
 fn cli_device_context() -> DeviceContext {
@@ -907,7 +1000,11 @@ fn cmd_entry(conn: &mut VaultConnection, action: EntryAction) -> Result<(), Stri
 // ATTACH
 // ---------------------------------------------------------------------------
 
-fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), String> {
+fn cmd_attach(
+    conn: &mut VaultConnection,
+    vault_path: &Path,
+    action: AttachAction,
+) -> Result<(), String> {
     let ctx = ctx();
     match action {
         AttachAction::List {
@@ -936,7 +1033,15 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
             project_id,
             entry_id,
             file,
+            external,
         } => {
+            #[cfg(not(feature = "external-blob-store"))]
+            if external {
+                return Err(
+                    "this MDBX build does not include the filesystem encrypted Blob Provider"
+                        .to_string(),
+                );
+            }
             let mut input =
                 std::fs::File::open(&file).map_err(|e| format!("cannot open file: {}", e))?;
             let original_size = input
@@ -970,6 +1075,33 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
                         "",
                         original_size,
                     )?;
+                    #[cfg(feature = "external-blob-store")]
+                    if external {
+                        let store = FileSystemBlobStore::new(default_blob_store_path(vault_path));
+                        AttachmentRepo::write_external_content_from_reader_with_options(
+                            conn,
+                            scoped,
+                            &att.attachment_id,
+                            &mut input,
+                            AttachmentWriteOptions::exact(
+                                ATTACHMENT_STREAM_CHUNK_SIZE,
+                                original_size,
+                            ),
+                            &store,
+                        )?;
+                    } else {
+                        AttachmentRepo::write_content_from_reader_with_options(
+                            conn,
+                            scoped,
+                            &att.attachment_id,
+                            &mut input,
+                            AttachmentWriteOptions::exact(
+                                ATTACHMENT_STREAM_CHUNK_SIZE,
+                                original_size,
+                            ),
+                        )?;
+                    }
+                    #[cfg(not(feature = "external-blob-store"))]
                     AttachmentRepo::write_content_from_reader_with_options(
                         conn,
                         scoped,
@@ -994,13 +1126,19 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
                 "Added attachment {} ({} bytes)",
                 att.attachment_id, original_size
             );
+            if external {
+                println!(
+                    "Encrypted blobs: {}",
+                    default_blob_store_path(vault_path).display()
+                );
+            }
         }
         AttachAction::Get {
             attachment_id,
             output,
         } => {
             if let Some(path) = output {
-                let written = export_attachment_to_path(conn, &attachment_id, &path)?;
+                let written = export_attachment_to_path(conn, &attachment_id, vault_path, &path)?;
                 println!("Wrote {} bytes to {}", written, path.display());
             } else {
                 let device = cli_device_context();
@@ -1012,8 +1150,7 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
                     chrono::Utc::now().timestamp(),
                 )
                 .map_err(|error| error.to_string())?;
-                let data = AttachmentRepo::read_content(conn, &attachment_id)
-                    .map_err(|e| format!("{}", e))?;
+                let data = read_attachment_content(conn, &attachment_id, vault_path)?;
                 // stdout — only if looks like text
                 match std::str::from_utf8(&data) {
                     Ok(s) => println!("{}", s),
@@ -1060,8 +1197,7 @@ fn cmd_attach(conn: &mut VaultConnection, action: AttachAction) -> Result<(), St
             println!("Renamed attachment {}", renamed.attachment_id);
         }
         AttachAction::Verify { attachment_id } => {
-            let ok = AttachmentRepo::verify_integrity(conn, &attachment_id)
-                .map_err(|e| format!("{}", e))?;
+            let ok = verify_attachment_content(conn, &attachment_id, vault_path)?;
             if ok {
                 println!("Attachment {} integrity OK", attachment_id);
             } else {
@@ -2031,6 +2167,7 @@ mod tests {
                     project_id: project_id.clone(),
                     entry_id: None,
                     file: input.clone(),
+                    external: false,
                 },
             },
         ))
@@ -2193,6 +2330,7 @@ mod tests {
                     project_id: project_id.clone(),
                     entry_id: None,
                     file: input.clone(),
+                    external: false,
                 },
             },
         ))
@@ -2280,6 +2418,7 @@ mod tests {
                     project_id: project_id.clone(),
                     entry_id: None,
                     file: input.clone(),
+                    external: false,
                 },
             },
         ))
@@ -2368,6 +2507,7 @@ mod tests {
                     project_id: project_id.clone(),
                     entry_id: None,
                     file: input.clone(),
+                    external: false,
                 },
             },
         ))
@@ -2403,6 +2543,140 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_roundtrips_external_encrypted_attachment() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "External Attachments".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        drop(conn);
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-external-{}.bin", uuid::Uuid::new_v4()));
+        let output = std::env::temp_dir().join(format!(
+            "mdbx-cli-external-out-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let data: Vec<u8> = (0..ATTACHMENT_STREAM_CHUNK_SIZE + 31)
+            .map(|index| (index % 241) as u8)
+            .collect();
+        std::fs::write(&input, &data).unwrap();
+
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id: project_id.clone(),
+                    entry_id: None,
+                    file: input.clone(),
+                    external: true,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let attachment = AttachmentRepo::list_by_project(&conn, &project_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(attachment.storage_mode, StorageMode::ExternalHashRef);
+        assert_eq!(attachment.chunk_count, 2);
+        let (embedded_count, external_count): (i64, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(chunk_ct), COUNT(external_uri_ct)
+                 FROM attachment_chunks WHERE attachment_id = ?1",
+                params![attachment.attachment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(embedded_count, 0);
+        assert_eq!(external_count, 2);
+        drop(conn);
+        assert!(default_blob_store_path(&path).is_dir());
+
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Verify {
+                    attachment_id: attachment.attachment_id.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Get {
+                    attachment_id: attachment.attachment_id,
+                    output: Some(output.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
+    #[cfg(not(feature = "external-blob-store"))]
+    #[test]
+    fn core_cli_reports_missing_external_blob_provider_before_mutation() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Core Attachments".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        drop(conn);
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-core-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&input, b"external").unwrap();
+
+        let error = run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id: project_id.clone(),
+                    entry_id: None,
+                    file: input.clone(),
+                    external: true,
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("does not include the filesystem encrypted Blob Provider"));
+        let conn = open_unlocked(&path);
+        assert!(AttachmentRepo::list_by_project(&conn, &project_id)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]
