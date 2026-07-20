@@ -8,10 +8,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
-    CollectionProfile, CollectionTypeId, Conflict, ConflictObjectType, ConflictResolution,
-    EntryType, ExtensionCapabilityId, ObjectSummary, ObjectTypeId, PayloadMigrationExecution,
-    PayloadMigrationOutput, PayloadMigrationPlan, PayloadMigrationPlanItem, RelationKindId,
-    Tombstone, UnlockMethodType,
+    Attachment, CollectionProfile, CollectionTypeId, Conflict, ConflictObjectType,
+    ConflictResolution, EntryType, ExtensionCapabilityId, ObjectSummary, ObjectTypeId,
+    PayloadMigrationExecution, PayloadMigrationOutput, PayloadMigrationPlan,
+    PayloadMigrationPlanItem, RelationKindId, Tombstone, UnlockMethodType,
 };
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
@@ -26,9 +26,9 @@ use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
-    BranchRepo, CollectionProfileRepo, CollectionProfileSpec, CommitChange, CommitContext,
-    CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo, CommitOperation, ConflictRepo,
-    EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
+    AttachmentRepo, BranchRepo, CollectionProfileRepo, CollectionProfileSpec, CommitChange,
+    CommitContext, CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo, CommitOperation,
+    ConflictRepo, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
     ObjectSummaryRepo, OperationExecution, PayloadMigrationPlanRequest, PayloadMigrationRepo,
     PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility,
@@ -567,6 +567,34 @@ pub struct MdbxConflictRecord {
     pub resolution: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+}
+
+/// Client-editable project fields for an explicit custom conflict merge.
+///
+/// The conflict ID supplies the project identity. Policy, clocks, collection
+/// profile, and derived counters remain storage-owned.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxProjectConflictMerge {
+    pub title: String,
+    pub summary: Option<String>,
+    pub group_id: Option<String>,
+    pub icon_ref: Option<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    pub deleted: bool,
+}
+
+/// Client-editable attachment metadata for an explicit custom conflict merge.
+///
+/// Content identity and chunk metadata are intentionally absent. Content must
+/// be transferred and verified through the attachment/blob APIs first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentConflictMerge {
+    pub project_id: String,
+    pub entry_id: Option<String>,
+    pub file_name: String,
+    pub media_type: Option<String>,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
@@ -2976,6 +3004,68 @@ impl MdbxVault {
         Ok(conflict_record(&resolved))
     }
 
+    pub fn resolve_project_conflict_custom(
+        &self,
+        conflict_id: String,
+        merged: MdbxProjectConflictMerge,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        if conflict.object_type != ConflictObjectType::Project {
+            return Err(StorageError::ConstraintViolation(
+                "project custom resolution requires a project conflict".to_string(),
+            )
+            .into());
+        }
+        let mut project = ProjectRepo::get_by_id(&conn, &conflict.object_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict.object_id.clone()))?;
+        project.title_ct = merged.title.into_bytes();
+        project.summary_ct = merged.summary.map(String::into_bytes);
+        project.group_id = merged.group_id;
+        project.icon_ref = merged.icon_ref;
+        project.favorite = merged.favorite;
+        project.archived = merged.archived;
+        project.deleted = merged.deleted;
+        let resolved = ConflictRepo::resolve_project_custom(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &project,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
+    pub fn resolve_attachment_conflict_custom(
+        &self,
+        conflict_id: String,
+        merged: MdbxAttachmentConflictMerge,
+    ) -> Result<MdbxConflictRecord, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let conflict = ConflictRepo::get_by_id(&conn, &conflict_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict_id.clone()))?;
+        if conflict.object_type != ConflictObjectType::Attachment {
+            return Err(StorageError::ConstraintViolation(
+                "attachment custom resolution requires an attachment conflict".to_string(),
+            )
+            .into());
+        }
+        let mut attachment: Attachment = AttachmentRepo::get_by_id(&conn, &conflict.object_id)?
+            .ok_or_else(|| StorageError::NotFound(conflict.object_id.clone()))?;
+        attachment.project_id = merged.project_id;
+        attachment.entry_id = merged.entry_id;
+        attachment.file_name_ct = merged.file_name.into_bytes();
+        attachment.media_type_ct = merged.media_type.map(String::into_bytes);
+        attachment.deleted = merged.deleted;
+        let resolved = ConflictRepo::resolve_attachment_custom(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &conflict_id,
+            &attachment,
+        )?;
+        Ok(conflict_record(&resolved))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_object_relation_conflict_custom(
         &self,
@@ -4584,6 +4674,160 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&stored.payload_ct).unwrap(),
             serde_json::json!({"position":2})
         );
+    }
+
+    #[test]
+    fn conflict_facade_applies_typed_project_and_attachment_custom_merges() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("ffi-custom-conflict-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Local", None, None).unwrap();
+        let project_row =
+            mdbx_storage::repo::ObjectVersionRepo::current_project_row(&conn, &project.project_id)
+                .unwrap();
+        let project_incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "project",
+                std::slice::from_ref(&project.project_id),
+                std::slice::from_ref(&project_row.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming_project = project_row.clone();
+        incoming_project.title_ct = b"Incoming".to_vec();
+        incoming_project.head_commit_id = project_incoming_commit.clone();
+        mdbx_storage::repo::ObjectVersionRepo::record_project_row(
+            &conn,
+            &project_incoming_commit,
+            &incoming_project,
+        )
+        .unwrap();
+        let project_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Project,
+            &project.project_id,
+            &project_row.head_commit_id,
+            &project_row.head_commit_id,
+            &project_incoming_commit,
+            &["title_ct".to_string()],
+        )
+        .unwrap();
+
+        let content_hash = "a".repeat(64);
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "local.mafile",
+            Some("application/json"),
+            &content_hash,
+            256,
+        )
+        .unwrap();
+        let attachment_row = mdbx_storage::repo::ObjectVersionRepo::current_attachment_row(
+            &conn,
+            &attachment.attachment_id,
+        )
+        .unwrap();
+        let attachment_incoming_commit = ctx
+            .create_commit(
+                &conn,
+                "change",
+                "attachment",
+                std::slice::from_ref(&attachment.attachment_id),
+                std::slice::from_ref(&attachment_row.head_commit_id),
+            )
+            .unwrap();
+        let mut incoming_attachment = attachment_row.clone();
+        incoming_attachment.file_name_ct = b"incoming.mafile".to_vec();
+        incoming_attachment.head_commit_id = attachment_incoming_commit.clone();
+        mdbx_storage::repo::ObjectVersionRepo::record_attachment_row(
+            &conn,
+            &attachment_incoming_commit,
+            &incoming_attachment,
+        )
+        .unwrap();
+        let attachment_conflict = ConflictRepo::create(
+            &conn,
+            &ctx,
+            ConflictObjectType::Attachment,
+            &attachment.attachment_id,
+            &attachment_row.head_commit_id,
+            &attachment_row.head_commit_id,
+            &attachment_incoming_commit,
+            &["file_name_ct".to_string()],
+        )
+        .unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-custom-conflict-device".to_string(),
+            vault_id: "ffi-custom-conflict-vault".to_string(),
+        };
+
+        assert!(vault
+            .resolve_project_conflict_custom(
+                attachment_conflict.conflict_id.clone(),
+                MdbxProjectConflictMerge {
+                    title: "Wrong type".to_string(),
+                    summary: None,
+                    group_id: None,
+                    icon_ref: None,
+                    favorite: false,
+                    archived: false,
+                    deleted: false,
+                },
+            )
+            .is_err());
+
+        let resolved_project = vault
+            .resolve_project_conflict_custom(
+                project_conflict.conflict_id,
+                MdbxProjectConflictMerge {
+                    title: "Merged".to_string(),
+                    summary: Some("Selected summary".to_string()),
+                    group_id: Some("accounts".to_string()),
+                    icon_ref: Some("steam".to_string()),
+                    favorite: true,
+                    archived: false,
+                    deleted: false,
+                },
+            )
+            .unwrap();
+        let resolved_attachment = vault
+            .resolve_attachment_conflict_custom(
+                attachment_conflict.conflict_id,
+                MdbxAttachmentConflictMerge {
+                    project_id: project.project_id.clone(),
+                    entry_id: None,
+                    file_name: "merged.mafile".to_string(),
+                    media_type: Some("application/vnd.monica.mafile+json".to_string()),
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved_project.resolution, "custom");
+        assert_eq!(resolved_attachment.resolution, "custom");
+        assert!(vault.list_unresolved_conflicts().unwrap().is_empty());
+        let conn = vault.conn.lock().unwrap();
+        let stored_project = ProjectRepo::get_by_id(&conn, &project.project_id)
+            .unwrap()
+            .unwrap();
+        let stored_attachment = AttachmentRepo::get_by_id(&conn, &attachment.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_project.title_ct, b"Merged");
+        assert_eq!(
+            stored_project.summary_ct.as_deref(),
+            Some(b"Selected summary".as_slice())
+        );
+        assert!(stored_project.favorite);
+        assert_eq!(stored_attachment.file_name_ct, b"merged.mafile");
+        assert_eq!(stored_attachment.content_hash, content_hash);
+        assert_eq!(stored_attachment.original_size, 256);
     }
 
     #[test]
