@@ -13,6 +13,7 @@ pub mod object_version;
 pub mod payload_migration;
 pub mod project;
 pub mod snapshot;
+pub mod sync_delta_inventory;
 pub mod tombstone;
 
 pub use attachment::{
@@ -38,6 +39,10 @@ pub use object_version::ObjectVersionRepo;
 pub use payload_migration::{PayloadMigrationPlanRequest, PayloadMigrationRepo};
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
+pub use sync_delta_inventory::{
+    SyncDeltaInventoryItem, SyncDeltaInventoryPage, SyncDeltaInventoryRepo,
+    MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE, MAX_SYNC_DELTA_INVENTORY_TOKEN_BYTES,
+};
 pub use tombstone::{
     PermanentPurgeReceipt, TombstonePurgeBlocker, TombstonePurgeEligibility,
     TombstonePurgeScheduleResult, TombstoneRepo,
