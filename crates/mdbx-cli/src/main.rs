@@ -14,6 +14,10 @@ use mdbx_storage::benchmark::BenchmarkRunner;
 use mdbx_storage::blob_lifecycle::{BlobAuditOptions, BlobLifecycleLimits, BlobLifecycleService};
 #[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_store::FileSystemBlobStore;
+#[cfg(feature = "external-blob-store")]
+use mdbx_storage::blob_transfer::{
+    BlobTransferCheckpoint, BlobTransferLimits, BlobTransferService,
+};
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 use mdbx_storage::import::KdbxEntry;
@@ -341,6 +345,29 @@ enum BlobAction {
         /// `gc-plan` 返回的固定清理时间边界
         #[arg(long)]
         cutoff_unix_secs: i64,
+    },
+    /// 将当前 vault Provider 中的加密 Blob 传输到另一个 Provider
+    Transfer {
+        /// 内容寻址 Blob ID
+        blob_id: String,
+        /// Blob ciphertext 的精确字节数
+        #[arg(long)]
+        size: u64,
+        /// 目标 filesystem Provider 根目录
+        #[arg(long)]
+        destination: PathBuf,
+        /// 续传 checkpoint 文件
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// 每个传输块的最大字节数
+        #[arg(long, default_value_t = 1024 * 1024)]
+        chunk_size: usize,
+        /// 本次调用最多传输的块数
+        #[arg(long, default_value_t = 10_000)]
+        max_chunks: usize,
+        /// Provider 租约有效期，单位秒
+        #[arg(long, default_value_t = 5 * 60)]
+        lease_ttl_secs: i64,
     },
 }
 
@@ -1303,6 +1330,79 @@ fn blob_cutoff_unix_secs(grace_hours: u64) -> Result<i64, String> {
         .ok_or_else(|| "Blob grace period underflowed the supported time range".to_string())
 }
 
+#[cfg(feature = "external-blob-store")]
+const CLI_BLOB_TRANSFER_CHECKPOINT_FORMAT: &str = "mdbx-cli-blob-transfer-checkpoint-v1";
+
+#[cfg(feature = "external-blob-store")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CliBlobTransferCheckpointFile {
+    format: String,
+    owner_id: String,
+    checkpoint: BlobTransferCheckpoint,
+}
+
+#[cfg(feature = "external-blob-store")]
+fn read_blob_transfer_checkpoint(path: &Path) -> Result<CliBlobTransferCheckpointFile, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "failed to read Blob transfer checkpoint '{}': {error}",
+            path.display()
+        )
+    })?;
+    let value: CliBlobTransferCheckpointFile = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid Blob transfer checkpoint '{}': {error}",
+            path.display()
+        )
+    })?;
+    if value.format != CLI_BLOB_TRANSFER_CHECKPOINT_FORMAT {
+        return Err(format!(
+            "unsupported Blob transfer checkpoint format: {}",
+            value.format
+        ));
+    }
+    if value.owner_id.is_empty() || value.owner_id.len() > 512 || value.owner_id.contains('\n') {
+        return Err("Blob transfer checkpoint contains an invalid owner ID".to_string());
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "external-blob-store")]
+fn write_blob_transfer_checkpoint(
+    path: &Path,
+    owner_id: &str,
+    checkpoint: &BlobTransferCheckpoint,
+) -> Result<(), String> {
+    let value = CliBlobTransferCheckpointFile {
+        format: CLI_BLOB_TRANSFER_CHECKPOINT_FORMAT.to_string(),
+        owner_id: owner_id.to_string(),
+        checkpoint: checkpoint.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("failed to serialize Blob transfer checkpoint: {error}"))?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mdbx-blob-transfer-checkpoint-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to create temporary Blob transfer checkpoint: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| format!("failed to write temporary Blob transfer checkpoint: {error}"))?;
+    temporary.as_file_mut().sync_all().map_err(|error| {
+        format!("failed to synchronize temporary Blob transfer checkpoint: {error}")
+    })?;
+    temporary.persist(path).map_err(|error| {
+        format!(
+            "failed to publish Blob transfer checkpoint: {}",
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
 fn cmd_blob(_conn: &VaultConnection, _vault_path: &Path, action: BlobAction) -> Result<(), String> {
     #[cfg(not(feature = "external-blob-store"))]
     {
@@ -1400,6 +1500,64 @@ fn cmd_blob(_conn: &VaultConnection, _vault_path: &Path, action: BlobAction) -> 
                         "Blob garbage collection completed with failures; create a new plan before retrying"
                             .to_string(),
                     );
+                }
+            }
+            BlobAction::Transfer {
+                blob_id,
+                size,
+                destination,
+                checkpoint,
+                chunk_size,
+                max_chunks,
+                lease_ttl_secs,
+            } => {
+                let source = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+                let destination_store = FileSystemBlobStore::new(destination);
+                let saved = if checkpoint.exists() {
+                    Some(read_blob_transfer_checkpoint(&checkpoint)?)
+                } else {
+                    None
+                };
+                let owner_id = saved
+                    .as_ref()
+                    .map(|value| value.owner_id.clone())
+                    .unwrap_or_else(|| format!("mdbx-cli-blob-transfer-{}", uuid::Uuid::new_v4()));
+                let saved_checkpoint = saved.as_ref().map(|value| &value.checkpoint);
+                let result = BlobTransferService::transfer(
+                    &source,
+                    &destination_store,
+                    &blob_id,
+                    size,
+                    &owner_id,
+                    saved_checkpoint,
+                    BlobTransferLimits {
+                        chunk_size,
+                        max_blob_bytes: size,
+                        max_chunks_per_run: max_chunks,
+                        lease_ttl_secs,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                println!("Blob:             {}", result.checkpoint.blob_id);
+                println!(
+                    "Transferred bytes: {} / {}",
+                    result.checkpoint.transferred_bytes, size
+                );
+                println!("Chunks:            {}", result.chunks_transferred);
+                println!("Completed:         {}", result.completed);
+                if result.completed {
+                    match std::fs::remove_file(&checkpoint) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "Blob transfer completed but checkpoint cleanup failed: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    write_blob_transfer_checkpoint(&checkpoint, &owner_id, &result.checkpoint)?;
+                    println!("Checkpoint:        {}", checkpoint.display());
                 }
             }
         }
@@ -3402,6 +3560,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
     }
 
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_blob_transfer_persists_owner_resumes_and_removes_checkpoint() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        let source = FileSystemBlobStore::new(default_blob_store_path(&path));
+        let ciphertext = vec![0x7b; 37];
+        let blob_id = mdbx_storage::blob_store::compute_blob_id(&ciphertext);
+        mdbx_storage::blob_store::EncryptedBlobStore::put(&source, &blob_id, &ciphertext).unwrap();
+        let destination_directory = tempfile::tempdir().unwrap();
+        let destination_path = destination_directory.path().join("replica.blobs");
+        let checkpoint = destination_directory.path().join("transfer.json");
+
+        let transfer = || {
+            cli(
+                &path,
+                Commands::Blob {
+                    action: BlobAction::Transfer {
+                        blob_id: blob_id.clone(),
+                        size: ciphertext.len() as u64,
+                        destination: destination_path.clone(),
+                        checkpoint: checkpoint.clone(),
+                        chunk_size: 8,
+                        max_chunks: 2,
+                        lease_ttl_secs: 60,
+                    },
+                },
+            )
+        };
+
+        run(transfer()).unwrap();
+        let first = read_blob_transfer_checkpoint(&checkpoint).unwrap();
+        assert_eq!(first.checkpoint.transferred_bytes, 16);
+        run(transfer()).unwrap();
+        let second = read_blob_transfer_checkpoint(&checkpoint).unwrap();
+        assert_eq!(second.owner_id, first.owner_id);
+        assert_eq!(second.checkpoint.transferred_bytes, 32);
+        run(transfer()).unwrap();
+        assert!(!checkpoint.exists());
+
+        let destination = FileSystemBlobStore::new(&destination_path);
+        assert_eq!(
+            mdbx_storage::blob_store::EncryptedBlobStore::get(&destination, &blob_id, 100).unwrap(),
+            ciphertext
+        );
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_blob_transfer_rejects_tampered_checkpoint_without_publishing() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        let source = FileSystemBlobStore::new(default_blob_store_path(&path));
+        let ciphertext = vec![0x41; 24];
+        let blob_id = mdbx_storage::blob_store::compute_blob_id(&ciphertext);
+        mdbx_storage::blob_store::EncryptedBlobStore::put(&source, &blob_id, &ciphertext).unwrap();
+        let destination_directory = tempfile::tempdir().unwrap();
+        let destination_path = destination_directory.path().join("replica.blobs");
+        let checkpoint = destination_directory.path().join("transfer.json");
+        let command = || {
+            cli(
+                &path,
+                Commands::Blob {
+                    action: BlobAction::Transfer {
+                        blob_id: blob_id.clone(),
+                        size: ciphertext.len() as u64,
+                        destination: destination_path.clone(),
+                        checkpoint: checkpoint.clone(),
+                        chunk_size: 8,
+                        max_chunks: 1,
+                        lease_ttl_secs: 60,
+                    },
+                },
+            )
+        };
+        run(command()).unwrap();
+        let mut saved = read_blob_transfer_checkpoint(&checkpoint).unwrap();
+        saved.checkpoint.transferred_bytes += 1;
+        write_blob_transfer_checkpoint(&checkpoint, &saved.owner_id, &saved.checkpoint).unwrap();
+
+        let error = run(command()).unwrap_err();
+        assert!(error.contains("checkpoint does not match this transfer"));
+        let destination = FileSystemBlobStore::new(&destination_path);
+        assert!(!destination.blob_path(&blob_id).unwrap().exists());
+        assert!(checkpoint.exists());
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
     #[cfg(not(feature = "external-blob-store"))]
     #[test]
     fn core_cli_reports_missing_external_blob_provider_before_mutation() {
@@ -3465,6 +3714,31 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("does not include filesystem Blob lifecycle management"));
+
+        let destination = std::env::temp_dir().join(format!(
+            "mdbx-cli-core-blob-transfer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkpoint = destination.with_extension("checkpoint.json");
+        let error = run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::Transfer {
+                    blob_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                    size: 1,
+                    destination: destination.clone(),
+                    checkpoint: checkpoint.clone(),
+                    chunk_size: 1,
+                    max_chunks: 1,
+                    lease_ttl_secs: 60,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("does not include filesystem Blob lifecycle management"));
+        assert!(!destination.exists());
+        assert!(!checkpoint.exists());
     }
 
     #[test]

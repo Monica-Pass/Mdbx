@@ -27,3 +27,5 @@ No database table, attachment reference, bundle, or synchronization format chang
 ## Consequences
 
 Database state and Blob bodies remain separate synchronization streams, but both can now converge without loading a large object into memory. A checkpoint is a consistency binding, not an authorization credential. Providers that need stronger multi-host coordination can implement the same contracts with object-store conditional writes or distributed leases.
+
+The default CLI exposes `blob transfer <blob-id> --size <bytes> --destination <provider-root> --checkpoint <path>`. It processes a bounded number of chunks per invocation, writes a versioned `mdbx-cli-blob-transfer-checkpoint-v1` file atomically, preserves the lease owner across invocations, and removes the checkpoint only after the destination object is complete.
