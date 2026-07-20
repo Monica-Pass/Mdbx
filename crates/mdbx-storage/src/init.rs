@@ -147,6 +147,7 @@ pub fn initialize_vault(
         )?;
 
         crate::schema::v13::initialize_bootstrap_floor(db, &now)?;
+        crate::schema::v14::discard_bootstrap_mutations(db)?;
 
         Ok(VaultInitResult {
             vault_id,
