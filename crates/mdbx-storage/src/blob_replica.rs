@@ -8,8 +8,10 @@ use crate::blob_lifecycle::{
     ExternalBlobReferenceInventory, MAX_BLOB_LIFECYCLE_ITEMS,
 };
 use crate::blob_store::{
-    validate_blob_id, EncryptedBlobMetadata, ManageableEncryptedBlobStore, MAX_BLOB_PAGE_SIZE,
+    validate_blob_id, EncryptedBlobMetadata, EncryptedBlobTransferStore,
+    ManageableEncryptedBlobStore, MAX_BLOB_PAGE_SIZE,
 };
+use crate::blob_transfer::{BlobTransferCheckpoint, BlobTransferLimits, BlobTransferService};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 
@@ -85,6 +87,83 @@ pub struct BlobReplicaPage {
     pub unique_reference_count: usize,
     pub items: Vec<BlobReplicaItem>,
     pub next_cursor: Option<String>,
+}
+
+pub const MAX_BLOB_REPLICA_ITEMS_PER_RUN: usize = 10_000;
+
+pub trait ReplicableEncryptedBlobStore:
+    ManageableEncryptedBlobStore + EncryptedBlobTransferStore
+{
+}
+
+impl<T> ReplicableEncryptedBlobStore for T where
+    T: ManageableEncryptedBlobStore + EncryptedBlobTransferStore
+{
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobReplicaTransferCheckpoint {
+    pub owner_id: String,
+    pub plan_token: Option<String>,
+    pub cursor: Option<String>,
+    pub current: Option<BlobTransferCheckpoint>,
+}
+
+impl BlobReplicaTransferCheckpoint {
+    pub fn new(owner_id: String) -> StorageResult<Self> {
+        validate_owner_id(&owner_id)?;
+        Ok(Self {
+            owner_id,
+            plan_token: None,
+            cursor: None,
+            current: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobReplicaTransferLimits {
+    pub lifecycle: BlobLifecycleLimits,
+    pub page_size: usize,
+    pub max_items_per_run: usize,
+    pub transfer: BlobTransferLimits,
+}
+
+impl Default for BlobReplicaTransferLimits {
+    fn default() -> Self {
+        Self {
+            lifecycle: BlobLifecycleLimits::default(),
+            page_size: 100,
+            max_items_per_run: 100,
+            transfer: BlobTransferLimits::default(),
+        }
+    }
+}
+
+impl BlobReplicaTransferLimits {
+    fn validate(self) -> StorageResult<()> {
+        self.lifecycle.validate()?;
+        self.transfer.validate()?;
+        if !(1..=MAX_BLOB_PAGE_SIZE).contains(&self.page_size) {
+            return Err(StorageError::Validation(format!(
+                "Blob replica transfer page size must be between 1 and {MAX_BLOB_PAGE_SIZE}"
+            )));
+        }
+        if !(1..=MAX_BLOB_REPLICA_ITEMS_PER_RUN).contains(&self.max_items_per_run) {
+            return Err(StorageError::Validation(format!(
+                "Blob replica transfer item count must be between 1 and {MAX_BLOB_REPLICA_ITEMS_PER_RUN}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobReplicaTransferResult {
+    pub checkpoint: BlobReplicaTransferCheckpoint,
+    pub completed: bool,
+    pub transferred_items: usize,
+    pub blocked_items: Vec<BlobReplicaItem>,
 }
 
 pub struct BlobReplicaService;
@@ -213,6 +292,135 @@ impl BlobReplicaService {
             next_cursor,
         })
     }
+
+    pub fn transfer(
+        conn: &VaultConnection,
+        source: &dyn ReplicableEncryptedBlobStore,
+        destination: &dyn ReplicableEncryptedBlobStore,
+        owner_id: &str,
+        checkpoint: Option<&BlobReplicaTransferCheckpoint>,
+        limits: BlobReplicaTransferLimits,
+    ) -> StorageResult<BlobReplicaTransferResult> {
+        validate_owner_id(owner_id)?;
+        limits.validate()?;
+        let mut state = match checkpoint {
+            Some(checkpoint) => {
+                validate_owner_id(&checkpoint.owner_id)?;
+                if checkpoint.owner_id != owner_id {
+                    return Err(StorageError::ConstraintViolation(
+                        "Blob replica checkpoint owner does not match this transfer".to_string(),
+                    ));
+                }
+                if let Some(cursor) = checkpoint.cursor.as_deref() {
+                    validate_blob_id(cursor)?;
+                }
+                if let Some(plan_token) = checkpoint.plan_token.as_deref() {
+                    validate_blob_id(plan_token)?;
+                }
+                checkpoint.clone()
+            }
+            None => BlobReplicaTransferCheckpoint::new(owner_id.to_string())?,
+        };
+        let mut transferred_items = 0usize;
+
+        if let Some(current) = state.current.clone() {
+            let transfer_limits = limits_for_item(limits.transfer, current.total_size);
+            let result = BlobTransferService::transfer(
+                source,
+                destination,
+                &current.blob_id,
+                current.total_size,
+                owner_id,
+                Some(&current),
+                transfer_limits,
+            )?;
+            if !result.completed {
+                state.current = Some(result.checkpoint);
+                return Ok(BlobReplicaTransferResult {
+                    checkpoint: state,
+                    completed: false,
+                    transferred_items,
+                    blocked_items: Vec::new(),
+                });
+            }
+            state.current = None;
+            state.cursor = Some(current.blob_id);
+            state.plan_token = None;
+            transferred_items += 1;
+        }
+
+        loop {
+            if transferred_items >= limits.max_items_per_run {
+                return Ok(BlobReplicaTransferResult {
+                    checkpoint: state,
+                    completed: false,
+                    transferred_items,
+                    blocked_items: Vec::new(),
+                });
+            }
+            let page = Self::page(
+                conn,
+                source,
+                destination,
+                BlobReplicaPageRequest::new(None, None, limits.page_size, limits.lifecycle)?,
+            );
+            let page = page?;
+            state.plan_token = Some(page.plan_token.clone());
+            if page.items.is_empty() {
+                return Ok(BlobReplicaTransferResult {
+                    checkpoint: state,
+                    completed: page.next_cursor.is_none(),
+                    transferred_items,
+                    blocked_items: Vec::new(),
+                });
+            }
+            for item in page.items {
+                if transferred_items >= limits.max_items_per_run {
+                    return Ok(BlobReplicaTransferResult {
+                        checkpoint: state,
+                        completed: false,
+                        transferred_items,
+                        blocked_items: Vec::new(),
+                    });
+                }
+                if item.state != BlobReplicaState::TransferRequired {
+                    return Ok(BlobReplicaTransferResult {
+                        checkpoint: state,
+                        completed: false,
+                        transferred_items,
+                        blocked_items: vec![item],
+                    });
+                }
+                let total_size = item.source_size.ok_or_else(|| {
+                    StorageError::ConstraintViolation(
+                        "transfer-required Blob has no source size".to_string(),
+                    )
+                })?;
+                let result = BlobTransferService::transfer(
+                    source,
+                    destination,
+                    &item.blob_id,
+                    total_size,
+                    owner_id,
+                    None,
+                    limits_for_item(limits.transfer, total_size),
+                )?;
+                if !result.completed {
+                    state.current = Some(result.checkpoint);
+                    return Ok(BlobReplicaTransferResult {
+                        checkpoint: state,
+                        completed: false,
+                        transferred_items,
+                        blocked_items: Vec::new(),
+                    });
+                }
+                state.cursor = Some(item.blob_id);
+                state.current = None;
+                state.plan_token = None;
+                transferred_items += 1;
+            }
+        }
+    }
 }
 
 fn validate_namespace(namespace_id: String) -> StorageResult<String> {
@@ -222,6 +430,21 @@ fn validate_namespace(namespace_id: String) -> StorageResult<String> {
         ));
     }
     Ok(namespace_id)
+}
+
+fn validate_owner_id(owner_id: &str) -> StorageResult<()> {
+    if owner_id.is_empty() || owner_id.len() > 512 || owner_id.contains('\n') {
+        return Err(StorageError::Validation(
+            "Blob replica transfer owner ID must contain 1 to 512 bytes without newlines"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn limits_for_item(mut limits: BlobTransferLimits, total_size: u64) -> BlobTransferLimits {
+    limits.max_blob_bytes = limits.max_blob_bytes.min(total_size);
+    limits
 }
 
 fn vault_id(conn: &VaultConnection) -> StorageResult<String> {
@@ -461,5 +684,97 @@ mod tests {
             BlobLifecycleLimits::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn replica_transfer_resumes_partial_blobs_and_converges_all_references() {
+        let (conn, context, project_id) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = FileSystemBlobStore::new(source_dir.path().join("source.blobs"));
+        let destination =
+            FileSystemBlobStore::new(destination_dir.path().join("destination.blobs"));
+        add_external(&conn, &context, &project_id, &source);
+        let limits = BlobReplicaTransferLimits {
+            lifecycle: BlobLifecycleLimits::default(),
+            page_size: 1,
+            max_items_per_run: 1,
+            transfer: BlobTransferLimits {
+                chunk_size: 8,
+                max_blob_bytes: 1024,
+                max_chunks_per_run: 1,
+                lease_ttl_secs: 60,
+            },
+        };
+        let mut checkpoint = None;
+        let mut observed_partial = false;
+        let mut completed = false;
+        for _ in 0..100 {
+            let result = BlobReplicaService::transfer(
+                &conn,
+                &source,
+                &destination,
+                "replica-owner",
+                checkpoint.as_ref(),
+                limits,
+            )
+            .unwrap();
+            assert!(result.blocked_items.is_empty());
+            observed_partial |= result.checkpoint.current.is_some();
+            completed = result.completed;
+            checkpoint = Some(result.checkpoint);
+            if completed {
+                break;
+            }
+        }
+        assert!(observed_partial);
+        assert!(completed);
+        let stable_inventory = |store: &FileSystemBlobStore| {
+            store
+                .list(None, 10)
+                .unwrap()
+                .blobs
+                .into_iter()
+                .map(|blob| (blob.blob_id, blob.stored_size))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stable_inventory(&source), stable_inventory(&destination));
+
+        let serialized = serde_json::to_vec(checkpoint.as_ref().unwrap()).unwrap();
+        let restored: BlobReplicaTransferCheckpoint = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(restored, checkpoint.unwrap());
+    }
+
+    #[test]
+    fn replica_transfer_stops_on_missing_source_without_advancing() {
+        let (conn, context, project_id) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = FileSystemBlobStore::new(source_dir.path().join("source.blobs"));
+        let destination =
+            FileSystemBlobStore::new(destination_dir.path().join("destination.blobs"));
+        add_external(&conn, &context, &project_id, &source);
+        let missing_id = source.list(None, 10).unwrap().blobs[0].blob_id.clone();
+        source.delete(&missing_id).unwrap();
+
+        let result = BlobReplicaService::transfer(
+            &conn,
+            &source,
+            &destination,
+            "replica-owner",
+            None,
+            BlobReplicaTransferLimits::default(),
+        )
+        .unwrap();
+        assert!(!result.completed);
+        assert_eq!(result.transferred_items, 0);
+        assert_eq!(result.blocked_items.len(), 1);
+        assert_eq!(result.blocked_items[0].blob_id, missing_id);
+        assert_eq!(
+            result.blocked_items[0].state,
+            BlobReplicaState::SourceMissing
+        );
+        assert!(result.checkpoint.cursor.is_none());
+        assert!(destination.list(None, 10).unwrap().blobs.is_empty());
     }
 }

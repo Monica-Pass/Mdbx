@@ -31,7 +31,7 @@ impl Default for BlobTransferLimits {
 }
 
 impl BlobTransferLimits {
-    fn validate(self) -> StorageResult<()> {
+    pub(crate) fn validate(self) -> StorageResult<()> {
         if !(1..=MAX_BLOB_TRANSFER_CHUNK_SIZE).contains(&self.chunk_size) {
             return Err(StorageError::Validation(format!(
                 "Blob transfer chunk size must be between 1 and {MAX_BLOB_TRANSFER_CHUNK_SIZE}"

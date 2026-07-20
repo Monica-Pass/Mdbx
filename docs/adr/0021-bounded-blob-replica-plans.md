@@ -21,6 +21,8 @@ An exact-size destination object is omitted because content-addressed identity m
 
 The planner is independent of sync bundles and performs no writes, Provider leases, commits, or deletions. Transfer executors can consume `transfer-required` items through `BlobTransferService`; clients can choose their own transport and checkpoint storage. The existing Blob lifecycle audit reuses the same reference inventory implementation.
 
+`BlobReplicaService::transfer` is the reusable bounded executor. It resumes an in-progress Blob from its nested transfer checkpoint, processes only a caller-limited number of items and chunks, and stops at the first non-transferable state without advancing beyond it. Publishing a destination object necessarily changes the destination-bound plan token, so the executor clears that token and refreshes the next page; completed objects then disappear from the actionable set. A partial file is excluded from Provider inventory and continues under its exact Blob checkpoint.
+
 ## Compatibility
 
 No MDBX1 table, attachment column, snapshot format, sync bundle, or Provider required method changes. Existing read/write-only Providers remain source-compatible. The planner is an additive storage capability and remains available in core builds, while filesystem inventory is still feature-gated.
