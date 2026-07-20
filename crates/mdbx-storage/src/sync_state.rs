@@ -1,6 +1,7 @@
 use mdbx_sync::ObjectPayload;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
@@ -11,9 +12,62 @@ use crate::tiga_policy::{optional_integrity_tag, verify_optional_integrity_tag};
 pub const SYNC_STATE_OBJECT_TYPE: &str = "mdbx-storage/state-v1";
 pub const LEGACY_CLI_SYNC_STATE_OBJECT_TYPE: &str = "mdbx-cli/state-v1";
 pub const SYNC_STATE_OBJECT_ID: &str = "state";
+pub const DEFAULT_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 96 * 1024 * 1024;
+pub const DEFAULT_MAX_SYNC_STATE_ROWS: usize = 250_000;
+pub const HARD_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+pub const HARD_MAX_SYNC_STATE_ROWS: usize = 2_000_000;
 const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v2";
 const PREVIOUS_SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v1";
 const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncStateLimits {
+    max_payload_bytes: usize,
+    max_rows: usize,
+}
+
+impl SyncStateLimits {
+    pub fn new(max_payload_bytes: usize, max_rows: usize) -> StorageResult<Self> {
+        if max_payload_bytes == 0 || max_payload_bytes > HARD_MAX_SYNC_STATE_PAYLOAD_BYTES {
+            return Err(StorageError::Validation(format!(
+                "sync state payload limit must be between 1 and {HARD_MAX_SYNC_STATE_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        if max_rows == 0 || max_rows > HARD_MAX_SYNC_STATE_ROWS {
+            return Err(StorageError::Validation(format!(
+                "sync state row limit must be between 1 and {HARD_MAX_SYNC_STATE_ROWS}"
+            )));
+        }
+        Ok(Self {
+            max_payload_bytes,
+            max_rows,
+        })
+    }
+
+    pub const fn desktop() -> Self {
+        Self {
+            max_payload_bytes: HARD_MAX_SYNC_STATE_PAYLOAD_BYTES,
+            max_rows: HARD_MAX_SYNC_STATE_ROWS,
+        }
+    }
+
+    pub const fn max_payload_bytes(self) -> usize {
+        self.max_payload_bytes
+    }
+
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+}
+
+impl Default for SyncStateLimits {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: DEFAULT_MAX_SYNC_STATE_PAYLOAD_BYTES,
+            max_rows: DEFAULT_MAX_SYNC_STATE_ROWS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncStatePayload {
@@ -333,7 +387,15 @@ pub struct BranchRow {
 }
 
 pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayload> {
-    Ok(SyncStatePayload {
+    collect_sync_state_with_limits(conn, SyncStateLimits::default())
+}
+
+pub fn collect_sync_state_with_limits(
+    conn: &VaultConnection,
+    limits: SyncStateLimits,
+) -> StorageResult<SyncStatePayload> {
+    validate_row_limit(count_source_rows(conn)?, limits)?;
+    let state = SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
         key_epoch_state: Some(load_key_epoch_state(conn)?),
         tiga_vault_state: Some(load_tiga_vault_state(conn)?),
@@ -352,7 +414,9 @@ pub fn collect_sync_state(conn: &VaultConnection) -> StorageResult<SyncStatePayl
         tombstone_acknowledgements: Some(load_tombstone_acknowledgement_rows(conn)?),
         purge_receipts: Some(load_purge_receipt_rows(conn)?),
         branches: load_branch_rows(conn)?,
-    })
+    };
+    state.validate_resource_limits(limits)?;
+    Ok(state)
 }
 
 fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
@@ -512,9 +576,15 @@ fn collect_rows<T>(
 }
 
 pub fn collect_sync_state_payload(conn: &VaultConnection) -> StorageResult<ObjectPayload> {
-    let state = collect_sync_state(conn)?;
-    let ciphertext =
-        serde_json::to_vec(&state).map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
+    collect_sync_state_payload_with_limits(conn, SyncStateLimits::default())
+}
+
+pub fn collect_sync_state_payload_with_limits(
+    conn: &VaultConnection,
+    limits: SyncStateLimits,
+) -> StorageResult<ObjectPayload> {
+    let state = collect_sync_state_with_limits(conn, limits)?;
+    let ciphertext = serialize_state_bounded(&state, limits)?;
     Ok(ObjectPayload {
         object_type: SYNC_STATE_OBJECT_TYPE.to_string(),
         object_id: SYNC_STATE_OBJECT_ID.to_string(),
@@ -526,14 +596,31 @@ pub fn collect_sync_state_payload(conn: &VaultConnection) -> StorageResult<Objec
 pub fn decode_sync_state_payload(
     payload: &ObjectPayload,
 ) -> StorageResult<Option<SyncStatePayload>> {
-    if payload.object_id != SYNC_STATE_OBJECT_ID {
-        return Ok(None);
-    }
+    decode_sync_state_payload_with_limits(payload, SyncStateLimits::default())
+}
+
+pub fn decode_sync_state_payload_with_limits(
+    payload: &ObjectPayload,
+    limits: SyncStateLimits,
+) -> StorageResult<Option<SyncStatePayload>> {
     if payload.object_type != SYNC_STATE_OBJECT_TYPE
         && payload.object_type != LEGACY_CLI_SYNC_STATE_OBJECT_TYPE
     {
         return Ok(None);
     }
+    if payload.object_id != SYNC_STATE_OBJECT_ID {
+        return Err(StorageError::Validation(format!(
+            "reserved sync state type {} requires object ID {}",
+            payload.object_type, SYNC_STATE_OBJECT_ID
+        )));
+    }
+    if payload.associated_data != payload.object_type.as_bytes() {
+        return Err(StorageError::Validation(format!(
+            "sync state payload {} has invalid associated data",
+            payload.object_type
+        )));
+    }
+    validate_payload_limit(payload.ciphertext.len(), limits)?;
 
     let state: SyncStatePayload = serde_json::from_slice(&payload.ciphertext)
         .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
@@ -546,7 +633,193 @@ pub fn decode_sync_state_payload(
             state.format
         )));
     }
+    state.validate_resource_limits(limits)?;
     Ok(Some(state))
+}
+
+impl SyncStatePayload {
+    pub fn validate_resource_limits(&self, limits: SyncStateLimits) -> StorageResult<()> {
+        validate_row_limit(self.total_rows()?, limits)
+    }
+
+    fn total_rows(&self) -> StorageResult<usize> {
+        let mut total = 0usize;
+        let mut add = |count: usize| -> StorageResult<()> {
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| StorageError::ResourceLimit {
+                    resource: "sync state rows".to_string(),
+                    actual: u64::MAX,
+                    limit: HARD_MAX_SYNC_STATE_ROWS as u64,
+                })?;
+            Ok(())
+        };
+
+        if let Some(key_epochs) = &self.key_epoch_state {
+            add(key_epochs.epochs.len())?;
+        }
+        add(usize::from(self.tiga_vault_state.is_some()))?;
+        add(self.tiga_policy_overrides.as_ref().map_or(0, Vec::len))?;
+        add(self.tiga_policy_exceptions.as_ref().map_or(0, Vec::len))?;
+        add(self.security_audit_events.as_ref().map_or(0, Vec::len))?;
+        add(self.projects.len())?;
+        add(self
+            .projects
+            .iter()
+            .filter(|project| project.collection_profile.is_some())
+            .count())?;
+        add(self.entries.len())?;
+        add(self.object_relations.as_ref().map_or(0, Vec::len))?;
+        add(self.object_labels.as_ref().map_or(0, Vec::len))?;
+        add(self.object_label_assignments.as_ref().map_or(0, Vec::len))?;
+        add(self.attachments.len())?;
+        add(self.attachment_chunks.len())?;
+        if let Some(tag_sets) = &self.project_tags {
+            add(tag_sets.len())?;
+            for tag_set in tag_sets {
+                add(tag_set.tags.len())?;
+            }
+        }
+        add(self.tombstones.as_ref().map_or(0, Vec::len))?;
+        add(self.tombstone_acknowledgements.as_ref().map_or(0, Vec::len))?;
+        add(self.purge_receipts.as_ref().map_or(0, Vec::len))?;
+        add(self.branches.len())?;
+        Ok(total)
+    }
+}
+
+fn count_source_rows(conn: &VaultConnection) -> StorageResult<usize> {
+    let tables = [
+        "key_epochs",
+        "tiga_policy_overrides",
+        "tiga_policy_exceptions",
+        "security_audit_events",
+        "projects",
+        "collection_profiles",
+        "entries",
+        "object_relations",
+        "object_labels",
+        "object_label_assignments",
+        "attachments",
+        "attachment_chunks",
+        "project_tags",
+        "tombstones",
+        "tombstone_acknowledgements",
+        "purge_receipts",
+        "branches",
+    ];
+    let mut total = 1usize;
+    for table in tables {
+        let count =
+            conn.inner()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let count = usize::try_from(count).map_err(|error| {
+            StorageError::Validation(format!("invalid row count for {table}: {error}"))
+        })?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| StorageError::ResourceLimit {
+                resource: "sync state rows".to_string(),
+                actual: u64::MAX,
+                limit: HARD_MAX_SYNC_STATE_ROWS as u64,
+            })?;
+    }
+
+    let project_count = conn
+        .inner()
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    let project_count = usize::try_from(project_count)
+        .map_err(|error| StorageError::Validation(format!("invalid project row count: {error}")))?;
+    total
+        .checked_add(project_count)
+        .ok_or_else(|| StorageError::ResourceLimit {
+            resource: "sync state rows".to_string(),
+            actual: u64::MAX,
+            limit: HARD_MAX_SYNC_STATE_ROWS as u64,
+        })
+}
+
+fn validate_payload_limit(actual: usize, limits: SyncStateLimits) -> StorageResult<()> {
+    if actual > limits.max_payload_bytes {
+        return Err(StorageError::ResourceLimit {
+            resource: "sync state payload bytes".to_string(),
+            actual: actual as u64,
+            limit: limits.max_payload_bytes as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_row_limit(actual: usize, limits: SyncStateLimits) -> StorageResult<()> {
+    if actual > limits.max_rows {
+        return Err(StorageError::ResourceLimit {
+            resource: "sync state rows".to_string(),
+            actual: actual as u64,
+            limit: limits.max_rows as u64,
+        });
+    }
+    Ok(())
+}
+
+fn serialize_state_bounded(
+    state: &SyncStatePayload,
+    limits: SyncStateLimits,
+) -> StorageResult<Vec<u8>> {
+    let mut writer = LimitedVecWriter::new(limits.max_payload_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, state) {
+        if let Some(actual) = writer.exceeded_at {
+            return Err(StorageError::ResourceLimit {
+                resource: "sync state payload bytes".to_string(),
+                actual: actual as u64,
+                limit: limits.max_payload_bytes as u64,
+            });
+        }
+        return Err(StorageError::SchemaCreation(error.to_string()));
+    }
+    Ok(writer.bytes)
+}
+
+struct LimitedVecWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded_at: Option<usize>,
+}
+
+impl LimitedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded_at: None,
+        }
+    }
+}
+
+impl Write for LimitedVecWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let actual = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .unwrap_or(usize::MAX);
+        if actual > self.limit {
+            self.exceeded_at = Some(actual);
+            return Err(io::Error::other("sync state payload limit exceeded"));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn load_project_rows(conn: &VaultConnection) -> StorageResult<Vec<ProjectRow>> {
@@ -926,6 +1199,91 @@ mod tests {
         initialize_vault(&conn, &VaultInitParams::default()).unwrap();
         let ctx = CommitContext::new("test-device".to_string());
         (conn, ctx)
+    }
+
+    #[test]
+    fn sync_state_limits_enforce_positive_hard_bounded_values() {
+        assert!(SyncStateLimits::new(0, 1).is_err());
+        assert!(SyncStateLimits::new(1, 0).is_err());
+        assert!(SyncStateLimits::new(HARD_MAX_SYNC_STATE_PAYLOAD_BYTES + 1, 1).is_err());
+        assert!(SyncStateLimits::new(1, HARD_MAX_SYNC_STATE_ROWS + 1).is_err());
+
+        let defaults = SyncStateLimits::default();
+        assert_eq!(
+            defaults.max_payload_bytes(),
+            DEFAULT_MAX_SYNC_STATE_PAYLOAD_BYTES
+        );
+        assert_eq!(defaults.max_rows(), DEFAULT_MAX_SYNC_STATE_ROWS);
+    }
+
+    #[test]
+    fn reserved_sync_state_identity_and_associated_data_are_strict() {
+        let (conn, _) = setup();
+        let payload = collect_sync_state_payload(&conn).unwrap();
+
+        let mut wrong_id = payload.clone();
+        wrong_id.object_id = "other".to_string();
+        assert!(decode_sync_state_payload(&wrong_id)
+            .unwrap_err()
+            .to_string()
+            .contains("requires object ID"));
+
+        let mut wrong_aad = payload;
+        wrong_aad.associated_data = b"other".to_vec();
+        assert!(decode_sync_state_payload(&wrong_aad)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid associated data"));
+
+        let unknown = ObjectPayload {
+            object_type: "com.example.opaque".to_string(),
+            object_id: "other".to_string(),
+            ciphertext: vec![0; 64],
+            associated_data: Vec::new(),
+        };
+        assert!(decode_sync_state_payload(&unknown).unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_state_input_bytes_and_rows_are_rejected_before_apply() {
+        let (conn, _) = setup();
+        let payload = collect_sync_state_payload(&conn).unwrap();
+        let byte_limits = SyncStateLimits::new(payload.ciphertext.len() - 1, 100).unwrap();
+        assert!(matches!(
+            decode_sync_state_payload_with_limits(&payload, byte_limits),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state payload bytes"
+        ));
+
+        let row_limits = SyncStateLimits::new(payload.ciphertext.len(), 2).unwrap();
+        assert!(matches!(
+            decode_sync_state_payload_with_limits(&payload, row_limits),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state rows"
+        ));
+    }
+
+    #[test]
+    fn outbound_collection_and_serialization_remain_bounded() {
+        let (conn, _) = setup();
+        let row_limits = SyncStateLimits::new(1024 * 1024, 2).unwrap();
+        assert!(matches!(
+            collect_sync_state_with_limits(&conn, row_limits),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state rows"
+        ));
+
+        let byte_limits = SyncStateLimits::new(32, 100).unwrap();
+        assert!(matches!(
+            collect_sync_state_payload_with_limits(&conn, byte_limits),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state payload bytes"
+        ));
+
+        let mut writer = LimitedVecWriter::new(4);
+        writer.write_all(b"1234").unwrap();
+        assert!(writer.write_all(b"5").is_err());
+        assert_eq!(writer.bytes, b"1234");
     }
 
     #[cfg(feature = "derived-search-index")]

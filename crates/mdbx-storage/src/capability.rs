@@ -17,6 +17,7 @@ pub struct CapabilitySet {
     pub snapshots: bool,
     pub recovery: bool,
     pub synchronization: bool,
+    pub bounded_sync_state: bool,
     pub external_blob_references: bool,
     pub external_blob_lifecycle: bool,
     pub filesystem_blob_store: bool,
@@ -43,6 +44,7 @@ impl CapabilitySet {
             snapshots: true,
             recovery: true,
             synchronization: true,
+            bounded_sync_state: true,
             external_blob_references: true,
             external_blob_lifecycle: true,
             filesystem_blob_store: cfg!(feature = "filesystem-blob-store"),
@@ -74,6 +76,7 @@ mod tests {
         assert!(capabilities.snapshots);
         assert!(capabilities.recovery);
         assert!(capabilities.synchronization);
+        assert!(capabilities.bounded_sync_state);
         assert!(capabilities.external_blob_references);
         assert!(capabilities.external_blob_lifecycle);
     }

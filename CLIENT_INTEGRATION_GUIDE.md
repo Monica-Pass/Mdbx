@@ -554,6 +554,8 @@ At minimum, sync state should include:
 - complete
 - failed
 
+Complete sync state has a resource contract independent of the surrounding bundle. The default encoded-state limit is 96 MiB and the default logical-row limit is 250,000. Desktop callers that need larger batches should pass the same `SyncStateLimits` to state collection, decoding, and apply; the hard ceilings remain 512 MiB and 2,000,000 rows. A limit or reserved-identity failure rolls back the complete sync transaction. Incremental state transfer is not part of the current format, so clients should present a resource-limit error as a retryable sync-capacity condition.
+
 Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
 
 Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.

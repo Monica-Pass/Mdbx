@@ -98,6 +98,7 @@ MDBX 必须坚持：
 
 - benchmark harness 已有，但还没有形成可发布报告。
 - 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
+- 完整同步状态已经增加独立的字节和行数限制；大规模 vault 后续仍需增量状态传输协议。
 - 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
 - external-hash-ref 的 Provider 间 Blob 传输尚未实现；跨进程清理与导入的强协调仍需 Provider lease 协议。
 - CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。

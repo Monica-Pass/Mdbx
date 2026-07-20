@@ -107,6 +107,8 @@ Power 整改通过 `setup_password_security_key_unlock`、`list_unlock_methods` 
 
 已经打开的 vault 继续调用 `MdbxVault.create_backup(destination)`。两个接口都会验证完整性与 MDBX 身份，并以禁止覆盖的方式发布单个文件；目标主文件、`-wal` 或 `-shm` 已经存在时均返回错误。备份保留源 vault 的解锁方式，可以继续使用相同凭据打开。它与 vault 内部 snapshot、sync bundle 分别承担完整文件副本、逻辑恢复点和增量传输职责；WAL 活跃时客户端不得仅复制 SQLite 主文件。
 
+Rust storage core 的完整同步状态使用 `SyncStateLimits` 独立限制编码字节和逻辑行数。UniFFI 当前沿用默认限制：96 MiB 与 250,000 行；桌面原生层如调用 Rust apply facade，应为状态收集、解码和 apply 选择同一组显式 limits。保留状态类型必须使用 `state` object ID 和匹配 associated data，错误或超限会回滚整个同步事务。
+
 ### 密钥 epoch 轮换
 
 客户端通过 `MdbxVault.rotate_key_epoch(device)` 请求轮换。调用必须使用活动解锁会话并提交真实设备能力。storage core 在一个事务中生成随机 32 字节 epoch key、包装密钥、退休旧 active epoch、激活新 epoch、创建 rotation commit，并把 Tiga 审计记录关联到该 commit。授权拒绝或事务失败不会改变 active epoch，也不会创建 rotation commit。

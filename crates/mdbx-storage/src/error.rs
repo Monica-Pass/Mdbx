@@ -25,6 +25,13 @@ pub enum StorageError {
     #[error("encrypted blob store error: {0}")]
     BlobStore(String),
 
+    #[error("resource limit exceeded for {resource}: {actual} > {limit}")]
+    ResourceLimit {
+        resource: String,
+        actual: u64,
+        limit: u64,
+    },
+
     #[error(
         "collection {collection_id} requires unavailable extension capabilities: {capabilities:?}"
     )]

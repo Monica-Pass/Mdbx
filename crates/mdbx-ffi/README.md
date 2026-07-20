@@ -107,6 +107,8 @@ For client-controlled migration, call top-level `create_portable_backup(source_p
 
 Call `MdbxVault.create_backup(destination)` for an already open vault. Both interfaces verify integrity and MDBX identity and publish one file without replacing an existing destination, `-wal`, or `-shm` artifact. The backup retains the source unlock methods and reopens with the same credentials. It is separate from a vault-internal snapshot and a sync bundle; clients must not copy only the SQLite main file while WAL is active.
 
+The Rust storage core applies `SyncStateLimits` independently to complete sync state bytes and logical rows. UniFFI currently uses the default limits of 96 MiB and 250,000 rows; native Rust callers that use an explicit apply facade should select the same limits for collection, decoding, and apply. Reserved state types require the `state` object ID and matching associated data; an identity or resource violation rolls back the complete sync transaction.
+
 ### Key Epoch Rotation
 
 Call `MdbxVault.rotate_key_epoch(device)` with an active unlock session and truthful device capabilities. In one transaction, storage generates a random 32-byte epoch key, wraps it, retires the previous active epoch, activates the new epoch, creates the rotation commit, and correlates the Tiga audit event with that commit. Authorization denial or transaction failure leaves the active epoch and rotation-commit count unchanged.

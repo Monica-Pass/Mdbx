@@ -104,6 +104,10 @@ The `MigrationIntegrityGate` is the read-only verification performed before an M
 
 A `BoundedSyncBundle` is an offline commit transport with a hash-checked payload and an explicit resource contract. Version 3 records the encoded payload length before the body, applies a configurable reader limit and a hard decoder ceiling, and rejects reserved-header changes or trailing bytes. MDBX2 continues to read bundle versions 1 and 2 through a bounded legacy reader.
 
+### BoundedSyncState
+
+A `BoundedSyncState` is the complete state object carried inside a sync commit. Its JSON bytes and decoded row count are checked independently from the surrounding bundle. The default contract allows 96 MiB and 250,000 logical rows; explicit desktop callers may use the hard ceiling of 512 MiB and 2,000,000 rows. Reserved state object types require the exact `state` object ID and matching associated data. Exceeding a limit fails the enclosing apply transaction before any commit, tombstone, branch head, or object row remains visible.
+
 ### HealthReport
 
 A `HealthReport` is a read-only structured diagnosis of vault integrity. Each issue has a stable severity, category, and description suitable for CLI output and native client presentation. Tombstone diagnostics compare exact typed markers with the current deletion state of every synchronized object family while recognizing unresolved delete-versus-modify conflicts as a temporary valid state.
@@ -142,6 +146,9 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 30. Adapter payload migration plans are bounded to 256 objects, 1 MiB per source or target payload, and 8 MiB total source or target bytes per operation.
 31. A payload migration executes only while its CollectionProfile, branch head, object identity, object head, object type, source schema version, deletion state, and source payload digest still match.
 32. One payload migration plan produces one idempotent CommitOperation. Missing outputs, duplicate outputs, unavailable Adapter capabilities, stale bindings, invalid versions, or oversized payloads cause complete rollback.
+33. Complete sync state is bounded independently from its surrounding bundle. The default decoder accepts at most 96 MiB and 250,000 logical rows; the hard ceiling is 512 MiB and 2,000,000 rows.
+34. Sync state output uses bounded serialization, and input size is checked before JSON deserialization. A resource-limit failure rolls back the enclosing commit transaction.
+35. Reserved sync state types require object ID `state` and associated data equal to the exact object type. Unknown object types remain available to ordinary opaque payload handling.
 
 ## Module Architecture
 
@@ -193,6 +200,6 @@ Optional storage features are additive:
 | `derived-search-index` | Legacy password-project search and temporary FTS index |
 | `benchmarks` | Local benchmark harness; enables `derived-search-index` |
 
-`CapabilitySet::current()` exposes the compiled capability set to Rust clients. Mandatory fields always report true in a supported build. Optional fields reflect Cargo feature selection.
+`CapabilitySet::current()` exposes the compiled capability set to Rust clients. Mandatory fields always report true in a supported build. Optional fields reflect Cargo feature selection. `bounded_sync_state` reports the mandatory complete-state resource contract.
 
 When a domain adapter is absent, the Generic Object Module continues to read, authenticate, preserve, snapshot, synchronize, and recover its namespaced ObjectTypeIds as opaque records. Adapter-specific Rust modules and CLI commands are absent from that build. An absent adapter never authorizes plaintext interpretation, rewrites the type identity, or removes stored data. Unknown critical storage extensions continue to fail before writable open.

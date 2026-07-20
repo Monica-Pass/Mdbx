@@ -20,11 +20,11 @@ use crate::repo::{
     PermanentPurgeReceipt, TombstoneRepo,
 };
 use crate::sync_state::{
-    decode_sync_state_payload, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow, KeyEpochRow,
-    KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow,
-    ProjectTagSetRow, PurgeReceiptRow, SecurityAuditEventRow, SyncStatePayload,
-    TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneAcknowledgementRow,
-    TombstoneRow,
+    decode_sync_state_payload_with_limits, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow,
+    KeyEpochRow, KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
+    ProjectRow, ProjectTagSetRow, PurgeReceiptRow, SecurityAuditEventRow, SyncStateLimits,
+    SyncStatePayload, TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow,
+    TombstoneAcknowledgementRow, TombstoneRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -56,7 +56,17 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         batch: &CommitBatch,
     ) -> StorageResult<ApplyBatchResult> {
-        Self::apply_batch_inner(conn, ctx, batch, false)
+        Self::apply_batch_with_limits(conn, ctx, batch, SyncStateLimits::default())
+    }
+
+    /// Applies a sync batch with an explicit bounded complete-state contract.
+    pub fn apply_batch_with_limits(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        batch: &CommitBatch,
+        sync_limits: SyncStateLimits,
+    ) -> StorageResult<ApplyBatchResult> {
+        Self::apply_batch_inner(conn, ctx, batch, false, sync_limits)
     }
 
     /// Applies sync batches through a mutable connection. Epoch changes require
@@ -66,7 +76,17 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         batch: &CommitBatch,
     ) -> StorageResult<ApplyBatchResult> {
-        let result = Self::apply_batch_inner(conn, ctx, batch, true)?;
+        Self::apply_batch_mut_with_limits(conn, ctx, batch, SyncStateLimits::default())
+    }
+
+    /// Mutable sync apply with an explicit bounded complete-state contract.
+    pub fn apply_batch_mut_with_limits(
+        conn: &mut VaultConnection,
+        ctx: &CommitContext,
+        batch: &CommitBatch,
+        sync_limits: SyncStateLimits,
+    ) -> StorageResult<ApplyBatchResult> {
+        let result = Self::apply_batch_inner(conn, ctx, batch, true, sync_limits)?;
         if conn.active_key_epoch_id().is_some() {
             if let Err(error) = UnlockService::refresh_verified_keyring(conn) {
                 conn.clear_session();
@@ -81,11 +101,12 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         batch: &CommitBatch,
         allow_key_epoch_changes: bool,
+        sync_limits: SyncStateLimits,
     ) -> StorageResult<ApplyBatchResult> {
         let mut result = ApplyBatchResult::default();
 
         for serialized in &batch.commits {
-            match Self::apply_commit(conn, ctx, serialized, allow_key_epoch_changes)? {
+            match Self::apply_commit(conn, ctx, serialized, allow_key_epoch_changes, sync_limits)? {
                 ApplyOutcome::Applied => result.applied_commits += 1,
                 ApplyOutcome::Skipped => result.skipped_commits += 1,
                 ApplyOutcome::Conflict => {
@@ -104,6 +125,7 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         serialized: &SerializedCommit,
         allow_key_epoch_changes: bool,
+        sync_limits: SyncStateLimits,
     ) -> StorageResult<ApplyOutcome> {
         if Self::commit_exists(conn, &serialized.commit.commit_id)? {
             if let Some(operation) = &serialized.operation {
@@ -151,6 +173,7 @@ impl SyncApplyRepo {
                     ctx,
                     serialized,
                     allow_key_epoch_changes,
+                    sync_limits,
                 )?;
                 if payload_conflicts == 0 {
                     Self::advance_branch(
@@ -173,6 +196,7 @@ impl SyncApplyRepo {
                     serialized,
                     local_head.as_deref(),
                     allow_key_epoch_changes,
+                    sync_limits,
                 )?;
                 Self::sync_device_head(conn, serialized)?;
                 Ok(if payload_conflicts == 0 {
@@ -389,10 +413,11 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         serialized: &SerializedCommit,
         allow_key_epoch_changes: bool,
+        sync_limits: SyncStateLimits,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for payload in &serialized.object_payloads {
-            if let Some(state) = decode_sync_state_payload(payload)? {
+            if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)? {
                 conflicts += Self::apply_sync_state(
                     conn,
                     ctx,
@@ -412,10 +437,11 @@ impl SyncApplyRepo {
         serialized: &SerializedCommit,
         local_head: Option<&str>,
         allow_key_epoch_changes: bool,
+        sync_limits: SyncStateLimits,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         for payload in &serialized.object_payloads {
-            if let Some(state) = decode_sync_state_payload(payload)? {
+            if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)? {
                 conflicts += Self::apply_sync_state(
                     conn,
                     ctx,
@@ -3096,7 +3122,7 @@ mod tests {
         ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
         ObjectVersionRepo, ProjectRepo, TombstoneRepo,
     };
-    use crate::sync_state::{collect_sync_state, collect_sync_state_payload};
+    use crate::sync_state::{collect_sync_state, collect_sync_state_payload, SyncStateLimits};
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
     use crate::unlock::UnlockService;
@@ -3945,6 +3971,66 @@ mod tests {
         let result = SyncApplyRepo::apply_batch(&conn, &ctx, &batch).unwrap();
         assert_eq!(result.applied_commits, 1);
         assert_eq!(result.conflict_count, 0);
+    }
+
+    #[test]
+    fn sync_state_resource_limit_rolls_back_commit_tombstone_and_branch_head() {
+        let (conn, ctx) = setup();
+        let original_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload = collect_sync_state_payload(&conn).unwrap();
+        let payload_len = payload.ciphertext.len();
+        let mut incoming = make_commit(
+            "remote-over-limit",
+            "device-b",
+            1,
+            vec![original_head.clone()],
+            vec!["project-over-limit".to_string()],
+            "project-over-limit",
+            "project",
+        );
+        incoming.object_payloads = vec![payload];
+        let batch = CommitBatch::new(vec![incoming], 0, true);
+        let limits = SyncStateLimits::new(payload_len, 2).unwrap();
+
+        assert!(matches!(
+            SyncApplyRepo::apply_batch_with_limits(&conn, &ctx, &batch, limits),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state rows"
+        ));
+        let commit_exists: bool = conn
+            .inner()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commits WHERE commit_id = 'remote-over-limit')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tombstone_exists: bool = conn
+            .inner()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tombstones WHERE tombstone_id = 't-remote-over-limit')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!commit_exists);
+        assert!(!tombstone_exists);
+        assert_eq!(current_head, original_head);
     }
 
     #[test]
