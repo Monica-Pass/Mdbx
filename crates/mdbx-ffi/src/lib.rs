@@ -40,7 +40,8 @@ use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
 use mdbx_sync::{
     BlobChunkRequest, BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState,
     BlobManifestPageRequest, BlobManifestPageResponse, BlobSyncPhase, BlobSyncResume, BranchHead,
-    HelloRequest, HelloResponse, SyncClient, SyncNegotiator,
+    HelloRequest, HelloResponse, SyncClient, SyncMessage, SyncNegotiator, SyncWireFrame,
+    SyncWireLimits, SyncWireResume, SyncWireSession,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -1504,6 +1505,20 @@ impl From<BlobManifestPageRequest> for MdbxBlobManifestPageRequest {
     }
 }
 
+impl MdbxBlobManifestPageRequest {
+    fn into_core(self) -> Result<BlobManifestPageRequest, MdbxFfiError> {
+        BlobManifestPageRequest::new(
+            self.namespace_id,
+            self.checkpoint,
+            self.cursor,
+            usize::try_from(self.page_size).map_err(|_| MdbxFfiError::SyncProtocol {
+                message: "Blob manifest page size cannot be represented locally".to_string(),
+            })?,
+        )
+        .map_err(Into::into)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxBlobManifestPageResponse {
     pub namespace_id: String,
@@ -1552,6 +1567,21 @@ impl From<BlobChunkRequest> for MdbxBlobChunkRequest {
             offset: value.offset,
             max_bytes: value.max_bytes,
         }
+    }
+}
+
+impl MdbxBlobChunkRequest {
+    fn into_core(self) -> Result<BlobChunkRequest, MdbxFfiError> {
+        BlobChunkRequest::new(
+            self.namespace_id,
+            self.blob_id,
+            self.total_size,
+            self.offset,
+            usize::try_from(self.max_bytes).map_err(|_| MdbxFfiError::SyncProtocol {
+                message: "Blob chunk size cannot be represented locally".to_string(),
+            })?,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -1652,6 +1682,272 @@ impl From<BlobSyncPhase> for MdbxBlobSyncPhase {
             BlobSyncPhase::AwaitingChunkAcknowledgement => Self::AwaitingChunkAcknowledgement,
             BlobSyncPhase::Complete => Self::Complete,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct MdbxSyncWireResume {
+    pub session_id: String,
+    pub next_outbound_sequence: u64,
+    pub next_inbound_sequence: u64,
+}
+
+impl From<SyncWireResume> for MdbxSyncWireResume {
+    fn from(value: SyncWireResume) -> Self {
+        Self {
+            session_id: value.session_id,
+            next_outbound_sequence: value.next_outbound_sequence,
+            next_inbound_sequence: value.next_inbound_sequence,
+        }
+    }
+}
+
+impl MdbxSyncWireResume {
+    fn into_core(self) -> SyncWireResume {
+        SyncWireResume {
+            session_id: self.session_id,
+            next_outbound_sequence: self.next_outbound_sequence,
+            next_inbound_sequence: self.next_inbound_sequence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireHello {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub hello: MdbxSyncHello,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireManifestPageRequest {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub request: MdbxBlobManifestPageRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireManifestPageResponse {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub response: MdbxBlobManifestPageResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireChunkRequest {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub request: MdbxBlobChunkRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireChunkResponse {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub response: MdbxBlobChunkResponse,
+}
+
+#[derive(uniffi::Object)]
+pub struct MdbxSyncWireSession {
+    wire: Mutex<SyncWireSession>,
+    limits: SyncWireLimits,
+}
+
+#[uniffi::export]
+impl MdbxSyncWireSession {
+    pub fn resume(&self) -> Result<MdbxSyncWireResume, MdbxFfiError> {
+        let wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(wire.resume().clone().into())
+    }
+
+    pub fn restore_resume(&self, resume: MdbxSyncWireResume) -> Result<(), MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        *wire = SyncWireSession::restore(resume.into_core())?;
+        Ok(())
+    }
+
+    pub fn pending_inbound_sequence(&self) -> Result<Option<u64>, MdbxFfiError> {
+        let wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(wire.pending_inbound_sequence())
+    }
+
+    pub fn acknowledge_inbound(&self, sequence: u64) -> Result<(), MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        wire.acknowledge_inbound(sequence)?;
+        Ok(())
+    }
+
+    pub fn discard_inbound(&self, sequence: u64) -> Result<(), MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        wire.discard_inbound(sequence)?;
+        Ok(())
+    }
+
+    pub fn encode_hello(
+        &self,
+        hello: MdbxSyncHello,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(SyncMessage::Hello(hello.into_request()), in_reply_to)
+    }
+
+    pub fn encode_hello_ack(
+        &self,
+        hello: MdbxSyncHello,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(SyncMessage::HelloAck(hello.into_response()), in_reply_to)
+    }
+
+    pub fn encode_blob_manifest_page_request(
+        &self,
+        request: MdbxBlobManifestPageRequest,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(
+            SyncMessage::BlobManifestPageRequest(request.into_core()?),
+            in_reply_to,
+        )
+    }
+
+    pub fn encode_blob_manifest_page_response(
+        &self,
+        response: MdbxBlobManifestPageResponse,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(
+            SyncMessage::BlobManifestPageResponse(response.into()),
+            in_reply_to,
+        )
+    }
+
+    pub fn encode_blob_chunk_request(
+        &self,
+        request: MdbxBlobChunkRequest,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(
+            SyncMessage::BlobChunkRequest(request.into_core()?),
+            in_reply_to,
+        )
+    }
+
+    pub fn encode_blob_chunk_response(
+        &self,
+        response: MdbxBlobChunkResponse,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(SyncMessage::BlobChunkResponse(response.into()), in_reply_to)
+    }
+
+    pub fn accept_hello(&self, bytes: Vec<u8>) -> Result<MdbxSyncWireHello, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::Hello(hello) => Ok(MdbxSyncWireHello {
+                sequence: frame.sequence,
+                in_reply_to: frame.in_reply_to,
+                hello: hello.into(),
+            }),
+            _ => self.reject_wrong_message(frame.sequence, "Hello"),
+        }
+    }
+
+    pub fn accept_hello_ack(&self, bytes: Vec<u8>) -> Result<MdbxSyncWireHello, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::HelloAck(hello) => Ok(MdbxSyncWireHello {
+                sequence: frame.sequence,
+                in_reply_to: frame.in_reply_to,
+                hello: hello.into(),
+            }),
+            _ => self.reject_wrong_message(frame.sequence, "HelloAck"),
+        }
+    }
+
+    pub fn accept_blob_manifest_page_request(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireManifestPageRequest, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::BlobManifestPageRequest(request) => Ok(MdbxSyncWireManifestPageRequest {
+                sequence: frame.sequence,
+                in_reply_to: frame.in_reply_to,
+                request: request.into(),
+            }),
+            _ => self.reject_wrong_message(frame.sequence, "BlobManifestPageRequest"),
+        }
+    }
+
+    pub fn accept_blob_manifest_page_response(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireManifestPageResponse, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::BlobManifestPageResponse(response) => {
+                Ok(MdbxSyncWireManifestPageResponse {
+                    sequence: frame.sequence,
+                    in_reply_to: frame.in_reply_to,
+                    response: response.into(),
+                })
+            }
+            _ => self.reject_wrong_message(frame.sequence, "BlobManifestPageResponse"),
+        }
+    }
+
+    pub fn accept_blob_chunk_request(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireChunkRequest, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::BlobChunkRequest(request) => Ok(MdbxSyncWireChunkRequest {
+                sequence: frame.sequence,
+                in_reply_to: frame.in_reply_to,
+                request: request.into(),
+            }),
+            _ => self.reject_wrong_message(frame.sequence, "BlobChunkRequest"),
+        }
+    }
+
+    pub fn accept_blob_chunk_response(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireChunkResponse, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::BlobChunkResponse(response) => Ok(MdbxSyncWireChunkResponse {
+                sequence: frame.sequence,
+                in_reply_to: frame.in_reply_to,
+                response: response.into(),
+            }),
+            _ => self.reject_wrong_message(frame.sequence, "BlobChunkResponse"),
+        }
+    }
+}
+
+impl MdbxSyncWireSession {
+    fn encode(
+        &self,
+        message: SyncMessage,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(wire.encode_outbound(message, in_reply_to, self.limits)?)
+    }
+
+    fn accept(&self, bytes: Vec<u8>) -> Result<SyncWireFrame, MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(wire.accept_inbound_bytes(&bytes, self.limits)?)
+    }
+
+    fn reject_wrong_message<T>(&self, sequence: u64, expected: &str) -> Result<T, MdbxFfiError> {
+        let mut wire = self.wire.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        wire.discard_inbound(sequence)?;
+        Err(MdbxFfiError::SyncProtocol {
+            message: format!("expected {expected} message in sync wire frame"),
+        })
     }
 }
 
@@ -3072,6 +3368,23 @@ pub fn create_blob_sync_session(
 }
 
 #[uniffi::export]
+pub fn default_sync_wire_payload_bytes() -> u64 {
+    mdbx_sync::MAX_SYNC_WIRE_PAYLOAD_BYTES
+}
+
+#[uniffi::export]
+pub fn create_sync_wire_session(
+    session_id: String,
+    max_payload_bytes: u64,
+) -> Result<Arc<MdbxSyncWireSession>, MdbxFfiError> {
+    let limits = SyncWireLimits::new(max_payload_bytes)?;
+    Ok(Arc::new(MdbxSyncWireSession {
+        wire: Mutex::new(SyncWireSession::new(session_id)?),
+        limits,
+    }))
+}
+
+#[uniffi::export]
 pub fn create_vault(
     path: String,
     password: String,
@@ -3851,6 +4164,84 @@ fn object_label_assignment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffi_wire_session_roundtrips_blob_messages_and_sequences() {
+        let limit = default_sync_wire_payload_bytes();
+        let sender = create_sync_wire_session("wire-session".to_string(), limit).unwrap();
+        let receiver = create_sync_wire_session("wire-session".to_string(), limit).unwrap();
+        let blob_id = "a".repeat(64);
+        let request = MdbxBlobChunkRequest {
+            namespace_id: "source".to_string(),
+            blob_id: blob_id.clone(),
+            total_size: 8,
+            offset: 0,
+            max_bytes: 4,
+        };
+        let bytes = sender
+            .encode_blob_chunk_request(request.clone(), None)
+            .unwrap();
+        let decoded = receiver.accept_blob_chunk_request(bytes.clone()).unwrap();
+        assert_eq!(decoded.sequence, 1);
+        assert_eq!(decoded.request, request);
+        assert_eq!(receiver.pending_inbound_sequence().unwrap(), Some(1));
+        receiver.acknowledge_inbound(1).unwrap();
+        assert!(receiver.accept_blob_chunk_request(bytes).is_err());
+
+        let response = MdbxBlobChunkResponse {
+            namespace_id: "source".to_string(),
+            blob_id,
+            total_size: 8,
+            offset: 0,
+            ciphertext: vec![1, 2, 3, 4],
+            is_last: false,
+        };
+        let response_bytes = sender
+            .encode_blob_chunk_response(response.clone(), Some(decoded.sequence))
+            .unwrap();
+        let decoded_response = receiver.accept_blob_chunk_response(response_bytes).unwrap();
+        assert_eq!(decoded_response.sequence, 2);
+        assert_eq!(decoded_response.in_reply_to, Some(1));
+        assert_eq!(decoded_response.response, response);
+    }
+
+    #[test]
+    fn ffi_wire_session_restores_sequence_state_and_rejects_wrong_types() {
+        let limit = default_sync_wire_payload_bytes();
+        let sender = create_sync_wire_session("wire-session".to_string(), limit).unwrap();
+        let receiver = create_sync_wire_session("wire-session".to_string(), limit).unwrap();
+        let hello = MdbxSyncHello {
+            device_id: "device-a".to_string(),
+            protocol_version: 2,
+            heads: Vec::new(),
+            known_commit_ids: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        let hello_bytes = sender.encode_hello(hello.clone(), None).unwrap();
+        let decoded = receiver.accept_hello(hello_bytes).unwrap();
+        assert_eq!(decoded.hello, hello);
+        receiver.acknowledge_inbound(decoded.sequence).unwrap();
+        let resume = receiver.resume().unwrap();
+        let encoded_resume = serde_json::to_vec(&resume).unwrap();
+        let restored: MdbxSyncWireResume = serde_json::from_slice(&encoded_resume).unwrap();
+        let restarted = create_sync_wire_session("wire-session".to_string(), limit).unwrap();
+        restarted.restore_resume(restored).unwrap();
+        assert_eq!(restarted.resume().unwrap().next_inbound_sequence, 2);
+
+        let response = MdbxBlobChunkResponse {
+            namespace_id: "source".to_string(),
+            blob_id: "b".repeat(64),
+            total_size: 4,
+            offset: 0,
+            ciphertext: vec![8, 9, 10, 11],
+            is_last: true,
+        };
+        let response_bytes = sender
+            .encode_blob_chunk_response(response, Some(decoded.sequence))
+            .unwrap();
+        assert!(restarted.accept_blob_chunk_request(response_bytes).is_err());
+        assert_eq!(restarted.pending_inbound_sequence().unwrap(), None);
+    }
 
     #[test]
     fn ffi_blob_sync_session_negotiates_and_advances_only_after_ack() {
