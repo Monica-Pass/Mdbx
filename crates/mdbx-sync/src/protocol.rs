@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::bundle::{
     incremental_bundle_payload_sha256, IncrementalBundleCheckpoint, IncrementalBundleResume,
     IncrementalSyncBundle,
@@ -299,6 +301,93 @@ pub enum SyncClientPhase {
     Fallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobSyncPhase {
+    Disabled,
+    Idle,
+    Manifest,
+    AwaitingManifestAcknowledgement,
+    Chunk,
+    AwaitingChunkAcknowledgement,
+    Complete,
+}
+
+/// Durable Blob progress. Pending requests and validated responses are
+/// intentionally excluded so a restart resumes from the last storage ack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlobSyncResume {
+    pub namespace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_blob_id: Option<String>,
+    pub total_size: u64,
+    pub next_durable_offset: u64,
+    #[serde(default)]
+    pub manifest_complete: bool,
+}
+
+impl BlobSyncResume {
+    pub fn new(namespace_id: String) -> SyncResult<Self> {
+        let resume = Self {
+            namespace_id,
+            manifest_checkpoint: None,
+            manifest_cursor: None,
+            current_blob_id: None,
+            total_size: 0,
+            next_durable_offset: 0,
+            manifest_complete: false,
+        };
+        resume.validate()?;
+        Ok(resume)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        BlobManifestPageRequest::new(
+            self.namespace_id.clone(),
+            self.manifest_checkpoint.clone(),
+            self.manifest_cursor.clone(),
+            1,
+        )?;
+        if self.manifest_cursor.is_some() && self.manifest_checkpoint.is_none() {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest cursor requires a checkpoint".to_string(),
+            ));
+        }
+        if self.manifest_complete && self.manifest_cursor.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "completed Blob manifest cannot retain a cursor".to_string(),
+            ));
+        }
+        match self.current_blob_id.as_deref() {
+            Some(blob_id) => {
+                BlobChunkRequest::new(
+                    self.namespace_id.clone(),
+                    blob_id.to_string(),
+                    self.total_size,
+                    self.next_durable_offset,
+                    1,
+                )?;
+                if self.manifest_complete {
+                    return Err(SyncError::InvalidMessage(
+                        "completed Blob manifest cannot retain an active Blob".to_string(),
+                    ));
+                }
+            }
+            None if self.total_size != 0 || self.next_durable_offset != 0 => {
+                return Err(SyncError::InvalidMessage(
+                    "Blob resume size and offset require an active Blob".to_string(),
+                ));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
 /// Transport-neutral state holder for a negotiated synchronization exchange.
 ///
 /// Storage adapters call [`acknowledge_incremental_segment`](Self::acknowledge_incremental_segment)
@@ -310,6 +399,12 @@ pub struct SyncClient {
     mode: SyncTransferMode,
     checkpoint: Option<IncrementalBundleCheckpoint>,
     resume: Option<IncrementalBundleResume>,
+    blob_phase: BlobSyncPhase,
+    blob_resume: Option<BlobSyncResume>,
+    pending_blob_manifest_request: Option<BlobManifestPageRequest>,
+    pending_blob_manifest_response: Option<BlobManifestPageResponse>,
+    pending_blob_chunk_request: Option<BlobChunkRequest>,
+    pending_blob_chunk_response: Option<BlobChunkResponse>,
 }
 
 impl SyncClient {
@@ -324,6 +419,12 @@ impl SyncClient {
             mode: SyncTransferMode::CompleteState,
             checkpoint,
             resume,
+            blob_phase: BlobSyncPhase::Disabled,
+            blob_resume: None,
+            pending_blob_manifest_request: None,
+            pending_blob_manifest_response: None,
+            pending_blob_chunk_request: None,
+            pending_blob_chunk_response: None,
         }
     }
 
@@ -335,6 +436,7 @@ impl SyncClient {
     pub fn on_hello(&mut self, hello: &HelloRequest) -> SyncResult<HelloResponse> {
         let response = self.negotiator.on_hello(hello)?;
         self.mode = self.negotiator.transfer_mode();
+        self.refresh_blob_phase();
         self.phase = SyncClientPhase::Negotiated;
         Ok(response)
     }
@@ -342,6 +444,7 @@ impl SyncClient {
     pub fn on_hello_ack(&mut self, response: &HelloResponse) -> SyncResult<()> {
         self.negotiator.on_hello_ack(response)?;
         self.mode = self.negotiator.transfer_mode();
+        self.refresh_blob_phase();
         self.phase = SyncClientPhase::Negotiated;
         Ok(())
     }
@@ -364,6 +467,244 @@ impl SyncClient {
 
     pub fn resume(&self) -> Option<&IncrementalBundleResume> {
         self.resume.as_ref()
+    }
+
+    pub fn blob_sync_phase(&self) -> BlobSyncPhase {
+        self.blob_phase
+    }
+
+    pub fn blob_resume(&self) -> Option<&BlobSyncResume> {
+        self.blob_resume.as_ref()
+    }
+
+    pub fn blob_replication_is_negotiated(&self) -> bool {
+        self.negotiator.blob_replication_is_negotiated()
+    }
+
+    pub fn begin_blob_sync(&mut self, namespace_id: String) -> SyncResult<()> {
+        self.restore_blob_sync(BlobSyncResume::new(namespace_id)?)
+    }
+
+    pub fn restore_blob_sync(&mut self, resume: BlobSyncResume) -> SyncResult<()> {
+        resume.validate()?;
+        self.blob_resume = Some(resume);
+        self.clear_pending_blob_exchange();
+        self.refresh_blob_phase();
+        Ok(())
+    }
+
+    pub fn blob_manifest_request(
+        &mut self,
+        page_size: usize,
+    ) -> SyncResult<BlobManifestPageRequest> {
+        self.require_blob_replication()?;
+        let resume = self.blob_resume.as_ref().ok_or_else(|| {
+            SyncError::InvalidMessage(
+                "Blob synchronization has no configured namespace".to_string(),
+            )
+        })?;
+        if resume.manifest_complete {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest synchronization is already complete".to_string(),
+            ));
+        }
+        if resume.current_blob_id.is_some() || self.pending_blob_chunk_request.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "cannot request a Blob manifest page during an active Blob transfer".to_string(),
+            ));
+        }
+        let request = BlobManifestPageRequest::new(
+            resume.namespace_id.clone(),
+            resume.manifest_checkpoint.clone(),
+            resume.manifest_cursor.clone(),
+            page_size,
+        )?;
+        self.pending_blob_manifest_request = Some(request.clone());
+        self.pending_blob_manifest_response = None;
+        self.blob_phase = BlobSyncPhase::Manifest;
+        Ok(request)
+    }
+
+    pub fn validate_blob_manifest_response(
+        &mut self,
+        response: &BlobManifestPageResponse,
+    ) -> SyncResult<()> {
+        self.require_blob_replication()?;
+        response.validate()?;
+        let request = self.pending_blob_manifest_request.as_ref().ok_or_else(|| {
+            SyncError::InvalidMessage("Blob manifest response has no pending request".to_string())
+        })?;
+        if response.namespace_id != request.namespace_id {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest namespace does not match the pending request".to_string(),
+            ));
+        }
+        if request
+            .checkpoint
+            .as_deref()
+            .is_some_and(|checkpoint| checkpoint != response.checkpoint)
+        {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest checkpoint changed during paging".to_string(),
+            ));
+        }
+        self.pending_blob_manifest_response = Some(response.clone());
+        self.blob_phase = BlobSyncPhase::AwaitingManifestAcknowledgement;
+        Ok(())
+    }
+
+    /// Advance manifest progress only after the page has been fully processed
+    /// and any required Provider writes are durable.
+    pub fn acknowledge_blob_manifest_page(
+        &mut self,
+        response: &BlobManifestPageResponse,
+    ) -> SyncResult<()> {
+        if self.pending_blob_manifest_response.as_ref() != Some(response) {
+            self.validate_blob_manifest_response(response)?;
+        }
+        let resume = self.blob_resume.as_mut().ok_or_else(|| {
+            SyncError::InvalidMessage(
+                "Blob synchronization has no durable resume state".to_string(),
+            )
+        })?;
+        if resume.current_blob_id.is_some() || self.pending_blob_chunk_request.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "cannot acknowledge a Blob manifest page during an active Blob transfer"
+                    .to_string(),
+            ));
+        }
+        resume.manifest_checkpoint = Some(response.checkpoint.clone());
+        resume.manifest_cursor = response.next_cursor.clone();
+        resume.manifest_complete = response.next_cursor.is_none();
+        self.pending_blob_manifest_request = None;
+        self.pending_blob_manifest_response = None;
+        self.blob_phase = if resume.manifest_complete {
+            BlobSyncPhase::Complete
+        } else {
+            BlobSyncPhase::Manifest
+        };
+        Ok(())
+    }
+
+    pub fn blob_chunk_request(
+        &mut self,
+        blob_id: String,
+        total_size: u64,
+        max_bytes: usize,
+    ) -> SyncResult<BlobChunkRequest> {
+        self.require_blob_replication()?;
+        let resume = self.blob_resume.as_ref().ok_or_else(|| {
+            SyncError::InvalidMessage(
+                "Blob synchronization has no configured namespace".to_string(),
+            )
+        })?;
+        if resume.manifest_complete {
+            return Err(SyncError::InvalidMessage(
+                "Blob manifest synchronization is already complete".to_string(),
+            ));
+        }
+        let offset = match resume.current_blob_id.as_deref() {
+            Some(current) if current == blob_id && resume.total_size == total_size => {
+                resume.next_durable_offset
+            }
+            Some(_) => {
+                return Err(SyncError::InvalidMessage(
+                    "Blob request does not match the durable active Blob".to_string(),
+                ))
+            }
+            None => {
+                let manifest = self
+                    .pending_blob_manifest_response
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SyncError::InvalidMessage(
+                            "new Blob transfer requires a validated manifest page".to_string(),
+                        )
+                    })?;
+                let declared = manifest.items.iter().any(|item| {
+                    item.blob_id == blob_id
+                        && item.total_size == Some(total_size)
+                        && item.state == BlobManifestEntryState::Available
+                });
+                if !declared {
+                    return Err(SyncError::InvalidMessage(
+                        "Blob request is not an available item in the validated manifest page"
+                            .to_string(),
+                    ));
+                }
+                0
+            }
+        };
+        let request = BlobChunkRequest::new(
+            resume.namespace_id.clone(),
+            blob_id,
+            total_size,
+            offset,
+            max_bytes,
+        )?;
+        self.pending_blob_chunk_request = Some(request.clone());
+        self.pending_blob_chunk_response = None;
+        self.blob_phase = BlobSyncPhase::Chunk;
+        Ok(request)
+    }
+
+    pub fn validate_blob_chunk_response(&mut self, response: &BlobChunkResponse) -> SyncResult<()> {
+        self.require_blob_replication()?;
+        response.validate()?;
+        let request = self.pending_blob_chunk_request.as_ref().ok_or_else(|| {
+            SyncError::InvalidMessage("Blob chunk response has no pending request".to_string())
+        })?;
+        if response.namespace_id != request.namespace_id
+            || response.blob_id != request.blob_id
+            || response.total_size != request.total_size
+            || response.offset != request.offset
+        {
+            return Err(SyncError::InvalidMessage(
+                "Blob chunk response does not match the pending request".to_string(),
+            ));
+        }
+        if response.ciphertext.len() > request.max_bytes as usize {
+            return Err(SyncError::InvalidMessage(
+                "Blob chunk response exceeds the requested byte limit".to_string(),
+            ));
+        }
+        self.pending_blob_chunk_response = Some(response.clone());
+        self.blob_phase = BlobSyncPhase::AwaitingChunkAcknowledgement;
+        Ok(())
+    }
+
+    /// Advance the ciphertext offset only after the Provider confirms that
+    /// this exact chunk is durable.
+    pub fn acknowledge_blob_chunk(&mut self, response: &BlobChunkResponse) -> SyncResult<()> {
+        if self.pending_blob_chunk_response.as_ref() != Some(response) {
+            self.validate_blob_chunk_response(response)?;
+        }
+        let end = response
+            .offset
+            .checked_add(response.ciphertext.len() as u64)
+            .ok_or_else(|| SyncError::InvalidMessage("Blob chunk offset overflow".to_string()))?;
+        let resume = self.blob_resume.as_mut().ok_or_else(|| {
+            SyncError::InvalidMessage(
+                "Blob synchronization has no durable resume state".to_string(),
+            )
+        })?;
+        if response.is_last {
+            resume.current_blob_id = None;
+            resume.total_size = 0;
+            resume.next_durable_offset = 0;
+        } else {
+            resume.current_blob_id = Some(response.blob_id.clone());
+            resume.total_size = response.total_size;
+            resume.next_durable_offset = end;
+        }
+        self.pending_blob_chunk_request = None;
+        self.pending_blob_chunk_response = None;
+        self.blob_phase = if self.pending_blob_manifest_response.is_some() {
+            BlobSyncPhase::AwaitingManifestAcknowledgement
+        } else {
+            BlobSyncPhase::Chunk
+        };
+        Ok(())
     }
 
     /// Record a completed complete-state bootstrap. The storage adapter must
@@ -489,6 +830,36 @@ impl SyncClient {
         self.mode = SyncTransferMode::CompleteState;
         self.phase = SyncClientPhase::Fallback;
         self.resume = None;
+    }
+
+    fn require_blob_replication(&self) -> SyncResult<()> {
+        if !self.blob_replication_is_negotiated() {
+            return Err(SyncError::InvalidMessage(
+                "peer did not negotiate the complete Blob replication contract".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn clear_pending_blob_exchange(&mut self) {
+        self.pending_blob_manifest_request = None;
+        self.pending_blob_manifest_response = None;
+        self.pending_blob_chunk_request = None;
+        self.pending_blob_chunk_response = None;
+    }
+
+    fn refresh_blob_phase(&mut self) {
+        if !self.blob_replication_is_negotiated() {
+            self.blob_phase = BlobSyncPhase::Disabled;
+            self.clear_pending_blob_exchange();
+            return;
+        }
+        self.blob_phase = match self.blob_resume.as_ref() {
+            None => BlobSyncPhase::Idle,
+            Some(resume) if resume.manifest_complete => BlobSyncPhase::Complete,
+            Some(resume) if resume.current_blob_id.is_some() => BlobSyncPhase::Chunk,
+            Some(_) => BlobSyncPhase::Manifest,
+        };
     }
 }
 
@@ -660,8 +1031,8 @@ mod tests {
 
     #[test]
     fn blob_replication_requires_the_complete_three_capability_contract() {
-        let mut responder = SyncNegotiator::new_incremental("device-a", Vec::new(), Vec::new())
-            .unwrap();
+        let mut responder =
+            SyncNegotiator::new_incremental("device-a", Vec::new(), Vec::new()).unwrap();
         responder.enable_blob_replication_capabilities().unwrap();
 
         let partial = HelloRequest::new("partial", Vec::new(), Vec::new())
@@ -675,8 +1046,8 @@ mod tests {
         assert!(!partial_response.supports(CAPABILITY_BLOB_TRANSFER_RESUME_V1));
         assert_eq!(responder.transfer_mode(), SyncTransferMode::CompleteState);
 
-        let mut initiator = SyncNegotiator::new_incremental("device-b", Vec::new(), Vec::new())
-            .unwrap();
+        let mut initiator =
+            SyncNegotiator::new_incremental("device-b", Vec::new(), Vec::new()).unwrap();
         initiator.enable_blob_replication_capabilities().unwrap();
         let hello = initiator.local_hello().unwrap();
         let response = responder.on_hello(&hello).unwrap();
@@ -964,5 +1335,131 @@ mod tests {
         );
         client.fallback_to_complete_state();
         assert_eq!(client.transfer_mode(), SyncTransferMode::CompleteState);
+    }
+
+    #[test]
+    fn blob_client_advances_only_after_storage_acknowledgements() {
+        let mut local = SyncNegotiator::new("device-a", vec![], vec![]);
+        local.enable_blob_replication_capabilities().unwrap();
+        let mut client = SyncClient::new(local, None, None);
+        client.begin_blob_sync("attachments".to_string()).unwrap();
+        let hello = client.hello().unwrap();
+
+        let mut peer = SyncNegotiator::new("device-b", vec![], vec![]);
+        peer.enable_blob_replication_capabilities().unwrap();
+        let ack = peer.on_hello(&hello).unwrap();
+        client.on_hello_ack(&ack).unwrap();
+        assert_eq!(client.blob_sync_phase(), BlobSyncPhase::Manifest);
+
+        let blob_id = "a".repeat(MAX_BLOB_ID_BYTES);
+        let manifest_request = client.blob_manifest_request(32).unwrap();
+        assert_eq!(manifest_request.namespace_id, "attachments");
+        let manifest_response = BlobManifestPageResponse::new(
+            "attachments".to_string(),
+            "manifest-checkpoint".to_string(),
+            vec![BlobManifestEntry {
+                blob_id: blob_id.clone(),
+                total_size: Some(8),
+                state: BlobManifestEntryState::Available,
+            }],
+            None,
+        )
+        .unwrap();
+        client
+            .validate_blob_manifest_response(&manifest_response)
+            .unwrap();
+        assert_eq!(
+            client.blob_sync_phase(),
+            BlobSyncPhase::AwaitingManifestAcknowledgement
+        );
+        assert!(client.blob_resume().unwrap().manifest_checkpoint.is_none());
+
+        let first_request = client.blob_chunk_request(blob_id.clone(), 8, 4).unwrap();
+        assert_eq!(first_request.offset, 0);
+        let first_response = BlobChunkResponse::new(
+            "attachments".to_string(),
+            blob_id.clone(),
+            8,
+            0,
+            vec![1, 2, 3, 4],
+            false,
+        )
+        .unwrap();
+        client
+            .validate_blob_chunk_response(&first_response)
+            .unwrap();
+        assert!(client.blob_resume().unwrap().current_blob_id.is_none());
+        assert_eq!(client.blob_resume().unwrap().next_durable_offset, 0);
+
+        client.acknowledge_blob_chunk(&first_response).unwrap();
+        assert_eq!(
+            client.blob_resume().unwrap().current_blob_id.as_deref(),
+            Some(blob_id.as_str())
+        );
+        assert_eq!(client.blob_resume().unwrap().next_durable_offset, 4);
+
+        let restored_json = serde_json::to_string(client.blob_resume().unwrap()).unwrap();
+        let restored: BlobSyncResume = serde_json::from_str(&restored_json).unwrap();
+        restored.validate().unwrap();
+
+        let second_request = client.blob_chunk_request(blob_id.clone(), 8, 4).unwrap();
+        assert_eq!(second_request.offset, 4);
+        let second_response = BlobChunkResponse::new(
+            "attachments".to_string(),
+            blob_id,
+            8,
+            4,
+            vec![5, 6, 7, 8],
+            true,
+        )
+        .unwrap();
+        client.acknowledge_blob_chunk(&second_response).unwrap();
+        assert!(client.blob_resume().unwrap().current_blob_id.is_none());
+        assert_eq!(
+            client.blob_sync_phase(),
+            BlobSyncPhase::AwaitingManifestAcknowledgement
+        );
+
+        client
+            .acknowledge_blob_manifest_page(&manifest_response)
+            .unwrap();
+        assert_eq!(client.blob_sync_phase(), BlobSyncPhase::Complete);
+        assert_eq!(
+            client.blob_resume().unwrap().manifest_checkpoint.as_deref(),
+            Some("manifest-checkpoint")
+        );
+        assert!(client.blob_resume().unwrap().manifest_complete);
+    }
+
+    #[test]
+    fn blob_client_rejects_partial_capabilities_and_mismatched_chunks() {
+        let mut local = SyncNegotiator::new("device-a", vec![], vec![]);
+        local.enable_blob_replication_capabilities().unwrap();
+        let mut client = SyncClient::new(local, None, None);
+        client.begin_blob_sync("attachments".to_string()).unwrap();
+        let hello = client.hello().unwrap();
+
+        let mut partial = SyncNegotiator::new("partial", vec![], vec![]);
+        partial
+            .enable_capability(CAPABILITY_BLOB_MANIFEST_PAGING_V1)
+            .unwrap();
+        partial
+            .enable_capability(CAPABILITY_BLOB_CHUNK_TRANSFER_V1)
+            .unwrap();
+        let ack = partial.on_hello(&hello).unwrap();
+        client.on_hello_ack(&ack).unwrap();
+        assert_eq!(client.blob_sync_phase(), BlobSyncPhase::Disabled);
+        assert!(client.blob_manifest_request(1).is_err());
+
+        let invalid_resume = BlobSyncResume {
+            namespace_id: "attachments".to_string(),
+            manifest_checkpoint: None,
+            manifest_cursor: Some("cursor".to_string()),
+            current_blob_id: None,
+            total_size: 0,
+            next_durable_offset: 0,
+            manifest_complete: false,
+        };
+        assert!(invalid_resume.validate().is_err());
     }
 }

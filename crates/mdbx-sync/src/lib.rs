@@ -7,5 +7,6 @@ pub use bundle::*;
 pub use error::{SyncError, SyncResult};
 pub use message::*;
 pub use protocol::{
-    BatchBuilder, SyncClient, SyncClientPhase, SyncNegotiator, SyncPhase, SyncTransferMode,
+    BatchBuilder, BlobSyncPhase, BlobSyncResume, SyncClient, SyncClientPhase, SyncNegotiator,
+    SyncPhase, SyncTransferMode,
 };

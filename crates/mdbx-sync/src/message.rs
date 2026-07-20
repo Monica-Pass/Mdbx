@@ -722,7 +722,14 @@ impl BlobManifestEntry {
                 })?;
                 validate_blob_total_size(total_size)?;
             }
-            BlobManifestEntryState::SourceMissing | BlobManifestEntryState::SourceSizeInvalid => {
+            BlobManifestEntryState::SourceMissing => {
+                if self.total_size.is_some() {
+                    return Err(SyncError::InvalidMessage(
+                        "missing Blob manifest entries cannot declare a total size".to_string(),
+                    ));
+                }
+            }
+            BlobManifestEntryState::SourceSizeInvalid => {
                 if let Some(total_size) = self.total_size {
                     if total_size > MAX_BLOB_TOTAL_SIZE {
                         return Err(SyncError::InvalidMessage(format!(
@@ -1209,14 +1216,10 @@ mod tests {
             Some("cursor".to_string()),
         )
         .is_err());
-        assert!(BlobChunkRequest::new(
-            "ns".to_string(),
-            "a".repeat(MAX_BLOB_ID_BYTES),
-            8,
-            8,
-            1,
-        )
-        .is_err());
+        assert!(
+            BlobChunkRequest::new("ns".to_string(), "a".repeat(MAX_BLOB_ID_BYTES), 8, 8, 1,)
+                .is_err()
+        );
         assert!(BlobChunkResponse::new(
             "ns".to_string(),
             "a".repeat(MAX_BLOB_ID_BYTES),
