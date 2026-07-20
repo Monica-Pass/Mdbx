@@ -119,15 +119,25 @@ Rotation is not an ordinary idempotent operation API. If a network response is u
 
 ### Entry Types
 
-`entry_type` is a string parsed by `mdbx-core::model::EntryType`. Current accepted values are:
+The legacy single-entry methods parse `entry_type` through the MDBX1 adapter. Current accepted values are:
 
 - `login`
 - `note`
 - `totp`
 - `card`
 - `identity`
+- `passkey`
+- `ssh-key`
+- `api-token`
+- `document-ref`
 
 Invalid values return `MdbxFfiError::InvalidEntryType`.
+
+### Bounded Generic Write Operations
+
+Use `execute_write_operation` or `execute_write_operation_on_branch` when one user action changes several Collections or Objects. One call is atomic, creates one commit, and uses the complete command list as its idempotent intent. These operation commands additionally accept namespaced ObjectTypeIds such as `com.monica.mail.message`; the legacy single-entry methods retain their published MDBX1 type boundary.
+
+The compatibility methods default to 256 commands, 1 MiB per JSON payload, 8 MiB total JSON payload, and 16 MiB serialized intent. `default_write_operation_limits` returns this profile. New clients may call the `*_with_limits` methods with an explicit profile, subject to hard ceilings of 4,096 commands, 16 MiB per payload, 64 MiB total payload, and 128 MiB intent. Validation and streaming intent hashing happen before the vault write lock and transaction. Split larger imports into new operation IDs; retry a batch with its original operation ID and exact commands.
 
 ### Paginated Object Summaries
 

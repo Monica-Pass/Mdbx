@@ -3,6 +3,7 @@
 //! This crate intentionally exposes vault, project, and generic entry
 //! operations only. Product-specific payloads belong in each client.
 
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +42,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
+
+#[uniffi::export]
+pub fn default_write_operation_limits() -> MdbxWriteOperationLimits {
+    InternalWriteOperationLimits::default().public()
+}
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MdbxFfiError {
@@ -589,6 +595,125 @@ pub struct MdbxWriteOperationResult {
     pub already_committed: bool,
     pub project_ids: Vec<String>,
     pub entry_ids: Vec<String>,
+}
+
+/// Resource contract for one generic user-level write operation.
+///
+/// The defaults are suitable for interactive clients. Explicit values are
+/// accepted only within the hard ceilings so a caller cannot disable the
+/// boundary by opting into a custom profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxWriteOperationLimits {
+    pub max_commands: u64,
+    pub max_payload_bytes_per_command: u64,
+    pub max_payload_bytes: u64,
+    pub max_intent_bytes: u64,
+}
+
+const DEFAULT_MAX_WRITE_COMMANDS: usize = 256;
+const HARD_MAX_WRITE_COMMANDS: usize = 4_096;
+const DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 1024 * 1024;
+const HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_WRITE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const HARD_MAX_WRITE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_WRITE_INTENT_BYTES: usize = 16 * 1024 * 1024;
+const HARD_MAX_WRITE_INTENT_BYTES: usize = 128 * 1024 * 1024;
+
+impl Default for MdbxWriteOperationLimits {
+    fn default() -> Self {
+        Self {
+            max_commands: DEFAULT_MAX_WRITE_COMMANDS as u64,
+            max_payload_bytes_per_command: DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND as u64,
+            max_payload_bytes: DEFAULT_MAX_WRITE_PAYLOAD_BYTES as u64,
+            max_intent_bytes: DEFAULT_MAX_WRITE_INTENT_BYTES as u64,
+        }
+    }
+}
+
+impl MdbxWriteOperationLimits {
+    fn into_internal(self) -> Result<InternalWriteOperationLimits, MdbxFfiError> {
+        let limits = InternalWriteOperationLimits {
+            max_commands: usize::try_from(self.max_commands)
+                .map_err(|_| StorageError::Validation("max_commands is too large".to_string()))?,
+            max_payload_bytes_per_command: usize::try_from(self.max_payload_bytes_per_command)
+                .map_err(|_| {
+                    StorageError::Validation(
+                        "max_payload_bytes_per_command is too large".to_string(),
+                    )
+                })?,
+            max_payload_bytes: usize::try_from(self.max_payload_bytes).map_err(|_| {
+                StorageError::Validation("max_payload_bytes is too large".to_string())
+            })?,
+            max_intent_bytes: usize::try_from(self.max_intent_bytes).map_err(|_| {
+                StorageError::Validation("max_intent_bytes is too large".to_string())
+            })?,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InternalWriteOperationLimits {
+    max_commands: usize,
+    max_payload_bytes_per_command: usize,
+    max_payload_bytes: usize,
+    max_intent_bytes: usize,
+}
+
+impl Default for InternalWriteOperationLimits {
+    fn default() -> Self {
+        MdbxWriteOperationLimits::default()
+            .into_internal()
+            .expect("built-in write operation limits must be valid")
+    }
+}
+
+impl InternalWriteOperationLimits {
+    fn validate(self) -> Result<(), MdbxFfiError> {
+        let checks = [
+            ("max_commands", self.max_commands, HARD_MAX_WRITE_COMMANDS),
+            (
+                "max_payload_bytes_per_command",
+                self.max_payload_bytes_per_command,
+                HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND,
+            ),
+            (
+                "max_payload_bytes",
+                self.max_payload_bytes,
+                HARD_MAX_WRITE_PAYLOAD_BYTES,
+            ),
+            (
+                "max_intent_bytes",
+                self.max_intent_bytes,
+                HARD_MAX_WRITE_INTENT_BYTES,
+            ),
+        ];
+        for (name, value, hard_max) in checks {
+            if value == 0 || value > hard_max {
+                return Err(StorageError::Validation(format!(
+                    "{name} must be between 1 and {hard_max}"
+                ))
+                .into());
+            }
+        }
+        if self.max_payload_bytes_per_command > self.max_payload_bytes {
+            return Err(StorageError::Validation(
+                "per-command payload limit cannot exceed total payload limit".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn public(self) -> MdbxWriteOperationLimits {
+        MdbxWriteOperationLimits {
+            max_commands: self.max_commands as u64,
+            max_payload_bytes_per_command: self.max_payload_bytes_per_command as u64,
+            max_payload_bytes: self.max_payload_bytes as u64,
+            max_intent_bytes: self.max_intent_bytes as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1601,7 +1726,31 @@ impl MdbxVault {
         operation_kind: String,
         commands: Vec<MdbxWriteCommand>,
     ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
-        execute_write_operation_for_branch(self, None, operation_id, operation_kind, commands)
+        execute_write_operation_for_branch(
+            self,
+            None,
+            operation_id,
+            operation_kind,
+            commands,
+            InternalWriteOperationLimits::default(),
+        )
+    }
+
+    pub fn execute_write_operation_with_limits(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        limits: MdbxWriteOperationLimits,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            None,
+            operation_id,
+            operation_kind,
+            commands,
+            limits.into_internal()?,
+        )
     }
 
     pub fn execute_write_operation_on_branch(
@@ -1617,6 +1766,25 @@ impl MdbxVault {
             operation_id,
             operation_kind,
             commands,
+            InternalWriteOperationLimits::default(),
+        )
+    }
+
+    pub fn execute_write_operation_on_branch_with_limits(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        limits: MdbxWriteOperationLimits,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            Some(branch_id),
+            operation_id,
+            operation_kind,
+            commands,
+            limits.into_internal()?,
         )
     }
 
@@ -2591,6 +2759,7 @@ fn validate_write_operation(
     operation_id: &str,
     operation_kind: &str,
     commands: &[MdbxWriteCommand],
+    limits: InternalWriteOperationLimits,
 ) -> Result<(), MdbxFfiError> {
     if operation_id.trim().is_empty() {
         return Err(StorageError::Validation("operation_id must not be empty".to_string()).into());
@@ -2605,6 +2774,15 @@ fn validate_write_operation(
             StorageError::Validation("write operation requires commands".to_string()).into(),
         );
     }
+    if commands.len() > limits.max_commands {
+        return Err(StorageError::ResourceLimit {
+            resource: "write operation commands".to_string(),
+            actual: commands.len() as u64,
+            limit: limits.max_commands as u64,
+        }
+        .into());
+    }
+    let mut total_payload_bytes = 0usize;
     for command in commands {
         match command {
             MdbxWriteCommand::CreateProject { project_id, .. } => {
@@ -2623,7 +2801,32 @@ fn validate_write_operation(
                 ..
             } => {
                 validate_uuid(entry_id, "entry_id")?;
-                parse_entry_type(entry_type)?;
+                parse_write_object_type(entry_type)?;
+                let payload_bytes = payload_json.len();
+                if payload_bytes > limits.max_payload_bytes_per_command {
+                    return Err(StorageError::ResourceLimit {
+                        resource: "write operation command payload bytes".to_string(),
+                        actual: payload_bytes as u64,
+                        limit: limits.max_payload_bytes_per_command as u64,
+                    }
+                    .into());
+                }
+                total_payload_bytes =
+                    total_payload_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(|| StorageError::ResourceLimit {
+                            resource: "write operation payload bytes".to_string(),
+                            actual: u64::MAX,
+                            limit: limits.max_payload_bytes as u64,
+                        })?;
+                if total_payload_bytes > limits.max_payload_bytes {
+                    return Err(StorageError::ResourceLimit {
+                        resource: "write operation payload bytes".to_string(),
+                        actual: total_payload_bytes as u64,
+                        limit: limits.max_payload_bytes as u64,
+                    }
+                    .into());
+                }
                 parse_payload_json(payload_json)?;
             }
             MdbxWriteCommand::DeleteEntry { entry_id, .. }
@@ -2632,6 +2835,69 @@ fn validate_write_operation(
         }
     }
     Ok(())
+}
+
+fn hash_write_operation_intent(
+    commands: &[MdbxWriteCommand],
+    limit: usize,
+) -> Result<Vec<u8>, MdbxFfiError> {
+    let mut writer = LimitedIntentHashWriter::new(limit);
+    if let Err(error) = serde_json::to_writer(&mut writer, commands) {
+        if let Some(actual) = writer.exceeded_at {
+            return Err(StorageError::ResourceLimit {
+                resource: "write operation serialized intent bytes".to_string(),
+                actual: actual as u64,
+                limit: limit as u64,
+            }
+            .into());
+        }
+        return Err(error.into());
+    }
+    Ok(writer.finalize())
+}
+
+struct LimitedIntentHashWriter {
+    hasher: Sha256,
+    bytes_written: usize,
+    limit: usize,
+    exceeded_at: Option<usize>,
+}
+
+impl LimitedIntentHashWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            limit,
+            exceeded_at: None,
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        self.hasher.finalize().to_vec()
+    }
+}
+
+impl Write for LimitedIntentHashWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let actual = self
+            .bytes_written
+            .checked_add(buffer.len())
+            .unwrap_or(usize::MAX);
+        if actual > self.limit {
+            self.exceeded_at = Some(actual);
+            return Err(io::Error::other(
+                "write operation serialized intent limit exceeded",
+            ));
+        }
+        self.hasher.update(buffer);
+        self.bytes_written = actual;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn validate_uuid(value: &str, field: &str) -> Result<(), MdbxFfiError> {
@@ -2719,9 +2985,8 @@ fn execute_write_commands(
             } => {
                 let payload = serde_json::from_str(payload_json)
                     .map_err(|error| StorageError::Validation(error.to_string()))?;
-                let entry_type = entry_type.parse().map_err(|_| {
-                    StorageError::Validation(format!("invalid entry type: {entry_type}"))
-                })?;
+                let entry_type = parse_write_object_type(entry_type)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
                 EntryRepo::create_with_id(
                     conn,
                     ctx,
@@ -2739,9 +3004,8 @@ fn execute_write_commands(
                 title,
                 payload_json,
             } => {
-                let expected_type = entry_type.parse().map_err(|_| {
-                    StorageError::Validation(format!("invalid entry type: {entry_type}"))
-                })?;
+                let expected_type = parse_write_object_type(entry_type)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
                 let mut entry = entry_for_project(conn, project_id, entry_id)?;
                 if entry.deleted || entry.entry_type != expected_type {
                     return Err(StorageError::ConstraintViolation(format!(
@@ -2789,10 +3053,10 @@ fn execute_write_operation_for_branch(
     operation_id: String,
     operation_kind: String,
     commands: Vec<MdbxWriteCommand>,
+    limits: InternalWriteOperationLimits,
 ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
-    validate_write_operation(&operation_id, &operation_kind, &commands)?;
-    let intent = serde_json::to_vec(&commands)?;
-    let intent_hash = Sha256::digest(intent).to_vec();
+    validate_write_operation(&operation_id, &operation_kind, &commands, limits)?;
+    let intent_hash = hash_write_operation_intent(&commands, limits.max_intent_bytes)?;
     let changed_objects = write_operation_changes(&commands);
     let mut operation = CommitOperation::new(
         operation_id,
@@ -2915,6 +3179,14 @@ fn parse_entry_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
             entry_type: entry_type.to_string(),
         })
     }
+}
+
+fn parse_write_object_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
+    entry_type
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidEntryType {
+            entry_type: entry_type.to_string(),
+        })
 }
 
 fn parse_optional_entry_type(
@@ -3422,6 +3694,266 @@ mod tests {
         assert!(!result.eligible);
         assert_eq!(result.blockers.len(), 1);
         assert_eq!(result.blockers[0].code, "retention-not-scheduled");
+    }
+
+    #[test]
+    fn bounded_write_operation_limits_and_streaming_intent_hash_are_stable() {
+        let limits = default_write_operation_limits();
+        assert_eq!(limits.max_commands, 256);
+        assert_eq!(limits.max_payload_bytes_per_command, 1024 * 1024);
+        assert_eq!(limits.max_payload_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.max_intent_bytes, 16 * 1024 * 1024);
+
+        let commands = vec![MdbxWriteCommand::CreateProject {
+            project_id: Uuid::new_v4().to_string(),
+            title: "Mail".to_string(),
+        }];
+        let encoded = serde_json::to_vec(&commands).unwrap();
+        assert_eq!(
+            hash_write_operation_intent(&commands, encoded.len()).unwrap(),
+            Sha256::digest(&encoded).to_vec()
+        );
+        assert!(hash_write_operation_intent(&commands, encoded.len() - 1)
+            .unwrap_err()
+            .to_string()
+            .contains("serialized intent bytes"));
+
+        let invalid = MdbxWriteOperationLimits {
+            max_commands: HARD_MAX_WRITE_COMMANDS as u64 + 1,
+            ..limits
+        };
+        assert!(invalid.into_internal().is_err());
+    }
+
+    #[test]
+    fn bounded_write_operation_rejects_without_database_side_effects() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let initial_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let initial_projects: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .unwrap();
+        let initial_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-bounded-write-device".to_string(),
+            vault_id: "ffi-bounded-write-vault".to_string(),
+        };
+
+        let too_many = (0..=DEFAULT_MAX_WRITE_COMMANDS)
+            .map(|index| MdbxWriteCommand::CreateProject {
+                project_id: Uuid::new_v4().to_string(),
+                title: format!("Collection {index}"),
+            })
+            .collect();
+        assert!(vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "bulk-import".to_string(),
+                too_many,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("write operation commands"));
+
+        let oversized_payload = format!(
+            "\"{}\"",
+            "x".repeat(DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND)
+        );
+        assert!(vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-import".to_string(),
+                vec![MdbxWriteCommand::CreateEntry {
+                    entry_id: Uuid::new_v4().to_string(),
+                    project_id: Uuid::new_v4().to_string(),
+                    entry_type: "com.monica.mail.message".to_string(),
+                    title: "Oversized".to_string(),
+                    payload_json: oversized_payload,
+                }],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("command payload bytes"));
+
+        let small_limits = MdbxWriteOperationLimits {
+            max_commands: 2,
+            max_payload_bytes_per_command: 16,
+            max_payload_bytes: 16,
+            max_intent_bytes: 4096,
+        };
+        let payload = r#"{"body":"1234"}"#.to_string();
+        assert!(vault
+            .execute_write_operation_with_limits(
+                Uuid::new_v4().to_string(),
+                "mail-import".to_string(),
+                vec![
+                    MdbxWriteCommand::CreateEntry {
+                        entry_id: Uuid::new_v4().to_string(),
+                        project_id: Uuid::new_v4().to_string(),
+                        entry_type: "com.monica.mail.message".to_string(),
+                        title: "First".to_string(),
+                        payload_json: payload.clone(),
+                    },
+                    MdbxWriteCommand::CreateEntry {
+                        entry_id: Uuid::new_v4().to_string(),
+                        project_id: Uuid::new_v4().to_string(),
+                        entry_type: "com.monica.mail.message".to_string(),
+                        title: "Second".to_string(),
+                        payload_json: payload,
+                    },
+                ],
+                small_limits,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("write operation payload bytes"));
+
+        let conn = vault.conn.lock().unwrap();
+        assert_eq!(
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            initial_commits
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            initial_projects
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row(
+                    "SELECT head_commit_id FROM branches WHERE branch_name = 'main'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            initial_head
+        );
+    }
+
+    #[test]
+    fn write_operation_is_atomic_single_commit_and_idempotent_across_limit_apis() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let initial_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-write-device".to_string(),
+            vault_id: "ffi-write-vault".to_string(),
+        };
+        let operation_id = Uuid::new_v4().to_string();
+        let project_id = Uuid::new_v4().to_string();
+        let entry_id = Uuid::new_v4().to_string();
+        let commands = vec![
+            MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Mail".to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id: entry_id.clone(),
+                project_id: project_id.clone(),
+                entry_type: "com.monica.mail.message".to_string(),
+                title: "Message".to_string(),
+                payload_json: r#"{"body":"encrypted by storage"}"#.to_string(),
+            },
+        ];
+        let explicit_limits = MdbxWriteOperationLimits {
+            max_commands: 2,
+            max_payload_bytes_per_command: 1024,
+            max_payload_bytes: 1024,
+            max_intent_bytes: 4096,
+        };
+
+        let first = vault
+            .execute_write_operation_with_limits(
+                operation_id.clone(),
+                "mail-import".to_string(),
+                commands.clone(),
+                explicit_limits,
+            )
+            .unwrap();
+        assert!(!first.already_committed);
+        assert_eq!(first.project_ids, vec![project_id.clone()]);
+        assert_eq!(first.entry_ids, vec![entry_id.clone()]);
+
+        let retry = vault
+            .execute_write_operation(
+                operation_id.clone(),
+                "mail-import".to_string(),
+                commands.clone(),
+            )
+            .unwrap();
+        assert!(retry.already_committed);
+        assert_eq!(retry.commit_id, first.commit_id);
+
+        let changed_commands = vec![commands[0].clone()];
+        assert!(vault
+            .execute_write_operation(operation_id, "mail-import".to_string(), changed_commands,)
+            .unwrap_err()
+            .to_string()
+            .contains("reused for a different operation"));
+
+        let failed_project_id = Uuid::new_v4().to_string();
+        let missing_project_id = Uuid::new_v4().to_string();
+        assert!(vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-import".to_string(),
+                vec![
+                    MdbxWriteCommand::CreateProject {
+                        project_id: failed_project_id.clone(),
+                        title: "Rolled back".to_string(),
+                    },
+                    MdbxWriteCommand::CreateEntry {
+                        entry_id: Uuid::new_v4().to_string(),
+                        project_id: missing_project_id,
+                        entry_type: "com.monica.mail.message".to_string(),
+                        title: "Failure".to_string(),
+                        payload_json: "{}".to_string(),
+                    },
+                ],
+            )
+            .is_err());
+
+        let conn = vault.conn.lock().unwrap();
+        assert_eq!(
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            initial_commits + 1
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE project_id = ?1",
+                    rusqlite::params![failed_project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let stored_entry = EntryRepo::get_by_id(&conn, &entry_id).unwrap().unwrap();
+        assert_eq!(stored_entry.head_commit_id, first.commit_id);
     }
 
     #[test]

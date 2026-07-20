@@ -190,6 +190,15 @@ operation returns its original commit without running the writes again. Keep the
 to one finite user action, not the lifetime of an editor page. Two explicit user saves should be two
 operations rather than an unbounded transaction.
 
+UniFFI clients should use `execute_write_operation` or its branch-specific equivalent for bounded
+multi-object changes. The compatibility methods use defaults of 256 commands, 1 MiB for one JSON
+payload, 8 MiB for all JSON payloads, and 16 MiB for the serialized operation intent. Controlled
+clients may call the additive `*_with_limits` methods, but limits cannot exceed the compiled hard
+ceilings. Validation and streaming intent hashing finish before the vault write lock and SQLite
+transaction. A larger import must use multiple new operation IDs; retrying one batch reuses its
+original operation ID and exact command list. Operation commands accept both MDBX1 entry names and
+namespaced ObjectTypeIds such as `com.monica.mail.message`.
+
 #### Adapter Payload Schema Migration
 
 MDBX file-format migration and domain payload migration use separate interfaces. MDBX1, SQLite schema, and field-ciphertext upgrades always use the storage-core migrator; clients do not convert them. The Adapter for an ObjectTypeId interprets that type's domain payload.

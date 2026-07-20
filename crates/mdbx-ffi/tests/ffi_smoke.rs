@@ -2,8 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
-    create_portable_backup, create_vault, create_vault_with_tiga_mode, inspect_vault_migration,
-    open_vault, open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    create_portable_backup, create_vault, create_vault_with_tiga_mode,
+    default_write_operation_limits, inspect_vault_migration, open_vault,
+    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
     MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxPolicyCompliance, MdbxTigaMode,
     MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
@@ -318,6 +319,49 @@ fn write_operation_coalesces_commands_and_retries_idempotently() {
             changed_commands,
         )
         .is_err());
+}
+
+#[test]
+fn bounded_write_operation_accepts_namespaced_object_types() {
+    let vault_path = temp_vault_path("bounded-generic-write-operation");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "generic operation password 12345!".to_string(),
+        "ffi-generic-operation-device".to_string(),
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    let entry_id = Uuid::new_v4().to_string();
+    let mut limits = default_write_operation_limits();
+    limits.max_commands = 2;
+    limits.max_payload_bytes_per_command = 1024;
+    limits.max_payload_bytes = 1024;
+    limits.max_intent_bytes = 4096;
+
+    let result = vault
+        .execute_write_operation_with_limits(
+            Uuid::new_v4().to_string(),
+            "mail-import".to_string(),
+            vec![
+                MdbxWriteCommand::CreateProject {
+                    project_id: project_id.clone(),
+                    title: "Mail".to_string(),
+                },
+                MdbxWriteCommand::CreateEntry {
+                    entry_id: entry_id.clone(),
+                    project_id: project_id.clone(),
+                    entry_type: "com.monica.mail.message".to_string(),
+                    title: "Message".to_string(),
+                    payload_json: r#"{"body":"hello"}"#.to_string(),
+                },
+            ],
+            limits,
+        )
+        .unwrap();
+
+    assert_eq!(result.entry_ids, vec![entry_id.clone()]);
+    let stored = vault.get_object(project_id, entry_id).unwrap().unwrap();
+    assert_eq!(stored.object_type_id, "com.monica.mail.message");
 }
 
 #[test]

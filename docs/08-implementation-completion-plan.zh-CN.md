@@ -59,7 +59,7 @@ MDBX 必须坚持：
 - `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
 - 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
 - `mdbx-ffi` 已进入 workspace，作为非 Rust 客户端的通用 UniFFI 边界；当前覆盖 vault/project/generic entry、完整 Tiga2 策略读取与逐操作授权、真实设备能力、迁移检查/显式升级、显式 Tiga 创建、安全密钥材料解锁、组合因素整改和已解锁状态下重设主密码，后续 tag、attachment、sync、conflict、snapshot、diagnostics 等跨语言能力应继续扩展 facade，而不是让客户端直接写表。
-- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
+- 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。随机 key rotation、retirement、历史读取、同步合并、Tiga 授权与 UniFFI 已闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - `external-hash-ref` 已通过通用 `EncryptedBlobStore` 接口实现；默认 CLI 使用 `<vault>.blobs` 内容寻址目录，core 裁剪构建保留引用格式和 Provider 接口并移除文件系统实现。数据库、snapshot 和同步状态携带加密引用，Blob 本体由 Provider 负责传输与保留。
 - 外部 Blob 生命周期管理已包含分页 Provider 清单、现行附件与 snapshot 引用审计、缺失与损坏检测、固定时间边界、计划凭证、TIGA 授权和可重试垃圾回收。维护请求写入单条安全审计，不产生逐 Blob commit。
@@ -92,7 +92,7 @@ MDBX 必须坚持：
 ### 3.3 变更历史覆盖
 
 - 搜索类临时索引已明确不写 commit；用户可见 tag 修改已有 tracked API。仍需为未来新增维护操作逐项分类是否属于用户可见历史。
-- project、entry、attachment、conflict resolution、tracked tag、Tiga mutation 和 snapshot restore 已进入原子事务。后续仍需为 bulk import、batch move/copy 等批量用户级 mutation 设计更高层的合并 commit API。
+- project、entry、attachment、conflict resolution、tracked tag、Tiga mutation 和 snapshot restore 已进入原子事务。UniFFI operation API 已为 project 和通用 object 提供有界、原子、幂等的批量创建、更新、删除、恢复和移动；attachment 与 relation/label 的批量命令仍需扩展。
 
 ### 3.4 性能与增量
 

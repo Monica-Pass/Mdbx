@@ -188,6 +188,14 @@ MDBX2 写入客户端 SHOULD 在用户动作开始时生成稳定的 `operation_
 只返回原 commit，不再次执行写入。事务边界应覆盖一个有限的用户动作，不应跨越整个编辑器
 页面生命周期。用户明确点击两次“保存”时，应生成两个 operation，而不是无限追加到同一个事务。
 
+UniFFI 客户端应通过 `execute_write_operation` 或对应的指定分支方法提交有界多对象变更。
+兼容方法默认最多接受 256 条命令、单条 JSON payload 1 MiB、全部 JSON payload 8 MiB，
+序列化 operation intent 16 MiB。受控客户端可以调用新增的 `*_with_limits` 方法，但显式
+limits 仍不能超过编译期硬上限。资源校验和流式 intent 哈希会在获取 vault 写锁及启动
+SQLite 事务前完成。更大的导入必须拆分为多个新 operation ID；重试某一批时复用该批原
+operation ID 和完整命令列表。operation 命令同时接受 MDBX1 类型名和
+`com.monica.mail.message` 等 namespaced ObjectTypeId。
+
 #### Adapter payload schema 迁移
 
 MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLite schema 和字段密文格式升级始终调用 storage core 迁移器，客户端不得自行转换。ObjectTypeId 的领域 payload 由对应 Adapter 解释。

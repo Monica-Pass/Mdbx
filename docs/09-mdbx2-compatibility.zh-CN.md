@@ -167,11 +167,13 @@ MDBX2 同时收紧以下实现边界：
 
 ### 7.4 客户端 operation 写入 API
 
-移动端和桌面端应先通过 UniFFI `MdbxVault::list_branches` 获取稳定 ID，再通过 `execute_write_operation_on_branch` 提交指定分支的多步编辑。原有 `execute_write_operation` 继续作为 main 分支兼容入口。接口只接受有限的类型化命令：创建项目、创建、更新、删除、恢复、移动条目；接口不暴露 SQL。
+移动端和桌面端应先通过 UniFFI `MdbxVault::list_branches` 获取稳定 ID，再通过 `execute_write_operation_on_branch` 提交指定分支的多步编辑。原有 `execute_write_operation` 继续作为 main 分支兼容入口。接口只接受有限的类型化命令：创建项目、创建、更新、删除、恢复、移动条目；创建和更新同时接受 MDBX1 类型与 namespaced ObjectTypeId，接口不暴露 SQL。
 
 每个创建命令必须携带客户端生成的稳定 UUID。客户端在首次调用和重试时复用同一 `operation_id` 与完整命令列表。storage 会将命令作为一个事务和一个 commit 执行；已完成 operation 的重试只返回 commit ID 与请求中的对象 ID，不再次执行写入。相同 operation ID 搭配不同命令内容会被拒绝，任一命令失败会回滚整个批次。
 
 原有单项 FFI 方法继续保留，作为 MDBX1 兼容投影和简单调用入口；需要把一个用户动作合并为单一历史节点时，应使用 operation API。
+
+原有 operation 方法现在施加默认资源契约：256 条命令、单条 JSON payload 1 MiB、全部 JSON payload 8 MiB、序列化 intent 16 MiB。新增 `default_write_operation_limits` 和 `*_with_limits` 接口允许新客户端选择更小或受控的更大限制，但不能超过 4,096 条命令、单条 16 MiB、总 payload 64 MiB 与 intent 128 MiB 的硬上限。限制检查和流式 intent 哈希发生在 vault 写锁及事务之前；超限不会创建对象、commit 或推进 branch head。旧客户端方法签名和默认 main 分支行为不变。
 
 ### 7.5 Commit 历史读取 API
 

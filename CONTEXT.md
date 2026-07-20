@@ -149,6 +149,8 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 33. Complete sync state is bounded independently from its surrounding bundle. The default decoder accepts at most 96 MiB and 250,000 logical rows; the hard ceiling is 512 MiB and 2,000,000 rows.
 34. Sync state output uses bounded serialization, and input size is checked before JSON deserialization. A resource-limit failure rolls back the enclosing commit transaction.
 35. Reserved sync state types require object ID `state` and associated data equal to the exact object type. Unknown object types remain available to ordinary opaque payload handling.
+36. Generic UniFFI write operations are bounded before the vault write lock: defaults are 256 commands, 1 MiB per JSON payload, 8 MiB total JSON payload, and 16 MiB serialized intent. Explicit limits remain under hard ceilings.
+37. A bounded write operation streams its complete command serialization into the intent digest, accepts namespaced ObjectTypeIds, creates one commit, and rolls back every object and head when any command fails.
 
 ## Module Architecture
 
@@ -156,7 +158,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 
 The Generic Object Module is the primary Interface for Collection, CollectionProfile, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, capability checks, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
 
-The module also owns bounded payload migration planning and execution. It exposes decrypted source bytes only in a short-lived plan, treats Adapter output as untrusted input, and preserves existing ObjectVersion, synchronization, snapshot, and MDBX1 table semantics by applying target payloads through EntryRepo inside one CommitOperation.
+The module also owns bounded payload migration planning and execution and the bounded generic write-operation facade. It exposes decrypted source bytes only in a short-lived plan, treats Adapter output and client commands as untrusted input, and preserves existing ObjectVersion, synchronization, snapshot, and MDBX1 table semantics by applying target payloads through EntryRepo inside one CommitOperation.
 
 ### Legacy Password Adapter
 
