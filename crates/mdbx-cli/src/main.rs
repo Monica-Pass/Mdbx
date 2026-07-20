@@ -3894,6 +3894,144 @@ mod tests {
     }
 
     #[test]
+    fn cli_incremental_checkpoint_advances_only_after_durable_segment_apply() {
+        let source = TempVault::new();
+        let target = TempVault::new();
+        let source_path = source.path();
+        let target_path = target.path();
+        let first_bundle = sync_bundle_path();
+        let tampered_bundle = sync_bundle_path();
+        let second_bundle = sync_bundle_path();
+        let sender_base =
+            std::env::temp_dir().join(format!("mdbx-cli-sync-base-{}.json", uuid::Uuid::new_v4()));
+        let sender_first =
+            std::env::temp_dir().join(format!("mdbx-cli-sync-first-{}.json", uuid::Uuid::new_v4()));
+        let sender_second = std::env::temp_dir().join(format!(
+            "mdbx-cli-sync-second-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_checkpoint = std::env::temp_dir().join(format!(
+            "mdbx-cli-sync-receiver-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        run(init_cli(&source_path)).unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let vault_id = vault_id(&source_conn).unwrap();
+        let base = current_incremental_checkpoint(&source_conn).unwrap();
+        drop(source_conn);
+        backup_vault(&source_path, &target_path);
+        write_cli_sync_checkpoint(&sender_base, &vault_id, &base, None).unwrap();
+        write_cli_sync_checkpoint(&receiver_checkpoint, &vault_id, &base, None).unwrap();
+
+        for title in ["Checkpoint One", "Checkpoint Two", "Checkpoint Three"] {
+            run(cli(
+                &source_path,
+                Commands::Project {
+                    action: ProjectAction::Create {
+                        title: title.to_string(),
+                        group: Some("checkpoint".to_string()),
+                    },
+                },
+            ))
+            .unwrap();
+        }
+        run(cli(
+            &source_path,
+            Commands::Sync {
+                action: SyncAction::Bundle {
+                    output: first_bundle.clone(),
+                    base_checkpoint: Some(sender_base.clone()),
+                    result_checkpoint: Some(sender_first.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        let first_result = read_cli_sync_checkpoint(&sender_first, &vault_id).unwrap();
+        assert!(first_result.resume.is_some());
+
+        let mut tampered_bytes = std::fs::read(&first_bundle).unwrap();
+        let last = tampered_bytes.len() - 1;
+        tampered_bytes[last] ^= 1;
+        std::fs::write(&tampered_bundle, tampered_bytes).unwrap();
+        let error = run(cli(
+            &target_path,
+            Commands::Sync {
+                action: SyncAction::Apply {
+                    file: tampered_bundle.clone(),
+                    checkpoint: Some(receiver_checkpoint.clone()),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("bundle read failed"));
+        let unchanged = read_cli_sync_checkpoint(&receiver_checkpoint, &vault_id).unwrap();
+        assert_eq!(unchanged.checkpoint, base);
+        assert!(unchanged.resume.is_none());
+        let target_conn = open_unlocked(&target_path);
+        assert!(ProjectRepo::list_all(&target_conn).unwrap().is_empty());
+        drop(target_conn);
+
+        run(cli(
+            &target_path,
+            Commands::Sync {
+                action: SyncAction::Apply {
+                    file: first_bundle.clone(),
+                    checkpoint: Some(receiver_checkpoint.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        let receiver_first = read_cli_sync_checkpoint(&receiver_checkpoint, &vault_id).unwrap();
+        assert_eq!(receiver_first.checkpoint, first_result.checkpoint);
+        assert_eq!(receiver_first.resume, first_result.resume);
+
+        run(cli(
+            &source_path,
+            Commands::Sync {
+                action: SyncAction::Bundle {
+                    output: second_bundle.clone(),
+                    base_checkpoint: Some(sender_first.clone()),
+                    result_checkpoint: Some(sender_second.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &target_path,
+            Commands::Sync {
+                action: SyncAction::Apply {
+                    file: second_bundle.clone(),
+                    checkpoint: Some(receiver_checkpoint.clone()),
+                },
+            },
+        ))
+        .unwrap();
+        let sender_done = read_cli_sync_checkpoint(&sender_second, &vault_id).unwrap();
+        let receiver_done = read_cli_sync_checkpoint(&receiver_checkpoint, &vault_id).unwrap();
+        assert_eq!(receiver_done.checkpoint, sender_done.checkpoint);
+        assert!(receiver_done.resume.is_none());
+        assert_eq!(
+            ProjectRepo::list_all(&open_unlocked(&target_path))
+                .unwrap()
+                .len(),
+            3
+        );
+
+        for path in [
+            first_bundle,
+            tampered_bundle,
+            second_bundle,
+            sender_base,
+            sender_first,
+            sender_second,
+            receiver_checkpoint,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn cli_rejects_configured_vault_without_unlock() {
         let vault = TempVault::new();
         let path = vault.path();
