@@ -166,6 +166,16 @@ A fast-forward rotation selects the incoming active epoch. Concurrent rotations 
 
 Changing epoch state requires a verified-unlocked mutable connection. The apply transaction verifies the state tag and wrappers before writing object ciphertext that depends on the new epoch, then refreshes active and historical epoch keyrings after commit. Older payloads without this field do not clear or roll back local epoch state.
 
+### 9.2 Transactional State Deltas
+
+After the bootstrap floor, an outer write transaction SHOULD materialize one bounded immutable state-delta batch. A batch with associated commits is attached to the final associated commit; a transaction without a commit produces an auxiliary batch and MUST NOT add a user-visible history record.
+
+The receiver MUST authenticate vault and batch identity, payload digest, row count, commit ownership, and resource limits before accepting state. Every associated commit MUST be available. A recognized delta cannot be mixed with complete sync state or a second delta on the same serialized commit. Commit insertion, sparse state application, attachment chunk replacement, device-head merge, authorized deletion, received-batch persistence, and incoming capture cleanup MUST commit or roll back together.
+
+Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones. Device revocation merges monotonically. Physical object or tombstone deletion requires a matching authenticated permanent-purge receipt. Key epoch changes require the mutable verified-unlocked apply path; the immutable compatibility path rejects them atomically.
+
+Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats; a client MUST NOT claim incremental convergence until it exchanges both commit-inventory and auxiliary-delta checkpoints.
+
 ## 10. Merge Model
 
 MDBX SHOULD support:

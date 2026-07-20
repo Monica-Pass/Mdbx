@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
+use mdbx_sync::ObjectPayload;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,7 @@ use crate::sync_state::{
 use crate::tiga_policy::{optional_integrity_tag, verify_optional_integrity_tag};
 
 pub const SYNC_DELTA_FORMAT: &str = "mdbx-storage-sync-delta-v1";
+pub const SYNC_DELTA_OBJECT_TYPE: &str = "mdbx-storage/state-delta-v1";
 pub const DEFAULT_MAX_SYNC_DELTA_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_SYNC_DELTA_ROWS: usize = 50_000;
 pub const DEFAULT_MAX_SYNC_DELTA_COMMITS: usize = 512;
@@ -375,6 +377,50 @@ pub fn decode_sync_delta_body(
     Ok(body)
 }
 
+pub fn sync_delta_object_payload(
+    envelope: &SyncDeltaEnvelope,
+    limits: SyncDeltaLimits,
+) -> StorageResult<ObjectPayload> {
+    Ok(ObjectPayload {
+        object_type: SYNC_DELTA_OBJECT_TYPE.to_string(),
+        object_id: envelope.batch_id.clone(),
+        ciphertext: envelope.encode(limits)?,
+        associated_data: delta_associated_data(&envelope.batch_id),
+    })
+}
+
+pub fn decode_sync_delta_object_payload(
+    conn: &VaultConnection,
+    payload: &ObjectPayload,
+    limits: SyncDeltaLimits,
+) -> StorageResult<Option<SyncDeltaEnvelope>> {
+    if payload.object_type != SYNC_DELTA_OBJECT_TYPE {
+        return Ok(None);
+    }
+    validate_id("batch ID", &payload.object_id)?;
+    if payload.associated_data != delta_associated_data(&payload.object_id) {
+        return Err(StorageError::Validation(
+            "sync delta object payload has invalid associated data".to_string(),
+        ));
+    }
+    let envelope = SyncDeltaEnvelope::decode(&payload.ciphertext, limits)?;
+    if envelope.batch_id != payload.object_id {
+        return Err(StorageError::Validation(
+            "sync delta object ID does not match its envelope".to_string(),
+        ));
+    }
+    envelope.verify(conn, limits)?;
+    Ok(Some(envelope))
+}
+
+fn delta_associated_data(batch_id: &str) -> Vec<u8> {
+    let mut value = Vec::with_capacity(SYNC_DELTA_OBJECT_TYPE.len() + batch_id.len() + 1);
+    value.extend_from_slice(SYNC_DELTA_OBJECT_TYPE.as_bytes());
+    value.push(0);
+    value.extend_from_slice(batch_id.as_bytes());
+    value
+}
+
 pub fn load_sync_delta_envelope(
     conn: &VaultConnection,
     batch_id: &str,
@@ -723,7 +769,10 @@ fn serialize_body_bounded(body: &SyncDeltaBody, limit: usize) -> StorageResult<V
     Ok(writer.bytes)
 }
 
-fn persist_envelope(conn: &VaultConnection, envelope: &SyncDeltaEnvelope) -> StorageResult<()> {
+pub(crate) fn persist_envelope(
+    conn: &VaultConnection,
+    envelope: &SyncDeltaEnvelope,
+) -> StorageResult<()> {
     conn.inner().execute(
         "INSERT INTO sync_delta_batches
             (batch_id, vault_id, format, batch_kind, logical_row_count, payload,

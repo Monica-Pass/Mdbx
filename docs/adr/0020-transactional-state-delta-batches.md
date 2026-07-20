@@ -45,9 +45,11 @@ domain mutation and the batch.
 
 Nested repository transactions contribute to the surrounding outer transaction. `run_operation`
 and incoming sync apply use the same finalization contract even though they manage SQLite
-transactions manually. Applying an incoming batch disables mutation capture for the materialized
-rows, validates and applies the complete batch, then stores the received immutable batch for
-deduplication and forwarding before the transaction commits.
+transactions manually. Applying an incoming batch validates and applies the complete batch,
+stores the received immutable batch for deduplication and forwarding, and discards capture rows
+caused by incoming materialization before the transaction commits. A divergent apply retains
+capture beginning with its first locally created merge commit so that local merge state receives
+its own outgoing batch.
 
 Batch identity is stable across replicas. Local batch inventory sequence numbers are derived
 ordering and are never synchronized as identity. The encoded envelope authenticates its format,
@@ -103,7 +105,7 @@ auxiliary state batch and no visible commit. A transaction that replaces attachm
 produces one Commit2 commit and one complete attachment delta.
 
 The stable commit inventory remains necessary for causal commit exchange, but it is not a complete
-state-change inventory by itself. Bundle v4 and the synchronization client must carry checkpoints
-for both commit inventory and state delta batches. Until schema capture, bounded envelopes, atomic
-apply, and both checkpoint classes are implemented and tested, the complete `SyncStatePayload`
-remains the convergence mechanism.
+state-change inventory by itself. Schema capture, bounded envelopes, and atomic storage apply are
+implemented. Bundle v4 and the synchronization client must still carry checkpoints for both commit
+inventory and state delta batches. Until those checkpoint classes are exchanged end to end, the
+complete `SyncStatePayload` remains the CLI convergence mechanism.

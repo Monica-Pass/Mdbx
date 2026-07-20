@@ -19,6 +19,11 @@ use crate::repo::{
     BranchRepo, CollectionProfileRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo,
     PermanentPurgeReceipt, TombstoneRepo,
 };
+use crate::sync_delta::{
+    decode_sync_delta_body, decode_sync_delta_object_payload, load_sync_delta_envelope,
+    persist_envelope, DeletedSyncEntity, DeviceHeadRow, SyncDeltaBatchKind, SyncDeltaBody,
+    SyncDeltaEnvelope, SyncDeltaLimits,
+};
 use crate::sync_state::{
     decode_sync_state_payload_with_limits, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow,
     KeyEpochRow, KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
@@ -42,6 +47,14 @@ pub struct ApplyBatchResult {
 
 pub struct SyncApplyRepo;
 
+#[derive(Debug, Clone, Default)]
+struct PayloadApplyResult {
+    conflicts: u32,
+    received_delta: bool,
+    received_complete_state: bool,
+    delta_commit_ids: Vec<String>,
+}
+
 #[derive(Clone, Copy)]
 enum KeyEpochMergeMode {
     FastForward,
@@ -49,6 +62,54 @@ enum KeyEpochMergeMode {
 }
 
 impl SyncApplyRepo {
+    pub fn apply_auxiliary_delta(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        envelope: &SyncDeltaEnvelope,
+    ) -> StorageResult<u32> {
+        Self::apply_auxiliary_delta_with_limits(conn, ctx, envelope, SyncDeltaLimits::default())
+    }
+
+    pub fn apply_auxiliary_delta_with_limits(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        envelope: &SyncDeltaEnvelope,
+        limits: SyncDeltaLimits,
+    ) -> StorageResult<u32> {
+        envelope.verify(conn, limits)?;
+        if envelope.batch_kind != SyncDeltaBatchKind::Auxiliary {
+            return Err(StorageError::Validation(
+                "auxiliary sync apply requires an auxiliary delta".to_string(),
+            ));
+        }
+        if let Some(existing) = load_sync_delta_envelope(conn, &envelope.batch_id, limits)? {
+            if existing == *envelope {
+                return Ok(0);
+            }
+            return Err(StorageError::Validation(format!(
+                "sync delta batch {} conflicts with stored content",
+                envelope.batch_id
+            )));
+        }
+        conn.with_immediate_transaction_and_sync_limits(limits, || {
+            let body = decode_sync_delta_body(envelope, limits)?;
+            let conflicts = Self::apply_sync_state(
+                conn,
+                ctx,
+                "",
+                &body.state,
+                KeyEpochMergeMode::FastForward,
+                false,
+                false,
+            )?;
+            Self::apply_delta_device_heads(conn, &body.device_heads)?;
+            Self::apply_delta_deletions(conn, &body)?;
+            persist_envelope(conn, envelope)?;
+            Self::discard_received_delta_mutations(conn, &[])?;
+            Ok(conflicts)
+        })
+    }
+
     /// Applies legacy-compatible sync batches through an immutable connection.
     /// Key epoch state may be inspected but cannot change through this entry.
     pub fn apply_batch(
@@ -128,18 +189,28 @@ impl SyncApplyRepo {
         sync_limits: SyncStateLimits,
     ) -> StorageResult<ApplyOutcome> {
         if Self::commit_exists(conn, &serialized.commit.commit_id)? {
-            if let Some(operation) = &serialized.operation {
-                CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
-                conn.with_immediate_transaction(|| {
+            return conn.with_immediate_transaction(|| {
+                if let Some(operation) = &serialized.operation {
+                    CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
                     Self::insert_operation(
                         conn,
                         &serialized.commit.commit_id,
                         &serialized.commit.created_at,
                         operation,
-                    )
-                })?;
-            }
-            return Ok(ApplyOutcome::Skipped);
+                    )?;
+                }
+                let payload_result = Self::apply_fast_forward_payloads(
+                    conn,
+                    ctx,
+                    serialized,
+                    allow_key_epoch_changes,
+                    sync_limits,
+                )?;
+                if payload_result.received_delta {
+                    Self::discard_received_delta_mutations(conn, &payload_result.delta_commit_ids)?;
+                }
+                Ok(ApplyOutcome::Skipped)
+            });
         }
 
         for parent in &serialized.parent_ids {
@@ -168,13 +239,14 @@ impl SyncApplyRepo {
             Self::insert_commit(conn, serialized)?;
             Self::acknowledge_received_tombstones(conn, ctx, serialized)?;
             if fast_forward {
-                let payload_conflicts = Self::apply_fast_forward_payloads(
+                let payload_result = Self::apply_fast_forward_payloads(
                     conn,
                     ctx,
                     serialized,
                     allow_key_epoch_changes,
                     sync_limits,
                 )?;
+                let payload_conflicts = payload_result.conflicts;
                 if payload_conflicts == 0 {
                     Self::advance_branch(
                         conn,
@@ -184,13 +256,16 @@ impl SyncApplyRepo {
                     )?;
                 }
                 Self::sync_device_head(conn, serialized)?;
+                if payload_result.received_delta {
+                    Self::discard_received_delta_mutations(conn, &payload_result.delta_commit_ids)?;
+                }
                 Ok(if payload_conflicts == 0 {
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::Conflict
                 })
             } else {
-                let payload_conflicts = Self::apply_divergent_payloads(
+                let payload_result = Self::apply_divergent_payloads(
                     conn,
                     ctx,
                     serialized,
@@ -198,7 +273,11 @@ impl SyncApplyRepo {
                     allow_key_epoch_changes,
                     sync_limits,
                 )?;
+                let payload_conflicts = payload_result.conflicts;
                 Self::sync_device_head(conn, serialized)?;
+                if payload_result.received_delta {
+                    Self::discard_received_delta_mutations(conn, &payload_result.delta_commit_ids)?;
+                }
                 Ok(if payload_conflicts == 0 {
                     ApplyOutcome::Applied
                 } else {
@@ -421,21 +500,47 @@ impl SyncApplyRepo {
         serialized: &SerializedCommit,
         allow_key_epoch_changes: bool,
         sync_limits: SyncStateLimits,
-    ) -> StorageResult<u32> {
-        let mut conflicts = 0;
+    ) -> StorageResult<PayloadApplyResult> {
+        let mut result = PayloadApplyResult::default();
         for payload in &serialized.object_payloads {
-            if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)? {
-                conflicts += Self::apply_sync_state(
+            if let Some(envelope) =
+                decode_sync_delta_object_payload(conn, payload, SyncDeltaLimits::default())?
+            {
+                if result.received_delta || result.received_complete_state {
+                    return Err(StorageError::Validation(
+                        "a commit cannot carry multiple sync delta envelopes".to_string(),
+                    ));
+                }
+                result.conflicts += Self::apply_commit_sync_delta(
+                    conn,
+                    ctx,
+                    serialized,
+                    &envelope,
+                    KeyEpochMergeMode::FastForward,
+                    allow_key_epoch_changes,
+                )?;
+                result.received_delta = true;
+                result.delta_commit_ids = envelope.commit_ids.clone();
+            } else if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)?
+            {
+                if result.received_delta || result.received_complete_state {
+                    return Err(StorageError::Validation(
+                        "a commit cannot mix complete sync state and a state delta".to_string(),
+                    ));
+                }
+                result.conflicts += Self::apply_sync_state(
                     conn,
                     ctx,
                     &serialized.commit.commit_id,
                     &state,
                     KeyEpochMergeMode::FastForward,
                     allow_key_epoch_changes,
+                    true,
                 )?;
+                result.received_complete_state = true;
             }
         }
-        Ok(conflicts)
+        Ok(result)
     }
 
     fn apply_divergent_payloads(
@@ -445,24 +550,134 @@ impl SyncApplyRepo {
         local_head: Option<&str>,
         allow_key_epoch_changes: bool,
         sync_limits: SyncStateLimits,
-    ) -> StorageResult<u32> {
-        let mut conflicts = 0;
+    ) -> StorageResult<PayloadApplyResult> {
+        let mut result = PayloadApplyResult::default();
         for payload in &serialized.object_payloads {
-            if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)? {
-                conflicts += Self::apply_sync_state(
+            if let Some(envelope) =
+                decode_sync_delta_object_payload(conn, payload, SyncDeltaLimits::default())?
+            {
+                if result.received_delta || result.received_complete_state {
+                    return Err(StorageError::Validation(
+                        "a commit cannot carry multiple sync delta envelopes".to_string(),
+                    ));
+                }
+                result.conflicts += Self::apply_commit_sync_delta(
+                    conn,
+                    ctx,
+                    serialized,
+                    &envelope,
+                    KeyEpochMergeMode::Divergent,
+                    allow_key_epoch_changes,
+                )?;
+                result.received_delta = true;
+                result.delta_commit_ids = envelope.commit_ids.clone();
+            } else if let Some(state) = decode_sync_state_payload_with_limits(payload, sync_limits)?
+            {
+                if result.received_delta || result.received_complete_state {
+                    return Err(StorageError::Validation(
+                        "a commit cannot mix complete sync state and a state delta".to_string(),
+                    ));
+                }
+                result.conflicts += Self::apply_sync_state(
                     conn,
                     ctx,
                     &serialized.commit.commit_id,
                     &state,
                     KeyEpochMergeMode::Divergent,
                     allow_key_epoch_changes,
+                    true,
                 )?;
+                result.received_complete_state = true;
             } else {
-                conflicts +=
+                result.conflicts +=
                     Self::record_payload_conflict(conn, ctx, serialized, payload, local_head)?;
             }
         }
+        Ok(result)
+    }
+
+    fn apply_commit_sync_delta(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        serialized: &SerializedCommit,
+        envelope: &SyncDeltaEnvelope,
+        merge_mode: KeyEpochMergeMode,
+        allow_key_epoch_changes: bool,
+    ) -> StorageResult<u32> {
+        if envelope.batch_kind != SyncDeltaBatchKind::Commit {
+            return Err(StorageError::Validation(
+                "a serialized commit requires a commit-associated sync delta".to_string(),
+            ));
+        }
+        if envelope.commit_ids.last() != Some(&serialized.commit.commit_id) {
+            return Err(StorageError::Validation(
+                "sync delta must be attached to its final associated commit".to_string(),
+            ));
+        }
+        for commit_id in &envelope.commit_ids {
+            if !Self::commit_exists(conn, commit_id)? {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "sync delta references unavailable commit {commit_id}"
+                )));
+            }
+        }
+        if let Some(existing) =
+            load_sync_delta_envelope(conn, &envelope.batch_id, SyncDeltaLimits::default())?
+        {
+            if existing == *envelope {
+                return Ok(0);
+            }
+            return Err(StorageError::Validation(format!(
+                "sync delta batch {} conflicts with stored content",
+                envelope.batch_id
+            )));
+        }
+        let body = decode_sync_delta_body(envelope, SyncDeltaLimits::default())?;
+        let conflicts = Self::apply_sync_state(
+            conn,
+            ctx,
+            &serialized.commit.commit_id,
+            &body.state,
+            merge_mode,
+            allow_key_epoch_changes,
+            false,
+        )?;
+        Self::apply_delta_device_heads(conn, &body.device_heads)?;
+        Self::apply_delta_deletions(conn, &body)?;
+        persist_envelope(conn, envelope)?;
         Ok(conflicts)
+    }
+
+    fn discard_received_delta_mutations(
+        conn: &VaultConnection,
+        incoming_commit_ids: &[String],
+    ) -> StorageResult<()> {
+        let incoming = incoming_commit_ids.iter().collect::<HashSet<_>>();
+        let mut stmt = conn.inner().prepare(
+            "SELECT mutation_seq, entity_id FROM sync_delta_mutations
+             WHERE entity_kind = 'commit' ORDER BY mutation_seq",
+        )?;
+        let commits = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut first_local_sequence = None;
+        for row in commits {
+            let (sequence, commit_id) = row?;
+            if !incoming.contains(&commit_id) {
+                first_local_sequence = Some(sequence);
+                break;
+            }
+        }
+        match first_local_sequence {
+            Some(sequence) => {
+                conn.inner().execute(
+                    "DELETE FROM sync_delta_mutations WHERE mutation_seq < ?1",
+                    [sequence],
+                )?;
+            }
+            None => crate::schema::v14::discard_captured_mutations(conn.inner())?,
+        }
+        Ok(())
     }
 
     fn apply_sync_state(
@@ -472,6 +687,7 @@ impl SyncApplyRepo {
         state: &SyncStatePayload,
         key_epoch_merge_mode: KeyEpochMergeMode,
         allow_key_epoch_changes: bool,
+        complete_tombstone_state: bool,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         if let Some(key_epoch_state) = &state.key_epoch_state {
@@ -520,9 +736,14 @@ impl SyncApplyRepo {
             Self::apply_security_audit_events(conn, audit_events)?;
         }
         Self::apply_branches(conn, &state.branches)?;
-        if matches!(key_epoch_merge_mode, KeyEpochMergeMode::FastForward) && conflicts == 0 {
-            if let Some(tombstones) = &state.tombstones {
+        if let Some(tombstones) = &state.tombstones {
+            if complete_tombstone_state
+                && matches!(key_epoch_merge_mode, KeyEpochMergeMode::FastForward)
+                && conflicts == 0
+            {
                 Self::apply_complete_tombstone_state(conn, tombstones)?;
+            } else if !complete_tombstone_state {
+                Self::apply_delta_tombstone_state(conn, tombstones)?;
             }
         }
         if let Some(acknowledgements) = &state.tombstone_acknowledgements {
@@ -1717,6 +1938,71 @@ impl SyncApplyRepo {
         Ok(())
     }
 
+    fn apply_delta_tombstone_state(
+        conn: &VaultConnection,
+        tombstones: &[TombstoneRow],
+    ) -> StorageResult<()> {
+        for row in tombstones {
+            if TombstoneRepo::is_permanently_purged(
+                conn,
+                &row.target_object_type,
+                &row.target_object_id,
+            )? {
+                continue;
+            }
+            let delete_commit_id = match row.delete_commit_id.as_deref() {
+                Some(commit_id) if Self::commit_exists(conn, commit_id)? => Some(commit_id),
+                Some(commit_id) => {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "delta tombstone {} references unavailable commit {commit_id}",
+                        row.tombstone_id
+                    )))
+                }
+                None => None,
+            };
+            let local_identity: Option<(String, String)> = conn
+                .inner()
+                .query_row(
+                    "SELECT target_object_type, target_object_id FROM tombstones
+                     WHERE tombstone_id = ?1",
+                    [&row.tombstone_id],
+                    |sql_row| Ok((sql_row.get(0)?, sql_row.get(1)?)),
+                )
+                .optional()?;
+            if local_identity.as_ref().is_some_and(|identity| {
+                identity.0 != row.target_object_type || identity.1 != row.target_object_id
+            }) {
+                return Err(StorageError::Validation(format!(
+                    "delta tombstone {} rewrites its target identity",
+                    row.tombstone_id
+                )));
+            }
+            conn.inner().execute(
+                "INSERT INTO tombstones
+                    (tombstone_id, target_object_type, target_object_id, delete_clock,
+                     deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(tombstone_id) DO UPDATE SET
+                    delete_clock = excluded.delete_clock,
+                    deleted_by_device_id = excluded.deleted_by_device_id,
+                    deleted_at = excluded.deleted_at,
+                    purge_eligible_at = excluded.purge_eligible_at,
+                    delete_commit_id = excluded.delete_commit_id",
+                params![
+                    row.tombstone_id,
+                    row.target_object_type,
+                    row.target_object_id,
+                    row.delete_clock,
+                    row.deleted_by_device_id,
+                    row.deleted_at,
+                    row.purge_eligible_at,
+                    delete_commit_id,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn apply_tombstone_acknowledgements(
         conn: &VaultConnection,
         acknowledgements: &[TombstoneAcknowledgementRow],
@@ -1788,6 +2074,134 @@ impl SyncApplyRepo {
                         row.updated_at,
                     ],
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_delta_device_heads(
+        conn: &VaultConnection,
+        device_heads: &[DeviceHeadRow],
+    ) -> StorageResult<()> {
+        for incoming in device_heads {
+            if !Self::commit_exists(conn, &incoming.head_commit_id)? {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "device head {} references unavailable commit {}",
+                    incoming.device_id, incoming.head_commit_id
+                )));
+            }
+            let local: Option<(String, String, bool)> = conn
+                .inner()
+                .query_row(
+                    "SELECT head_commit_id, last_seen_at, revoked FROM device_heads
+                     WHERE device_id = ?1",
+                    [&incoming.device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2)? != 0)),
+                )
+                .optional()?;
+            let (head_commit_id, last_seen_at, revoked) = match local {
+                None => (
+                    incoming.head_commit_id.clone(),
+                    incoming.last_seen_at.clone(),
+                    incoming.revoked,
+                ),
+                Some((local_head, local_seen, local_revoked)) => {
+                    let head = if local_head == incoming.head_commit_id
+                        || Self::is_ancestor_commit(conn, &local_head, &incoming.head_commit_id)?
+                    {
+                        incoming.head_commit_id.clone()
+                    } else {
+                        local_head
+                    };
+                    (
+                        head,
+                        std::cmp::max(local_seen, incoming.last_seen_at.clone()),
+                        local_revoked || incoming.revoked,
+                    )
+                }
+            };
+            conn.inner().execute(
+                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    head_commit_id = excluded.head_commit_id,
+                    last_seen_at = excluded.last_seen_at,
+                    revoked = excluded.revoked",
+                params![
+                    incoming.device_id,
+                    head_commit_id,
+                    last_seen_at,
+                    revoked as i32,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_delta_deletions(conn: &VaultConnection, body: &SyncDeltaBody) -> StorageResult<()> {
+        for deletion in &body.deletions {
+            match deletion.entity_kind.as_str() {
+                "tiga-override" => {
+                    let (scope_type, scope_id) = split_compound_delta_id(deletion)?;
+                    conn.inner().execute(
+                        "DELETE FROM tiga_policy_overrides
+                         WHERE scope_type = ?1 AND scope_id = ?2",
+                        params![scope_type, scope_id],
+                    )?;
+                }
+                "collection-profile" => {
+                    conn.inner().execute(
+                        "DELETE FROM collection_profiles WHERE project_id = ?1",
+                        [&deletion.entity_id],
+                    )?;
+                }
+                "project"
+                | "entry"
+                | "attachment"
+                | "object-relation"
+                | "object-label"
+                | "object-label-assignment" => {
+                    if !body.state.purge_receipts.as_ref().is_some_and(|receipts| {
+                        receipts.iter().any(|receipt| {
+                            receipt.target_object_type == deletion.entity_kind
+                                && receipt.target_object_id == deletion.entity_id
+                        })
+                    }) {
+                        return Err(StorageError::Validation(format!(
+                            "physical {} deletion lacks a matching purge receipt",
+                            deletion.entity_kind
+                        )));
+                    }
+                }
+                "tombstone" => {
+                    if !body.state.purge_receipts.as_ref().is_some_and(|receipts| {
+                        receipts
+                            .iter()
+                            .any(|receipt| receipt.tombstone_id == deletion.entity_id)
+                    }) {
+                        return Err(StorageError::Validation(
+                            "tombstone deletion lacks a matching purge receipt".to_string(),
+                        ));
+                    }
+                }
+                "tombstone-ack" => {
+                    let (tombstone_id, _) = split_compound_delta_id(deletion)?;
+                    if !body.state.purge_receipts.as_ref().is_some_and(|receipts| {
+                        receipts
+                            .iter()
+                            .any(|receipt| receipt.tombstone_id == tombstone_id)
+                    }) {
+                        return Err(StorageError::Validation(
+                            "tombstone acknowledgement deletion lacks a matching purge receipt"
+                                .to_string(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(StorageError::Validation(format!(
+                        "unsupported sync delta deletion kind: {other}"
+                    )))
+                }
             }
         }
         Ok(())
@@ -3116,6 +3530,15 @@ fn purge_dependency_order(object_type: &str) -> u8 {
     }
 }
 
+fn split_compound_delta_id(deletion: &DeletedSyncEntity) -> StorageResult<(&str, &str)> {
+    deletion.entity_id.split_once('\u{1f}').ok_or_else(|| {
+        StorageError::Validation(format!(
+            "invalid compound sync delta deletion ID for {}",
+            deletion.entity_kind
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3129,6 +3552,7 @@ mod tests {
         ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
         ObjectVersionRepo, ProjectRepo, TombstoneRepo,
     };
+    use crate::sync_delta::{sync_delta_object_payload, NewSyncDeltaEnvelope, SyncDeltaLimits};
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload, SyncStateLimits};
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
@@ -3669,6 +4093,87 @@ mod tests {
             .push(payload);
     }
 
+    fn latest_delta_envelope_for_test(conn: &VaultConnection) -> SyncDeltaEnvelope {
+        let batch_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT batch_id FROM sync_delta_batches ORDER BY batch_seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        load_sync_delta_envelope(conn, &batch_id, SyncDeltaLimits::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn delta_envelope_for_commit_test(
+        conn: &VaultConnection,
+        commit_id: &str,
+    ) -> SyncDeltaEnvelope {
+        let batch_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT b.batch_id
+                 FROM sync_delta_batches b
+                 JOIN sync_delta_batch_commits bc ON bc.batch_id = b.batch_id
+                 WHERE bc.commit_id = ?1
+                 ORDER BY b.batch_seq DESC LIMIT 1",
+                [commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        load_sync_delta_envelope(conn, &batch_id, SyncDeltaLimits::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn attach_delta_payload_to_commits(
+        conn: &VaultConnection,
+        commits: &mut [SerializedCommit],
+        envelope: &SyncDeltaEnvelope,
+    ) {
+        let commit_id = envelope.commit_ids.last().unwrap();
+        let payload = sync_delta_object_payload(envelope, SyncDeltaLimits::default()).unwrap();
+        commits
+            .iter_mut()
+            .find(|commit| &commit.commit.commit_id == commit_id)
+            .unwrap()
+            .object_payloads
+            .push(payload);
+        envelope.verify(conn, SyncDeltaLimits::default()).unwrap();
+    }
+
+    fn rebuild_delta_envelope(
+        conn: &VaultConnection,
+        template: &SyncDeltaEnvelope,
+        batch_id: &str,
+        batch_kind: SyncDeltaBatchKind,
+        commit_ids: Vec<String>,
+        body: &SyncDeltaBody,
+    ) -> SyncDeltaEnvelope {
+        let logical_row_count = body
+            .state
+            .total_rows()
+            .unwrap()
+            .checked_add(body.device_heads.len())
+            .and_then(|count| count.checked_add(body.deletions.len()))
+            .unwrap();
+        SyncDeltaEnvelope::new(
+            conn,
+            NewSyncDeltaEnvelope {
+                batch_id: batch_id.to_string(),
+                batch_kind,
+                commit_ids,
+                logical_row_count: u32::try_from(logical_row_count).unwrap(),
+                payload: serde_json::to_vec(body).unwrap(),
+                created_at: template.created_at.clone(),
+            },
+            SyncDeltaLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn attach_tombstones_to_commit(
         conn: &VaultConnection,
         commits: &mut [SerializedCommit],
@@ -3719,6 +4224,1071 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn sync_delta_apply_fast_forward_converges_and_persists_received_batch() {
+        let source_path = temp_vault_path("delta-apply-ff-source");
+        let target_path = temp_vault_path("delta-apply-ff-target");
+        let project_id;
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-ff-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            project_id = ProjectRepo::create(
+                &source,
+                &CommitContext::new("device-a".to_string()),
+                "Before",
+                None,
+                None,
+            )
+            .unwrap()
+            .project_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("mail".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commits = serialized_commits_from(&source)
+            .into_iter()
+            .filter(|commit| {
+                !SyncApplyRepo::commit_exists(&target, &commit.commit.commit_id).unwrap()
+            })
+            .collect::<Vec<_>>();
+        attach_delta_payload_to_commits(&source, &mut commits, &envelope);
+
+        let result = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch {
+                batch_index: 0,
+                commits,
+                is_last: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.applied_commits, 1);
+        assert_eq!(result.conflict_count, 0);
+        let applied = ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.icon_ref.as_deref(), Some("mail"));
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_some()
+        );
+        let pending: i64 = target
+            .inner()
+            .query_row("SELECT COUNT(*) FROM sync_delta_mutations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_tamper_rolls_back_commit_state_and_batch() {
+        let source_path = temp_vault_path("delta-apply-tamper-source");
+        let target_path = temp_vault_path("delta-apply-tamper-target");
+        let project_id;
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-tamper-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            project_id = ProjectRepo::create(
+                &source,
+                &CommitContext::new("device-a".to_string()),
+                "Before",
+                None,
+                None,
+            )
+            .unwrap()
+            .project_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let updated = update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("tampered".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commits = serialized_commits_from(&source)
+            .into_iter()
+            .filter(|commit| {
+                !SyncApplyRepo::commit_exists(&target, &commit.commit.commit_id).unwrap()
+            })
+            .collect::<Vec<_>>();
+        attach_delta_payload_to_commits(&source, &mut commits, &envelope);
+        let payload = &mut commits[0].object_payloads[0];
+        let last = payload.ciphertext.len() - 1;
+        payload.ciphertext[last] ^= 1;
+
+        let error = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch {
+                batch_index: 0,
+                commits,
+                is_last: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("schema creation failed")
+                || error.to_string().contains("digest mismatch")
+        );
+        assert!(!SyncApplyRepo::commit_exists(&target, &updated.head_commit_id).unwrap());
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref,
+            None
+        );
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_divergence_preserves_local_merge_delta() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-divergent");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("remote-icon".to_string()),
+        );
+        update_project_for_test(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &project_id,
+            |project| project.group_id = Some("local-group".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commits = serialized_commits_from(&source)
+            .into_iter()
+            .filter(|commit| {
+                !SyncApplyRepo::commit_exists(&target, &commit.commit.commit_id).unwrap()
+            })
+            .collect::<Vec<_>>();
+        attach_delta_payload_to_commits(&source, &mut commits, &envelope);
+
+        let result = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch {
+                batch_index: 0,
+                commits,
+                is_last: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.applied_commits, 1);
+        assert_eq!(result.conflict_count, 0);
+        let merged = ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.icon_ref.as_deref(), Some("remote-icon"));
+        assert_eq!(merged.group_id.as_deref(), Some("local-group"));
+        let merge_delta_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sync_delta_batch_commits bc
+                 JOIN commits c ON c.commit_id = bc.commit_id
+                 WHERE c.commit_kind = 'merge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(merge_delta_count >= 1);
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_some()
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_auxiliary_audit_is_atomic_and_idempotent() {
+        let source_path = temp_vault_path("delta-apply-aux-source");
+        let target_path = temp_vault_path("delta-apply-aux-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-aux-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        source
+            .with_immediate_transaction(|| {
+                source.inner().execute(
+                    "INSERT INTO security_audit_events
+                        (event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                         reason_codes_json, constraints_json)
+                     VALUES ('remote-aux-audit', '2026-07-20T00:00:00Z',
+                             'copy-secret', 'deny', 'vault', '', '[]', '[]')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+        assert_eq!(envelope.batch_kind, SyncDeltaBatchKind::Auxiliary);
+
+        let ctx = CommitContext::new("device-b".to_string());
+        assert_eq!(
+            SyncApplyRepo::apply_auxiliary_delta(&target, &ctx, &envelope).unwrap(),
+            0
+        );
+        assert_eq!(
+            SyncApplyRepo::apply_auxiliary_delta(&target, &ctx, &envelope).unwrap(),
+            0
+        );
+        let event_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM security_audit_events
+                 WHERE event_id = 'remote-aux-audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let batch_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_delta_batches WHERE batch_id = ?1",
+                [&envelope.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(batch_count, 1);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_auxiliary_metadata_deletion_converges() {
+        let source_path = temp_vault_path("delta-apply-delete-source");
+        let target_path = temp_vault_path("delta-apply-delete-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-delete-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            source
+                .with_immediate_transaction(|| {
+                    source.inner().execute(
+                        "INSERT INTO tiga_policy_overrides
+                            (scope_type, scope_id, policy_json, updated_at,
+                             updated_by_device_id)
+                         VALUES ('vault', '', '{}', '2026-07-20T00:00:00Z', 'device-a')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        source
+            .with_immediate_transaction(|| {
+                source.inner().execute(
+                    "DELETE FROM tiga_policy_overrides
+                     WHERE scope_type = 'vault' AND scope_id = ''",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+
+        SyncApplyRepo::apply_auxiliary_delta(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &envelope,
+        )
+        .unwrap();
+        let remaining: i64 = target
+            .inner()
+            .query_row("SELECT COUNT(*) FROM tiga_policy_overrides", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_late_payload_repairs_an_existing_commit() {
+        let source_path = temp_vault_path("delta-apply-late-source");
+        let target_path = temp_vault_path("delta-apply-late-target");
+        let project_id;
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-late-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            project_id = ProjectRepo::create(
+                &source,
+                &CommitContext::new("device-a".to_string()),
+                "Before",
+                None,
+                None,
+            )
+            .unwrap()
+            .project_id;
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("late".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == *envelope.commit_ids.last().unwrap())
+            .unwrap();
+        let commit_without_delta = commit.clone();
+        let ctx = CommitContext::new("device-b".to_string());
+        SyncApplyRepo::apply_batch(
+            &target,
+            &ctx,
+            &CommitBatch {
+                batch_index: 0,
+                commits: vec![commit_without_delta],
+                is_last: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref,
+            None
+        );
+
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+        let result = SyncApplyRepo::apply_batch(
+            &target,
+            &ctx,
+            &CommitBatch {
+                batch_index: 1,
+                commits: vec![commit],
+                is_last: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.skipped_commits, 1);
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref
+                .as_deref(),
+            Some("late")
+        );
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_some()
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_replaces_attachment_chunks_atomically() {
+        let (source_path, target_path, attachment_id) =
+            create_attachment_divergence("delta-apply-attachment");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        AttachmentRepo::write_inline_content(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &attachment_id,
+            b"delta replacement content",
+        )
+        .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commits = serialized_commits_from(&source)
+            .into_iter()
+            .filter(|commit| {
+                !SyncApplyRepo::commit_exists(&target, &commit.commit.commit_id).unwrap()
+            })
+            .collect::<Vec<_>>();
+        attach_delta_payload_to_commits(&source, &mut commits, &envelope);
+
+        SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch {
+                batch_index: 0,
+                commits,
+                is_last: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            AttachmentRepo::read_content(&target, &attachment_id).unwrap(),
+            b"delta replacement content"
+        );
+        let chunk_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM attachment_chunks WHERE attachment_id = ?1",
+                [&attachment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_count, 1);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_mutable_refreshes_rotated_key_epoch() {
+        let (source_path, target_path, _) = create_key_epoch_sync_pair("delta-apply-key-epoch");
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        UnlockService::unlock_with_password(&mut source, "epoch sync password").unwrap();
+        UnlockService::unlock_with_password(&mut target, "epoch sync password").unwrap();
+        let rotation = rotate_epoch_for_sync(
+            &mut source,
+            &CommitContext::new("device-a".to_string()),
+            "device-a",
+        );
+        let envelope = delta_envelope_for_commit_test(&source, &rotation.commit_id);
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == rotation.commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+
+        SyncApplyRepo::apply_batch_mut(
+            &mut target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(vec![commit], 0, true),
+        )
+        .unwrap();
+        assert_eq!(
+            target.active_key_epoch_id(),
+            Some(rotation.active_epoch_id.as_str())
+        );
+        assert!(target
+            .keyring_for_epoch(&rotation.previous_epoch_id)
+            .is_some());
+        assert!(target
+            .keyring_for_epoch(&rotation.active_epoch_id)
+            .is_some());
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_immutable_rejects_key_epoch_changes_atomically() {
+        let (source_path, target_path, _) =
+            create_key_epoch_sync_pair("delta-apply-key-epoch-immutable");
+        let mut source = VaultConnection::open(&source_path).unwrap();
+        let mut target = VaultConnection::open(&target_path).unwrap();
+        UnlockService::unlock_with_password(&mut source, "epoch sync password").unwrap();
+        UnlockService::unlock_with_password(&mut target, "epoch sync password").unwrap();
+        let original_epoch_id = target.active_key_epoch_id().unwrap().to_string();
+        let rotation = rotate_epoch_for_sync(
+            &mut source,
+            &CommitContext::new("device-a".to_string()),
+            "device-a",
+        );
+        let envelope = delta_envelope_for_commit_test(&source, &rotation.commit_id);
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == rotation.commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+
+        let error = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(vec![commit], 0, true),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("key epoch changes require mutable sync apply"));
+        assert_eq!(
+            target.active_key_epoch_id(),
+            Some(original_epoch_id.as_str())
+        );
+        assert!(!SyncApplyRepo::commit_exists(&target, &rotation.commit_id).unwrap());
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_rejects_missing_commit_association_atomically() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-missing-association");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let updated = update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("must-rollback".to_string()),
+        );
+        let template = latest_delta_envelope_for_test(&source);
+        let body = decode_sync_delta_body(&template, SyncDeltaLimits::default()).unwrap();
+        let envelope = rebuild_delta_envelope(
+            &source,
+            &template,
+            "delta-missing-associated-commit",
+            SyncDeltaBatchKind::Commit,
+            vec![
+                "missing-associated-commit".to_string(),
+                updated.head_commit_id.clone(),
+            ],
+            &body,
+        );
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == updated.head_commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+
+        let error = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(vec![commit], 0, true),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("references unavailable commit missing-associated-commit"));
+        assert!(!SyncApplyRepo::commit_exists(&target, &updated.head_commit_id).unwrap());
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref,
+            None
+        );
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_rejects_row_count_mismatch_atomically() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-row-mismatch");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let updated = update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("invalid-row-count".to_string()),
+        );
+        let mut envelope = latest_delta_envelope_for_test(&source);
+        envelope.logical_row_count += 1;
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == updated.head_commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+
+        let error = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(vec![commit], 0, true),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("sync delta logical row count mismatch"));
+        assert!(!SyncApplyRepo::commit_exists(&target, &updated.head_commit_id).unwrap());
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref,
+            None
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_rejects_foreign_vault_atomically() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-foreign-vault");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let updated = update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("foreign".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        target
+            .inner()
+            .execute("UPDATE vault_meta SET vault_id = 'different-vault-id'", [])
+            .unwrap();
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == updated.head_commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+
+        let error = SyncApplyRepo::apply_batch(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &CommitBatch::new(vec![commit], 0, true),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("sync delta belongs to a different vault"));
+        assert!(!SyncApplyRepo::commit_exists(&target, &updated.head_commit_id).unwrap());
+        assert_eq!(
+            ProjectRepo::get_by_id(&target, &project_id)
+                .unwrap()
+                .unwrap()
+                .icon_ref,
+            None
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_auxiliary_limit_rejects_before_writing() {
+        let source_path = temp_vault_path("delta-apply-limit-source");
+        let target_path = temp_vault_path("delta-apply-limit-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-limit-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        source
+            .with_immediate_transaction(|| {
+                for event_id in ["limited-incoming-a", "limited-incoming-b"] {
+                    source.inner().execute(
+                        "INSERT INTO security_audit_events
+                            (event_id, occurred_at, operation, outcome, scope_type, scope_id,
+                             reason_codes_json, constraints_json)
+                         VALUES (?1, '2026-07-20T00:00:00Z', 'copy-secret', 'deny',
+                                 'vault', '', '[]', '[]')",
+                        [event_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+        let defaults = SyncDeltaLimits::default();
+        let limits =
+            SyncDeltaLimits::new(defaults.max_payload_bytes(), 1, defaults.max_commits()).unwrap();
+
+        let error = SyncApplyRepo::apply_auxiliary_delta_with_limits(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &envelope,
+            limits,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit { resource, .. } if resource == "sync delta rows"
+        ));
+        let event_count: i64 = target
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM security_audit_events
+                 WHERE event_id IN ('limited-incoming-a', 'limited-incoming-b')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0);
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_rejects_reused_batch_id_with_different_content() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-batch-id-conflict");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let updated = update_project_for_test(
+            &source,
+            &CommitContext::new("device-a".to_string()),
+            &project_id,
+            |project| project.icon_ref = Some("accepted".to_string()),
+        );
+        let envelope = latest_delta_envelope_for_test(&source);
+        let mut commit = serialized_commits_from(&source)
+            .into_iter()
+            .find(|commit| commit.commit.commit_id == updated.head_commit_id)
+            .unwrap();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&envelope, SyncDeltaLimits::default()).unwrap());
+        let ctx = CommitContext::new("device-b".to_string());
+        SyncApplyRepo::apply_batch(
+            &target,
+            &ctx,
+            &CommitBatch::new(vec![commit.clone()], 0, true),
+        )
+        .unwrap();
+
+        let mut conflicting = envelope.clone();
+        conflicting.created_at = "2026-07-20T23:59:59Z".to_string();
+        commit.object_payloads.clear();
+        commit
+            .object_payloads
+            .push(sync_delta_object_payload(&conflicting, SyncDeltaLimits::default()).unwrap());
+        let error =
+            SyncApplyRepo::apply_batch(&target, &ctx, &CommitBatch::new(vec![commit], 1, true))
+                .unwrap_err();
+        assert!(error.to_string().contains("conflicts with stored content"));
+        let stored =
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored, envelope);
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_sparse_tombstones_preserve_unrelated_local_rows() {
+        let source_path = temp_vault_path("delta-apply-sparse-tombstone-source");
+        let target_path = temp_vault_path("delta-apply-sparse-tombstone-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-sparse-tombstone-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        source
+            .with_immediate_transaction(|| {
+                source.inner().execute(
+                    "INSERT INTO tombstones
+                        (tombstone_id, target_object_type, target_object_id, delete_clock,
+                         deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id)
+                     VALUES ('remote-tombstone', 'entry', 'remote-entry', '{}',
+                             'device-a', '2026-07-20T01:00:00Z', NULL, NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        target
+            .with_immediate_transaction(|| {
+                target.inner().execute(
+                    "INSERT INTO tombstones
+                        (tombstone_id, target_object_type, target_object_id, delete_clock,
+                         deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id)
+                     VALUES ('local-tombstone', 'entry', 'local-entry', '{}',
+                             'device-b', '2026-07-20T00:00:00Z', NULL, NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+
+        SyncApplyRepo::apply_auxiliary_delta(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &envelope,
+        )
+        .unwrap();
+        let tombstone_ids = TombstoneRepo::list_all(&target)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.tombstone_id)
+            .collect::<HashSet<_>>();
+        assert!(tombstone_ids.contains("local-tombstone"));
+        assert!(tombstone_ids.contains("remote-tombstone"));
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_device_revocation_is_monotonic() {
+        let source_path = temp_vault_path("delta-apply-device-head-source");
+        let target_path = temp_vault_path("delta-apply-device-head-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("delta-apply-device-head-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        source
+            .with_immediate_transaction(|| {
+                source.inner().execute(
+                    "UPDATE device_heads SET last_seen_at = '2026-07-20T02:00:00Z', revoked = 0
+                     WHERE device_id = 'device-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        target
+            .with_immediate_transaction(|| {
+                target.inner().execute(
+                    "UPDATE device_heads SET last_seen_at = '2026-07-20T01:00:00Z', revoked = 1
+                     WHERE device_id = 'device-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let envelope = latest_delta_envelope_for_test(&source);
+
+        SyncApplyRepo::apply_auxiliary_delta(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &envelope,
+        )
+        .unwrap();
+        let stored: (String, bool) = target
+            .inner()
+            .query_row(
+                "SELECT last_seen_at, revoked FROM device_heads WHERE device_id = 'device-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "2026-07-20T02:00:00Z");
+        assert!(stored.1);
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
+    fn sync_delta_apply_rejects_physical_deletion_without_purge_receipt() {
+        let (source_path, target_path, project_id) =
+            create_project_divergence("delta-apply-unauthorized-delete");
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let template = latest_delta_envelope_for_test(&source);
+        let mut body = decode_sync_delta_body(&template, SyncDeltaLimits::default()).unwrap();
+        body.deletions.push(DeletedSyncEntity {
+            entity_kind: "project".to_string(),
+            entity_id: project_id.clone(),
+        });
+        let envelope = rebuild_delta_envelope(
+            &source,
+            &template,
+            "delta-unauthorized-physical-delete",
+            SyncDeltaBatchKind::Auxiliary,
+            vec![],
+            &body,
+        );
+
+        let error = SyncApplyRepo::apply_auxiliary_delta(
+            &target,
+            &CommitContext::new("device-b".to_string()),
+            &envelope,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("physical project deletion lacks a matching purge receipt"));
+        assert!(ProjectRepo::get_by_id(&target, &project_id)
+            .unwrap()
+            .is_some());
+        assert!(
+            load_sync_delta_envelope(&target, &envelope.batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .is_none()
+        );
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
     }
 
     fn create_project_divergence(label: &str) -> (PathBuf, PathBuf, String) {

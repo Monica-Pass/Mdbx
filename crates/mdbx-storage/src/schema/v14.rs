@@ -295,6 +295,10 @@ pub fn create_extensions(conn: &Connection) -> StorageResult<()> {
 }
 
 pub fn discard_bootstrap_mutations(conn: &Connection) -> StorageResult<()> {
+    discard_captured_mutations(conn)
+}
+
+pub(crate) fn discard_captured_mutations(conn: &Connection) -> StorageResult<()> {
     conn.execute("DELETE FROM sync_delta_mutations", [])?;
     Ok(())
 }

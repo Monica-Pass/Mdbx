@@ -20,7 +20,7 @@ An upgraded vault records:
 
 ```text
 format_version     = MDBX-2
-schema_version     = 11
+schema_version     = 14
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -38,7 +38,9 @@ Early MDBX2 vaults with schema versions 2 or 3 upgrade in place to schema versio
 
 Schemas 6 through 11 continue as ordered additive migrations. Schema 7 adds generic relations, labels, and assignments; schema 8 adds tombstone delete proof and device acknowledgements; schema 9 adds permanent purge receipts; schema 10 adds Attachment Tiga scopes; schema 11 adds one-to-one Collection Profiles. These migrations preserve the physical `projects` and `entries` tables and the legacy public interfaces.
 
-Schema 12 adds a local stable commit inventory whose migration preserves commit identity and backfills parent-before-child order. Schema 13 adds the state-delta batch inventory, its normalized commit associations, bounded versioned envelope rules, and a bootstrap floor fixed at the migration commit watermark. Schema 14 adds transaction-local logical mutation capture for every synchronized core state family. Before each outer write transaction commits, MDBX deduplicates those keys, materializes a bounded state body, and stores either a commit-associated or auxiliary batch atomically with the domain rows. Bootstrap mutations generated while creating or upgrading a vault are discarded in the same transaction because their state is covered by the floor. Historical deltas are not invented during migration; checkpoints before the floor continue to require bounded complete-state bootstrap. These tables and triggers do not change the `projects`, `entries`, commit DAG, sync-state v1-v2, or bundle v1-v3 formats. CLI synchronization continues to use complete state until atomic delta apply is delivered.
+Schema 12 adds a local stable commit inventory whose migration preserves commit identity and backfills parent-before-child order. Schema 13 adds the state-delta batch inventory, its normalized commit associations, bounded versioned envelope rules, and a bootstrap floor fixed at the migration commit watermark. Schema 14 adds transaction-local logical mutation capture for every synchronized core state family. Before each outer write transaction commits, MDBX deduplicates those keys, materializes a bounded state body, and stores either a commit-associated or auxiliary batch atomically with the domain rows. Bootstrap mutations generated while creating or upgrading a vault are discarded in the same transaction because their state is covered by the floor. Historical deltas are not invented during migration; checkpoints before the floor continue to require bounded complete-state bootstrap.
+
+The storage apply path recognizes authenticated `mdbx-storage/state-delta-v1` object payloads. A commit-associated envelope must be carried by its final associated commit, every referenced commit must be available, and the commit, sparse state rows, device heads, authorized deletions, received batch, and capture cleanup succeed or roll back together. Fast-forward, divergent, and late-payload repair paths share this boundary. Auxiliary batches use a separate atomic entry point and never create user-visible commits. These additions do not change the `projects`, `entries`, commit DAG, sync-state v1-v2, or bundle v1-v3 formats. The current CLI and bundle v3 exporter still send bounded complete state; incremental bundle selection and checkpoints belong to bundle v4.
 
 Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 executes `MDBX-1 -> MDBX-2 -> MDBX-3`.
 
@@ -56,6 +58,7 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - Commit2 adds idempotent operation IDs, typed change summaries, stable branch identity, merged vector clocks, and atomic device sequence allocation without rewriting historical commits.
 - Offline sync bundle version 3 adds an explicit payload length and bounded decoding. MDBX2 readers continue to convert version 1 bundles without operation metadata and read version 2 bundles with operation metadata.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
+- Storage accepts bounded authenticated state-delta payloads atomically, persists received batches for forwarding, preserves sparse local tombstones, and merges device revocation monotonically. Complete-state payloads remain supported and cannot be mixed with a delta on one commit.
 - Portable backup uses SQLite online backup so committed WAL pages are included, verifies SQLite and MDBX metadata plus `vault_id`, converts the result to a sidecar-independent file, and refuses to replace any destination artifact.
 
 ## Client/Core Boundary

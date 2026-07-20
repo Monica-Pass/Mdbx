@@ -166,6 +166,16 @@ sync state 中的 key epoch 字段必须保持可选，使 MDBX1 和早期 MDBX2
 
 改变 epoch 状态需要经过验证解锁的可变连接。应用事务必须先验证状态标签与 wrapper，再写入依赖新 epoch 的对象密文；事务提交后刷新 active 与历史 epoch keyring。旧 payload 缺少该字段时不得清除或回退本地 epoch 状态。
 
+### 9.2 事务级状态 Delta
+
+超过 bootstrap floor 后，每个外层写事务应物化一个有界、不可变的状态 delta 批次。带关联 commit 的批次附着在最后一个关联 commit 上；没有 commit 的事务产生 auxiliary 批次，并且不得增加用户可见历史记录。
+
+接收端接受状态前，必须验证 vault 与批次身份、payload digest、逻辑行数、commit 归属和资源限制。所有关联 commit 必须可用。一个 serialized commit 上不得混用已识别 delta 与完整 sync state，也不得携带第二个 delta。commit 插入、稀疏状态应用、附件 chunk 替换、device-head 合并、授权删除、接收批次持久化和 incoming capture 清理必须全部提交或全部回滚。
+
+delta 中的 tombstone 是稀疏集合，不得替换无关的本地 tombstone。device revocation 必须单调合并。物理删除对象或 tombstone 必须有匹配且经过认证的永久清理凭证。key epoch 变更只能通过经过验证解锁的可变 apply 路径完成；不可变兼容入口必须原子拒绝。
+
+完整 sync state 继续承担首次 bootstrap 和旧 peer fallback。bundle v1-v3 格式保持不变；客户端在同时交换 commit inventory checkpoint 与 auxiliary delta checkpoint 之前，不得宣称已经实现增量收敛。
+
 ## 10. 合并模型
 
 MDBX 最好支持：
