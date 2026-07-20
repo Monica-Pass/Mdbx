@@ -6,4 +6,6 @@ pub mod protocol;
 pub use bundle::*;
 pub use error::{SyncError, SyncResult};
 pub use message::*;
-pub use protocol::{BatchBuilder, SyncNegotiator, SyncPhase};
+pub use protocol::{
+    BatchBuilder, SyncClient, SyncClientPhase, SyncNegotiator, SyncPhase, SyncTransferMode,
+};

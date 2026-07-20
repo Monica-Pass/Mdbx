@@ -61,6 +61,14 @@ pub struct IncrementalBundleCheckpoint {
     pub delta_inventory: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalBundleResume {
+    pub transfer_id: String,
+    pub next_segment_index: u32,
+    pub previous_segment_sha256: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncrementalCommitInventoryEntry {

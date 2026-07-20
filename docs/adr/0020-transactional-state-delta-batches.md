@@ -109,4 +109,6 @@ state-change inventory by itself. Schema capture, bounded envelopes, and atomic 
 implemented. Bundle v4 and the offline CLI now carry both checkpoint classes, resume bounded
 segments through a digest-bound transfer chain, and apply each segment atomically. Complete
 `SyncStatePayload` remains the bootstrap and old-peer fallback. The reusable synchronization client
-must still negotiate this capability before selecting v4 automatically.
+requires commit paging, delta paging, bundle v4, and resume capabilities as one contract, omits the
+legacy known-commit vector for paging peers, and advances checkpoints only after durable segment
+acknowledgement.

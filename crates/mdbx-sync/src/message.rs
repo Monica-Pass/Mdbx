@@ -15,6 +15,15 @@ pub const MAX_SYNC_CAPABILITY_ID_BYTES: usize = 128;
 pub const MAX_COMMIT_INVENTORY_PAGE_ITEMS: usize = 512;
 pub const MAX_COMMIT_INVENTORY_TOKEN_BYTES: usize = 4096;
 pub const MAX_COMMIT_ID_BYTES: usize = 256;
+pub const CAPABILITY_DELTA_INVENTORY_PAGING_V1: &str = "delta-inventory-paging-v1";
+pub const CAPABILITY_INCREMENTAL_BUNDLE_V4: &str = "incremental-bundle-v4";
+pub const CAPABILITY_INCREMENTAL_RESUME_V1: &str = "incremental-resume-v1";
+pub const INCREMENTAL_SYNC_CAPABILITIES: [&str; 4] = [
+    CAPABILITY_COMMIT_INVENTORY_PAGING_V1,
+    CAPABILITY_DELTA_INVENTORY_PAGING_V1,
+    CAPABILITY_INCREMENTAL_BUNDLE_V4,
+    CAPABILITY_INCREMENTAL_RESUME_V1,
+];
 
 // ---------------------------------------------------------------------------
 // 顶层消息容器
@@ -41,6 +50,12 @@ pub enum SyncMessage {
 
     /// 返回一个有界、因果有序的 commit inventory 页面。
     CommitInventoryPageResponse(CommitInventoryPageResponse),
+
+    /// Request a fixed watermark page from the state-delta inventory.
+    DeltaInventoryPageRequest(DeltaInventoryPageRequest),
+
+    /// Return a bounded, ordered state-delta inventory page.
+    DeltaInventoryPageResponse(DeltaInventoryPageResponse),
 
     /// 发送一组合并 commit。
     CommitBatch(CommitBatch),
@@ -128,6 +143,40 @@ pub struct CommitInventoryPageResponse {
 pub struct CommitInventoryEntry {
     pub inventory_seq: u64,
     pub commit_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaInventoryPageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub page_size: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeltaInventoryKind {
+    Commit,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaInventoryEntry {
+    pub batch_seq: u64,
+    pub batch_id: String,
+    pub batch_kind: DeltaInventoryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaInventoryPageResponse {
+    pub items: Vec<DeltaInventoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub checkpoint: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +340,8 @@ impl SyncMessage {
             Self::HelloAck(hello) => validate_capabilities(&hello.capabilities),
             Self::CommitInventoryPageRequest(request) => request.validate(),
             Self::CommitInventoryPageResponse(response) => response.validate(),
+            Self::DeltaInventoryPageRequest(request) => request.validate(),
+            Self::DeltaInventoryPageResponse(response) => response.validate(),
             _ => Ok(()),
         }
     }
@@ -409,6 +460,80 @@ impl CommitInventoryPageResponse {
             }
             validate_commit_id(&item.commit_id)?;
             previous = item.inventory_seq;
+        }
+        Ok(())
+    }
+}
+
+impl DeltaInventoryPageRequest {
+    pub fn new(
+        checkpoint: Option<String>,
+        cursor: Option<String>,
+        page_size: usize,
+    ) -> SyncResult<Self> {
+        let page_size = u16::try_from(page_size).map_err(|_| {
+            SyncError::InvalidMessage(format!(
+                "delta inventory page size must be between 1 and {MAX_COMMIT_INVENTORY_PAGE_ITEMS}"
+            ))
+        })?;
+        let request = Self {
+            checkpoint,
+            cursor,
+            page_size,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        let page_size = usize::from(self.page_size);
+        if page_size == 0 || page_size > MAX_COMMIT_INVENTORY_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "delta inventory page size must be between 1 and {MAX_COMMIT_INVENTORY_PAGE_ITEMS}"
+            )));
+        }
+        validate_optional_inventory_token(self.checkpoint.as_deref(), "delta checkpoint")?;
+        validate_optional_inventory_token(self.cursor.as_deref(), "delta cursor")
+    }
+}
+
+impl DeltaInventoryPageResponse {
+    pub fn new(
+        items: Vec<DeltaInventoryEntry>,
+        next_cursor: Option<String>,
+        checkpoint: String,
+    ) -> SyncResult<Self> {
+        let response = Self {
+            items,
+            next_cursor,
+            checkpoint,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        if self.items.len() > MAX_COMMIT_INVENTORY_PAGE_ITEMS {
+            return Err(SyncError::InvalidMessage(format!(
+                "delta inventory page exceeds {MAX_COMMIT_INVENTORY_PAGE_ITEMS} items"
+            )));
+        }
+        validate_inventory_token(&self.checkpoint, "delta checkpoint")?;
+        validate_optional_inventory_token(self.next_cursor.as_deref(), "delta cursor")?;
+        if self.items.is_empty() && self.next_cursor.is_some() {
+            return Err(SyncError::InvalidMessage(
+                "delta inventory page cannot continue without a position".to_string(),
+            ));
+        }
+        let mut previous = 0_u64;
+        for item in &self.items {
+            if item.batch_seq == 0 || item.batch_seq <= previous {
+                return Err(SyncError::InvalidMessage(
+                    "delta inventory sequences must be strictly increasing".to_string(),
+                ));
+            }
+            validate_commit_id(&item.batch_id)?;
+            previous = item.batch_seq;
         }
         Ok(())
     }

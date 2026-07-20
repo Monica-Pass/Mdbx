@@ -46,9 +46,10 @@ use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
     build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits, write_bundle,
     write_incremental_bundle, BundleReadLimits, CommitBatch, CommitOperationMetadata,
-    IncrementalBundleCheckpoint, IncrementalBundleManifest, IncrementalCommitInventoryEntry,
-    IncrementalDeltaInventoryEntry, IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit,
-    SyncBundleFile, TombstoneRecord, INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
+    IncrementalBundleCheckpoint, IncrementalBundleManifest, IncrementalBundleResume,
+    IncrementalCommitInventoryEntry, IncrementalDeltaInventoryEntry, IncrementalDeltaKind,
+    IncrementalSyncBundle, SerializedCommit, SyncBundleFile, TombstoneRecord,
+    INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
 };
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -1516,13 +1517,7 @@ const CLI_INCREMENTAL_SEGMENT_PAGE_SIZE: usize = MAX_COMMIT_INVENTORY_PAGE_SIZE;
 #[cfg(test)]
 const CLI_INCREMENTAL_SEGMENT_PAGE_SIZE: usize = 2;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct CliSyncResume {
-    transfer_id: String,
-    next_segment_index: u32,
-    previous_segment_sha256: Vec<u8>,
-}
+type CliSyncResume = IncrementalBundleResume;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

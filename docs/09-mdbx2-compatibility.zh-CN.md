@@ -69,7 +69,7 @@ schema 12 增加本地稳定 commit 库存，迁移过程保持 commit 身份不
 
 storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。
 
-CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4。未完成的 v4 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。自动 peer 能力协商与可复用同步客户端 facade 仍属于后续协议层工作。
+CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4。未完成的 v4 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择 v4；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。旧 peer 或能力不完整的 peer 使用有界完整状态回退。
 
 ## 4. Schema 演进规则
 

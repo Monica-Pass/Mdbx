@@ -176,6 +176,8 @@ Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones.
 
 Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats. Bundle v4 carries bounded commit and delta inventories after a paired checkpoint, binds resumed segments by transfer ID, segment index, and the previous payload digest, and advances the receiver checkpoint only after one segment is durably applied. Commit-associated and auxiliary deltas in a segment share one database transaction. A client MUST NOT claim incremental convergence until it exchanges both checkpoint classes and preserves the segment resume state.
 
+Protocol-v2 peers advertise commit inventory paging, delta inventory paging, bundle v4, and incremental resume as four additive capabilities. Incremental v4 is selected only when all four are negotiated. A paging-capable Hello omits the legacy `known_commit_ids` inventory; commit and delta pages carry bounded opaque checkpoint/cursor tokens instead. Missing or partial capability sets MUST fall back to bounded complete state. The transport-neutral `SyncClient` advances its paired checkpoint only through the durable acknowledgement API, never when a segment is merely received or validated.
+
 ## 10. Merge Model
 
 MDBX SHOULD support:
