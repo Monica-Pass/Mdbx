@@ -1259,29 +1259,18 @@ impl AttachmentRepo {
                         )))
                     }
                 };
-                let reference_field = external_reference_field(chunk_index);
-                let reference = Self::decrypt_attachment_field(
+                let blob_id = Self::decrypt_external_blob_id(
                     conn,
                     attachment_id,
-                    &reference_field,
+                    chunk_index,
                     &encrypted_reference,
                 )?;
-                let blob_id = std::str::from_utf8(&reference).map_err(|_| {
-                    StorageError::ConstraintViolation(format!(
-                        "external attachment chunk {chunk_index} has a non-UTF-8 blob ID"
-                    ))
-                })?;
-                validate_blob_id(blob_id).map_err(|error| {
-                    StorageError::ConstraintViolation(format!(
-                        "external attachment chunk {chunk_index} has an invalid blob ID: {error}"
-                    ))
-                })?;
                 let blob_store =
                     blob_store.ok_or_else(|| StorageError::EncryptedBlobStoreRequired {
                         attachment_id: attachment_id.to_string(),
                     })?;
                 let max_bytes = external_blob_read_limit(stored_size)?;
-                let encrypted_blob = blob_store.get(blob_id, max_bytes)?;
+                let encrypted_blob = blob_store.get(&blob_id, max_bytes)?;
                 if encrypted_blob.len() > max_bytes {
                     return Err(StorageError::BlobStore(format!(
                         "blob {blob_id} exceeded the repository read limit"
@@ -1333,6 +1322,32 @@ impl AttachmentRepo {
             field,
         )
     }
+
+    pub(crate) fn decrypt_external_blob_id(
+        conn: &VaultConnection,
+        attachment_id: &str,
+        chunk_index: i64,
+        encrypted_reference: &[u8],
+    ) -> StorageResult<String> {
+        let reference_field = external_reference_field(chunk_index);
+        let reference = Self::decrypt_attachment_field(
+            conn,
+            attachment_id,
+            &reference_field,
+            encrypted_reference,
+        )?;
+        let blob_id = std::str::from_utf8(&reference).map_err(|_| {
+            StorageError::ConstraintViolation(format!(
+                "external attachment chunk {chunk_index} has a non-UTF-8 blob ID"
+            ))
+        })?;
+        validate_blob_id(blob_id).map_err(|error| {
+            StorageError::ConstraintViolation(format!(
+                "external attachment chunk {chunk_index} has an invalid blob ID: {error}"
+            ))
+        })?;
+        Ok(blob_id.to_string())
+    }
 }
 
 fn read_chunk(reader: &mut dyn Read, buffer: &mut [u8]) -> StorageResult<usize> {
@@ -1372,7 +1387,7 @@ fn external_reference_field(chunk_index: i64) -> String {
     format!("external_uri:{chunk_index}")
 }
 
-fn external_blob_read_limit(stored_size: i64) -> StorageResult<usize> {
+pub(crate) fn external_blob_read_limit(stored_size: i64) -> StorageResult<usize> {
     let plaintext_size = u64::try_from(stored_size).map_err(|_| {
         StorageError::ConstraintViolation("external chunk has a negative stored size".to_string())
     })?;

@@ -62,6 +62,7 @@ MDBX 必须坚持：
 - 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。完整 key rotation / retirement 仍需在 key management 切片中闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - `external-hash-ref` 已通过通用 `EncryptedBlobStore` 接口实现；默认 CLI 使用 `<vault>.blobs` 内容寻址目录，core 裁剪构建保留引用格式和 Provider 接口并移除文件系统实现。数据库、snapshot 和同步状态携带加密引用，Blob 本体由 Provider 负责传输与保留。
+- 外部 Blob 生命周期管理已包含分页 Provider 清单、现行附件与 snapshot 引用审计、缺失与损坏检测、固定时间边界、计划凭证、TIGA 授权和可重试垃圾回收。维护请求写入单条安全审计，不产生逐 Blob commit。
 - project/attachment 本地 mutation 与 sync incoming state 已记录 `object_versions` 行快照；非快进 sync apply 已支持 project 字段级合并、attachment 元数据字段合并和附件内容组保守合并。
 - project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
 - project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
@@ -96,7 +97,7 @@ MDBX 必须坚持：
 - benchmark harness 已有，但还没有形成可发布报告。
 - 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
 - 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
-- external-hash-ref 的引用扫描、加密孤儿回收和 Provider 间 Blob 传输尚未实现。
+- external-hash-ref 的 Provider 间 Blob 传输尚未实现；跨进程清理与导入的强协调仍需 Provider lease 协议。
 
 ### 3.5 安全
 
@@ -176,7 +177,8 @@ MDBX 必须坚持：
 
 - external-hash-ref 模式已完成。
 - 附件 Blob 内容寻址目录和可插拔加密 Blob Provider 已完成。
-- 增加显式引用扫描、加密孤儿回收和 Provider 间 Blob 传输。
+- 显式引用扫描和加密孤儿回收已完成。
+- 增加 Provider 间 Blob 传输和跨进程 lease 协议。
 - metadata-only 更新不触碰 chunk。
 - benchmark 输出 delta size 和时延报告。
 - 可选 zstd 压缩和二进制 payload 序列化。

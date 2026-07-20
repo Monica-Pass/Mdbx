@@ -9,6 +9,8 @@ use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
 use mdbx_storage::benchmark::BenchmarkRunner;
 #[cfg(feature = "external-blob-store")]
+use mdbx_storage::blob_lifecycle::{BlobAuditOptions, BlobLifecycleLimits, BlobLifecycleService};
+#[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_store::FileSystemBlobStore;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
@@ -97,6 +99,11 @@ enum Commands {
     Attach {
         #[command(subcommand)]
         action: AttachAction,
+    },
+    /// 审计和维护外部加密 Blob Provider
+    Blob {
+        #[command(subcommand)]
+        action: BlobAction,
     },
     /// 快照备份与恢复
     Snapshot {
@@ -296,6 +303,32 @@ enum AttachAction {
 }
 
 #[derive(Subcommand)]
+enum BlobAction {
+    /// 审计引用、缺失、损坏和未引用 Blob
+    Audit {
+        /// 未引用 Blob 的保护时长，单位小时
+        #[arg(long, default_value_t = 168)]
+        grace_hours: u64,
+        /// 跳过密文内容读取，仅检查引用与 Provider 清单
+        #[arg(long)]
+        skip_content_verification: bool,
+    },
+    /// 生成垃圾回收计划凭证
+    GcPlan {
+        /// 未引用 Blob 的保护时长，单位小时
+        #[arg(long, default_value_t = 168)]
+        grace_hours: u64,
+    },
+    /// 使用计划凭证执行垃圾回收
+    GcApply {
+        plan_token: String,
+        /// `gc-plan` 返回的固定清理时间边界
+        #[arg(long)]
+        cutoff_unix_secs: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotAction {
     /// 创建快照
     Create,
@@ -360,6 +393,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Attach { action } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_attach(&mut conn, &cli.vault, action)
+        }
+        Commands::Blob { action } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_blob(&conn, &cli.vault, action)
         }
         Commands::Snapshot { action } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -1227,6 +1264,122 @@ fn cmd_attach(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "external-blob-store")]
+fn blob_cutoff_unix_secs(grace_hours: u64) -> Result<i64, String> {
+    let grace_seconds = grace_hours
+        .checked_mul(60 * 60)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| "Blob grace period exceeds supported time range".to_string())?;
+    chrono::Utc::now()
+        .timestamp()
+        .checked_sub(grace_seconds)
+        .ok_or_else(|| "Blob grace period underflowed the supported time range".to_string())
+}
+
+fn cmd_blob(_conn: &VaultConnection, _vault_path: &Path, action: BlobAction) -> Result<(), String> {
+    #[cfg(not(feature = "external-blob-store"))]
+    {
+        let _ = action;
+        Err("this MDBX build does not include filesystem Blob lifecycle management".to_string())
+    }
+    #[cfg(feature = "external-blob-store")]
+    {
+        let store = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+        match action {
+            BlobAction::Audit {
+                grace_hours,
+                skip_content_verification,
+            } => {
+                let cutoff = blob_cutoff_unix_secs(grace_hours)?;
+                let report = BlobLifecycleService::audit(
+                    _conn,
+                    &store,
+                    BlobAuditOptions {
+                        limits: BlobLifecycleLimits::default(),
+                        orphan_cutoff_unix_secs: cutoff,
+                        verify_provider_contents: !skip_content_verification,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                println!("Provider:            {}", report.namespace_id);
+                println!("References:          {}", report.raw_reference_count);
+                println!("Unique references:   {}", report.unique_reference_count);
+                println!("Provider blobs:       {}", report.provider_blob_count);
+                println!("Healthy references:  {}", report.healthy_reference_count);
+                println!("Missing references:  {}", report.missing_references.len());
+                println!("Corrupt blobs:       {}", report.corrupt_blobs.len());
+                println!("Eligible orphans:    {}", report.eligible_orphans.len());
+                println!("Recent orphans:      {}", report.recent_orphan_count);
+                for issue in &report.missing_references {
+                    println!("MISSING {}  {}", issue.blob_id, issue.detail);
+                }
+                for issue in &report.corrupt_blobs {
+                    println!("CORRUPT {}  {}", issue.blob_id, issue.detail);
+                }
+                for blob in &report.eligible_orphans {
+                    println!("ORPHAN {}  {} bytes", blob.blob_id, blob.stored_size);
+                }
+            }
+            BlobAction::GcPlan { grace_hours } => {
+                let cutoff = blob_cutoff_unix_secs(grace_hours)?;
+                let plan = BlobLifecycleService::plan_gc(
+                    _conn,
+                    &store,
+                    cutoff,
+                    BlobLifecycleLimits::default(),
+                )
+                .map_err(|error| error.to_string())?;
+                println!("Plan token:       {}", plan.plan_token);
+                println!("Cutoff Unix secs: {}", plan.orphan_cutoff_unix_secs);
+                println!("Eligible orphans: {}", plan.eligible_orphans.len());
+                println!("Recent orphans:   {}", plan.recent_orphan_count);
+                println!(
+                    "Apply with: mdbx --vault {} blob gc-apply {} --cutoff-unix-secs {}",
+                    _vault_path.display(),
+                    plan.plan_token,
+                    plan.orphan_cutoff_unix_secs
+                );
+            }
+            BlobAction::GcApply {
+                plan_token,
+                cutoff_unix_secs,
+            } => {
+                let session = _conn.active_session().ok_or_else(|| {
+                    "Blob garbage collection requires an active unlock session".to_string()
+                })?;
+                let device = cli_device_context();
+                let (result, _decision) = BlobLifecycleService::apply_gc_authorized(
+                    _conn,
+                    &store,
+                    &plan_token,
+                    cutoff_unix_secs,
+                    BlobLifecycleLimits::default(),
+                    TigaAuthorizationContext {
+                        session: Some(session),
+                        device: &device,
+                        now_unix_secs: chrono::Utc::now().timestamp(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                println!("Planned:        {}", result.planned_count);
+                println!("Deleted:        {}", result.deleted_blob_ids.len());
+                println!("Already absent: {}", result.already_absent_blob_ids.len());
+                println!("Failures:       {}", result.failures.len());
+                for failure in &result.failures {
+                    println!("FAILED {}  {}", failure.blob_id, failure.detail);
+                }
+                if !result.completed() {
+                    return Err(
+                        "Blob garbage collection completed with failures; create a new plan before retrying"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn mime_guess_for_path(path: &std::path::Path) -> Option<String> {
@@ -2635,6 +2788,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
     }
 
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_audits_plans_and_applies_blob_garbage_collection() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Blob maintenance".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        drop(conn);
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-blob-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&input, b"referenced external content").unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id,
+                    entry_id: None,
+                    file: input.clone(),
+                    external: true,
+                },
+            },
+        ))
+        .unwrap();
+
+        let store = FileSystemBlobStore::new(default_blob_store_path(&path));
+        let orphan = b"opaque orphan ciphertext";
+        let orphan_id = mdbx_storage::blob_store::compute_blob_id(orphan);
+        mdbx_storage::blob_store::EncryptedBlobStore::put(&store, &orphan_id, orphan).unwrap();
+        let conn = open_unlocked(&path);
+        let cutoff = chrono::Utc::now().timestamp().saturating_add(1);
+        let plan =
+            BlobLifecycleService::plan_gc(&conn, &store, cutoff, BlobLifecycleLimits::default())
+                .unwrap();
+        assert_eq!(plan.eligible_orphans.len(), 1);
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::Audit {
+                    grace_hours: 0,
+                    skip_content_verification: false,
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::GcPlan { grace_hours: 0 },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::GcApply {
+                    plan_token: plan.plan_token,
+                    cutoff_unix_secs: cutoff,
+                },
+            },
+        ))
+        .unwrap();
+
+        assert!(!store.blob_path(&orphan_id).unwrap().exists());
+        let conn = open_unlocked(&path);
+        let audit_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM security_audit_events
+                 WHERE operation = 'purge-deleted-object'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
     #[cfg(not(feature = "external-blob-store"))]
     #[test]
     fn core_cli_reports_missing_external_blob_provider_before_mutation() {
@@ -2677,6 +2922,27 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_file(input);
+    }
+
+    #[cfg(not(feature = "external-blob-store"))]
+    #[test]
+    fn core_cli_reports_missing_blob_lifecycle_capability() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+
+        let error = run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::Audit {
+                    grace_hours: 168,
+                    skip_content_verification: false,
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("does not include filesystem Blob lifecycle management"));
     }
 
     #[test]

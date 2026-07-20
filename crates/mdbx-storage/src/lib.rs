@@ -1,6 +1,7 @@
 pub mod backup;
 #[cfg(feature = "benchmarks")]
 pub mod benchmark;
+pub mod blob_lifecycle;
 pub mod blob_store;
 pub mod capability;
 pub(crate) mod commit_integrity;

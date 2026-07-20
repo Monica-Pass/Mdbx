@@ -44,6 +44,14 @@ struct SnapshotPayload {
     project_tags: Option<Vec<ProjectTagSetRow>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotExternalBlobReference {
+    pub attachment_id: String,
+    pub chunk_index: u32,
+    pub external_uri_ct: Vec<u8>,
+    pub stored_size: u64,
+}
+
 /// Snapshot 持久化仓库。
 ///
 /// 负责创建和恢复检查点，捕获 projects / entries / attachments 元数据。
@@ -474,6 +482,95 @@ impl SnapshotRepo {
             Err(_) => return Ok(false),
         };
         Ok(serde_json::from_slice::<SnapshotPayload>(&plaintext).is_ok())
+    }
+
+    pub(crate) fn collect_external_blob_references(
+        conn: &VaultConnection,
+        max_snapshots: usize,
+        max_snapshot_ciphertext_bytes: usize,
+        max_references: usize,
+    ) -> StorageResult<Vec<SnapshotExternalBlobReference>> {
+        let mut stmt = conn.inner().prepare(
+            "SELECT snapshot_id, snapshot_ct, snapshot_hash
+             FROM snapshots ORDER BY snapshot_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut references = Vec::new();
+        let mut snapshot_count = 0usize;
+        for row in rows {
+            snapshot_count = snapshot_count
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Validation("snapshot count overflow".to_string()))?;
+            if snapshot_count > max_snapshots {
+                return Err(StorageError::Validation(format!(
+                    "snapshot count exceeds the maintenance limit of {max_snapshots}"
+                )));
+            }
+            let (snapshot_id, snapshot_ct, snapshot_hash) = row?;
+            if snapshot_ct.len() > max_snapshot_ciphertext_bytes {
+                return Err(StorageError::Validation(format!(
+                    "snapshot {snapshot_id} exceeds the {max_snapshot_ciphertext_bytes}-byte maintenance limit"
+                )));
+            }
+            if compute_sha256_hex(&snapshot_ct) != snapshot_hash {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "snapshot {snapshot_id} failed integrity verification"
+                )));
+            }
+            let plaintext = Self::decrypt_payload(conn, &snapshot_id, &snapshot_ct)?;
+            let payload: SnapshotPayload = serde_json::from_slice(&plaintext).map_err(|error| {
+                StorageError::ConstraintViolation(format!(
+                    "snapshot {snapshot_id} payload is invalid: {error}"
+                ))
+            })?;
+            let modes: BTreeMap<_, _> = payload
+                .attachments
+                .iter()
+                .map(|attachment| (attachment.attachment_id.as_str(), &attachment.storage_mode))
+                .collect();
+            for chunk in payload.attachment_chunks.unwrap_or_default() {
+                let mode = modes.get(chunk.attachment_id.as_str()).ok_or_else(|| {
+                    StorageError::ConstraintViolation(format!(
+                        "snapshot {snapshot_id} chunk references a missing attachment {}",
+                        chunk.attachment_id
+                    ))
+                })?;
+                match (*mode, chunk.chunk_ct, chunk.external_uri_ct) {
+                    (StorageMode::ExternalHashRef, None, Some(external_uri_ct)) => {
+                        if references.len() >= max_references {
+                            return Err(StorageError::Validation(format!(
+                                "snapshot external reference count exceeds the maintenance limit of {max_references}"
+                            )));
+                        }
+                        references.push(SnapshotExternalBlobReference {
+                            attachment_id: chunk.attachment_id,
+                            chunk_index: chunk.chunk_index,
+                            external_uri_ct,
+                            stored_size: chunk.stored_size,
+                        });
+                    }
+                    (StorageMode::ExternalHashRef, _, _) => {
+                        return Err(StorageError::ConstraintViolation(format!(
+                            "snapshot {snapshot_id} external chunk has invalid storage columns"
+                        )))
+                    }
+                    (StorageMode::EmbeddedInline | StorageMode::EmbeddedChunked, Some(_), None) => {
+                    }
+                    (StorageMode::EmbeddedInline | StorageMode::EmbeddedChunked, _, _) => {
+                        return Err(StorageError::ConstraintViolation(format!(
+                            "snapshot {snapshot_id} embedded chunk has invalid storage columns"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(references)
     }
 
     // -----------------------------------------------------------------------

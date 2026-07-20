@@ -16,6 +16,7 @@ pub struct CapabilitySet {
     pub recovery: bool,
     pub synchronization: bool,
     pub external_blob_references: bool,
+    pub external_blob_lifecycle: bool,
     pub filesystem_blob_store: bool,
     pub kdbx_import: bool,
     pub kdbx_export: bool,
@@ -39,6 +40,7 @@ impl CapabilitySet {
             recovery: true,
             synchronization: true,
             external_blob_references: true,
+            external_blob_lifecycle: true,
             filesystem_blob_store: cfg!(feature = "filesystem-blob-store"),
             kdbx_import: cfg!(feature = "kdbx-import"),
             kdbx_export: cfg!(feature = "kdbx-export"),
@@ -67,6 +69,7 @@ mod tests {
         assert!(capabilities.recovery);
         assert!(capabilities.synchronization);
         assert!(capabilities.external_blob_references);
+        assert!(capabilities.external_blob_lifecycle);
     }
 
     #[test]
