@@ -13,7 +13,14 @@ use mdbx_storage::benchmark::BenchmarkRunner;
 #[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_lifecycle::{BlobAuditOptions, BlobLifecycleLimits, BlobLifecycleService};
 #[cfg(feature = "external-blob-store")]
+use mdbx_storage::blob_replica::{
+    BlobReplicaPageRequest, BlobReplicaService, BlobReplicaTransferCheckpoint,
+    BlobReplicaTransferLimits,
+};
+#[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_store::FileSystemBlobStore;
+#[cfg(all(feature = "external-blob-store", test))]
+use mdbx_storage::blob_store::ManageableEncryptedBlobStore;
 #[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_transfer::{
     BlobTransferCheckpoint, BlobTransferLimits, BlobTransferService,
@@ -365,6 +372,51 @@ enum BlobAction {
         /// 本次调用最多传输的块数
         #[arg(long, default_value_t = 10_000)]
         max_chunks: usize,
+        /// Provider 租约有效期，单位秒
+        #[arg(long, default_value_t = 5 * 60)]
+        lease_ttl_secs: i64,
+    },
+    /// 生成当前 vault 引用在目标 Provider 上的差异计划
+    ReplicaPlan {
+        /// 目标 filesystem Provider 根目录
+        #[arg(long)]
+        destination: PathBuf,
+        /// 上一页返回的 Blob ID
+        #[arg(long)]
+        cursor: Option<String>,
+        /// 第一页返回的 plan token
+        #[arg(long)]
+        checkpoint: Option<String>,
+        /// 每页最多返回的差异项
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        /// 输出机器可读 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 自动复制当前 vault 引用的全部可传输 Blob
+    Replicate {
+        /// 目标 filesystem Provider 根目录
+        #[arg(long)]
+        destination: PathBuf,
+        /// 批量续传 checkpoint 文件
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// planner 每页最多处理的差异项
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        /// 本次调用最多完成的 Blob 数
+        #[arg(long, default_value_t = 100)]
+        max_items: usize,
+        /// 单个传输块的最大字节数
+        #[arg(long, default_value_t = 1024 * 1024)]
+        chunk_size: usize,
+        /// 单个 Blob 本次最多传输的块数
+        #[arg(long, default_value_t = 10_000)]
+        max_chunks: usize,
+        /// 单个 Blob 的最大 ciphertext 字节数
+        #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024_u64)]
+        max_blob_bytes: u64,
         /// Provider 租约有效期，单位秒
         #[arg(long, default_value_t = 5 * 60)]
         lease_ttl_secs: i64,
@@ -1403,6 +1455,70 @@ fn write_blob_transfer_checkpoint(
     Ok(())
 }
 
+#[cfg(feature = "external-blob-store")]
+const CLI_BLOB_REPLICA_CHECKPOINT_FORMAT: &str = "mdbx-cli-blob-replica-checkpoint-v1";
+
+#[cfg(feature = "external-blob-store")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CliBlobReplicaCheckpointFile {
+    format: String,
+    checkpoint: BlobReplicaTransferCheckpoint,
+}
+
+#[cfg(feature = "external-blob-store")]
+fn read_blob_replica_checkpoint(path: &Path) -> Result<BlobReplicaTransferCheckpoint, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "failed to read Blob replica checkpoint '{}': {error}",
+            path.display()
+        )
+    })?;
+    let value: CliBlobReplicaCheckpointFile = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid Blob replica checkpoint '{}': {error}",
+            path.display()
+        )
+    })?;
+    if value.format != CLI_BLOB_REPLICA_CHECKPOINT_FORMAT {
+        return Err(format!(
+            "unsupported Blob replica checkpoint format: {}",
+            value.format
+        ));
+    }
+    Ok(value.checkpoint)
+}
+
+#[cfg(feature = "external-blob-store")]
+fn write_blob_replica_checkpoint(
+    path: &Path,
+    checkpoint: &BlobReplicaTransferCheckpoint,
+) -> Result<(), String> {
+    let value = CliBlobReplicaCheckpointFile {
+        format: CLI_BLOB_REPLICA_CHECKPOINT_FORMAT.to_string(),
+        checkpoint: checkpoint.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("failed to serialize Blob replica checkpoint: {error}"))?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mdbx-blob-replica-checkpoint-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to create temporary Blob replica checkpoint: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| format!("failed to write temporary Blob replica checkpoint: {error}"))?;
+    temporary.as_file_mut().sync_all().map_err(|error| {
+        format!("failed to synchronize temporary Blob replica checkpoint: {error}")
+    })?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("failed to publish Blob replica checkpoint: {}", error.error))?;
+    Ok(())
+}
+
 fn cmd_blob(_conn: &VaultConnection, _vault_path: &Path, action: BlobAction) -> Result<(), String> {
     #[cfg(not(feature = "external-blob-store"))]
     {
@@ -1558,6 +1674,122 @@ fn cmd_blob(_conn: &VaultConnection, _vault_path: &Path, action: BlobAction) -> 
                 } else {
                     write_blob_transfer_checkpoint(&checkpoint, &owner_id, &result.checkpoint)?;
                     println!("Checkpoint:        {}", checkpoint.display());
+                }
+            }
+            BlobAction::ReplicaPlan {
+                destination,
+                cursor,
+                checkpoint,
+                page_size,
+                json,
+            } => {
+                let source = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+                let destination_store = FileSystemBlobStore::new(destination);
+                let page = BlobReplicaService::page(
+                    _conn,
+                    &source,
+                    &destination_store,
+                    BlobReplicaPageRequest::new(
+                        cursor,
+                        checkpoint,
+                        page_size,
+                        BlobLifecycleLimits::default(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&page).map_err(|error| format!(
+                            "failed to serialize replica plan: {error}"
+                        ))?
+                    );
+                } else {
+                    println!("Plan token:       {}", page.plan_token);
+                    println!("Source Provider:  {}", page.source_namespace_id);
+                    println!("Target Provider:  {}", page.destination_namespace_id);
+                    println!("References:       {}", page.raw_reference_count);
+                    println!("Unique references: {}", page.unique_reference_count);
+                    for item in &page.items {
+                        println!(
+                            "{:?} {} source={:?} target={:?} max={}",
+                            item.state,
+                            item.blob_id,
+                            item.source_size,
+                            item.destination_size,
+                            item.declared_max_bytes
+                        );
+                    }
+                    if let Some(next_cursor) = page.next_cursor {
+                        println!("Next cursor:      {next_cursor}");
+                    }
+                }
+            }
+            BlobAction::Replicate {
+                destination,
+                checkpoint,
+                page_size,
+                max_items,
+                chunk_size,
+                max_chunks,
+                max_blob_bytes,
+                lease_ttl_secs,
+            } => {
+                let source = FileSystemBlobStore::new(default_blob_store_path(_vault_path));
+                let destination_store = FileSystemBlobStore::new(destination);
+                let saved = if checkpoint.exists() {
+                    Some(read_blob_replica_checkpoint(&checkpoint)?)
+                } else {
+                    None
+                };
+                let owner_id = saved
+                    .as_ref()
+                    .map(|value| value.owner_id.clone())
+                    .unwrap_or_else(|| format!("mdbx-cli-blob-replica-{}", uuid::Uuid::new_v4()));
+                let result = BlobReplicaService::transfer(
+                    _conn,
+                    &source,
+                    &destination_store,
+                    &owner_id,
+                    saved.as_ref(),
+                    BlobReplicaTransferLimits {
+                        lifecycle: BlobLifecycleLimits::default(),
+                        page_size,
+                        max_items_per_run: max_items,
+                        transfer: BlobTransferLimits {
+                            chunk_size,
+                            max_blob_bytes,
+                            max_chunks_per_run: max_chunks,
+                            lease_ttl_secs,
+                        },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                println!("Transferred items: {}", result.transferred_items);
+                println!("Completed:         {}", result.completed);
+                if result.completed {
+                    match std::fs::remove_file(&checkpoint) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "Blob replica completed but checkpoint cleanup failed: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    write_blob_replica_checkpoint(&checkpoint, &result.checkpoint)?;
+                    println!("Checkpoint:        {}", checkpoint.display());
+                }
+                if !result.blocked_items.is_empty() {
+                    for item in result.blocked_items {
+                        println!("BLOCKED {:?} {}", item.state, item.blob_id);
+                    }
+                    return Err(
+                        "Blob replica is blocked; repair the reported Provider state before retrying"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -3651,6 +3883,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
     }
 
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_blob_replica_plan_and_replicate_converge_with_atomic_checkpoint() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Replica CLI".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let project_id = ProjectRepo::list_all(&open_unlocked(&path)).unwrap()[0]
+            .project_id
+            .clone();
+        let input =
+            std::env::temp_dir().join(format!("mdbx-cli-replica-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&input, vec![0x37_u8; 100]).unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id,
+                    entry_id: None,
+                    file: input.clone(),
+                    external: true,
+                },
+            },
+        ))
+        .unwrap();
+        let destination_directory = tempfile::tempdir().unwrap();
+        let destination = destination_directory.path().join("replica.blobs");
+        let checkpoint = destination_directory.path().join("replica.json");
+        run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::ReplicaPlan {
+                    destination: destination.clone(),
+                    cursor: None,
+                    checkpoint: None,
+                    page_size: 10,
+                    json: true,
+                },
+            },
+        ))
+        .unwrap();
+
+        let mut completed = false;
+        for _ in 0..10 {
+            run(cli(
+                &path,
+                Commands::Blob {
+                    action: BlobAction::Replicate {
+                        destination: destination.clone(),
+                        checkpoint: checkpoint.clone(),
+                        page_size: 2,
+                        max_items: 1,
+                        chunk_size: 8,
+                        max_chunks: 100,
+                        max_blob_bytes: 1024 * 1024,
+                        lease_ttl_secs: 60,
+                    },
+                },
+            ))
+            .unwrap();
+            if !checkpoint.exists() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        let conn = open_unlocked(&path);
+        let source = FileSystemBlobStore::new(default_blob_store_path(&path));
+        let destination_store = FileSystemBlobStore::new(&destination);
+        let plan = BlobReplicaService::page(
+            &conn,
+            &source,
+            &destination_store,
+            BlobReplicaPageRequest::new(None, None, 10, BlobLifecycleLimits::default()).unwrap(),
+        )
+        .unwrap();
+        assert!(plan.items.is_empty());
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
+    #[cfg(feature = "external-blob-store")]
+    #[test]
+    fn cli_blob_replicate_preserves_checkpoint_when_source_is_missing() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Replica blocked".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let project_id = ProjectRepo::list_all(&open_unlocked(&path)).unwrap()[0]
+            .project_id
+            .clone();
+        let input = std::env::temp_dir().join(format!(
+            "mdbx-cli-replica-blocked-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&input, vec![0x48_u8; 100]).unwrap();
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::Add {
+                    project_id,
+                    entry_id: None,
+                    file: input.clone(),
+                    external: true,
+                },
+            },
+        ))
+        .unwrap();
+        let source = FileSystemBlobStore::new(default_blob_store_path(&path));
+        let missing_id = source.list(None, 10).unwrap().blobs[0].blob_id.clone();
+        source.delete(&missing_id).unwrap();
+        let destination_directory = tempfile::tempdir().unwrap();
+        let destination = destination_directory.path().join("replica.blobs");
+        let checkpoint = destination_directory.path().join("replica.json");
+        let error = run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::Replicate {
+                    destination,
+                    checkpoint: checkpoint.clone(),
+                    page_size: 2,
+                    max_items: 1,
+                    chunk_size: 8,
+                    max_chunks: 1,
+                    max_blob_bytes: 1024 * 1024,
+                    lease_ttl_secs: 60,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("Blob replica is blocked"));
+        assert!(checkpoint.exists());
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(checkpoint);
+        let _ = std::fs::remove_dir_all(default_blob_store_path(&path));
+    }
+
     #[cfg(not(feature = "external-blob-store"))]
     #[test]
     fn core_cli_reports_missing_external_blob_provider_before_mutation() {
@@ -3739,6 +4126,29 @@ mod tests {
         assert!(error.contains("does not include filesystem Blob lifecycle management"));
         assert!(!destination.exists());
         assert!(!checkpoint.exists());
+
+        let replica_destination =
+            std::env::temp_dir().join(format!("mdbx-cli-core-replica-{}", uuid::Uuid::new_v4()));
+        let replica_checkpoint = replica_destination.with_extension("json");
+        let error = run(cli(
+            &path,
+            Commands::Blob {
+                action: BlobAction::Replicate {
+                    destination: replica_destination.clone(),
+                    checkpoint: replica_checkpoint.clone(),
+                    page_size: 1,
+                    max_items: 1,
+                    chunk_size: 1,
+                    max_chunks: 1,
+                    max_blob_bytes: 1,
+                    lease_ttl_secs: 60,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("does not include filesystem Blob lifecycle management"));
+        assert!(!replica_destination.exists());
+        assert!(!replica_checkpoint.exists());
     }
 
     #[test]

@@ -30,3 +30,5 @@ No MDBX1 table, attachment column, snapshot format, sync bundle, or Provider req
 ## Consequences
 
 A database sync client can discover all external bodies needed for convergence without plaintext disclosure or manual ID extraction. Missing and conflicting bodies become explicit operator-visible states instead of being mistaken for successful synchronization. The plan token is a consistency binding, not an authorization credential; transfer and Provider leases remain separate concerns.
+
+The default CLI exposes `blob replica-plan` for human or JSON inspection and `blob replicate` for bounded execution. The latter stores `mdbx-cli-blob-replica-checkpoint-v1` atomically, preserves the transfer owner, retains blocked state for repair, and removes the checkpoint only after all referenced transfer candidates converge.
