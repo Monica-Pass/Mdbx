@@ -97,6 +97,14 @@ impl SyncNegotiator {
         Ok(())
     }
 
+    /// Advertise the complete optional Blob synchronization contract.
+    pub fn enable_blob_replication_capabilities(&mut self) -> SyncResult<()> {
+        for capability in BLOB_SYNC_CAPABILITIES {
+            self.enable_capability(capability)?;
+        }
+        Ok(())
+    }
+
     /// Build the local Hello. New peers do not put an unbounded commit-ID
     /// inventory in this message once paging is enabled locally.
     pub fn local_hello(&self) -> SyncResult<HelloRequest> {
@@ -257,6 +265,14 @@ impl SyncNegotiator {
     pub fn capability_is_negotiated(&self, capability: &str) -> bool {
         self.local_capabilities.contains(capability)
             && self.remote_capabilities.contains(capability)
+    }
+
+    /// Blob replication is enabled only when both peers negotiated every
+    /// capability needed for bounded, resumable transfer.
+    pub fn blob_replication_is_negotiated(&self) -> bool {
+        BLOB_SYNC_CAPABILITIES
+            .iter()
+            .all(|capability| self.capability_is_negotiated(capability))
     }
 
     pub fn transfer_mode(&self) -> SyncTransferMode {
@@ -640,6 +656,47 @@ mod tests {
         let legacy_response = responder.on_hello(&legacy_hello).unwrap();
         assert!(legacy_response.capabilities.is_empty());
         assert!(!responder.capability_is_negotiated(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+    }
+
+    #[test]
+    fn blob_replication_requires_the_complete_three_capability_contract() {
+        let mut responder = SyncNegotiator::new_incremental("device-a", Vec::new(), Vec::new())
+            .unwrap();
+        responder.enable_blob_replication_capabilities().unwrap();
+
+        let partial = HelloRequest::new("partial", Vec::new(), Vec::new())
+            .with_capabilities(vec![
+                CAPABILITY_BLOB_MANIFEST_PAGING_V1.to_string(),
+                CAPABILITY_BLOB_CHUNK_TRANSFER_V1.to_string(),
+            ])
+            .unwrap();
+        let partial_response = responder.on_hello(&partial).unwrap();
+        assert!(!responder.blob_replication_is_negotiated());
+        assert!(!partial_response.supports(CAPABILITY_BLOB_TRANSFER_RESUME_V1));
+        assert_eq!(responder.transfer_mode(), SyncTransferMode::CompleteState);
+
+        let mut initiator = SyncNegotiator::new_incremental("device-b", Vec::new(), Vec::new())
+            .unwrap();
+        initiator.enable_blob_replication_capabilities().unwrap();
+        let hello = initiator.local_hello().unwrap();
+        let response = responder.on_hello(&hello).unwrap();
+        initiator.on_hello_ack(&response).unwrap();
+
+        assert!(responder.blob_replication_is_negotiated());
+        assert!(initiator.blob_replication_is_negotiated());
+        assert_eq!(
+            responder.transfer_mode(),
+            SyncTransferMode::IncrementalBundleV4
+        );
+        assert_eq!(
+            initiator.transfer_mode(),
+            SyncTransferMode::IncrementalBundleV4
+        );
+
+        let legacy = HelloRequest::new("legacy", Vec::new(), Vec::new());
+        let legacy_response = responder.on_hello(&legacy).unwrap();
+        assert!(legacy_response.capabilities.is_empty());
+        assert!(!responder.blob_replication_is_negotiated());
     }
 
     #[test]

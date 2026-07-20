@@ -32,6 +32,11 @@ pub const INCREMENTAL_SYNC_CAPABILITIES: [&str; 4] = [
     CAPABILITY_INCREMENTAL_BUNDLE_V4,
     CAPABILITY_INCREMENTAL_RESUME_V1,
 ];
+pub const BLOB_SYNC_CAPABILITIES: [&str; 3] = [
+    CAPABILITY_BLOB_MANIFEST_PAGING_V1,
+    CAPABILITY_BLOB_CHUNK_TRANSFER_V1,
+    CAPABILITY_BLOB_TRANSFER_RESUME_V1,
+];
 
 // ---------------------------------------------------------------------------
 // 顶层消息容器
