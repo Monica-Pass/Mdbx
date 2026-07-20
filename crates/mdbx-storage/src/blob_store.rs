@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{StorageError, StorageResult};
 
 pub const MAX_BLOB_PAGE_SIZE: usize = 1_000;
+pub const MAX_BLOB_TRANSFER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_BLOB_LEASE_TTL_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedBlobMetadata {
@@ -40,6 +42,57 @@ pub trait ManageableEncryptedBlobStore: EncryptedBlobStore {
     fn list(&self, cursor: Option<&str>, limit: usize) -> StorageResult<EncryptedBlobPage>;
 
     fn delete(&self, blob_id: &str) -> StorageResult<bool>;
+
+    /// Returns whether a transfer or other Provider operation currently owns
+    /// an unexpired lease for this object. Existing Providers remain source
+    /// compatible because the default is an unleased object.
+    fn is_leased(&self, _blob_id: &str) -> StorageResult<bool> {
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobLease {
+    pub blob_id: String,
+    pub owner_id: String,
+    pub expires_at_unix_secs: i64,
+}
+
+/// Optional bounded transfer capability layered above the stable Blob store
+/// contract. Implementations must make writes idempotent for an already
+/// completed content-addressed object and persist incomplete chunks until the
+/// caller resumes or abandons the transfer.
+pub trait EncryptedBlobTransferStore: EncryptedBlobStore {
+    fn namespace_id(&self) -> StorageResult<String>;
+
+    fn read_chunk(&self, blob_id: &str, offset: u64, max_bytes: usize) -> StorageResult<Vec<u8>>;
+
+    fn write_chunk(
+        &self,
+        blob_id: &str,
+        total_size: u64,
+        offset: u64,
+        chunk: &[u8],
+        finalize: bool,
+    ) -> StorageResult<()>;
+
+    fn acquire_lease(
+        &self,
+        blob_id: &str,
+        owner_id: &str,
+        now_unix_secs: i64,
+        ttl_secs: i64,
+    ) -> StorageResult<BlobLease>;
+
+    fn renew_lease(
+        &self,
+        blob_id: &str,
+        owner_id: &str,
+        now_unix_secs: i64,
+        ttl_secs: i64,
+    ) -> StorageResult<BlobLease>;
+
+    fn release_lease(&self, blob_id: &str, owner_id: &str) -> StorageResult<()>;
 }
 
 pub fn validate_blob_id(blob_id: &str) -> StorageResult<()> {
@@ -63,15 +116,17 @@ pub fn compute_blob_id(encrypted_blob: &[u8]) -> String {
 #[cfg(feature = "filesystem-blob-store")]
 mod filesystem {
     use std::ffi::OsStr;
-    use std::fs::{self, File};
-    use std::io::{Read, Write};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::NamedTempFile;
 
     use super::{
-        compute_blob_id, validate_blob_id, EncryptedBlobMetadata, EncryptedBlobPage,
-        EncryptedBlobStore, ManageableEncryptedBlobStore, MAX_BLOB_PAGE_SIZE,
+        compute_blob_id, validate_blob_id, BlobLease, EncryptedBlobMetadata, EncryptedBlobPage,
+        EncryptedBlobStore, EncryptedBlobTransferStore, ManageableEncryptedBlobStore,
+        MAX_BLOB_LEASE_TTL_SECS, MAX_BLOB_PAGE_SIZE, MAX_BLOB_TRANSFER_CHUNK_SIZE,
     };
     use crate::error::{StorageError, StorageResult};
 
@@ -125,6 +180,83 @@ mod filesystem {
                 }
             }
             Ok(path)
+        }
+
+        fn sidecar_root(&self, suffix: &str) -> PathBuf {
+            let mut path = self.root.clone();
+            path.set_extension(suffix);
+            path
+        }
+
+        fn sidecar_path(
+            &self,
+            suffix: &str,
+            blob_id: &str,
+            extension: &str,
+        ) -> StorageResult<PathBuf> {
+            validate_blob_id(blob_id)?;
+            let directory = self.sidecar_root(suffix);
+            fs::create_dir_all(&directory)?;
+            let metadata = fs::symlink_metadata(&directory)?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(StorageError::BlobStore(format!(
+                    "Blob Provider sidecar is not a regular directory: {}",
+                    directory.display()
+                )));
+            }
+            Ok(directory.join(format!("{blob_id}.{extension}")))
+        }
+
+        fn lease_path(&self, blob_id: &str) -> StorageResult<PathBuf> {
+            self.sidecar_path("leases", blob_id, "lease")
+        }
+
+        fn transfer_path(&self, blob_id: &str) -> StorageResult<PathBuf> {
+            self.sidecar_path("transfers", blob_id, "part")
+        }
+
+        fn read_lease(path: &Path) -> StorageResult<Option<(String, i64)>> {
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(StorageError::Io(error)),
+            };
+            let text = String::from_utf8(bytes).map_err(|_| {
+                StorageError::BlobStore("Blob lease record is not UTF-8".to_string())
+            })?;
+            let mut lines = text.lines();
+            let owner = lines.next().unwrap_or_default().to_string();
+            let expiry = lines
+                .next()
+                .ok_or_else(|| {
+                    StorageError::BlobStore("Blob lease record is truncated".to_string())
+                })?
+                .parse::<i64>()
+                .map_err(|_| StorageError::BlobStore("Blob lease expiry is invalid".to_string()))?;
+            if owner.is_empty() || lines.next().is_some() {
+                return Err(StorageError::BlobStore(
+                    "Blob lease record is malformed".to_string(),
+                ));
+            }
+            Ok(Some((owner, expiry)))
+        }
+
+        fn validate_lease_inputs(
+            owner_id: &str,
+            now_unix_secs: i64,
+            ttl_secs: i64,
+        ) -> StorageResult<()> {
+            if owner_id.is_empty() || owner_id.len() > 512 || owner_id.contains('\n') {
+                return Err(StorageError::Validation(
+                    "Blob lease owner ID must contain 1 to 512 bytes without newlines".to_string(),
+                ));
+            }
+            if now_unix_secs < 0 || !(1..=MAX_BLOB_LEASE_TTL_SECS).contains(&ttl_secs) {
+                return Err(StorageError::Validation(format!(
+                    "Blob lease time must be non-negative and TTL must be between 1 and {MAX_BLOB_LEASE_TTL_SECS} seconds"
+                )));
+            }
+            Ok(())
         }
 
         fn read_verified(&self, blob_id: &str, max_bytes: usize) -> StorageResult<Vec<u8>> {
@@ -368,6 +500,11 @@ mod filesystem {
         }
 
         fn delete(&self, blob_id: &str) -> StorageResult<bool> {
+            if self.is_leased(blob_id)? {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob {blob_id} is protected by an active Provider lease"
+                )));
+            }
             let path = self.blob_path(blob_id)?;
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -389,6 +526,236 @@ mod filesystem {
                 }
             }
             Ok(true)
+        }
+
+        fn is_leased(&self, blob_id: &str) -> StorageResult<bool> {
+            let path = self.lease_path(blob_id)?;
+            let Some((_owner, expiry)) = Self::read_lease(&path)? else {
+                return Ok(false);
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .try_into()
+                .unwrap_or(i64::MAX);
+            if expiry <= now {
+                let _ = fs::remove_file(path);
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+
+    impl EncryptedBlobTransferStore for FileSystemBlobStore {
+        fn namespace_id(&self) -> StorageResult<String> {
+            <Self as ManageableEncryptedBlobStore>::namespace_id(self)
+        }
+
+        fn read_chunk(
+            &self,
+            blob_id: &str,
+            offset: u64,
+            max_bytes: usize,
+        ) -> StorageResult<Vec<u8>> {
+            validate_blob_id(blob_id)?;
+            if !(1..=MAX_BLOB_TRANSFER_CHUNK_SIZE).contains(&max_bytes) {
+                return Err(StorageError::Validation(format!(
+                    "Blob transfer chunk size must be between 1 and {MAX_BLOB_TRANSFER_CHUNK_SIZE}"
+                )));
+            }
+            let path = self.blob_path(blob_id)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::BlobStore(format!("blob {blob_id} is missing"))
+                } else {
+                    StorageError::Io(error)
+                }
+            })?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(StorageError::BlobStore(format!(
+                    "blob {blob_id} is not a regular file"
+                )));
+            }
+            if offset > metadata.len() {
+                return Err(StorageError::Validation(format!(
+                    "Blob transfer offset {offset} exceeds blob size {}",
+                    metadata.len()
+                )));
+            }
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let remaining = metadata.len() - offset;
+            let amount = remaining.min(max_bytes as u64) as usize;
+            let mut chunk = vec![0; amount];
+            file.read_exact(&mut chunk)?;
+            Ok(chunk)
+        }
+
+        fn write_chunk(
+            &self,
+            blob_id: &str,
+            total_size: u64,
+            offset: u64,
+            chunk: &[u8],
+            finalize: bool,
+        ) -> StorageResult<()> {
+            validate_blob_id(blob_id)?;
+            if total_size == 0
+                || total_size > usize::MAX as u64
+                || chunk.len() > MAX_BLOB_TRANSFER_CHUNK_SIZE
+            {
+                return Err(StorageError::Validation(
+                    "Blob transfer size is outside supported bounds".to_string(),
+                ));
+            }
+            let end = offset.checked_add(chunk.len() as u64).ok_or_else(|| {
+                StorageError::Validation("Blob transfer offset overflow".to_string())
+            })?;
+            if end > total_size || finalize != (end == total_size) {
+                return Err(StorageError::Validation(
+                    "Blob transfer chunk boundary is invalid".to_string(),
+                ));
+            }
+            let destination = self.blob_path(blob_id)?;
+            if destination.exists() {
+                self.read_verified(blob_id, total_size as usize)?;
+                if offset == total_size && chunk.is_empty() && finalize {
+                    return Ok(());
+                }
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob {blob_id} already exists with a complete body"
+                )));
+            }
+            let partial = self.transfer_path(blob_id)?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&partial)?;
+            let current = file.metadata()?.len();
+            if current != offset {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob transfer checkpoint offset {offset} does not match staged size {current}"
+                )));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(chunk)?;
+            file.sync_all()?;
+            if finalize {
+                drop(file);
+                let bytes = fs::read(&partial)?;
+                if bytes.len() as u64 != total_size || compute_blob_id(&bytes) != blob_id {
+                    return Err(StorageError::BlobStore(format!(
+                        "Blob {blob_id} failed final transfer verification"
+                    )));
+                }
+                let destination = self.prepare_parent(blob_id)?;
+                match fs::rename(&partial, &destination) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        self.read_verified(blob_id, total_size as usize)?;
+                        let _ = fs::remove_file(&partial);
+                        Ok(())
+                    }
+                    Err(error) => Err(StorageError::Io(error)),
+                }
+            } else {
+                Ok(())
+            }
+        }
+
+        fn acquire_lease(
+            &self,
+            blob_id: &str,
+            owner_id: &str,
+            now_unix_secs: i64,
+            ttl_secs: i64,
+        ) -> StorageResult<BlobLease> {
+            Self::validate_lease_inputs(owner_id, now_unix_secs, ttl_secs)?;
+            let path = self.lease_path(blob_id)?;
+            if let Some((existing_owner, expiry)) = Self::read_lease(&path)? {
+                if expiry > now_unix_secs && existing_owner != owner_id {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob {blob_id} is leased by another owner"
+                    )));
+                }
+                if expiry > now_unix_secs {
+                    return self.renew_lease(blob_id, owner_id, now_unix_secs, ttl_secs);
+                }
+                if expiry <= now_unix_secs {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            let expires = now_unix_secs.checked_add(ttl_secs).ok_or_else(|| {
+                StorageError::Validation("Blob lease expiry overflow".to_string())
+            })?;
+            let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob {blob_id} is leased by another owner"
+                    )));
+                }
+                Err(error) => return Err(StorageError::Io(error)),
+            };
+            writeln!(file, "{owner_id}\n{expires}")?;
+            file.sync_all()?;
+            Ok(BlobLease {
+                blob_id: blob_id.to_string(),
+                owner_id: owner_id.to_string(),
+                expires_at_unix_secs: expires,
+            })
+        }
+
+        fn renew_lease(
+            &self,
+            blob_id: &str,
+            owner_id: &str,
+            now_unix_secs: i64,
+            ttl_secs: i64,
+        ) -> StorageResult<BlobLease> {
+            Self::validate_lease_inputs(owner_id, now_unix_secs, ttl_secs)?;
+            let path = self.lease_path(blob_id)?;
+            let Some((existing_owner, expiry)) = Self::read_lease(&path)? else {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob {blob_id} has no active lease"
+                )));
+            };
+            if existing_owner != owner_id || expiry <= now_unix_secs {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "Blob {blob_id} lease is not owned by this transfer"
+                )));
+            }
+            let expires = now_unix_secs.checked_add(ttl_secs).ok_or_else(|| {
+                StorageError::Validation("Blob lease expiry overflow".to_string())
+            })?;
+            let temporary = NamedTempFile::new_in(path.parent().unwrap())?;
+            let mut file = temporary.as_file();
+            writeln!(file, "{owner_id}\n{expires}")?;
+            file.sync_all()?;
+            temporary
+                .persist(&path)
+                .map_err(|error| StorageError::Io(error.error))?;
+            Ok(BlobLease {
+                blob_id: blob_id.to_string(),
+                owner_id: owner_id.to_string(),
+                expires_at_unix_secs: expires,
+            })
+        }
+
+        fn release_lease(&self, blob_id: &str, owner_id: &str) -> StorageResult<()> {
+            let path = self.lease_path(blob_id)?;
+            if let Some((existing_owner, _)) = Self::read_lease(&path)? {
+                if existing_owner != owner_id {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob {blob_id} lease is owned by another transfer"
+                    )));
+                }
+                let _ = fs::remove_file(path);
+            }
+            Ok(())
         }
     }
 }
@@ -491,5 +858,43 @@ mod tests {
         std::fs::create_dir_all(directory.path()).unwrap();
         std::fs::write(directory.path().join("unexpected"), b"data").unwrap();
         assert!(store.list(None, 10).is_err());
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn filesystem_blob_leases_are_reentrant_and_stale_owner_is_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileSystemBlobStore::new(directory.path().join("lease-test.blobs"));
+        let blob_id = compute_blob_id(b"leased ciphertext");
+
+        store.acquire_lease(&blob_id, "first", 10, 10).unwrap();
+        let renewed = store.acquire_lease(&blob_id, "first", 11, 20).unwrap();
+        assert_eq!(renewed.expires_at_unix_secs, 31);
+        assert!(store.acquire_lease(&blob_id, "second", 12, 10).is_err());
+
+        let recovered = store.acquire_lease(&blob_id, "second", 32, 10).unwrap();
+        assert_eq!(recovered.owner_id, "second");
+        store.release_lease(&blob_id, "second").unwrap();
+    }
+
+    #[cfg(feature = "filesystem-blob-store")]
+    #[test]
+    fn filesystem_delete_observes_a_lease_from_another_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("shared.blobs");
+        let writer = FileSystemBlobStore::new(&root);
+        let maintenance = FileSystemBlobStore::new(&root);
+        let ciphertext = b"cross-process lease";
+        let blob_id = compute_blob_id(ciphertext);
+        writer.put(&blob_id, ciphertext).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        writer.acquire_lease(&blob_id, "copy", now, 60).unwrap();
+
+        assert!(maintenance.delete(&blob_id).is_err());
+        writer.release_lease(&blob_id, "copy").unwrap();
+        assert!(maintenance.delete(&blob_id).unwrap());
     }
 }

@@ -20,6 +20,7 @@ pub struct CapabilitySet {
     pub bounded_sync_state: bool,
     pub external_blob_references: bool,
     pub external_blob_lifecycle: bool,
+    pub external_blob_transfer: bool,
     pub filesystem_blob_store: bool,
     pub kdbx_import: bool,
     pub kdbx_export: bool,
@@ -47,6 +48,7 @@ impl CapabilitySet {
             bounded_sync_state: true,
             external_blob_references: true,
             external_blob_lifecycle: true,
+            external_blob_transfer: true,
             filesystem_blob_store: cfg!(feature = "filesystem-blob-store"),
             kdbx_import: cfg!(feature = "kdbx-import"),
             kdbx_export: cfg!(feature = "kdbx-export"),
@@ -79,6 +81,7 @@ mod tests {
         assert!(capabilities.bounded_sync_state);
         assert!(capabilities.external_blob_references);
         assert!(capabilities.external_blob_lifecycle);
+        assert!(capabilities.external_blob_transfer);
     }
 
     #[test]
