@@ -190,6 +190,12 @@ operation returns its original commit without running the writes again. Keep the
 to one finite user action, not the lifetime of an editor page. Two explicit user saves should be two
 operations rather than an unbounded transaction.
 
+#### Adapter Payload Schema Migration
+
+MDBX file-format migration and domain payload migration use separate interfaces. MDBX1, SQLite schema, and field-ciphertext upgrades always use the storage-core migrator; clients do not convert them. The Adapter for an ObjectTypeId interprets that type's domain payload.
+
+Register every ExtensionCapabilityId required by the CollectionProfile before calling `PayloadMigrationRepo::create_plan` or the UniFFI `create_payload_migration_plan` method. A plan contains bounded decrypted payloads and must remain in protected process memory rather than logs, caches, or sync metadata. The Adapter supplies exactly one output for every planned object and calls `PayloadMigrationRepo::execute` or `execute_payload_migration`. Any concurrent object, Profile, or branch change fails the complete batch without partial updates. A successful batch creates one commit. When `remaining_count` is greater than zero, create a fresh plan for the next batch.
+
 ### 4.2 Deletion Must Use Tombstones
 
 Deleting an object must:

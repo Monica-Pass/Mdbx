@@ -71,6 +71,8 @@
 
 客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
 
+`create_payload_migration_plan` 为一个 ObjectTypeId 建立有界迁移计划。`MdbxPayloadMigrationPlan.items` 包含 Adapter 需要解释的源 payload 字节、源摘要和对象 head。Adapter 为每项生成 `MdbxPayloadMigrationOutput` 后调用 `execute_payload_migration`。核心会复核 Profile、能力、分支 head、对象 head、类型、版本和摘要，并在一个事务及一条 commit 内更新整个批次。计划最多包含 256 项，单项最多 1 MiB，源和目标批次分别最多 8 MiB；`remaining_count` 表示仍需后续批次处理的对象数量。迁移计划包含解密后的敏感内容，客户端不得记录或持久化。
+
 `EntryRecord` 包含：
 
 - `entry_id`

@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
     CollectionProfile, CollectionTypeId, Conflict, ConflictObjectType, ConflictResolution,
-    EntryType, ExtensionCapabilityId, ObjectSummary, ObjectTypeId, RelationKindId, Tombstone,
-    UnlockMethodType,
+    EntryType, ExtensionCapabilityId, ObjectSummary, ObjectTypeId, PayloadMigrationExecution,
+    PayloadMigrationOutput, PayloadMigrationPlan, PayloadMigrationPlanItem, RelationKindId,
+    Tombstone, UnlockMethodType,
 };
 use mdbx_core::tiga::{
     AuditLevel, AuthorizationConstraint, AuthorizationDecision, AuthorizationOutcome,
@@ -28,8 +29,9 @@ use mdbx_storage::repo::{
     CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo, CommitOperation, ConflictRepo,
     EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
-    ObjectSummaryRepo, OperationExecution, PermanentPurgeReceipt, ProjectRepo,
-    TombstonePurgeBlocker, TombstonePurgeEligibility, TombstonePurgeScheduleResult, TombstoneRepo,
+    ObjectSummaryRepo, OperationExecution, PayloadMigrationPlanRequest, PayloadMigrationRepo,
+    PermanentPurgeReceipt, ProjectRepo, TombstonePurgeBlocker, TombstonePurgeEligibility,
+    TombstonePurgeScheduleResult, TombstoneRepo,
 };
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
@@ -371,6 +373,111 @@ pub struct MdbxObjectRecord {
     pub payload_json: String,
     pub payload_schema_version: u32,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationPlanItem {
+    pub object_id: String,
+    pub object_head_commit_id: String,
+    pub source_payload_digest: Vec<u8>,
+    pub source_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationPlan {
+    pub plan_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub source_schema_version: u32,
+    pub target_schema_version: u32,
+    pub branch_id: String,
+    pub branch_name: String,
+    pub branch_head_commit_id: String,
+    pub collection_profile_digest: Option<Vec<u8>>,
+    pub items: Vec<MdbxPayloadMigrationPlanItem>,
+    pub remaining_count: u64,
+    pub total_source_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationOutput {
+    pub object_id: String,
+    pub target_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationExecution {
+    pub commit_id: String,
+    pub migrated_count: u32,
+    pub already_committed: bool,
+}
+
+impl From<PayloadMigrationPlanItem> for MdbxPayloadMigrationPlanItem {
+    fn from(value: PayloadMigrationPlanItem) -> Self {
+        Self {
+            object_id: value.object_id,
+            object_head_commit_id: value.object_head_commit_id,
+            source_payload_digest: value.source_payload_digest,
+            source_payload: value.source_payload,
+        }
+    }
+}
+
+impl From<PayloadMigrationPlan> for MdbxPayloadMigrationPlan {
+    fn from(value: PayloadMigrationPlan) -> Self {
+        Self {
+            plan_id: value.plan_id,
+            collection_id: value.collection_id,
+            object_type_id: value.object_type_id.to_string(),
+            source_schema_version: value.source_schema_version,
+            target_schema_version: value.target_schema_version,
+            branch_id: value.branch_id,
+            branch_name: value.branch_name,
+            branch_head_commit_id: value.branch_head_commit_id,
+            collection_profile_digest: value.collection_profile_digest,
+            items: value.items.into_iter().map(Into::into).collect(),
+            remaining_count: value.remaining_count,
+            total_source_bytes: value.total_source_bytes,
+        }
+    }
+}
+
+impl MdbxPayloadMigrationPlan {
+    fn into_core(self) -> Result<PayloadMigrationPlan, MdbxFfiError> {
+        Ok(PayloadMigrationPlan {
+            plan_id: self.plan_id,
+            collection_id: self.collection_id,
+            object_type_id: parse_object_type_id(&self.object_type_id)?,
+            source_schema_version: self.source_schema_version,
+            target_schema_version: self.target_schema_version,
+            branch_id: self.branch_id,
+            branch_name: self.branch_name,
+            branch_head_commit_id: self.branch_head_commit_id,
+            collection_profile_digest: self.collection_profile_digest,
+            items: self
+                .items
+                .into_iter()
+                .map(|item| PayloadMigrationPlanItem {
+                    object_id: item.object_id,
+                    object_head_commit_id: item.object_head_commit_id,
+                    source_payload_digest: item.source_payload_digest,
+                    source_payload: item.source_payload,
+                })
+                .collect(),
+            remaining_count: self.remaining_count,
+            total_source_bytes: self.total_source_bytes,
+        })
+    }
+}
+
+impl From<PayloadMigrationExecution> for MdbxPayloadMigrationExecution {
+    fn from(value: PayloadMigrationExecution) -> Self {
+        Self {
+            commit_id: value.commit_id,
+            migrated_count: value.migrated_count,
+            already_committed: value.already_committed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1440,6 +1547,52 @@ impl MdbxVault {
             },
         )?;
         Ok(collection_profile_from_core(profile))
+    }
+
+    /// Build a bounded Adapter payload migration plan. The returned payloads
+    /// are decrypted bytes; the Adapter owns their interpretation and
+    /// conversion, while storage rechecks every binding during execution.
+    pub fn create_payload_migration_plan(
+        &self,
+        collection_id: String,
+        object_type_id: String,
+        source_schema_version: u32,
+        target_schema_version: u32,
+        max_items: u32,
+        branch_id: Option<String>,
+    ) -> Result<MdbxPayloadMigrationPlan, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(PayloadMigrationRepo::create_plan(
+            &conn,
+            PayloadMigrationPlanRequest {
+                collection_id,
+                object_type_id: parse_object_type_id(&object_type_id)?,
+                source_schema_version,
+                target_schema_version,
+                max_items: max_items as usize,
+                branch_id,
+            },
+        )?
+        .into())
+    }
+
+    /// Apply Adapter-produced payloads as one idempotent user operation.
+    pub fn execute_payload_migration(
+        &self,
+        plan: MdbxPayloadMigrationPlan,
+        outputs: Vec<MdbxPayloadMigrationOutput>,
+    ) -> Result<MdbxPayloadMigrationExecution, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let plan = plan.into_core()?;
+        let outputs = outputs
+            .into_iter()
+            .map(|output| PayloadMigrationOutput {
+                object_id: output.object_id,
+                target_payload: output.target_payload,
+            })
+            .collect::<Vec<_>>();
+        let ctx = CommitContext::new(self.device_id.clone());
+        Ok(PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs)?.into())
     }
 
     pub fn execute_write_operation(
@@ -3039,6 +3192,72 @@ mod tests {
                 1,
             )
             .is_err());
+    }
+
+    #[test]
+    fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let vault = MdbxVault {
+            conn: Mutex::new(conn),
+            device_id: "ffi-migration-device".to_string(),
+            vault_id: "ffi-migration-vault".to_string(),
+        };
+        let collection = vault.create_project("Mail".to_string()).unwrap();
+        vault
+            .set_extension_capabilities(vec!["com.monica.mail.payload-v2".to_string()])
+            .unwrap();
+        vault
+            .set_collection_profile(
+                collection.project_id.clone(),
+                "com.monica.mail".to_string(),
+                b"profile".to_vec(),
+                1,
+                vec!["com.monica.mail.message".to_string()],
+                vec!["com.monica.mail.payload-v2".to_string()],
+            )
+            .unwrap();
+        let object = vault
+            .create_object(
+                collection.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                "Message".to_string(),
+                r#"{"version":1}"#.to_string(),
+                1,
+            )
+            .unwrap();
+
+        let plan = vault
+            .create_payload_migration_plan(
+                collection.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                1,
+                2,
+                16,
+                None,
+            )
+            .unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].object_id, object.object_id);
+        assert_eq!(plan.items[0].source_payload, br#"{"version":1}"#);
+
+        let result = vault
+            .execute_payload_migration(
+                plan,
+                vec![MdbxPayloadMigrationOutput {
+                    object_id: object.object_id.clone(),
+                    target_payload: br#"{"version":2}"#.to_vec(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(result.migrated_count, 1);
+        assert!(!result.already_committed);
+        let migrated = vault
+            .get_object(collection.project_id, object.object_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.payload_schema_version, 2);
+        assert_eq!(migrated.payload_json, r#"{"version":2}"#);
     }
 
     #[test]

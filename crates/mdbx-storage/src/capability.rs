@@ -11,6 +11,7 @@ pub struct CapabilitySet {
     pub generic_objects: bool,
     pub generic_metadata: bool,
     pub collection_profiles: bool,
+    pub payload_migrations: bool,
     pub commit_history: bool,
     pub conflicts: bool,
     pub snapshots: bool,
@@ -36,6 +37,7 @@ impl CapabilitySet {
             generic_objects: true,
             generic_metadata: true,
             collection_profiles: true,
+            payload_migrations: true,
             commit_history: true,
             conflicts: true,
             snapshots: true,
@@ -66,6 +68,7 @@ mod tests {
         assert!(capabilities.generic_objects);
         assert!(capabilities.generic_metadata);
         assert!(capabilities.collection_profiles);
+        assert!(capabilities.payload_migrations);
         assert!(capabilities.commit_history);
         assert!(capabilities.conflicts);
         assert!(capabilities.snapshots);

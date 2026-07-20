@@ -200,6 +200,34 @@ impl VaultConnection {
         }
     }
 
+    /// Run a group of reads against one SQLite snapshot.
+    pub(crate) fn with_read_transaction<T>(
+        &self,
+        f: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        if !self.conn.is_autocommit() {
+            return f();
+        }
+
+        self.conn
+            .execute_batch("BEGIN DEFERRED TRANSACTION;")
+            .map_err(StorageError::Database)?;
+        match f() {
+            Ok(value) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT;") {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    Err(StorageError::Database(error))
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn with_immediate_transaction_mut<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> StorageResult<T>,

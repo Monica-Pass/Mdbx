@@ -71,6 +71,8 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 
 Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
 
+`create_payload_migration_plan` creates a bounded migration plan for one ObjectTypeId. `MdbxPayloadMigrationPlan.items` carries the source payload bytes, source digest, and object head that the Adapter needs to interpret. After producing one `MdbxPayloadMigrationOutput` per item, call `execute_payload_migration`. The core rechecks the Profile, capabilities, branch head, object heads, type, versions, and digests, then updates the complete batch in one transaction and one commit. A plan contains at most 256 items, each item is at most 1 MiB, and source and target batches are each limited to 8 MiB. `remaining_count` reports objects for later batches. Plans contain decrypted sensitive data and must not be logged or persisted by the client.
+
 `EntryRecord` contains:
 
 - `entry_id`

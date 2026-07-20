@@ -314,6 +314,54 @@ impl EntryRepo {
         )
     }
 
+    pub(crate) fn list_for_payload_migration(
+        conn: &VaultConnection,
+        project_id: &str,
+        entry_type: &EntryType,
+        payload_schema_version: u32,
+        limit: usize,
+    ) -> StorageResult<Vec<Entry>> {
+        query_entries(
+            conn,
+            "SELECT entry_id, project_id, entry_type, title_ct, payload_ct,
+                    payload_schema_version, tiga_mode_override, object_clock,
+                    head_commit_id, deleted, created_at, updated_at,
+                    created_by_device_id, updated_by_device_id
+             FROM entries
+             WHERE deleted = 0 AND project_id = ?1 AND entry_type = ?2
+                   AND payload_schema_version = ?3
+             ORDER BY entry_id LIMIT ?4",
+            params![
+                project_id,
+                entry_type.to_string(),
+                payload_schema_version as i64,
+                limit as i64
+            ],
+        )
+    }
+
+    pub(crate) fn count_for_payload_migration(
+        conn: &VaultConnection,
+        project_id: &str,
+        entry_type: &EntryType,
+        payload_schema_version: u32,
+    ) -> StorageResult<u64> {
+        conn.inner()
+            .query_row(
+                "SELECT COUNT(*) FROM entries
+                 WHERE deleted = 0 AND project_id = ?1 AND entry_type = ?2
+                       AND payload_schema_version = ?3",
+                params![
+                    project_id,
+                    entry_type.to_string(),
+                    payload_schema_version as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(StorageError::Database)
+    }
+
     fn list_where(
         conn: &VaultConnection,
         where_clause: &str,
@@ -328,53 +376,7 @@ impl EntryRepo {
             where_clause
         );
 
-        let mut stmt = conn.inner().prepare(&sql)?;
-        let rows = stmt.query_map(params, |row| {
-            let eid: String = row.get(0)?;
-            let raw_title: Option<Vec<u8>> = row.get(3)?;
-            let raw_payload: Vec<u8> = row.get(4)?;
-            Ok(Entry {
-                entry_id: eid.clone(),
-                project_id: row.get(1)?,
-                entry_type: {
-                    let s: String = row.get(2)?;
-                    s.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            Type::Text,
-                            Box::new(StorageError::Validation(error)),
-                        )
-                    })?
-                },
-                title_ct: raw_title
-                    .map(|t| {
-                        Self::decrypt_metadata(conn, &eid, "title", &t).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(3, Type::Blob, Box::new(e))
-                        })
-                    })
-                    .transpose()?,
-                payload_ct: Self::decrypt_record(conn, &eid, "payload", &raw_payload).map_err(
-                    |e| rusqlite::Error::FromSqlConversionFailure(4, Type::Blob, Box::new(e)),
-                )?,
-                payload_schema_version: read_payload_schema_version(row, 5)?,
-                tiga_mode_override: row
-                    .get::<_, Option<String>>(6)?
-                    .and_then(|s| s.parse().ok()),
-                object_clock: row.get(7)?,
-                head_commit_id: row.get(8)?,
-                deleted: row.get::<_, i32>(9)? != 0,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                created_by_device_id: row.get(12)?,
-                updated_by_device_id: row.get(13)?,
-            })
-        })?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row?);
-        }
-        Ok(entries)
+        query_entries(conn, &sql, params)
     }
 
     // -----------------------------------------------------------------------
@@ -733,6 +735,57 @@ impl EntryRepo {
     ) -> StorageResult<Vec<u8>> {
         Self::decrypt_record(conn, entry_id, "payload", ciphertext)
     }
+}
+
+fn query_entries(
+    conn: &VaultConnection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> StorageResult<Vec<Entry>> {
+    let mut stmt = conn.inner().prepare(sql)?;
+    let rows = stmt.query_map(params, |row| {
+        let eid: String = row.get(0)?;
+        let raw_title: Option<Vec<u8>> = row.get(3)?;
+        let raw_payload: Vec<u8> = row.get(4)?;
+        Ok(Entry {
+            entry_id: eid.clone(),
+            project_id: row.get(1)?,
+            entry_type: {
+                let value: String = row.get(2)?;
+                value.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        Type::Text,
+                        Box::new(StorageError::Validation(error)),
+                    )
+                })?
+            },
+            title_ct: raw_title
+                .map(|title| {
+                    EntryRepo::decrypt_metadata(conn, &eid, "title", &title).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(3, Type::Blob, Box::new(error))
+                    })
+                })
+                .transpose()?,
+            payload_ct: EntryRepo::decrypt_record(conn, &eid, "payload", &raw_payload).map_err(
+                |error| rusqlite::Error::FromSqlConversionFailure(4, Type::Blob, Box::new(error)),
+            )?,
+            payload_schema_version: read_payload_schema_version(row, 5)?,
+            tiga_mode_override: row
+                .get::<_, Option<String>>(6)?
+                .and_then(|value| value.parse().ok()),
+            object_clock: row.get(7)?,
+            head_commit_id: row.get(8)?,
+            deleted: row.get::<_, i32>(9)? != 0,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+            created_by_device_id: row.get(12)?,
+            updated_by_device_id: row.get(13)?,
+        })
+    })?;
+
+    rows.map(|row| row.map_err(StorageError::Database))
+        .collect()
 }
 
 fn read_payload_schema_version(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u32> {

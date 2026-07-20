@@ -48,6 +48,12 @@ The core preserves every valid ObjectTypeId exactly. An unknown identifier remai
 
 `PayloadSchemaVersion` is the unsigned version of the payload contract owned by an ObjectTypeId. It is independent from the MDBX database schema version. A domain adapter migrates its own plaintext payload after authenticated decryption; the core stores and synchronizes the declared version.
 
+### PayloadMigrationPlan
+
+A `PayloadMigrationPlan` is a bounded, short-lived description for advancing one ObjectTypeId payload contract. The storage core creates the plan from one consistent database snapshot and binds it to the CollectionProfile, branch head, object heads, source schema version, and digests of payload bytes obtained after authenticated decryption. The plan returns source payload bytes only to the Adapter that registered the Collection's required capabilities.
+
+The Adapter interprets each source payload and returns target payload bytes. The storage core revalidates the complete plan in one write transaction, applies every output through the Generic Object Module, records one CommitOperation, and rolls back the complete batch on any mismatch. Plans are not persisted because they contain decrypted Adapter payloads and become stale whenever bound state changes.
+
 ### ObjectRelation
 
 An `ObjectRelation` is a typed directed edge between stable objects. It represents mail thread membership, reply relationships, bookmark aliases, label membership, contact links, Steam account ownership, or future cross-domain references. Relation kinds use stable namespaced identifiers and participate in commit, tombstone, snapshot, and synchronization rules.
@@ -132,12 +138,18 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 26. CollectionProfile existence is monotonic and CollectionTypeId is immutable. Legacy payloads that omit the profile preserve the receiver's current profile.
 27. User-visible writes to a profiled Collection require every declared ExtensionCapabilityId and must use an allowed ObjectTypeId. Synchronization and recovery preserve unknown profiled data without requiring its adapter.
 28. New synchronization producers emit `mdbx-storage-sync-state-v2`. Readers continue to accept state-v1; older readers encounter an unsupported format instead of silently discarding CollectionProfile semantics.
+29. Database-format migration and Adapter payload migration are separate protocols. MDBX1 and storage schema conversion remain mandatory storage-core responsibilities; clients never reimplement them.
+30. Adapter payload migration plans are bounded to 256 objects, 1 MiB per source or target payload, and 8 MiB total source or target bytes per operation.
+31. A payload migration executes only while its CollectionProfile, branch head, object identity, object head, object type, source schema version, deletion state, and source payload digest still match.
+32. One payload migration plan produces one idempotent CommitOperation. Missing outputs, duplicate outputs, unavailable Adapter capabilities, stale bindings, invalid versions, or oversized payloads cause complete rollback.
 
 ## Module Architecture
 
 ### Generic Object Module
 
 The Generic Object Module is the primary Interface for Collection, CollectionProfile, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, capability checks, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
+
+The module also owns bounded payload migration planning and execution. It exposes decrypted source bytes only in a short-lived plan, treats Adapter output as untrusted input, and preserves existing ObjectVersion, synchronization, snapshot, and MDBX1 table semantics by applying target payloads through EntryRepo inside one CommitOperation.
 
 ### Legacy Password Adapter
 

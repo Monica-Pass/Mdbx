@@ -9,6 +9,7 @@ pub mod object_label;
 pub mod object_relation;
 pub mod object_summary;
 pub mod object_version;
+pub mod payload_migration;
 pub mod project;
 pub mod snapshot;
 pub mod tombstone;
@@ -29,6 +30,7 @@ pub use object_label::{
 pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
 pub use object_summary::{ObjectSummaryRepo, MAX_OBJECT_SUMMARY_PAGE_SIZE};
 pub use object_version::ObjectVersionRepo;
+pub use payload_migration::{PayloadMigrationPlanRequest, PayloadMigrationRepo};
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
 pub use tombstone::{

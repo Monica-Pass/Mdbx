@@ -188,6 +188,12 @@ MDBX2 写入客户端 SHOULD 在用户动作开始时生成稳定的 `operation_
 只返回原 commit，不再次执行写入。事务边界应覆盖一个有限的用户动作，不应跨越整个编辑器
 页面生命周期。用户明确点击两次“保存”时，应生成两个 operation，而不是无限追加到同一个事务。
 
+#### Adapter payload schema 迁移
+
+MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLite schema 和字段密文格式升级始终调用 storage core 迁移器，客户端不得自行转换。ObjectTypeId 的领域 payload 由对应 Adapter 解释。
+
+客户端先注册 CollectionProfile 所需的 ExtensionCapabilityId，再调用 `PayloadMigrationRepo::create_plan`，或者 UniFFI 的 `create_payload_migration_plan`。计划包含有界解密 payload，必须留在受保护的进程内存中，不得写日志、缓存或同步元数据。Adapter 必须为计划中的每个对象生成一次输出，然后调用 `PayloadMigrationRepo::execute` 或 `execute_payload_migration`。执行期间任一对象、Profile 或分支发生变化时，整批失败且保持原状态。成功批次只产生一条 commit；`remaining_count` 大于零时，以新计划继续下一批。
+
 ### 4.2 删除必须走 tombstone
 
 删除对象时 MUST：

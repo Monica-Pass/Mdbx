@@ -3,6 +3,7 @@ pub mod collection;
 pub mod commit;
 pub mod entry;
 pub mod object_metadata;
+pub mod payload_migration;
 pub mod project;
 pub mod unlock;
 
@@ -18,5 +19,11 @@ pub use commit::{
 };
 pub use entry::{Entry, EntryType, ObjectSummary, ObjectSummaryPage, ObjectTypeId};
 pub use object_metadata::{ObjectLabel, ObjectLabelAssignment, ObjectRelation, RelationKindId};
+pub use payload_migration::{
+    payload_migration_digest, validate_payload_migration_outputs, PayloadMigrationExecution,
+    PayloadMigrationOutput, PayloadMigrationPlan, PayloadMigrationPlanItem,
+    MAX_PAYLOAD_MIGRATION_ITEMS, MAX_PAYLOAD_MIGRATION_ITEM_BYTES,
+    MAX_PAYLOAD_MIGRATION_TOTAL_BYTES, PAYLOAD_MIGRATION_DIGEST_BYTES,
+};
 pub use project::Project;
 pub use unlock::{KdfParams, UnlockMethod, UnlockMethodType, VaultSession};
