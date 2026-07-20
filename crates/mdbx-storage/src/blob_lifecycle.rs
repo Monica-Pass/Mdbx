@@ -225,6 +225,13 @@ impl BlobLifecycleService {
                 failures: Vec::new(),
             };
             for blob in plan.eligible_orphans {
+                if blob_store.is_leased(&blob.blob_id)? {
+                    result.failures.push(BlobGcFailure {
+                        blob_id: blob.blob_id,
+                        detail: "Blob is protected by an active Provider lease".to_string(),
+                    });
+                    continue;
+                }
                 match blob_store.delete(&blob.blob_id) {
                     Ok(true) => result.deleted_blob_ids.push(blob.blob_id),
                     Ok(false) => result.already_absent_blob_ids.push(blob.blob_id),
@@ -475,6 +482,9 @@ fn build_report(
             continue;
         }
         if blob.modified_at_unix_secs <= options.orphan_cutoff_unix_secs {
+            if blob_store.is_leased(&blob.blob_id)? {
+                continue;
+            }
             if eligible_orphans.len() >= options.limits.max_gc_candidates {
                 return Err(StorageError::Validation(format!(
                     "eligible orphan count exceeds the maintenance limit of {}",
@@ -565,6 +575,7 @@ mod tests {
     struct MemoryBlobStore {
         blobs: Mutex<BTreeMap<String, (Vec<u8>, i64)>>,
         failed_deletes: Mutex<BTreeSet<String>>,
+        leased: Mutex<BTreeSet<String>>,
         put_modified_at: Mutex<i64>,
     }
 
@@ -605,6 +616,14 @@ mod tests {
 
         fn allow_delete(&self, blob_id: &str) {
             self.failed_deletes.lock().unwrap().remove(blob_id);
+        }
+
+        fn lease(&self, blob_id: &str) {
+            self.leased.lock().unwrap().insert(blob_id.to_string());
+        }
+
+        fn release_lease(&self, blob_id: &str) {
+            self.leased.lock().unwrap().remove(blob_id);
         }
     }
 
@@ -673,12 +692,21 @@ mod tests {
         }
 
         fn delete(&self, blob_id: &str) -> StorageResult<bool> {
+            if self.leased.lock().unwrap().contains(blob_id) {
+                return Err(StorageError::ConstraintViolation(format!(
+                    "test Blob {blob_id} is leased"
+                )));
+            }
             if self.failed_deletes.lock().unwrap().contains(blob_id) {
                 return Err(StorageError::BlobStore(format!(
                     "test deletion failed for {blob_id}"
                 )));
             }
             Ok(self.blobs.lock().unwrap().remove(blob_id).is_some())
+        }
+
+        fn is_leased(&self, blob_id: &str) -> StorageResult<bool> {
+            Ok(self.leased.lock().unwrap().contains(blob_id))
         }
     }
 
@@ -915,6 +943,43 @@ mod tests {
         .unwrap();
         assert!(retry.completed());
         assert_eq!(retry.deleted_blob_ids, vec![second]);
+    }
+
+    #[test]
+    fn gc_excludes_active_leases_and_rejects_a_lease_added_after_planning() {
+        let (conn, _ctx, _project_id) = setup();
+        let store = MemoryBlobStore::default();
+        let leased = store.insert_at(b"leased orphan", 1);
+        store.lease(&leased);
+        let protected_plan =
+            BlobLifecycleService::plan_gc(&conn, &store, 100, BlobLifecycleLimits::default())
+                .unwrap();
+        assert!(protected_plan.eligible_orphans.is_empty());
+
+        store.release_lease(&leased);
+        let plan =
+            BlobLifecycleService::plan_gc(&conn, &store, 100, BlobLifecycleLimits::default())
+                .unwrap();
+        assert_eq!(plan.eligible_orphans.len(), 1);
+        store.lease(&leased);
+        let session = session(1_000);
+        let device = device();
+        let (result, _) = BlobLifecycleService::apply_gc_authorized(
+            &conn,
+            &store,
+            &plan.plan_token,
+            100,
+            BlobLifecycleLimits::default(),
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: 1_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.planned_count, 0);
+        assert!(result.deleted_blob_ids.is_empty());
+        assert!(store.blob_ids().contains(&leased));
     }
 
     #[test]
