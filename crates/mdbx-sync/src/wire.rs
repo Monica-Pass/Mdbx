@@ -53,6 +53,149 @@ pub struct SyncWireFrame {
     pub message: SyncMessage,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SyncWireResume {
+    pub session_id: String,
+    pub next_outbound_sequence: u64,
+    pub next_inbound_sequence: u64,
+}
+
+impl SyncWireResume {
+    pub fn new(session_id: String) -> SyncResult<Self> {
+        let resume = Self {
+            session_id,
+            next_outbound_sequence: 1,
+            next_inbound_sequence: 1,
+        };
+        resume.validate()?;
+        Ok(resume)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_session_id(&self.session_id)?;
+        if self.next_outbound_sequence == 0 || self.next_inbound_sequence == 0 {
+            return Err(SyncError::InvalidMessage(
+                "sync wire resume sequences must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ordered wire state. Inbound sequence state advances only after an
+/// application calls acknowledge_inbound after durable processing.
+#[derive(Debug, Clone)]
+pub struct SyncWireSession {
+    resume: SyncWireResume,
+    pending_inbound_sequence: Option<u64>,
+}
+
+impl SyncWireSession {
+    pub fn new(session_id: String) -> SyncResult<Self> {
+        Self::restore(SyncWireResume::new(session_id)?)
+    }
+
+    pub fn restore(resume: SyncWireResume) -> SyncResult<Self> {
+        resume.validate()?;
+        Ok(Self {
+            resume,
+            pending_inbound_sequence: None,
+        })
+    }
+
+    pub fn resume(&self) -> &SyncWireResume {
+        &self.resume
+    }
+
+    pub fn pending_inbound_sequence(&self) -> Option<u64> {
+        self.pending_inbound_sequence
+    }
+
+    pub fn encode_outbound(
+        &mut self,
+        message: SyncMessage,
+        in_reply_to: Option<u64>,
+        limits: SyncWireLimits,
+    ) -> SyncResult<Vec<u8>> {
+        let frame = SyncWireFrame::new(
+            self.resume.session_id.clone(),
+            self.resume.next_outbound_sequence,
+            in_reply_to,
+            message,
+        )?;
+        let bytes = frame.to_wire_bytes(limits)?;
+        self.resume.next_outbound_sequence = self
+            .resume
+            .next_outbound_sequence
+            .checked_add(1)
+            .ok_or_else(|| SyncError::InvalidMessage("sync wire sequence overflow".to_string()))?;
+        Ok(bytes)
+    }
+
+    pub fn accept_inbound_bytes(
+        &mut self,
+        bytes: &[u8],
+        limits: SyncWireLimits,
+    ) -> SyncResult<SyncWireFrame> {
+        let frame = SyncWireFrame::from_wire_bytes(bytes, limits)?;
+        self.accept_inbound_frame(frame)
+    }
+
+    pub fn accept_inbound_frame(&mut self, frame: SyncWireFrame) -> SyncResult<SyncWireFrame> {
+        frame.validate()?;
+        if frame.session_id != self.resume.session_id {
+            return Err(SyncError::Protocol(
+                "sync wire frame belongs to another session".to_string(),
+            ));
+        }
+        if let Some(pending) = self.pending_inbound_sequence {
+            return Err(SyncError::Protocol(format!(
+                "sync wire sequence {pending} is awaiting acknowledgement"
+            )));
+        }
+        if frame.sequence < self.resume.next_inbound_sequence {
+            return Err(SyncError::Protocol(format!(
+                "sync wire sequence {} is a replay; expected {}",
+                frame.sequence, self.resume.next_inbound_sequence
+            )));
+        }
+        if frame.sequence > self.resume.next_inbound_sequence {
+            return Err(SyncError::Protocol(format!(
+                "sync wire sequence {} is out of order; expected {}",
+                frame.sequence, self.resume.next_inbound_sequence
+            )));
+        }
+        self.pending_inbound_sequence = Some(frame.sequence);
+        Ok(frame)
+    }
+
+    pub fn acknowledge_inbound(&mut self, sequence: u64) -> SyncResult<()> {
+        if self.pending_inbound_sequence != Some(sequence) {
+            return Err(SyncError::Protocol(
+                "sync wire acknowledgement does not match the pending frame".to_string(),
+            ));
+        }
+        self.resume.next_inbound_sequence = self
+            .resume
+            .next_inbound_sequence
+            .checked_add(1)
+            .ok_or_else(|| SyncError::InvalidMessage("sync wire sequence overflow".to_string()))?;
+        self.pending_inbound_sequence = None;
+        Ok(())
+    }
+
+    pub fn discard_inbound(&mut self, sequence: u64) -> SyncResult<()> {
+        if self.pending_inbound_sequence != Some(sequence) {
+            return Err(SyncError::Protocol(
+                "sync wire discard does not match the pending frame".to_string(),
+            ));
+        }
+        self.pending_inbound_sequence = None;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WirePayload {
     session_id: String,
@@ -464,5 +607,63 @@ mod tests {
             oversized.to_wire_bytes(limits),
             Err(SyncError::ResourceLimit { .. })
         ));
+    }
+
+    #[test]
+    fn session_requires_ordered_acknowledgement_and_rejects_replays() {
+        let mut sender = SyncWireSession::new("session-1".to_string()).unwrap();
+        let mut receiver = SyncWireSession::new("session-1".to_string()).unwrap();
+        let bytes = sender
+            .encode_outbound(
+                SyncMessage::Done(SyncDone {
+                    device_id: "sender".to_string(),
+                    total_commits: 0,
+                    final_heads: Vec::new(),
+                }),
+                None,
+                SyncWireLimits::default(),
+            )
+            .unwrap();
+        let frame = receiver
+            .accept_inbound_bytes(&bytes, SyncWireLimits::default())
+            .unwrap();
+        assert_eq!(frame.sequence, 1);
+        assert_eq!(receiver.pending_inbound_sequence(), Some(1));
+        assert!(receiver
+            .accept_inbound_bytes(&bytes, SyncWireLimits::default())
+            .is_err());
+        receiver.acknowledge_inbound(1).unwrap();
+        assert!(receiver
+            .accept_inbound_bytes(&bytes, SyncWireLimits::default())
+            .is_err());
+
+        let mut wrong_session = frame;
+        wrong_session.session_id = "other-session".to_string();
+        assert!(receiver.accept_inbound_frame(wrong_session).is_err());
+
+        let resume = receiver.resume().clone();
+        let encoded = serde_json::to_vec(&resume).unwrap();
+        let restored: SyncWireResume = serde_json::from_slice(&encoded).unwrap();
+        let restored = SyncWireSession::restore(restored).unwrap();
+        assert_eq!(restored.resume().next_inbound_sequence, 2);
+    }
+
+    #[test]
+    fn session_rejects_out_of_order_without_advancing_resume() {
+        let mut receiver = SyncWireSession::new("session-1".to_string()).unwrap();
+        let frame = SyncWireFrame::new(
+            "session-1".to_string(),
+            2,
+            None,
+            SyncMessage::Done(SyncDone {
+                device_id: "sender".to_string(),
+                total_commits: 0,
+                final_heads: Vec::new(),
+            }),
+        )
+        .unwrap();
+        assert!(receiver.accept_inbound_frame(frame).is_err());
+        assert_eq!(receiver.resume().next_inbound_sequence, 1);
+        assert_eq!(receiver.pending_inbound_sequence(), None);
     }
 }
