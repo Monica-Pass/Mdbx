@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v11, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v12, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -22,6 +22,7 @@ pub const MIGRATION_TOMBSTONE_DELETE_PROOF: &str = "mdbx-2-tombstone-delete-proo
 pub const MIGRATION_PURGE_RECEIPTS: &str = "mdbx-2-purge-receipts-v1";
 pub const MIGRATION_TIGA_ATTACHMENT_SCOPE: &str = "mdbx-2-tiga-attachment-scope-v1";
 pub const MIGRATION_COLLECTION_PROFILES: &str = "mdbx-2-collection-profiles-v1";
+pub const MIGRATION_COMMIT_INVENTORY: &str = "mdbx-2-commit-inventory-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -284,6 +285,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v9::create_extensions(conn)?;
         v10::create_extensions(conn)?;
         v11::create_extensions(conn)?;
+        v12::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -292,6 +294,13 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
              (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![MIGRATION_V1_TO_V2, from_format, FORMAT_V2, now],
+        )
+        .map_err(StorageError::Database)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![MIGRATION_COMMIT_INVENTORY, from_format, FORMAT_V2, now],
         )
         .map_err(StorageError::Database)?;
 
@@ -351,6 +360,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v9::create_extensions(conn)?;
         v10::create_extensions(conn)?;
         v11::create_extensions(conn)?;
+        v12::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
         conn.execute(
@@ -406,6 +416,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_COLLECTION_PROFILES, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_COMMIT_INVENTORY, FORMAT_V2, now],
         )?;
         conn.execute(
             "UPDATE vault_meta SET schema_version = ?1, tiga_policy_version = ?2,
@@ -609,6 +625,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "tombstone_acknowledgements",
         "purge_receipts",
         "collection_profiles",
+        "commit_inventory",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -616,6 +633,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
             )));
         }
     }
+    v12::validate_commit_inventory(conn)?;
     for column in [
         "operation_id",
         "commit_id",
@@ -897,7 +915,15 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
+        let inventory_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_COMMIT_INVENTORY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inventory_migration_count, 1);
         let policy_state: (i64, String) = conn
             .query_row(
                 "SELECT tiga_policy_version, tiga_compliance_status FROM vault_meta",
@@ -981,7 +1007,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -1445,6 +1471,165 @@ mod tests {
         assert!(table_exists(&conn, "object_relations").unwrap());
         assert!(table_exists(&conn, "object_labels").unwrap());
         assert!(table_exists(&conn, "object_label_assignments").unwrap());
+        assert!(table_exists(&conn, "commit_inventory").unwrap());
+    }
+
+    #[test]
+    fn schema12_migration_backfills_causally_and_remains_idempotent() {
+        let conn = v1_database();
+        for (commit_id, local_seq, created_at) in [
+            ("child", 1_i64, "2026-07-20T00:00:00Z"),
+            ("parent", 2_i64, "2026-07-20T00:00:01Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO commits
+                    (commit_id, device_id, local_seq, commit_kind, change_scope,
+                     changed_object_ids_ct, vector_clock, created_at, integrity_tag)
+                 VALUES (?1, 'device-1', ?2, 'change', 'vault', X'5B5D', '{}', ?3, X'00')",
+                params![commit_id, local_seq, created_at],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO commit_parents (commit_id, parent_commit_id)
+             VALUES ('child', 'parent')",
+            [],
+        )
+        .unwrap();
+
+        let before: Vec<(String, String, i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT commit_id, device_id, local_seq, created_at
+                     FROM commits ORDER BY commit_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+
+        let info = upgrade_to_latest(&conn).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        let sequences: (i64, i64) = conn
+            .query_row(
+                "SELECT parent.inventory_seq, child.inventory_seq
+                 FROM commit_inventory parent CROSS JOIN commit_inventory child
+                 WHERE parent.commit_id = 'parent' AND child.commit_id = 'child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(sequences.0 < sequences.1);
+
+        let after: Vec<(String, String, i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT commit_id, device_id, local_seq, created_at
+                     FROM commits ORDER BY commit_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(after, before);
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commit_parents
+                 WHERE commit_id = 'child' AND parent_commit_id = 'parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 1);
+
+        upgrade_to_latest(&conn).unwrap();
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_COMMIT_INVENTORY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+        let sequences_after: (i64, i64) = conn
+            .query_row(
+                "SELECT parent.inventory_seq, child.inventory_seq
+                 FROM commit_inventory parent CROSS JOIN commit_inventory child
+                 WHERE parent.commit_id = 'parent' AND child.commit_id = 'child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sequences_after, sequences);
+
+        conn.execute(
+            "INSERT INTO commits
+                (commit_id, device_id, local_seq, commit_kind, change_scope,
+                 changed_object_ids_ct, vector_clock, created_at, integrity_tag)
+             VALUES ('future', 'device-1', 3, 'change', 'vault', X'5B5D', '{}',
+                     '2026-07-20T00:00:02Z', X'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO commit_parents (commit_id, parent_commit_id)
+             VALUES ('future', 'child')",
+            [],
+        )
+        .unwrap();
+        let future_seq: i64 = conn
+            .query_row(
+                "SELECT inventory_seq FROM commit_inventory WHERE commit_id = 'future'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(future_seq > sequences.1);
+    }
+
+    #[test]
+    fn schema12_migration_rejects_a_cycle_and_rolls_back() {
+        let conn = v1_database();
+        for (commit_id, local_seq) in [("cycle-a", 1_i64), ("cycle-b", 2_i64)] {
+            conn.execute(
+                "INSERT INTO commits
+                    (commit_id, device_id, local_seq, commit_kind, change_scope,
+                     changed_object_ids_ct, vector_clock, created_at, integrity_tag)
+                 VALUES (?1, 'device-1', ?2, 'change', 'vault', X'5B5D', '{}',
+                         '2026-07-20T00:00:00Z', X'00')",
+                params![commit_id, local_seq],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO commit_parents (commit_id, parent_commit_id)
+             VALUES ('cycle-a', 'cycle-b');
+             INSERT INTO commit_parents (commit_id, parent_commit_id)
+             VALUES ('cycle-b', 'cycle-a');",
+        )
+        .unwrap();
+
+        let error = upgrade_to_latest(&conn).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("commit DAG is cyclic or damaged"));
+        assert!(!table_exists(&conn, "commit_inventory").unwrap());
+        assert!(!v2::column_exists(&conn, "vault_meta", "schema_version").unwrap());
+        let format: String = conn
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
     }
 
     #[test]
