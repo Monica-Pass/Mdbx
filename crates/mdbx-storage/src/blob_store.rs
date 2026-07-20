@@ -619,12 +619,12 @@ mod filesystem {
             }
             let destination = self.blob_path(blob_id)?;
             if destination.exists() {
-                self.read_verified(blob_id, total_size as usize)?;
-                if offset == total_size && chunk.is_empty() && finalize {
+                let completed = self.read_verified(blob_id, total_size as usize)?;
+                if completed.len() as u64 == total_size {
                     return Ok(());
                 }
                 return Err(StorageError::ConstraintViolation(format!(
-                    "Blob {blob_id} already exists with a complete body"
+                    "Blob {blob_id} exists with a different declared size"
                 )));
             }
             let partial = self.transfer_path(blob_id)?;
@@ -635,14 +635,33 @@ mod filesystem {
                 .write(true)
                 .open(&partial)?;
             let current = file.metadata()?.len();
-            if current != offset {
+            if current < offset {
                 return Err(StorageError::ConstraintViolation(format!(
-                    "Blob transfer checkpoint offset {offset} does not match staged size {current}"
+                    "Blob transfer checkpoint offset {offset} is ahead of staged size {current}"
                 )));
             }
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(chunk)?;
-            file.sync_all()?;
+            if current > offset {
+                if end > current {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob transfer replay from {offset} overlaps staged size {current}"
+                    )));
+                }
+                file.seek(SeekFrom::Start(offset))?;
+                let mut staged = vec![0; chunk.len()];
+                file.read_exact(&mut staged)?;
+                if staged != chunk {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "Blob transfer replay at offset {offset} does not match staged ciphertext"
+                    )));
+                }
+                if !finalize {
+                    return Ok(());
+                }
+            } else {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(chunk)?;
+                file.sync_all()?;
+            }
             if finalize {
                 drop(file);
                 let bytes = fs::read(&partial)?;

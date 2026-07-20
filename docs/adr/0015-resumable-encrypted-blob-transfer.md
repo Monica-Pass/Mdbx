@@ -16,6 +16,8 @@ MDBX2 adds the optional `EncryptedBlobTransferStore` capability without changing
 
 The filesystem Provider stores incomplete bodies and leases in sibling sidecar directories so Blob inventory remains a strict digest-prefix tree. Partial writes are synchronized before the checkpoint advances. Lease acquisition uses exclusive creation, supports renewal by the same owner, rejects a different live owner, and permits takeover after expiry. Both source and destination are leased for each transfer call. Leases are released on successful, incomplete, and failed calls; a process crash leaves an expiring record.
 
+Checkpoint persistence and Provider writes cannot form one atomic transaction. If a crash leaves the durable partial body ahead of the saved checkpoint, the source replays old chunks. The filesystem Provider compares replayed ciphertext with the already staged range before accepting it. If the complete content-addressed object was published before the checkpoint update, its exact size and SHA-256 identity make the stale replay idempotent.
+
 Garbage collection asks the manageable Provider whether each Blob is leased and refuses deletion while a lease is active. The filesystem `delete` implementation repeats that check immediately before removing the file, covering a lease acquired after planning.
 
 ## Compatibility

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,7 +56,7 @@ impl BlobTransferLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobTransferCheckpoint {
     pub source_namespace_id: String,
     pub destination_namespace_id: String,
@@ -331,7 +332,31 @@ mod tests {
         assert!(!first.completed);
         assert_eq!(first.checkpoint.transferred_bytes, 16);
 
-        let mut checkpoint = first.checkpoint;
+        let advanced_but_not_saved = BlobTransferService::transfer(
+            &source,
+            &destination,
+            &blob_id,
+            ciphertext.len() as u64,
+            "transfer-test",
+            Some(&first.checkpoint),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(advanced_but_not_saved.checkpoint.transferred_bytes, 32);
+        let replayed = BlobTransferService::transfer(
+            &source,
+            &destination,
+            &blob_id,
+            ciphertext.len() as u64,
+            "transfer-test",
+            Some(&first.checkpoint),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(replayed.checkpoint.transferred_bytes, 32);
+
+        let mut checkpoint = replayed.checkpoint;
+        let before_completion = checkpoint.clone();
         loop {
             let result = BlobTransferService::transfer(
                 &source,
@@ -349,6 +374,18 @@ mod tests {
             }
         }
         assert_eq!(destination.get(&blob_id, 100).unwrap(), ciphertext);
+
+        let recovered_after_publish = BlobTransferService::transfer(
+            &source,
+            &destination,
+            &blob_id,
+            ciphertext.len() as u64,
+            "transfer-test",
+            Some(&before_completion),
+            limits,
+        )
+        .unwrap();
+        assert!(recovered_after_publish.completed);
 
         let repeated = BlobTransferService::transfer(
             &source,
