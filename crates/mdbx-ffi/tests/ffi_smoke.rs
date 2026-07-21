@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
-    default_write_operation_limits, inspect_vault_migration, open_vault,
-    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
-    MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
-    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxPolicyCompliance, MdbxTigaMode,
-    MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
+    default_attachment_batch_limits, default_write_operation_limits, inspect_vault_migration,
+    open_vault, open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    MdbxAttachmentBatchCommand, MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome,
+    MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError,
+    MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
+    MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use mdbx_storage::migration::CURRENT_SCHEMA_VERSION;
 use uuid::Uuid;
@@ -401,6 +402,65 @@ fn generic_metadata_write_operation_is_available_to_external_clients() {
     assert_eq!(
         vault.list_object_label_assignments(first_entry_id).unwrap()[0].assignment_id,
         assignment_id
+    );
+}
+
+#[test]
+fn attachment_batch_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("attachment-batch");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "attachment batch password 12345!".to_string(),
+        "ffi-attachment-batch-device".to_string(),
+    )
+    .unwrap();
+    let project = vault.create_project("Mail".to_string()).unwrap();
+    let first_id = Uuid::new_v4().to_string();
+    let second_id = Uuid::new_v4().to_string();
+    let before = count_rows(vault_path.path(), "commits");
+    let mut limits = default_attachment_batch_limits();
+    limits.max_commands = 2;
+    limits.max_plaintext_bytes_per_command = 64;
+    limits.max_plaintext_bytes = 128;
+    limits.chunk_size = 3;
+
+    let result = vault
+        .execute_attachment_batch_with_limits(
+            Uuid::new_v4().to_string(),
+            vec![
+                MdbxAttachmentBatchCommand::Create {
+                    attachment_id: first_id.clone(),
+                    project_id: project.project_id.clone(),
+                    entry_id: None,
+                    file_name: "first.eml".to_string(),
+                    media_type: Some("message/rfc822".to_string()),
+                    content: b"first".to_vec(),
+                },
+                MdbxAttachmentBatchCommand::Create {
+                    attachment_id: second_id.clone(),
+                    project_id: project.project_id,
+                    entry_id: None,
+                    file_name: "second.eml".to_string(),
+                    media_type: Some("message/rfc822".to_string()),
+                    content: b"second".to_vec(),
+                },
+            ],
+            limits,
+        )
+        .unwrap();
+
+    assert_eq!(count_rows(vault_path.path(), "commits"), before + 1);
+    assert_eq!(
+        result
+            .attachments
+            .iter()
+            .map(|attachment| attachment.attachment_id.clone())
+            .collect::<Vec<_>>(),
+        vec![first_id.clone(), second_id]
+    );
+    assert_eq!(
+        vault.read_attachment_content(first_id, 64).unwrap(),
+        b"first"
     );
 }
 

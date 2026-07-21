@@ -635,16 +635,69 @@ pub struct MdbxAttachmentWriteResult {
     pub already_committed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxAttachmentBatchCommand {
+    Create {
+        attachment_id: String,
+        project_id: String,
+        entry_id: Option<String>,
+        file_name: String,
+        media_type: Option<String>,
+        content: Vec<u8>,
+    },
+    Replace {
+        attachment_id: String,
+        content: Vec<u8>,
+    },
+    Rename {
+        attachment_id: String,
+        file_name: String,
+        media_type: Option<String>,
+    },
+    Delete {
+        attachment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentBatchLimits {
+    pub max_commands: u64,
+    pub max_plaintext_bytes_per_command: u64,
+    pub max_plaintext_bytes: u64,
+    pub chunk_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentBatchResult {
+    pub attachments: Vec<MdbxAttachmentRecord>,
+    pub commit_id: String,
+    pub already_committed: bool,
+}
+
 const DEFAULT_ATTACHMENT_CHUNK_SIZE: usize = 256 * 1024;
 const HARD_MAX_ATTACHMENT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
 const HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_BATCH_COMMANDS: usize = 64;
+const HARD_MAX_ATTACHMENT_BATCH_COMMANDS: usize = 512;
+const DEFAULT_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
+const HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES: usize = 256 * 1024 * 1024;
 
 #[uniffi::export]
 pub fn default_attachment_content_limits() -> MdbxAttachmentContentLimits {
     MdbxAttachmentContentLimits {
         chunk_size: DEFAULT_ATTACHMENT_CHUNK_SIZE as u64,
         max_plaintext_bytes: DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES as u64,
+    }
+}
+
+#[uniffi::export]
+pub fn default_attachment_batch_limits() -> MdbxAttachmentBatchLimits {
+    MdbxAttachmentBatchLimits {
+        max_commands: DEFAULT_MAX_ATTACHMENT_BATCH_COMMANDS as u64,
+        max_plaintext_bytes_per_command: DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES as u64,
+        max_plaintext_bytes: DEFAULT_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES as u64,
+        chunk_size: DEFAULT_ATTACHMENT_CHUNK_SIZE as u64,
     }
 }
 
@@ -2704,6 +2757,39 @@ impl MdbxVault {
         )
     }
 
+    pub fn execute_attachment_batch(
+        &self,
+        operation_id: String,
+        commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxAttachmentBatchResult, MdbxFfiError> {
+        self.execute_attachment_batch_with_limits(
+            operation_id,
+            commands,
+            default_attachment_batch_limits(),
+        )
+    }
+
+    pub fn execute_attachment_batch_with_limits(
+        &self,
+        operation_id: String,
+        commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxAttachmentBatchLimits,
+    ) -> Result<MdbxAttachmentBatchResult, MdbxFfiError> {
+        let chunk_size =
+            validate_attachment_batch_operation_inputs(&operation_id, &commands, limits)?;
+        let intent_hash = hash_attachment_batch_intent(&operation_id, &commands, limits);
+        let attachment_ids = attachment_batch_ids(&commands);
+        execute_attachment_batch_operation(
+            &self.conn,
+            &self.device_id,
+            operation_id,
+            commands,
+            chunk_size,
+            intent_hash,
+            attachment_ids,
+        )
+    }
+
     pub fn read_attachment_content(
         &self,
         attachment_id: String,
@@ -3821,6 +3907,414 @@ where
         commit_id,
         already_committed,
     })
+}
+
+fn validate_attachment_batch_operation_inputs(
+    operation_id: &str,
+    commands: &[MdbxAttachmentBatchCommand],
+    limits: MdbxAttachmentBatchLimits,
+) -> Result<usize, MdbxFfiError> {
+    if operation_id.trim().is_empty() {
+        return Err(StorageError::Validation("operation_id must not be empty".to_string()).into());
+    }
+    if commands.is_empty() {
+        return Err(
+            StorageError::Validation("attachment batch requires commands".to_string()).into(),
+        );
+    }
+    let max_commands = usize::try_from(limits.max_commands).map_err(|_| {
+        StorageError::Validation("attachment batch max_commands is too large".to_string())
+    })?;
+    if max_commands == 0 || max_commands > HARD_MAX_ATTACHMENT_BATCH_COMMANDS {
+        return Err(StorageError::Validation(format!(
+            "attachment batch max_commands must be between 1 and {HARD_MAX_ATTACHMENT_BATCH_COMMANDS}"
+        ))
+        .into());
+    }
+    if commands.len() > max_commands {
+        return Err(StorageError::ResourceLimit {
+            resource: "attachment batch commands".to_string(),
+            actual: commands.len() as u64,
+            limit: max_commands as u64,
+        }
+        .into());
+    }
+    let max_per_command =
+        usize::try_from(limits.max_plaintext_bytes_per_command).map_err(|_| {
+            StorageError::Validation("attachment batch per-command limit is too large".to_string())
+        })?;
+    if max_per_command == 0 || max_per_command > HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES {
+        return Err(StorageError::Validation(format!(
+            "attachment batch per-command bytes must be between 1 and {HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES}"
+        ))
+        .into());
+    }
+    let max_total = usize::try_from(limits.max_plaintext_bytes).map_err(|_| {
+        StorageError::Validation("attachment batch total limit is too large".to_string())
+    })?;
+    if max_total == 0 || max_total > HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES {
+        return Err(StorageError::Validation(format!(
+            "attachment batch total bytes must be between 1 and {HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES}"
+        ))
+        .into());
+    }
+    if max_per_command > max_total {
+        return Err(StorageError::Validation(
+            "attachment batch per-command limit cannot exceed total limit".to_string(),
+        )
+        .into());
+    }
+    let chunk_size = attachment_chunk_size(MdbxAttachmentContentLimits {
+        chunk_size: limits.chunk_size,
+        max_plaintext_bytes: limits.max_plaintext_bytes_per_command,
+    })?;
+    let mut total_plaintext_bytes = 0usize;
+    for command in commands {
+        match command {
+            MdbxAttachmentBatchCommand::Create {
+                attachment_id,
+                project_id,
+                entry_id,
+                file_name,
+                media_type,
+                content,
+            } => {
+                validate_uuid(attachment_id, "attachment_id")?;
+                validate_uuid(project_id, "project_id")?;
+                if let Some(entry_id) = entry_id {
+                    validate_uuid(entry_id, "entry_id")?;
+                }
+                validate_attachment_batch_text(file_name, "file_name")?;
+                if let Some(media_type) = media_type {
+                    validate_attachment_batch_text(media_type, "media_type")?;
+                }
+                add_attachment_batch_plaintext_bytes(
+                    &mut total_plaintext_bytes,
+                    content.len(),
+                    max_per_command,
+                    max_total,
+                )?;
+            }
+            MdbxAttachmentBatchCommand::Replace {
+                attachment_id,
+                content,
+            } => {
+                validate_uuid(attachment_id, "attachment_id")?;
+                add_attachment_batch_plaintext_bytes(
+                    &mut total_plaintext_bytes,
+                    content.len(),
+                    max_per_command,
+                    max_total,
+                )?;
+            }
+            MdbxAttachmentBatchCommand::Rename {
+                attachment_id,
+                file_name,
+                media_type,
+            } => {
+                validate_uuid(attachment_id, "attachment_id")?;
+                validate_attachment_batch_text(file_name, "file_name")?;
+                if let Some(media_type) = media_type {
+                    validate_attachment_batch_text(media_type, "media_type")?;
+                }
+            }
+            MdbxAttachmentBatchCommand::Delete { attachment_id } => {
+                validate_uuid(attachment_id, "attachment_id")?;
+            }
+        }
+    }
+    Ok(chunk_size)
+}
+
+fn validate_attachment_batch_text(value: &str, field: &str) -> Result<(), MdbxFfiError> {
+    if value.trim().is_empty() || value.len() > 512 {
+        return Err(StorageError::Validation(format!(
+            "attachment {field} must contain 1 to 512 UTF-8 bytes"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn add_attachment_batch_plaintext_bytes(
+    total: &mut usize,
+    actual: usize,
+    per_command_limit: usize,
+    total_limit: usize,
+) -> Result<(), MdbxFfiError> {
+    if actual > per_command_limit {
+        return Err(StorageError::ResourceLimit {
+            resource: "attachment batch command plaintext bytes".to_string(),
+            actual: actual as u64,
+            limit: per_command_limit as u64,
+        }
+        .into());
+    }
+    *total = total
+        .checked_add(actual)
+        .ok_or_else(|| StorageError::ResourceLimit {
+            resource: "attachment batch plaintext bytes".to_string(),
+            actual: u64::MAX,
+            limit: total_limit as u64,
+        })?;
+    if *total > total_limit {
+        return Err(StorageError::ResourceLimit {
+            resource: "attachment batch plaintext bytes".to_string(),
+            actual: *total as u64,
+            limit: total_limit as u64,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn attachment_batch_ids(commands: &[MdbxAttachmentBatchCommand]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for command in commands {
+        let id = match command {
+            MdbxAttachmentBatchCommand::Create { attachment_id, .. }
+            | MdbxAttachmentBatchCommand::Replace { attachment_id, .. }
+            | MdbxAttachmentBatchCommand::Rename { attachment_id, .. }
+            | MdbxAttachmentBatchCommand::Delete { attachment_id } => attachment_id,
+        };
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
+fn attachment_batch_changes(commands: &[MdbxAttachmentBatchCommand]) -> Vec<CommitChange> {
+    let mut changes = Vec::new();
+    for command in commands {
+        let (action, fields, object_id) = match command {
+            MdbxAttachmentBatchCommand::Create { attachment_id, .. } => (
+                "create",
+                vec![
+                    "project_id",
+                    "entry_id",
+                    "file_name",
+                    "media_type",
+                    "content",
+                ],
+                attachment_id,
+            ),
+            MdbxAttachmentBatchCommand::Replace { attachment_id, .. } => {
+                ("update", vec!["content"], attachment_id)
+            }
+            MdbxAttachmentBatchCommand::Rename { attachment_id, .. } => {
+                ("update", vec!["file_name", "media_type"], attachment_id)
+            }
+            MdbxAttachmentBatchCommand::Delete { attachment_id } => {
+                ("delete", vec!["deleted"], attachment_id)
+            }
+        };
+        let incoming = CommitChange {
+            object_type: "attachment".to_string(),
+            object_id: object_id.clone(),
+            action: action.to_string(),
+            fields: fields.into_iter().map(str::to_string).collect(),
+        };
+        if let Some(existing) = changes.iter_mut().find(|change: &&mut CommitChange| {
+            change.object_type == "attachment" && change.object_id == *object_id
+        }) {
+            if existing.action != incoming.action {
+                existing.action = "change".to_string();
+            }
+            for field in incoming.fields {
+                if !existing.fields.contains(&field) {
+                    existing.fields.push(field);
+                }
+            }
+        } else {
+            changes.push(incoming);
+        }
+    }
+    changes
+}
+
+fn hash_attachment_batch_intent(
+    operation_id: &str,
+    commands: &[MdbxAttachmentBatchCommand],
+    limits: MdbxAttachmentBatchLimits,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    update_attachment_intent_part(&mut hasher, b"mdbx-ffi-attachment-batch-v1");
+    update_attachment_intent_part(&mut hasher, operation_id.as_bytes());
+    update_attachment_intent_part(&mut hasher, &limits.chunk_size.to_le_bytes());
+    update_attachment_intent_part(&mut hasher, &(commands.len() as u64).to_le_bytes());
+    for command in commands {
+        match command {
+            MdbxAttachmentBatchCommand::Create {
+                attachment_id,
+                project_id,
+                entry_id,
+                file_name,
+                media_type,
+                content,
+            } => {
+                update_attachment_intent_part(&mut hasher, b"create");
+                update_attachment_intent_part(&mut hasher, attachment_id.as_bytes());
+                update_attachment_intent_part(&mut hasher, project_id.as_bytes());
+                update_attachment_intent_option(&mut hasher, entry_id.as_deref());
+                update_attachment_intent_part(&mut hasher, file_name.as_bytes());
+                update_attachment_intent_option(&mut hasher, media_type.as_deref());
+                update_attachment_intent_part(&mut hasher, content);
+            }
+            MdbxAttachmentBatchCommand::Replace {
+                attachment_id,
+                content,
+            } => {
+                update_attachment_intent_part(&mut hasher, b"replace");
+                update_attachment_intent_part(&mut hasher, attachment_id.as_bytes());
+                update_attachment_intent_part(&mut hasher, content);
+            }
+            MdbxAttachmentBatchCommand::Rename {
+                attachment_id,
+                file_name,
+                media_type,
+            } => {
+                update_attachment_intent_part(&mut hasher, b"rename");
+                update_attachment_intent_part(&mut hasher, attachment_id.as_bytes());
+                update_attachment_intent_part(&mut hasher, file_name.as_bytes());
+                update_attachment_intent_option(&mut hasher, media_type.as_deref());
+            }
+            MdbxAttachmentBatchCommand::Delete { attachment_id } => {
+                update_attachment_intent_part(&mut hasher, b"delete");
+                update_attachment_intent_part(&mut hasher, attachment_id.as_bytes());
+            }
+        }
+    }
+    hasher.finalize().to_vec()
+}
+
+fn execute_attachment_batch_operation(
+    conn: &Mutex<VaultConnection>,
+    device_id: &str,
+    operation_id: String,
+    commands: Vec<MdbxAttachmentBatchCommand>,
+    chunk_size: usize,
+    intent_hash: Vec<u8>,
+    attachment_ids: Vec<String>,
+) -> Result<MdbxAttachmentBatchResult, MdbxFfiError> {
+    let operation = CommitOperation::new(
+        operation_id,
+        "attachment-batch",
+        "main",
+        "change",
+        "attachment",
+        attachment_batch_changes(&commands),
+    )
+    .with_intent_hash(intent_hash);
+    let conn = conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+    let ctx = CommitContext::new(device_id.to_string());
+    let ids_for_action = attachment_ids.clone();
+    let execution = ctx.run_operation(&conn, operation, |scoped| {
+        execute_attachment_batch_commands(&conn, scoped, commands, chunk_size, &ids_for_action)
+    })?;
+    let (attachments, commit_id, already_committed) = match execution {
+        OperationExecution::Applied { value, commit_id } => (value, commit_id, false),
+        OperationExecution::AlreadyCommitted { commit_id } => (
+            attachment_ids
+                .iter()
+                .map(|attachment_id| {
+                    AttachmentRepo::get_by_id(&conn, attachment_id)?
+                        .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))
+                })
+                .collect::<StorageResult<Vec<_>>>()?,
+            commit_id,
+            true,
+        ),
+    };
+    Ok(MdbxAttachmentBatchResult {
+        attachments: attachments
+            .iter()
+            .map(attachment_record_from_core)
+            .collect::<Result<Vec<_>, _>>()?,
+        commit_id,
+        already_committed,
+    })
+}
+
+fn execute_attachment_batch_commands(
+    conn: &VaultConnection,
+    ctx: &CommitContext,
+    commands: Vec<MdbxAttachmentBatchCommand>,
+    chunk_size: usize,
+    attachment_ids: &[String],
+) -> StorageResult<Vec<Attachment>> {
+    for command in commands {
+        match command {
+            MdbxAttachmentBatchCommand::Create {
+                attachment_id,
+                project_id,
+                entry_id,
+                file_name,
+                media_type,
+                content,
+            } => {
+                let original_size = content.len() as u64;
+                AttachmentRepo::add_with_id(
+                    conn,
+                    ctx,
+                    &attachment_id,
+                    mdbx_storage::repo::AttachmentCreateRequest {
+                        project_id: &project_id,
+                        entry_id: entry_id.as_deref(),
+                        file_name: &file_name,
+                        media_type: media_type.as_deref(),
+                        content_hash: "",
+                        original_size,
+                    },
+                )?;
+                let mut reader = Cursor::new(content);
+                AttachmentRepo::write_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                )?;
+            }
+            MdbxAttachmentBatchCommand::Replace {
+                attachment_id,
+                content,
+            } => {
+                let original_size = content.len() as u64;
+                let mut reader = Cursor::new(content);
+                AttachmentRepo::write_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                )?;
+            }
+            MdbxAttachmentBatchCommand::Rename {
+                attachment_id,
+                file_name,
+                media_type,
+            } => {
+                AttachmentRepo::rename(
+                    conn,
+                    ctx,
+                    &attachment_id,
+                    &file_name,
+                    media_type.as_deref(),
+                )?;
+            }
+            MdbxAttachmentBatchCommand::Delete { attachment_id } => {
+                AttachmentRepo::soft_delete(conn, ctx, &attachment_id)?;
+            }
+        }
+    }
+    attachment_ids
+        .iter()
+        .map(|attachment_id| {
+            AttachmentRepo::get_by_id(conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))
+        })
+        .collect()
 }
 
 fn conservative_ffi_device_context() -> MdbxDeviceContext {
@@ -5484,6 +5978,215 @@ mod tests {
             .unwrap()
             .iter()
             .any(|attachment| attachment.attachment_id == attachment_id));
+    }
+
+    #[test]
+    fn attachment_batch_is_atomic_idempotent_and_mixes_content_metadata() {
+        let vault = ffi_test_vault();
+        let project = vault.create_project("Mail".to_string()).unwrap();
+        let first_id = Uuid::new_v4().to_string();
+        let second_id = Uuid::new_v4().to_string();
+        let operation_id = Uuid::new_v4().to_string();
+        let limits = MdbxAttachmentBatchLimits {
+            max_commands: 4,
+            max_plaintext_bytes_per_command: 64,
+            max_plaintext_bytes: 64,
+            chunk_size: 3,
+        };
+        let commands = vec![
+            MdbxAttachmentBatchCommand::Create {
+                attachment_id: first_id.clone(),
+                project_id: project.project_id.clone(),
+                entry_id: None,
+                file_name: "first.bin".to_string(),
+                media_type: Some("application/octet-stream".to_string()),
+                content: b"first-content".to_vec(),
+            },
+            MdbxAttachmentBatchCommand::Create {
+                attachment_id: second_id.clone(),
+                project_id: project.project_id,
+                entry_id: None,
+                file_name: "second.bin".to_string(),
+                media_type: None,
+                content: b"second-content".to_vec(),
+            },
+            MdbxAttachmentBatchCommand::Rename {
+                attachment_id: first_id.clone(),
+                file_name: "renamed.bin".to_string(),
+                media_type: Some("application/custom".to_string()),
+            },
+            MdbxAttachmentBatchCommand::Replace {
+                attachment_id: second_id.clone(),
+                content: b"replacement".to_vec(),
+            },
+        ];
+        let commits_before = ffi_test_count(&vault, "commits");
+        let first = vault
+            .execute_attachment_batch_with_limits(operation_id.clone(), commands.clone(), limits)
+            .unwrap();
+        assert!(!first.already_committed);
+        assert_eq!(first.attachments.len(), 2);
+        assert_eq!(first.attachments[0].attachment_id, first_id);
+        assert_eq!(first.attachments[0].file_name, "renamed.bin");
+        assert_eq!(first.attachments[1].attachment_id, second_id);
+        assert_eq!(first.attachments[1].original_size, 14);
+        assert_eq!(first.attachments[1].stored_size, 11);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+        assert_eq!(
+            vault
+                .read_attachment_content(first.attachments[0].attachment_id.clone(), 64)
+                .unwrap(),
+            b"first-content"
+        );
+        assert_eq!(
+            vault
+                .read_attachment_content(first.attachments[1].attachment_id.clone(), 64)
+                .unwrap(),
+            b"replacement"
+        );
+
+        let retry = vault
+            .execute_attachment_batch_with_limits(operation_id.clone(), commands.clone(), limits)
+            .unwrap();
+        assert!(retry.already_committed);
+        assert_eq!(retry.commit_id, first.commit_id);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+
+        let mut changed_commands = commands;
+        if let MdbxAttachmentBatchCommand::Replace { content, .. } = &mut changed_commands[3] {
+            *content = b"different-content".to_vec();
+        }
+        assert!(vault
+            .execute_attachment_batch_with_limits(operation_id, changed_commands, limits,)
+            .unwrap_err()
+            .to_string()
+            .contains("reused for a different operation"));
+
+        let deleted = vault
+            .execute_attachment_batch_with_limits(
+                Uuid::new_v4().to_string(),
+                vec![
+                    MdbxAttachmentBatchCommand::Delete {
+                        attachment_id: first.attachments[0].attachment_id.clone(),
+                    },
+                    MdbxAttachmentBatchCommand::Replace {
+                        attachment_id: first.attachments[1].attachment_id.clone(),
+                        content: b"final".to_vec(),
+                    },
+                ],
+                limits,
+            )
+            .unwrap();
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 2);
+        assert!(deleted.attachments[0].deleted);
+        assert_eq!(
+            vault
+                .read_attachment_content(first.attachments[1].attachment_id.clone(), 64)
+                .unwrap(),
+            b"final"
+        );
+        {
+            let conn = vault.conn.lock().unwrap();
+            conn.inner()
+                .execute(
+                    "UPDATE attachment_chunks SET chunk_ct = zeroblob(length(chunk_ct))
+                     WHERE attachment_id = ?1 AND chunk_index = 0",
+                    [&first.attachments[1].attachment_id],
+                )
+                .unwrap();
+        }
+        assert!(!vault
+            .verify_attachment_integrity(first.attachments[1].attachment_id.clone())
+            .unwrap());
+        assert!(vault
+            .read_attachment_content(first.attachments[1].attachment_id.clone(), 64)
+            .is_err());
+    }
+
+    #[test]
+    fn attachment_batch_rejects_partial_failures_bounds_and_missing_capability() {
+        let vault = ffi_test_vault();
+        let project = vault.create_project("Mail".to_string()).unwrap();
+        let commits_before = ffi_test_count(&vault, "commits");
+        let attachments_before = ffi_test_count(&vault, "attachments");
+        assert!(vault
+            .execute_attachment_batch(
+                Uuid::new_v4().to_string(),
+                vec![
+                    MdbxAttachmentBatchCommand::Create {
+                        attachment_id: Uuid::new_v4().to_string(),
+                        project_id: project.project_id.clone(),
+                        entry_id: None,
+                        file_name: "rolled-back.bin".to_string(),
+                        media_type: None,
+                        content: b"content".to_vec(),
+                    },
+                    MdbxAttachmentBatchCommand::Delete {
+                        attachment_id: Uuid::new_v4().to_string(),
+                    },
+                ],
+            )
+            .is_err());
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+        assert_eq!(ffi_test_count(&vault, "attachments"), attachments_before);
+
+        let small_limits = MdbxAttachmentBatchLimits {
+            max_commands: 2,
+            max_plaintext_bytes_per_command: 4,
+            max_plaintext_bytes: 8,
+            chunk_size: 2,
+        };
+        assert!(vault
+            .execute_attachment_batch_with_limits(
+                Uuid::new_v4().to_string(),
+                vec![MdbxAttachmentBatchCommand::Create {
+                    attachment_id: Uuid::new_v4().to_string(),
+                    project_id: project.project_id.clone(),
+                    entry_id: None,
+                    file_name: "oversized.bin".to_string(),
+                    media_type: None,
+                    content: b"12345".to_vec(),
+                }],
+                small_limits,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("command plaintext bytes"));
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+
+        vault
+            .set_extension_capabilities(vec!["com.monica.mail.store".to_string()])
+            .unwrap();
+        vault
+            .set_collection_profile(
+                project.project_id.clone(),
+                "com.monica.mail".to_string(),
+                b"profile".to_vec(),
+                1,
+                vec!["com.monica.mail.message".to_string()],
+                vec!["com.monica.mail.store".to_string()],
+            )
+            .unwrap();
+        vault.set_extension_capabilities(Vec::new()).unwrap();
+        let commits_before_capability_failure = ffi_test_count(&vault, "commits");
+        assert!(vault
+            .execute_attachment_batch(
+                Uuid::new_v4().to_string(),
+                vec![MdbxAttachmentBatchCommand::Create {
+                    attachment_id: Uuid::new_v4().to_string(),
+                    project_id: project.project_id,
+                    entry_id: None,
+                    file_name: "blocked.bin".to_string(),
+                    media_type: None,
+                    content: b"content".to_vec(),
+                }],
+            )
+            .is_err());
+        assert_eq!(
+            ffi_test_count(&vault, "commits"),
+            commits_before_capability_failure
+        );
+        assert_eq!(ffi_test_count(&vault, "attachments"), attachments_before);
     }
 
     #[test]
