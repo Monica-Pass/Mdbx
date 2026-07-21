@@ -7,6 +7,7 @@ mod attachment_facade;
 mod conflict_facade;
 mod extension_facade;
 mod history_facade;
+mod lifecycle_facade;
 mod object_facade;
 mod security_facade;
 mod sync_facade;
@@ -34,11 +35,11 @@ use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::key_epoch::KeyEpochRotationResult;
 use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
-use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity, RecoveryVerifier};
+use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity};
 use mdbx_storage::repo::{
     AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, CommitContext, EntryRepo,
     PermanentPurgeReceipt, TombstonePurgeBlocker, TombstonePurgeEligibility,
-    TombstonePurgeScheduleResult, TombstoneRepo,
+    TombstonePurgeScheduleResult,
 };
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
@@ -1969,108 +1970,6 @@ pub struct MdbxVault {
 
 #[uniffi::export]
 impl MdbxVault {
-    pub fn info(&self) -> VaultInfo {
-        VaultInfo {
-            vault_id: self.vault_id.clone(),
-            device_id: self.device_id.clone(),
-        }
-    }
-
-    pub fn create_backup(&self, destination: String) -> Result<MdbxBackupInfo, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(BackupService::create_portable_copy(&conn, Path::new(&destination))?.into())
-    }
-
-    pub fn health_check(&self) -> Result<MdbxHealthCheckResult, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(RecoveryVerifier::full_health_check(&conn)?.into())
-    }
-
-    pub fn evaluate_tombstone_purge_eligibility(
-        &self,
-        tombstone_id: String,
-        now: String,
-    ) -> Result<MdbxTombstonePurgeEligibility, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(TombstoneRepo::evaluate_purge_eligibility(&conn, &tombstone_id, &now)?.into())
-    }
-
-    pub fn find_tombstone_by_target(
-        &self,
-        target_object_id: String,
-    ) -> Result<Option<MdbxTombstoneRecord>, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(TombstoneRepo::find_by_target(&conn, &target_object_id)?.map(Into::into))
-    }
-
-    pub fn find_permanent_purge_receipt_by_tombstone(
-        &self,
-        tombstone_id: String,
-    ) -> Result<Option<MdbxPermanentPurgeReceipt>, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(TombstoneRepo::find_purge_receipt_by_tombstone(&conn, &tombstone_id)?.map(Into::into))
-    }
-
-    pub fn find_permanent_purge_receipt_by_target(
-        &self,
-        target_object_type: String,
-        target_object_id: String,
-    ) -> Result<Option<MdbxPermanentPurgeReceipt>, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(TombstoneRepo::find_purge_receipt_by_target(
-            &conn,
-            &target_object_type,
-            &target_object_id,
-        )?
-        .map(Into::into))
-    }
-
-    pub fn schedule_tombstone_purge(
-        &self,
-        tombstone_id: String,
-        purge_eligible_at: String,
-        device: MdbxDeviceContext,
-    ) -> Result<MdbxTombstonePurgeScheduleResult, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        let session = conn.active_session().cloned();
-        let device = device.into_core(&self.device_id);
-        let ctx = CommitContext::new(self.device_id.clone());
-        let (result, _) = TombstoneRepo::schedule_purge_authorized(
-            &conn,
-            &ctx,
-            &tombstone_id,
-            &purge_eligible_at,
-            TigaAuthorizationContext {
-                session: session.as_ref(),
-                device: &device,
-                now_unix_secs: unix_now(),
-            },
-        )?;
-        Ok(result.into())
-    }
-
-    pub fn purge_tombstone(
-        &self,
-        tombstone_id: String,
-        device: MdbxDeviceContext,
-    ) -> Result<MdbxPermanentPurgeReceipt, MdbxFfiError> {
-        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        let session = conn.active_session().cloned();
-        let device = device.into_core(&self.device_id);
-        let ctx = CommitContext::new(self.device_id.clone());
-        let (receipt, _) = TombstoneRepo::purge_authorized(
-            &conn,
-            &ctx,
-            &tombstone_id,
-            TigaAuthorizationContext {
-                session: session.as_ref(),
-                device: &device,
-                now_unix_secs: unix_now(),
-            },
-        )?;
-        Ok(receipt.into())
-    }
-
     pub fn get_attachment(
         &self,
         attachment_id: String,
@@ -2926,7 +2825,7 @@ mod tests {
     use mdbx_core::model::ConflictObjectType;
     use mdbx_storage::repo::{
         ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo, ObjectRelationCreateRequest,
-        ObjectRelationRepo, ProjectRepo,
+        ObjectRelationRepo, ProjectRepo, TombstoneRepo,
     };
     use sha2::{Digest, Sha256};
 
