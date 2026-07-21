@@ -16,10 +16,11 @@ use super::attachment_facade::{
     validate_attachment_batch_operation_inputs,
 };
 use super::{
-    entry_for_project, parse_payload_json, parse_relation_kind, parse_write_object_type,
-    validate_uuid, InternalWriteOperationLimits, MdbxAttachmentBatchCommand,
-    MdbxAttachmentBatchLimits, MdbxCompositeWriteOperationResult, MdbxFfiError, MdbxVault,
-    MdbxWriteCommand, MdbxWriteOperationResult,
+    default_attachment_batch_limits, entry_for_project, parse_payload_json, parse_relation_kind,
+    parse_write_object_type, validate_uuid, InternalWriteOperationLimits,
+    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxCompositeWriteOperationLimits,
+    MdbxCompositeWriteOperationResult, MdbxFfiError, MdbxVault, MdbxWriteCommand,
+    MdbxWriteOperationLimits, MdbxWriteOperationResult,
 };
 
 fn validate_write_operation(
@@ -759,5 +760,164 @@ fn write_operation_result(
         relation_ids,
         label_ids,
         label_assignment_ids,
+    }
+}
+
+#[uniffi::export]
+impl MdbxVault {
+    pub fn execute_write_operation(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            None,
+            operation_id,
+            operation_kind,
+            commands,
+            InternalWriteOperationLimits::default(),
+        )
+    }
+
+    pub fn execute_write_operation_with_limits(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        limits: MdbxWriteOperationLimits,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            None,
+            operation_id,
+            operation_kind,
+            commands,
+            limits.into_internal()?,
+        )
+    }
+
+    pub fn execute_write_operation_on_branch(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            Some(branch_id),
+            operation_id,
+            operation_kind,
+            commands,
+            InternalWriteOperationLimits::default(),
+        )
+    }
+
+    pub fn execute_write_operation_on_branch_with_limits(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        limits: MdbxWriteOperationLimits,
+    ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
+        execute_write_operation_for_branch(
+            self,
+            Some(branch_id),
+            operation_id,
+            operation_kind,
+            commands,
+            limits.into_internal()?,
+        )
+    }
+
+    pub fn execute_composite_write_operation(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: None,
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: InternalWriteOperationLimits::default(),
+                attachment_limits: default_attachment_batch_limits(),
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_with_limits(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxCompositeWriteOperationLimits,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: None,
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: limits.write_limits.into_internal()?,
+                attachment_limits: limits.attachment_limits,
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_on_branch(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: Some(branch_id),
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: InternalWriteOperationLimits::default(),
+                attachment_limits: default_attachment_batch_limits(),
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_on_branch_with_limits(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxCompositeWriteOperationLimits,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: Some(branch_id),
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: limits.write_limits.into_internal()?,
+                attachment_limits: limits.attachment_limits,
+            },
+        )
     }
 }
