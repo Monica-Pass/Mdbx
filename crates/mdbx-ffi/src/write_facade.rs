@@ -1,5 +1,251 @@
+#[uniffi::export]
+pub fn default_write_operation_limits() -> MdbxWriteOperationLimits {
+    InternalWriteOperationLimits::default().public()
+}
+
+#[uniffi::export]
+pub fn default_composite_write_operation_limits() -> MdbxCompositeWriteOperationLimits {
+    MdbxCompositeWriteOperationLimits {
+        write_limits: default_write_operation_limits(),
+        attachment_limits: default_attachment_batch_limits(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxCompositeWriteOperationLimits {
+    pub write_limits: MdbxWriteOperationLimits,
+    pub attachment_limits: MdbxAttachmentBatchLimits,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCompositeWriteOperationResult {
+    pub operation: MdbxWriteOperationResult,
+    pub attachments: Vec<MdbxAttachmentRecord>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, uniffi::Enum)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MdbxWriteCommand {
+    CreateProject {
+        project_id: String,
+        title: String,
+    },
+    CreateEntry {
+        entry_id: String,
+        project_id: String,
+        entry_type: String,
+        title: String,
+        payload_json: String,
+    },
+    UpdateEntry {
+        entry_id: String,
+        project_id: String,
+        entry_type: String,
+        title: String,
+        payload_json: String,
+    },
+    DeleteEntry {
+        entry_id: String,
+        project_id: String,
+    },
+    RestoreEntry {
+        entry_id: String,
+        project_id: String,
+    },
+    MoveEntry {
+        entry_id: String,
+        project_id: String,
+        target_project_id: String,
+    },
+    CreateObjectRelation {
+        relation_id: String,
+        source_object_id: String,
+        target_object_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    UpdateObjectRelation {
+        relation_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    DeleteObjectRelation {
+        relation_id: String,
+    },
+    CreateObjectLabel {
+        label_id: String,
+        collection_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    UpdateObjectLabel {
+        label_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    DeleteObjectLabel {
+        label_id: String,
+    },
+    AssignObjectLabel {
+        assignment_id: String,
+        object_id: String,
+        label_id: String,
+    },
+    RemoveObjectLabelAssignment {
+        assignment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxWriteOperationResult {
+    pub commit_id: String,
+    pub already_committed: bool,
+    pub project_ids: Vec<String>,
+    pub entry_ids: Vec<String>,
+    pub relation_ids: Vec<String>,
+    pub label_ids: Vec<String>,
+    pub label_assignment_ids: Vec<String>,
+}
+
+/// Resource contract for one generic user-level write operation.
+///
+/// The defaults are suitable for interactive clients. Explicit values are
+/// accepted only within the hard ceilings so a caller cannot disable the
+/// boundary by opting into a custom profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxWriteOperationLimits {
+    pub max_commands: u64,
+    pub max_payload_bytes_per_command: u64,
+    pub max_payload_bytes: u64,
+    pub max_intent_bytes: u64,
+}
+
+pub(crate) const DEFAULT_MAX_WRITE_COMMANDS: usize = 256;
+pub(crate) const HARD_MAX_WRITE_COMMANDS: usize = 4_096;
+pub(crate) const DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 1024 * 1024;
+const HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_WRITE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const HARD_MAX_WRITE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_WRITE_INTENT_BYTES: usize = 16 * 1024 * 1024;
+const HARD_MAX_WRITE_INTENT_BYTES: usize = 128 * 1024 * 1024;
+
+impl Default for MdbxWriteOperationLimits {
+    fn default() -> Self {
+        Self {
+            max_commands: DEFAULT_MAX_WRITE_COMMANDS as u64,
+            max_payload_bytes_per_command: DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND as u64,
+            max_payload_bytes: DEFAULT_MAX_WRITE_PAYLOAD_BYTES as u64,
+            max_intent_bytes: DEFAULT_MAX_WRITE_INTENT_BYTES as u64,
+        }
+    }
+}
+
+impl MdbxWriteOperationLimits {
+    pub(crate) fn into_internal(self) -> Result<InternalWriteOperationLimits, MdbxFfiError> {
+        let limits = InternalWriteOperationLimits {
+            max_commands: usize::try_from(self.max_commands)
+                .map_err(|_| StorageError::Validation("max_commands is too large".to_string()))?,
+            max_payload_bytes_per_command: usize::try_from(self.max_payload_bytes_per_command)
+                .map_err(|_| {
+                    StorageError::Validation(
+                        "max_payload_bytes_per_command is too large".to_string(),
+                    )
+                })?,
+            max_payload_bytes: usize::try_from(self.max_payload_bytes).map_err(|_| {
+                StorageError::Validation("max_payload_bytes is too large".to_string())
+            })?,
+            max_intent_bytes: usize::try_from(self.max_intent_bytes).map_err(|_| {
+                StorageError::Validation("max_intent_bytes is too large".to_string())
+            })?,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InternalWriteOperationLimits {
+    max_commands: usize,
+    max_payload_bytes_per_command: usize,
+    max_payload_bytes: usize,
+    max_intent_bytes: usize,
+}
+
+impl Default for InternalWriteOperationLimits {
+    fn default() -> Self {
+        MdbxWriteOperationLimits::default()
+            .into_internal()
+            .expect("built-in write operation limits must be valid")
+    }
+}
+
+impl InternalWriteOperationLimits {
+    fn validate(self) -> Result<(), MdbxFfiError> {
+        let checks = [
+            ("max_commands", self.max_commands, HARD_MAX_WRITE_COMMANDS),
+            (
+                "max_payload_bytes_per_command",
+                self.max_payload_bytes_per_command,
+                HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND,
+            ),
+            (
+                "max_payload_bytes",
+                self.max_payload_bytes,
+                HARD_MAX_WRITE_PAYLOAD_BYTES,
+            ),
+            (
+                "max_intent_bytes",
+                self.max_intent_bytes,
+                HARD_MAX_WRITE_INTENT_BYTES,
+            ),
+        ];
+        for (name, value, hard_max) in checks {
+            if value == 0 || value > hard_max {
+                return Err(StorageError::Validation(format!(
+                    "{name} must be between 1 and {hard_max}"
+                ))
+                .into());
+            }
+        }
+        if self.max_payload_bytes_per_command > self.max_payload_bytes {
+            return Err(StorageError::Validation(
+                "per-command payload limit cannot exceed total payload limit".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn public(self) -> MdbxWriteOperationLimits {
+        MdbxWriteOperationLimits {
+            max_commands: self.max_commands as u64,
+            max_payload_bytes_per_command: self.max_payload_bytes_per_command as u64,
+            max_payload_bytes: self.max_payload_bytes as u64,
+            max_intent_bytes: self.max_intent_bytes as u64,
+        }
+    }
+}
+
+pub(crate) fn validate_uuid(value: &str, field: &str) -> Result<(), MdbxFfiError> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| StorageError::Validation(format!("{field} {value} must be a UUID")).into())
+}
+
+fn parse_write_object_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
+    entry_type
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidEntryType {
+            entry_type: entry_type.to_string(),
+        })
+}
+
 use std::io::{self, Write};
 
+use mdbx_core::model::EntryType;
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::repo::{
@@ -9,6 +255,7 @@ use mdbx_storage::repo::{
     ProjectRepo,
 };
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::attachment_facade::{
     attachment_batch_changes, attachment_batch_ids, attachment_record_from_core,
@@ -17,10 +264,8 @@ use super::attachment_facade::{
 };
 use super::{
     default_attachment_batch_limits, entry_for_project, parse_payload_json, parse_relation_kind,
-    parse_write_object_type, validate_uuid, InternalWriteOperationLimits,
-    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxCompositeWriteOperationLimits,
-    MdbxCompositeWriteOperationResult, MdbxFfiError, MdbxVault, MdbxWriteCommand,
-    MdbxWriteOperationLimits, MdbxWriteOperationResult,
+    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxAttachmentRecord, MdbxFfiError,
+    MdbxVault,
 };
 
 fn validate_write_operation(
