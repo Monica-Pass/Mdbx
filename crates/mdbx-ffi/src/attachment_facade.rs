@@ -5,15 +5,17 @@ use mdbx_core::model::Attachment;
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::repo::{
-    AttachmentRepo, AttachmentWriteOptions, CommitChange, CommitContext, CommitOperation,
-    OperationExecution,
+    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, CommitChange,
+    CommitContext, CommitOperation, OperationExecution,
 };
+use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use sha2::{Digest, Sha256};
 
 use super::{
-    validate_uuid, MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits,
-    MdbxAttachmentBatchResult, MdbxAttachmentContentLimits, MdbxAttachmentRecord,
-    MdbxAttachmentWriteResult, MdbxFfiError, HARD_MAX_ATTACHMENT_BATCH_COMMANDS,
+    conservative_ffi_device_context, default_attachment_batch_limits, unix_now, validate_uuid,
+    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxAttachmentBatchResult,
+    MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest, MdbxAttachmentRecord,
+    MdbxAttachmentWriteResult, MdbxFfiError, MdbxVault, HARD_MAX_ATTACHMENT_BATCH_COMMANDS,
     HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES, HARD_MAX_ATTACHMENT_CHUNK_SIZE,
     HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES,
 };
@@ -671,5 +673,314 @@ impl Write for LimitedAttachmentContentWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[uniffi::export]
+impl MdbxVault {
+    pub fn get_attachment(
+        &self,
+        attachment_id: String,
+    ) -> Result<Option<MdbxAttachmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        AttachmentRepo::get_by_id(&conn, &attachment_id)?
+            .as_ref()
+            .map(attachment_record_from_core)
+            .transpose()
+    }
+
+    pub fn list_attachments(
+        &self,
+        project_id: String,
+        entry_id: Option<String>,
+    ) -> Result<Vec<MdbxAttachmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let attachments = match entry_id.as_deref() {
+            Some(entry_id) => AttachmentRepo::list_by_entry(&conn, entry_id)?
+                .into_iter()
+                .filter(|attachment| attachment.project_id == project_id)
+                .collect(),
+            None => AttachmentRepo::list_by_project(&conn, &project_id)?,
+        };
+        attachments
+            .iter()
+            .map(attachment_record_from_core)
+            .collect()
+    }
+
+    pub fn list_deleted_attachments(&self) -> Result<Vec<MdbxAttachmentRecord>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        AttachmentRepo::list_deleted(&conn)?
+            .iter()
+            .map(attachment_record_from_core)
+            .collect()
+    }
+
+    pub fn rename_attachment(
+        &self,
+        attachment_id: String,
+        file_name: String,
+        media_type: Option<String>,
+    ) -> Result<MdbxAttachmentRecord, MdbxFfiError> {
+        if file_name.trim().is_empty() {
+            return Err(StorageError::Validation(
+                "attachment file_name must not be empty".to_string(),
+            )
+            .into());
+        }
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let updated = AttachmentRepo::rename(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &attachment_id,
+            &file_name,
+            media_type.as_deref(),
+        )?;
+        attachment_record_from_core(&updated)
+    }
+
+    pub fn delete_attachment(&self, attachment_id: String) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        AttachmentRepo::soft_delete(
+            &conn,
+            &CommitContext::new(self.device_id.clone()),
+            &attachment_id,
+        )?;
+        Ok(())
+    }
+
+    pub fn create_attachment_with_content(
+        &self,
+        operation_id: String,
+        request: MdbxAttachmentCreateRequest,
+        content: Vec<u8>,
+        limits: MdbxAttachmentContentLimits,
+    ) -> Result<MdbxAttachmentWriteResult, MdbxFfiError> {
+        let MdbxAttachmentCreateRequest {
+            attachment_id,
+            project_id,
+            entry_id,
+            file_name,
+            media_type,
+        } = request;
+        validate_attachment_operation_inputs(
+            &operation_id,
+            &attachment_id,
+            &project_id,
+            entry_id.as_deref(),
+            &file_name,
+            content.len(),
+            limits,
+        )?;
+        let chunk_size = attachment_chunk_size(limits)?;
+        let intent_hash = hash_attachment_intent(
+            "create",
+            &operation_id,
+            &attachment_id,
+            &project_id,
+            entry_id.as_deref(),
+            &file_name,
+            media_type.as_deref(),
+            chunk_size,
+            &content,
+        );
+        let operation_id_for_closure = operation_id.clone();
+        let attachment_id_for_closure = attachment_id.clone();
+        let project_id_for_closure = project_id.clone();
+        let file_name_for_closure = file_name.clone();
+        let media_type_for_closure = media_type.clone();
+        let content_for_closure = content;
+        execute_attachment_content_operation(
+            &self.conn,
+            &self.device_id,
+            AttachmentContentOperation {
+                operation_id: operation_id_for_closure,
+                operation_kind: "attachment-create".to_string(),
+                attachment_id: attachment_id.clone(),
+                fields: vec![
+                    "project_id",
+                    "entry_id",
+                    "file_name",
+                    "media_type",
+                    "content",
+                ],
+                intent_hash,
+            },
+            move |conn, ctx| {
+                let original_size = content_for_closure.len() as u64;
+                AttachmentRepo::add_with_id(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    mdbx_storage::repo::AttachmentCreateRequest {
+                        project_id: &project_id_for_closure,
+                        entry_id: entry_id.as_deref(),
+                        file_name: &file_name_for_closure,
+                        media_type: media_type_for_closure.as_deref(),
+                        content_hash: "",
+                        original_size,
+                    },
+                )?;
+                let mut reader = Cursor::new(content_for_closure);
+                AttachmentRepo::write_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                )?;
+                AttachmentRepo::get_by_id(conn, &attachment_id_for_closure)?
+                    .ok_or_else(|| StorageError::NotFound(attachment_id_for_closure.clone()))
+            },
+        )
+    }
+
+    pub fn replace_attachment_content(
+        &self,
+        operation_id: String,
+        attachment_id: String,
+        content: Vec<u8>,
+        limits: MdbxAttachmentContentLimits,
+    ) -> Result<MdbxAttachmentWriteResult, MdbxFfiError> {
+        if operation_id.trim().is_empty() {
+            return Err(
+                StorageError::Validation("operation_id must not be empty".to_string()).into(),
+            );
+        }
+        validate_uuid(&attachment_id, "attachment_id")?;
+        let chunk_size = attachment_chunk_size(limits)?;
+        if content.len() > attachment_max_plaintext_bytes(limits)? {
+            return Err(StorageError::ResourceLimit {
+                resource: "attachment plaintext bytes".to_string(),
+                actual: content.len() as u64,
+                limit: limits.max_plaintext_bytes,
+            }
+            .into());
+        }
+        let intent_hash = hash_attachment_intent(
+            "replace",
+            &operation_id,
+            &attachment_id,
+            "",
+            None,
+            "",
+            None,
+            chunk_size,
+            &content,
+        );
+        let attachment_id_for_closure = attachment_id.clone();
+        let content_for_closure = content;
+        execute_attachment_content_operation(
+            &self.conn,
+            &self.device_id,
+            AttachmentContentOperation {
+                operation_id,
+                operation_kind: "attachment-replace".to_string(),
+                attachment_id: attachment_id.clone(),
+                fields: vec!["content"],
+                intent_hash,
+            },
+            move |conn, ctx| {
+                let original_size = content_for_closure.len() as u64;
+                let mut reader = Cursor::new(content_for_closure);
+                AttachmentRepo::write_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                )?;
+                AttachmentRepo::get_by_id(conn, &attachment_id_for_closure)?
+                    .ok_or_else(|| StorageError::NotFound(attachment_id_for_closure.clone()))
+            },
+        )
+    }
+
+    pub fn execute_attachment_batch(
+        &self,
+        operation_id: String,
+        commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxAttachmentBatchResult, MdbxFfiError> {
+        self.execute_attachment_batch_with_limits(
+            operation_id,
+            commands,
+            default_attachment_batch_limits(),
+        )
+    }
+
+    pub fn execute_attachment_batch_with_limits(
+        &self,
+        operation_id: String,
+        commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxAttachmentBatchLimits,
+    ) -> Result<MdbxAttachmentBatchResult, MdbxFfiError> {
+        let chunk_size =
+            validate_attachment_batch_operation_inputs(&operation_id, &commands, limits)?;
+        let intent_hash = hash_attachment_batch_intent(&operation_id, &commands, limits);
+        let attachment_ids = attachment_batch_ids(&commands);
+        execute_attachment_batch_operation(
+            &self.conn,
+            &self.device_id,
+            operation_id,
+            commands,
+            chunk_size,
+            intent_hash,
+            attachment_ids,
+        )
+    }
+
+    pub fn read_attachment_content(
+        &self,
+        attachment_id: String,
+        max_plaintext_bytes: u64,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        let max_plaintext_bytes = validate_attachment_read_limit(max_plaintext_bytes)?;
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let attachment = AttachmentRepo::get_by_id(&conn, &attachment_id)?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))?;
+        if attachment.stored_size > max_plaintext_bytes as u64 {
+            return Err(StorageError::ResourceLimit {
+                resource: "attachment plaintext bytes".to_string(),
+                actual: attachment.stored_size,
+                limit: max_plaintext_bytes as u64,
+            }
+            .into());
+        }
+        let session = conn.active_session().cloned();
+        let device = conservative_ffi_device_context().into_core(&self.device_id);
+        AttachmentRepo::authorize_plaintext_access(
+            &conn,
+            &attachment_id,
+            AttachmentPlaintextPurpose::InMemory,
+            TigaAuthorizationContext {
+                session: session.as_ref(),
+                device: &device,
+                now_unix_secs: unix_now(),
+            },
+        )?;
+        let mut content = LimitedAttachmentContentWriter::new(max_plaintext_bytes);
+        content
+            .bytes
+            .try_reserve_exact(attachment.stored_size as usize)
+            .map_err(|error| {
+                StorageError::Validation(format!("cannot allocate attachment content: {error}"))
+            })?;
+        let read_result =
+            AttachmentRepo::read_content_to_writer(&conn, &attachment_id, &mut content);
+        if let Some(actual) = content.exceeded_at {
+            return Err(StorageError::ResourceLimit {
+                resource: "attachment plaintext bytes".to_string(),
+                actual: actual as u64,
+                limit: max_plaintext_bytes as u64,
+            }
+            .into());
+        }
+        read_result?;
+        Ok(content.bytes)
+    }
+
+    pub fn verify_attachment_integrity(&self, attachment_id: String) -> Result<bool, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(AttachmentRepo::verify_integrity(&conn, &attachment_id)?)
     }
 }
