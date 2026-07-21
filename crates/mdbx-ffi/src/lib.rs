@@ -11,13 +11,14 @@ mod lifecycle_facade;
 mod object_facade;
 mod security_facade;
 mod sync_facade;
+mod vault_facade;
 mod write_facade;
 
 use attachment_facade::*;
+pub use vault_facade::*;
 use write_facade::*;
 
 use std::io::Cursor;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdbx_core::model::{
@@ -29,12 +30,11 @@ use mdbx_core::tiga::{
     AuthorizationReason, DeviceAssurance, DeviceContext, PolicyCompliance, ResolvedTigaPolicy,
     TigaMode, TigaOperation, TigaScope,
 };
-use mdbx_storage::backup::{BackupService, VaultBackupInfo};
-use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
+use mdbx_storage::backup::VaultBackupInfo;
+use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
-use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::key_epoch::KeyEpochRotationResult;
-use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
+use mdbx_storage::migration::MigrationInfo;
 use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity};
 use mdbx_storage::repo::{
     AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, CommitContext, EntryRepo,
@@ -42,7 +42,7 @@ use mdbx_storage::repo::{
     TombstonePurgeScheduleResult,
 };
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
-use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
+use mdbx_storage::unlock::TigaUnlockAssessment;
 use mdbx_sync::{
     BlobChunkRequest, BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState,
     BlobManifestPageRequest, BlobManifestPageResponse, BlobSyncPhase, BlobSyncResume, BranchHead,
@@ -50,7 +50,6 @@ use mdbx_sync::{
     SyncWireSession,
 };
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -2508,136 +2507,6 @@ pub fn create_sync_wire_session(
     }))
 }
 
-#[uniffi::export]
-pub fn create_vault(
-    path: String,
-    password: String,
-    device_id: String,
-) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    create_vault_with_tiga_mode(path, password, device_id, MdbxTigaMode::Multi)
-}
-
-/// Read migration metadata without opening the vault for writing.
-#[uniffi::export]
-pub fn inspect_vault_migration(path: String) -> Result<MdbxMigrationInfo, MdbxFfiError> {
-    Ok(inspect_migration_path(Path::new(&path))?.into())
-}
-
-/// Create a verified portable backup without writable open, unlock, or
-/// automatic migration of the source vault.
-#[uniffi::export]
-pub fn create_portable_backup(
-    source_path: String,
-    destination: String,
-) -> Result<MdbxBackupInfo, MdbxFfiError> {
-    Ok(
-        BackupService::create_portable_copy_path(Path::new(&source_path), Path::new(&destination))?
-            .into(),
-    )
-}
-
-/// Explicitly run the storage-core migration after the client has inspected,
-/// backed up, and obtained user consent. The compatibility `open_vault` path
-/// remains automatic for callers that do not need this orchestration.
-#[uniffi::export]
-pub fn upgrade_vault(path: String) -> Result<MdbxMigrationInfo, MdbxFfiError> {
-    upgrade_path(Path::new(&path))?;
-    Ok(inspect_migration_path(Path::new(&path))?.into())
-}
-
-#[uniffi::export]
-pub fn create_vault_with_tiga_mode(
-    path: String,
-    password: String,
-    device_id: String,
-    mode: MdbxTigaMode,
-) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    let mut creation = PendingVaultCreation::begin(Path::new(&path))?;
-    let mode: TigaMode = mode.into();
-    let init = initialize_vault(
-        creation.connection(),
-        &VaultInitParams {
-            default_tiga_mode: mode.to_string(),
-            device_id: device_id.clone(),
-            ..Default::default()
-        },
-    )?;
-    let password = Zeroizing::new(password);
-    UnlockService::setup_password_with_mode(creation.connection_mut(), password.as_str(), mode)?;
-    let conn = creation.commit();
-    Ok(Arc::new(MdbxVault {
-        conn: Mutex::new(conn),
-        device_id,
-        vault_id: init.vault_id,
-    }))
-}
-
-#[uniffi::export]
-pub fn open_vault(
-    path: String,
-    password: String,
-    device_id: String,
-) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    let mut conn = VaultConnection::open(Path::new(&path))?;
-    let password = Zeroizing::new(password);
-    UnlockService::unlock_with_password(&mut conn, password.as_str())?;
-    let vault_id = read_vault_id(&conn)?;
-    Ok(Arc::new(MdbxVault {
-        conn: Mutex::new(conn),
-        device_id,
-        vault_id,
-    }))
-}
-
-#[uniffi::export]
-pub fn open_vault_with_security_key(
-    path: String,
-    key_material: Vec<u8>,
-    device_id: String,
-) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    let mut conn = VaultConnection::open(Path::new(&path))?;
-    let key_material = Zeroizing::new(key_material);
-    UnlockService::unlock_with_security_key(&mut conn, key_material.as_slice())?;
-    let vault_id = read_vault_id(&conn)?;
-    Ok(Arc::new(MdbxVault {
-        conn: Mutex::new(conn),
-        device_id,
-        vault_id,
-    }))
-}
-
-#[uniffi::export]
-pub fn open_vault_with_password_security_key(
-    path: String,
-    password: String,
-    key_material: Vec<u8>,
-    device_id: String,
-) -> Result<Arc<MdbxVault>, MdbxFfiError> {
-    let mut conn = VaultConnection::open(Path::new(&path))?;
-    let password = Zeroizing::new(password);
-    let key_material = Zeroizing::new(key_material);
-    UnlockService::unlock_with_password_security_key(
-        &mut conn,
-        password.as_str(),
-        key_material.as_slice(),
-    )?;
-    let vault_id = read_vault_id(&conn)?;
-    Ok(Arc::new(MdbxVault {
-        conn: Mutex::new(conn),
-        device_id,
-        vault_id,
-    }))
-}
-
-fn read_vault_id(conn: &VaultConnection) -> Result<String, MdbxFfiError> {
-    conn.inner()
-        .query_row("SELECT vault_id FROM vault_meta LIMIT 1", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(StorageError::from)
-        .map_err(MdbxFfiError::from)
-}
-
 fn entry_for_project(
     conn: &VaultConnection,
     project_id: &str,
@@ -2823,10 +2692,12 @@ mod tests {
     use std::io::Write;
 
     use mdbx_core::model::ConflictObjectType;
+    use mdbx_storage::init::{initialize_vault, VaultInitParams};
     use mdbx_storage::repo::{
         ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo, ObjectRelationCreateRequest,
         ObjectRelationRepo, ProjectRepo, TombstoneRepo,
     };
+    use mdbx_storage::unlock::UnlockService;
     use sha2::{Digest, Sha256};
 
     fn ffi_test_vault() -> MdbxVault {
