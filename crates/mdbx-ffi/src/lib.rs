@@ -15,6 +15,7 @@ mod vault_facade;
 mod write_facade;
 
 pub use attachment_facade::*;
+pub use conflict_facade::*;
 pub use lifecycle_facade::*;
 pub use object_facade::*;
 pub(crate) use object_facade::{
@@ -123,54 +124,6 @@ impl From<MigrationInfo> for MdbxMigrationInfo {
             target_schema_version: value.target_schema_version,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum MdbxConflictChoice {
-    LocalWins,
-    IncomingWins,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct MdbxConflictRecord {
-    pub conflict_id: String,
-    pub object_type: String,
-    pub object_id: String,
-    pub base_commit_id: String,
-    pub local_commit_id: String,
-    pub incoming_commit_id: String,
-    pub conflicting_fields: Vec<String>,
-    pub resolution: String,
-    pub created_at: String,
-    pub resolved_at: Option<String>,
-}
-
-/// Client-editable project fields for an explicit custom conflict merge.
-///
-/// The conflict ID supplies the project identity. Policy, clocks, collection
-/// profile, and derived counters remain storage-owned.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct MdbxProjectConflictMerge {
-    pub title: String,
-    pub summary: Option<String>,
-    pub group_id: Option<String>,
-    pub icon_ref: Option<String>,
-    pub favorite: bool,
-    pub archived: bool,
-    pub deleted: bool,
-}
-
-/// Client-editable attachment metadata for an explicit custom conflict merge.
-///
-/// Content identity and chunk metadata are intentionally absent. Content must
-/// be transferred and verified through the attachment/blob APIs first.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct MdbxAttachmentConflictMerge {
-    pub project_id: String,
-    pub entry_id: Option<String>,
-    pub file_name: String,
-    pub media_type: Option<String>,
-    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]

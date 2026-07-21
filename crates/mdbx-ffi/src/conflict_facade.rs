@@ -1,3 +1,51 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxConflictChoice {
+    LocalWins,
+    IncomingWins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxConflictRecord {
+    pub conflict_id: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub base_commit_id: String,
+    pub local_commit_id: String,
+    pub incoming_commit_id: String,
+    pub conflicting_fields: Vec<String>,
+    pub resolution: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+/// Client-editable project fields for an explicit custom conflict merge.
+///
+/// The conflict ID supplies the project identity. Policy, clocks, collection
+/// profile, and derived counters remain storage-owned.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxProjectConflictMerge {
+    pub title: String,
+    pub summary: Option<String>,
+    pub group_id: Option<String>,
+    pub icon_ref: Option<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    pub deleted: bool,
+}
+
+/// Client-editable attachment metadata for an explicit custom conflict merge.
+///
+/// Content identity and chunk metadata are intentionally absent. Content must
+/// be transferred and verified through the attachment/blob APIs first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentConflictMerge {
+    pub project_id: String,
+    pub entry_id: Option<String>,
+    pub file_name: String,
+    pub media_type: Option<String>,
+    pub deleted: bool,
+}
+
 use mdbx_core::model::{Attachment, Conflict, ConflictObjectType, ConflictResolution};
 use mdbx_storage::error::StorageError;
 use mdbx_storage::repo::{
@@ -5,10 +53,7 @@ use mdbx_storage::repo::{
     ObjectRelationRepo, ProjectRepo,
 };
 
-use super::{
-    parse_payload_json, parse_relation_kind, MdbxAttachmentConflictMerge, MdbxConflictChoice,
-    MdbxConflictRecord, MdbxFfiError, MdbxProjectConflictMerge, MdbxVault,
-};
+use super::{parse_payload_json, parse_relation_kind, MdbxFfiError, MdbxVault};
 
 #[uniffi::export]
 impl MdbxVault {
