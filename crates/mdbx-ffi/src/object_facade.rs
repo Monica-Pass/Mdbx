@@ -1,18 +1,374 @@
-use mdbx_storage::error::StorageError;
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectRecord {
+    pub project_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxCollectionProfile {
+    pub collection_id: String,
+    pub collection_type_id: String,
+    pub payload: Vec<u8>,
+    pub payload_schema_version: u32,
+    pub allowed_object_type_ids: Vec<String>,
+    pub required_capability_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by_device_id: String,
+    pub updated_by_device_id: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EntryRecord {
+    pub entry_id: String,
+    pub project_id: String,
+    pub entry_type: String,
+    pub title: String,
+    pub payload_json: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRecord {
+    pub object_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub title: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationPlanItem {
+    pub object_id: String,
+    pub object_head_commit_id: String,
+    pub source_payload_digest: Vec<u8>,
+    pub source_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationPlan {
+    pub plan_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub source_schema_version: u32,
+    pub target_schema_version: u32,
+    pub branch_id: String,
+    pub branch_name: String,
+    pub branch_head_commit_id: String,
+    pub collection_profile_digest: Option<Vec<u8>>,
+    pub items: Vec<MdbxPayloadMigrationPlanItem>,
+    pub remaining_count: u64,
+    pub total_source_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationOutput {
+    pub object_id: String,
+    pub target_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxPayloadMigrationExecution {
+    pub commit_id: String,
+    pub migrated_count: u32,
+    pub already_committed: bool,
+}
+
+impl From<PayloadMigrationPlanItem> for MdbxPayloadMigrationPlanItem {
+    fn from(value: PayloadMigrationPlanItem) -> Self {
+        Self {
+            object_id: value.object_id,
+            object_head_commit_id: value.object_head_commit_id,
+            source_payload_digest: value.source_payload_digest,
+            source_payload: value.source_payload,
+        }
+    }
+}
+
+impl From<PayloadMigrationPlan> for MdbxPayloadMigrationPlan {
+    fn from(value: PayloadMigrationPlan) -> Self {
+        Self {
+            plan_id: value.plan_id,
+            collection_id: value.collection_id,
+            object_type_id: value.object_type_id.to_string(),
+            source_schema_version: value.source_schema_version,
+            target_schema_version: value.target_schema_version,
+            branch_id: value.branch_id,
+            branch_name: value.branch_name,
+            branch_head_commit_id: value.branch_head_commit_id,
+            collection_profile_digest: value.collection_profile_digest,
+            items: value.items.into_iter().map(Into::into).collect(),
+            remaining_count: value.remaining_count,
+            total_source_bytes: value.total_source_bytes,
+        }
+    }
+}
+
+impl MdbxPayloadMigrationPlan {
+    pub(crate) fn into_core(self) -> Result<PayloadMigrationPlan, MdbxFfiError> {
+        Ok(PayloadMigrationPlan {
+            plan_id: self.plan_id,
+            collection_id: self.collection_id,
+            object_type_id: parse_object_type_id(&self.object_type_id)?,
+            source_schema_version: self.source_schema_version,
+            target_schema_version: self.target_schema_version,
+            branch_id: self.branch_id,
+            branch_name: self.branch_name,
+            branch_head_commit_id: self.branch_head_commit_id,
+            collection_profile_digest: self.collection_profile_digest,
+            items: self
+                .items
+                .into_iter()
+                .map(|item| PayloadMigrationPlanItem {
+                    object_id: item.object_id,
+                    object_head_commit_id: item.object_head_commit_id,
+                    source_payload_digest: item.source_payload_digest,
+                    source_payload: item.source_payload,
+                })
+                .collect(),
+            remaining_count: self.remaining_count,
+            total_source_bytes: self.total_source_bytes,
+        })
+    }
+}
+
+impl From<PayloadMigrationExecution> for MdbxPayloadMigrationExecution {
+    fn from(value: PayloadMigrationExecution) -> Self {
+        Self {
+            commit_id: value.commit_id,
+            migrated_count: value.migrated_count,
+            already_committed: value.already_committed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectSummary {
+    pub object_id: String,
+    pub collection_id: String,
+    pub object_type_id: String,
+    pub title: String,
+    pub payload_schema_version: u32,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectSummaryPage {
+    pub items: Vec<MdbxObjectSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRelationRecord {
+    pub relation_id: String,
+    pub source_object_id: String,
+    pub target_object_id: String,
+    pub relation_kind: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelRecord {
+    pub label_id: String,
+    pub collection_id: String,
+    pub name: String,
+    pub payload_json: String,
+    pub payload_schema_version: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelAssignmentRecord {
+    pub assignment_id: String,
+    pub object_id: String,
+    pub label_id: String,
+    pub deleted: bool,
+}
+
+use mdbx_core::model::{
+    EntryType, ObjectSummary, ObjectTypeId, PayloadMigrationExecution, PayloadMigrationPlan,
+    PayloadMigrationPlanItem, RelationKindId,
+};
+use mdbx_storage::connection::VaultConnection;
+use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::repo::{
     CommitContext, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
     ObjectSummaryRepo, ProjectRepo,
 };
 
-use super::{
-    entry_for_project, entry_record_from_entry, object_label_assignment_record,
-    object_label_record, object_record_from_entry, object_relation_record,
-    object_summary_from_core, parse_entry_type, parse_object_type_id, parse_optional_entry_type,
-    parse_optional_object_type_id, parse_payload_json, parse_relation_kind, EntryRecord,
-    MdbxFfiError, MdbxObjectLabelAssignmentRecord, MdbxObjectLabelRecord, MdbxObjectRecord,
-    MdbxObjectRelationRecord, MdbxObjectSummaryPage, MdbxVault, ProjectRecord,
-};
+use super::{MdbxFfiError, MdbxVault};
+
+pub(crate) fn entry_for_project(
+    conn: &VaultConnection,
+    project_id: &str,
+    entry_id: &str,
+) -> StorageResult<mdbx_core::model::Entry> {
+    let entry = EntryRepo::get_by_id(conn, entry_id)?
+        .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
+    if entry.project_id != project_id {
+        return Err(StorageError::ConstraintViolation(format!(
+            "entry {} does not belong to project {}",
+            entry_id, project_id
+        )));
+    }
+    Ok(entry)
+}
+
+fn parse_entry_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
+    let parsed: EntryType = entry_type
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidEntryType {
+            entry_type: entry_type.to_string(),
+        })?;
+    if parsed.is_legacy() {
+        Ok(parsed)
+    } else {
+        Err(MdbxFfiError::InvalidEntryType {
+            entry_type: entry_type.to_string(),
+        })
+    }
+}
+
+fn parse_optional_entry_type(
+    entry_type: Option<String>,
+) -> Result<Option<EntryType>, MdbxFfiError> {
+    entry_type.as_deref().map(parse_entry_type).transpose()
+}
+
+pub(crate) fn parse_object_type_id(object_type_id: &str) -> Result<ObjectTypeId, MdbxFfiError> {
+    object_type_id
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidObjectTypeId {
+            object_type_id: object_type_id.to_string(),
+        })
+}
+
+fn parse_optional_object_type_id(
+    object_type_id: Option<String>,
+) -> Result<Option<ObjectTypeId>, MdbxFfiError> {
+    object_type_id
+        .as_deref()
+        .map(parse_object_type_id)
+        .transpose()
+}
+
+pub(crate) fn parse_relation_kind(relation_kind: &str) -> Result<RelationKindId, MdbxFfiError> {
+    relation_kind
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidRelationKind {
+            relation_kind: relation_kind.to_string(),
+        })
+}
+
+pub(crate) fn parse_payload_json(payload_json: &str) -> Result<serde_json::Value, MdbxFfiError> {
+    serde_json::from_str(payload_json).map_err(MdbxFfiError::from)
+}
+
+fn entry_record_from_entry(entry: &mdbx_core::model::Entry) -> Result<EntryRecord, MdbxFfiError> {
+    let payload: serde_json::Value = serde_json::from_slice(&entry.payload_ct)?;
+    Ok(EntryRecord {
+        entry_id: entry.entry_id.clone(),
+        project_id: entry.project_id.clone(),
+        entry_type: entry.entry_type.to_string(),
+        title: entry
+            .title_ct
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        payload_json: serde_json::to_string(&payload)?,
+        deleted: entry.deleted,
+    })
+}
+
+fn object_record_from_entry(
+    entry: &mdbx_core::model::Entry,
+) -> Result<MdbxObjectRecord, MdbxFfiError> {
+    let payload: serde_json::Value = serde_json::from_slice(&entry.payload_ct)?;
+    Ok(MdbxObjectRecord {
+        object_id: entry.entry_id.clone(),
+        collection_id: entry.project_id.clone(),
+        object_type_id: entry.entry_type.to_string(),
+        title: entry
+            .title_ct
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: entry.payload_schema_version,
+        deleted: entry.deleted,
+    })
+}
+
+fn object_summary_from_core(summary: ObjectSummary) -> MdbxObjectSummary {
+    MdbxObjectSummary {
+        object_id: summary.object_id,
+        collection_id: summary.collection_id,
+        object_type_id: summary.object_type_id.to_string(),
+        title: summary
+            .title
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        payload_schema_version: summary.payload_schema_version,
+        head_commit_id: summary.head_commit_id,
+        deleted: summary.deleted,
+        updated_at: summary.updated_at,
+    }
+}
+
+fn object_relation_record(
+    relation: &mdbx_core::model::ObjectRelation,
+) -> Result<MdbxObjectRelationRecord, MdbxFfiError> {
+    let payload: serde_json::Value = serde_json::from_slice(&relation.payload_ct)?;
+    Ok(MdbxObjectRelationRecord {
+        relation_id: relation.relation_id.clone(),
+        source_object_id: relation.source_object_id.clone(),
+        target_object_id: relation.target_object_id.clone(),
+        relation_kind: relation.relation_kind.to_string(),
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: relation.payload_schema_version,
+        deleted: relation.deleted,
+    })
+}
+
+fn object_label_record(
+    label: &mdbx_core::model::ObjectLabel,
+) -> Result<MdbxObjectLabelRecord, MdbxFfiError> {
+    let name =
+        String::from_utf8(label.name_ct.clone()).map_err(|error| MdbxFfiError::Serialization {
+            message: error.to_string(),
+        })?;
+    let payload: serde_json::Value = serde_json::from_slice(&label.payload_ct)?;
+    Ok(MdbxObjectLabelRecord {
+        label_id: label.label_id.clone(),
+        collection_id: label.collection_id.clone(),
+        name,
+        payload_json: serde_json::to_string(&payload)?,
+        payload_schema_version: label.payload_schema_version,
+        deleted: label.deleted,
+    })
+}
+
+fn object_label_assignment_record(
+    assignment: &mdbx_core::model::ObjectLabelAssignment,
+) -> MdbxObjectLabelAssignmentRecord {
+    MdbxObjectLabelAssignmentRecord {
+        assignment_id: assignment.assignment_id.clone(),
+        object_id: assignment.object_id.clone(),
+        label_id: assignment.label_id.clone(),
+        deleted: assignment.deleted,
+    }
+}
 
 #[uniffi::export]
 impl MdbxVault {
