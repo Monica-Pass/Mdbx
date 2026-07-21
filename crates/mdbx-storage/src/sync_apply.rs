@@ -4,6 +4,8 @@ use std::collections::HashSet;
 
 #[path = "sync_apply/attachment.rs"]
 mod attachment_apply;
+#[path = "sync_apply/commit_graph.rs"]
+mod commit_graph_apply;
 #[path = "sync_apply/entry.rs"]
 mod entry_apply;
 #[path = "sync_apply/generic_metadata.rs"]
@@ -25,16 +27,14 @@ use mdbx_sync::{CommitBatch, CommitOperationMetadata, ObjectPayload, SerializedC
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{BranchRepo, CommitContext, ConflictRepo, TombstoneRepo};
+use crate::repo::{CommitContext, ConflictRepo, TombstoneRepo};
 use crate::sync_delta::{
     decode_sync_delta_body, decode_sync_delta_object_payload, load_sync_delta_envelope,
     persist_envelope, SyncDeltaBatchKind, SyncDeltaEnvelope, SyncDeltaLimits,
 };
 #[cfg(test)]
 use crate::sync_delta::{DeletedSyncEntity, SyncDeltaBody};
-use crate::sync_state::{
-    decode_sync_state_payload_with_limits, BranchRow, SyncStateLimits, SyncStatePayload,
-};
+use crate::sync_state::{decode_sync_state_payload_with_limits, SyncStateLimits, SyncStatePayload};
 #[cfg(test)]
 use crate::sync_state::{SecurityAuditEventRow, TigaPolicyOverrideRow, TigaVaultStateRow};
 #[cfg(test)]
@@ -282,7 +282,7 @@ impl SyncApplyRepo {
             .as_ref()
             .map(|operation| operation.branch_name.as_str())
             .unwrap_or("main");
-        let local_head = Self::current_branch_head(conn, branch_id, branch_name)?;
+        let local_head = commit_graph_apply::current_branch_head(conn, branch_id, branch_name)?;
         let fast_forward = local_head
             .as_deref()
             .map(|head| serialized.parent_ids.iter().any(|parent| parent == head))
@@ -301,14 +301,14 @@ impl SyncApplyRepo {
                 )?;
                 let payload_conflicts = payload_result.conflicts;
                 if payload_conflicts == 0 {
-                    Self::advance_branch(
+                    commit_graph_apply::advance_branch(
                         conn,
                         branch_id,
                         branch_name,
                         &serialized.commit.commit_id,
                     )?;
                 }
-                Self::sync_device_head(conn, serialized)?;
+                commit_graph_apply::sync_device_head(conn, serialized)?;
                 if payload_result.received_delta {
                     Self::discard_received_delta_mutations(conn, &payload_result.delta_commit_ids)?;
                 }
@@ -327,7 +327,7 @@ impl SyncApplyRepo {
                     sync_limits,
                 )?;
                 let payload_conflicts = payload_result.conflicts;
-                Self::sync_device_head(conn, serialized)?;
+                commit_graph_apply::sync_device_head(conn, serialized)?;
                 if payload_result.received_delta {
                     Self::discard_received_delta_mutations(conn, &payload_result.delta_commit_ids)?;
                 }
@@ -771,7 +771,7 @@ impl SyncApplyRepo {
         if let Some(audit_events) = &state.security_audit_events {
             tiga_apply::apply_security_audit_events(conn, audit_events)?;
         }
-        Self::apply_branches(conn, &state.branches)?;
+        commit_graph_apply::apply_branches(conn, &state.branches)?;
         if let Some(tombstones) = &state.tombstones {
             if complete_tombstone_state
                 && matches!(
@@ -791,77 +791,14 @@ impl SyncApplyRepo {
         Ok(conflicts)
     }
 
-    fn apply_branches(conn: &VaultConnection, branches: &[BranchRow]) -> StorageResult<()> {
-        for row in branches {
-            if !Self::commit_exists(conn, &row.head_commit_id)? {
-                continue;
-            }
-            let local_head: Option<String> = conn
-                .inner()
-                .query_row(
-                    "SELECT head_commit_id FROM branches WHERE branch_id = ?1",
-                    params![row.branch_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            let should_upsert = match local_head {
-                None => true,
-                Some(local_head) if local_head == row.head_commit_id => false,
-                Some(local_head) => {
-                    Self::is_ancestor_commit(conn, &local_head, &row.head_commit_id)?
-                }
-            };
-            if should_upsert {
-                conn.inner().execute(
-                    "INSERT INTO branches (branch_id, branch_name, head_commit_id, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(branch_id) DO UPDATE SET
-                        branch_name = excluded.branch_name,
-                        head_commit_id = excluded.head_commit_id,
-                        updated_at = excluded.updated_at",
-                    params![
-                        row.branch_id,
-                        row.branch_name,
-                        row.head_commit_id,
-                        row.created_at,
-                        row.updated_at,
-                    ],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     fn object_apply_decision(
         conn: &VaultConnection,
         table: &str,
         id_column: &str,
         object_id: &str,
         incoming_head: &str,
-    ) -> StorageResult<ObjectDecision> {
-        let sql = format!(
-            "SELECT head_commit_id FROM {} WHERE {} = ?1",
-            table, id_column
-        );
-        let local_head: Option<String> = conn
-            .inner()
-            .query_row(&sql, params![object_id], |row| row.get(0))
-            .optional()?;
-
-        let Some(local_head) = local_head else {
-            return Ok(ObjectDecision::Insert);
-        };
-        if local_head == incoming_head {
-            return Ok(ObjectDecision::Skip);
-        }
-        if Self::is_ancestor_commit(conn, &local_head, incoming_head)? {
-            return Ok(ObjectDecision::FastForward);
-        }
-        if Self::is_ancestor_commit(conn, incoming_head, &local_head)? {
-            return Ok(ObjectDecision::Skip);
-        }
-        Ok(ObjectDecision::Conflict { local_head })
+    ) -> StorageResult<commit_graph_apply::ObjectDecision> {
+        commit_graph_apply::object_apply_decision(conn, table, id_column, object_id, incoming_head)
     }
 
     fn is_ancestor_commit(
@@ -869,41 +806,7 @@ impl SyncApplyRepo {
         ancestor: &str,
         descendant: &str,
     ) -> StorageResult<bool> {
-        if ancestor == descendant {
-            return Ok(true);
-        }
-        let mut stack = vec![descendant.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !seen.insert(commit_id.clone()) {
-                continue;
-            }
-            let parents = Self::parent_ids_for_commit(conn, &commit_id)?;
-            for parent in parents {
-                if parent == ancestor {
-                    return Ok(true);
-                }
-                stack.push(parent);
-            }
-        }
-        Ok(false)
-    }
-
-    fn parent_ids_for_commit(
-        conn: &VaultConnection,
-        commit_id: &str,
-    ) -> StorageResult<Vec<String>> {
-        let mut stmt = conn.inner().prepare(
-            "SELECT parent_commit_id FROM commit_parents
-             WHERE commit_id = ?1
-             ORDER BY parent_commit_id",
-        )?;
-        let rows = stmt.query_map(params![commit_id], |row| row.get(0))?;
-        let mut parents = Vec::new();
-        for row in rows {
-            parents.push(row?);
-        }
-        Ok(parents)
+        commit_graph_apply::is_ancestor_commit(conn, ancestor, descendant)
     }
 
     fn nearest_known_common_parent(
@@ -911,40 +814,36 @@ impl SyncApplyRepo {
         left: &str,
         right: &str,
     ) -> StorageResult<Option<String>> {
-        let left_ancestors = Self::ancestor_set(conn, left)?;
-        let mut stack = vec![right.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !seen.insert(commit_id.clone()) {
-                continue;
-            }
-            if left_ancestors.contains(&commit_id) {
-                return Ok(Some(commit_id));
-            }
-            stack.extend(Self::parent_ids_for_commit(conn, &commit_id)?);
-        }
-        Ok(None)
-    }
-
-    fn ancestor_set(conn: &VaultConnection, head: &str) -> StorageResult<HashSet<String>> {
-        let mut result = HashSet::new();
-        let mut stack = vec![head.to_string()];
-        while let Some(commit_id) = stack.pop() {
-            if !result.insert(commit_id.clone()) {
-                continue;
-            }
-            stack.extend(Self::parent_ids_for_commit(conn, &commit_id)?);
-        }
-        Ok(result)
+        commit_graph_apply::nearest_known_common_parent(conn, left, right)
     }
 
     fn commit_exists(conn: &VaultConnection, commit_id: &str) -> StorageResult<bool> {
-        let count: i64 = conn.inner().query_row(
-            "SELECT COUNT(*) FROM commits WHERE commit_id = ?1",
-            params![commit_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        commit_graph_apply::commit_exists(conn, commit_id)
+    }
+
+    #[cfg(test)]
+    fn parent_ids_for_commit(
+        conn: &VaultConnection,
+        commit_id: &str,
+    ) -> StorageResult<Vec<String>> {
+        commit_graph_apply::parent_ids_for_commit(conn, commit_id)
+    }
+
+    #[cfg(test)]
+    fn sync_device_head(
+        conn: &VaultConnection,
+        serialized: &SerializedCommit,
+    ) -> StorageResult<()> {
+        commit_graph_apply::sync_device_head(conn, serialized)
+    }
+
+    #[cfg(test)]
+    fn current_branch_head(
+        conn: &VaultConnection,
+        branch_id: Option<&str>,
+        branch_name: &str,
+    ) -> StorageResult<Option<String>> {
+        commit_graph_apply::current_branch_head(conn, branch_id, branch_name)
     }
 
     fn record_payload_conflict(
@@ -990,64 +889,6 @@ impl SyncApplyRepo {
         )?;
         Ok(1)
     }
-
-    fn sync_device_head(
-        conn: &VaultConnection,
-        serialized: &SerializedCommit,
-    ) -> StorageResult<()> {
-        conn.inner().execute(
-            "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
-             VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT(device_id) DO UPDATE SET
-                head_commit_id = excluded.head_commit_id,
-                last_seen_at = excluded.last_seen_at",
-            params![
-                serialized.commit.device_id,
-                serialized.commit.commit_id,
-                serialized.commit.created_at
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn current_branch_head(
-        conn: &VaultConnection,
-        branch_id: Option<&str>,
-        branch_name: &str,
-    ) -> StorageResult<Option<String>> {
-        if let Some(branch_id) = branch_id {
-            return Ok(BranchRepo::get_by_id(conn, branch_id)?.map(|branch| branch.head_commit_id));
-        }
-        match BranchRepo::resolve_unique_name(conn, branch_name) {
-            Ok(branch) => Ok(Some(branch.head_commit_id)),
-            Err(StorageError::NotFound(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn advance_branch(
-        conn: &VaultConnection,
-        branch_id: Option<&str>,
-        branch_name: &str,
-        commit_id: &str,
-    ) -> StorageResult<()> {
-        let branch = match branch_id {
-            Some(branch_id) => BranchRepo::require_by_id(conn, branch_id)?,
-            None => BranchRepo::resolve_unique_name(conn, branch_name)?,
-        };
-        let now = chrono::Utc::now().to_rfc3339();
-        let updated = conn.inner().execute(
-            "UPDATE branches SET head_commit_id = ?1, updated_at = ?2 WHERE branch_id = ?3",
-            params![commit_id, now, branch.branch_id],
-        )?;
-        if updated != 1 {
-            return Err(StorageError::NotFound(format!(
-                "branch ID {} not found",
-                branch.branch_id
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1065,14 +906,6 @@ fn conflict_object_type(value: &str) -> Option<ConflictObjectType> {
         "attachment" => Some(ConflictObjectType::Attachment),
         _ => None,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ObjectDecision {
-    Insert,
-    FastForward,
-    Conflict { local_head: String },
-    Skip,
 }
 
 fn exists(

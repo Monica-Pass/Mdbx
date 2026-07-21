@@ -9,7 +9,7 @@ use crate::error::StorageResult;
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{AttachmentChunkRow, AttachmentRow};
 
-use super::{merge_value, ObjectDecision, SyncApplyRepo};
+use super::{commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
 
 pub(super) fn apply_attachments(
     conn: &VaultConnection,

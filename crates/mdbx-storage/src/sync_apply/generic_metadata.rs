@@ -7,7 +7,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow};
 
-use super::{validate_payload_schema_version, ObjectDecision, SyncApplyRepo};
+use super::{commit_graph_apply::ObjectDecision, validate_payload_schema_version, SyncApplyRepo};
 
 pub(super) fn apply_object_relations(
     conn: &VaultConnection,

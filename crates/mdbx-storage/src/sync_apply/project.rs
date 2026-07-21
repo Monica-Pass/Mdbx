@@ -9,7 +9,7 @@ use crate::repo::{
 };
 use crate::sync_state::{ProjectRow, ProjectTagSetRow};
 
-use super::{bump_object_clock, merge_value, ObjectDecision, SyncApplyRepo};
+use super::{bump_object_clock, commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
 
 pub(super) fn apply_projects(
     conn: &VaultConnection,

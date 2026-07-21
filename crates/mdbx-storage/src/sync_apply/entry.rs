@@ -10,7 +10,7 @@ use crate::repo::{
 };
 use crate::sync_state::EntryRow;
 
-use super::{bump_object_clock, merge_value, ObjectDecision, SyncApplyRepo};
+use super::{bump_object_clock, commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
 
 pub(super) fn apply_entries(
     conn: &VaultConnection,
