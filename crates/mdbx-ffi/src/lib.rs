@@ -44,7 +44,6 @@ use mdbx_core::model::{EntryType, RelationKindId};
 use mdbx_core::tiga::{TigaMode, TigaScope};
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::StorageError;
-use mdbx_storage::migration::MigrationInfo;
 #[cfg(test)]
 use mdbx_storage::repo::EntryRepo;
 #[cfg(test)]
@@ -94,35 +93,6 @@ impl From<mdbx_sync::SyncError> for MdbxFfiError {
     fn from(value: mdbx_sync::SyncError) -> Self {
         MdbxFfiError::SyncProtocol {
             message: value.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct MdbxMigrationInfo {
-    pub initialized: bool,
-    pub format_version: Option<String>,
-    pub schema_version: Option<u32>,
-    pub min_reader_version: Option<String>,
-    pub min_writer_version: Option<String>,
-    pub requires_upgrade: bool,
-    pub unknown_critical_extensions: bool,
-    pub target_format_version: String,
-    pub target_schema_version: u32,
-}
-
-impl From<MigrationInfo> for MdbxMigrationInfo {
-    fn from(value: MigrationInfo) -> Self {
-        Self {
-            initialized: value.initialized,
-            format_version: value.format_version,
-            schema_version: value.schema_version,
-            min_reader_version: value.min_reader_version,
-            min_writer_version: value.min_writer_version,
-            requires_upgrade: value.requires_upgrade,
-            unknown_critical_extensions: value.unknown_critical_extensions,
-            target_format_version: value.target_format_version,
-            target_schema_version: value.target_schema_version,
         }
     }
 }

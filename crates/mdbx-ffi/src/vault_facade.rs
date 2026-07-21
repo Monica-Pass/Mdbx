@@ -1,3 +1,32 @@
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxMigrationInfo {
+    pub initialized: bool,
+    pub format_version: Option<String>,
+    pub schema_version: Option<u32>,
+    pub min_reader_version: Option<String>,
+    pub min_writer_version: Option<String>,
+    pub requires_upgrade: bool,
+    pub unknown_critical_extensions: bool,
+    pub target_format_version: String,
+    pub target_schema_version: u32,
+}
+
+impl From<MigrationInfo> for MdbxMigrationInfo {
+    fn from(value: MigrationInfo) -> Self {
+        Self {
+            initialized: value.initialized,
+            format_version: value.format_version,
+            schema_version: value.schema_version,
+            min_reader_version: value.min_reader_version,
+            min_writer_version: value.min_writer_version,
+            requires_upgrade: value.requires_upgrade,
+            unknown_critical_extensions: value.unknown_critical_extensions,
+            target_format_version: value.target_format_version,
+            target_schema_version: value.target_schema_version,
+        }
+    }
+}
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -6,11 +35,11 @@ use mdbx_storage::backup::BackupService;
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 use mdbx_storage::error::StorageError;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
-use mdbx_storage::migration::{inspect_migration_path, upgrade_path};
+use mdbx_storage::migration::{inspect_migration_path, upgrade_path, MigrationInfo};
 use mdbx_storage::unlock::UnlockService;
 use zeroize::Zeroizing;
 
-use super::{MdbxBackupInfo, MdbxFfiError, MdbxMigrationInfo, MdbxTigaMode, MdbxVault};
+use super::{MdbxBackupInfo, MdbxFfiError, MdbxTigaMode, MdbxVault};
 
 #[uniffi::export]
 pub fn create_vault(
