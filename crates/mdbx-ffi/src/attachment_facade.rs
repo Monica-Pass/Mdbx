@@ -1,3 +1,106 @@
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentRecord {
+    pub attachment_id: String,
+    pub project_id: String,
+    pub entry_id: Option<String>,
+    pub file_name: String,
+    pub media_type: Option<String>,
+    pub storage_mode: String,
+    pub content_hash: String,
+    pub original_size: u64,
+    pub stored_size: u64,
+    pub chunk_count: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentCreateRequest {
+    pub attachment_id: String,
+    pub project_id: String,
+    pub entry_id: Option<String>,
+    pub file_name: String,
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentContentLimits {
+    pub chunk_size: u64,
+    pub max_plaintext_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentWriteResult {
+    pub attachment: MdbxAttachmentRecord,
+    pub commit_id: String,
+    pub already_committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxAttachmentBatchCommand {
+    Create {
+        attachment_id: String,
+        project_id: String,
+        entry_id: Option<String>,
+        file_name: String,
+        media_type: Option<String>,
+        content: Vec<u8>,
+    },
+    Replace {
+        attachment_id: String,
+        content: Vec<u8>,
+    },
+    Rename {
+        attachment_id: String,
+        file_name: String,
+        media_type: Option<String>,
+    },
+    Delete {
+        attachment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentBatchLimits {
+    pub max_commands: u64,
+    pub max_plaintext_bytes_per_command: u64,
+    pub max_plaintext_bytes: u64,
+    pub chunk_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxAttachmentBatchResult {
+    pub attachments: Vec<MdbxAttachmentRecord>,
+    pub commit_id: String,
+    pub already_committed: bool,
+}
+
+const DEFAULT_ATTACHMENT_CHUNK_SIZE: usize = 256 * 1024;
+const HARD_MAX_ATTACHMENT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
+const HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_BATCH_COMMANDS: usize = 64;
+const HARD_MAX_ATTACHMENT_BATCH_COMMANDS: usize = 512;
+const DEFAULT_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
+const HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES: usize = 256 * 1024 * 1024;
+
+#[uniffi::export]
+pub fn default_attachment_content_limits() -> MdbxAttachmentContentLimits {
+    MdbxAttachmentContentLimits {
+        chunk_size: DEFAULT_ATTACHMENT_CHUNK_SIZE as u64,
+        max_plaintext_bytes: DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES as u64,
+    }
+}
+
+#[uniffi::export]
+pub fn default_attachment_batch_limits() -> MdbxAttachmentBatchLimits {
+    MdbxAttachmentBatchLimits {
+        max_commands: DEFAULT_MAX_ATTACHMENT_BATCH_COMMANDS as u64,
+        max_plaintext_bytes_per_command: DEFAULT_MAX_ATTACHMENT_PLAINTEXT_BYTES as u64,
+        max_plaintext_bytes: DEFAULT_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES as u64,
+        chunk_size: DEFAULT_ATTACHMENT_CHUNK_SIZE as u64,
+    }
+}
+
 use std::io::{self, Cursor, Write};
 use std::sync::Mutex;
 
@@ -11,14 +114,7 @@ use mdbx_storage::repo::{
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use sha2::{Digest, Sha256};
 
-use super::{
-    conservative_ffi_device_context, default_attachment_batch_limits, unix_now, validate_uuid,
-    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxAttachmentBatchResult,
-    MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest, MdbxAttachmentRecord,
-    MdbxAttachmentWriteResult, MdbxFfiError, MdbxVault, HARD_MAX_ATTACHMENT_BATCH_COMMANDS,
-    HARD_MAX_ATTACHMENT_BATCH_PLAINTEXT_BYTES, HARD_MAX_ATTACHMENT_CHUNK_SIZE,
-    HARD_MAX_ATTACHMENT_PLAINTEXT_BYTES,
-};
+use super::{conservative_ffi_device_context, unix_now, validate_uuid, MdbxFfiError, MdbxVault};
 
 pub(crate) struct AttachmentContentOperation<'a> {
     pub(crate) operation_id: String,
