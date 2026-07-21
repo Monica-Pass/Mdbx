@@ -1,6 +1,9 @@
 use rusqlite::params;
 use rusqlite::OptionalExtension;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
+
+#[path = "sync_apply/key_epoch.rs"]
+mod key_epoch_apply;
 
 use mdbx_core::model::{ConflictObjectType, ObjectTypeId};
 use mdbx_core::tiga::{
@@ -13,8 +16,6 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::conflict::ConflictDetector;
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::key_epoch::RANDOM_KEY_EPOCH_PROFILE_ID;
-use crate::migration::FIELD_KEY_EPOCHS_EXTENSION;
 use crate::repo::{
     BranchRepo, CollectionProfileRepo, CommitContext, ConflictRepo, EntryRepo, ObjectVersionRepo,
     PermanentPurgeReceipt, TombstoneRepo,
@@ -26,10 +27,10 @@ use crate::sync_delta::{
 };
 use crate::sync_state::{
     decode_sync_state_payload_with_limits, AttachmentChunkRow, AttachmentRow, BranchRow, EntryRow,
-    KeyEpochRow, KeyEpochState, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
-    ProjectRow, ProjectTagSetRow, PurgeReceiptRow, SecurityAuditEventRow, SyncStateLimits,
-    SyncStatePayload, TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow,
-    TombstoneAcknowledgementRow, TombstoneRow,
+    ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow, ProjectRow, ProjectTagSetRow,
+    PurgeReceiptRow, SecurityAuditEventRow, SyncStateLimits, SyncStatePayload,
+    TigaPolicyExceptionRow, TigaPolicyOverrideRow, TigaVaultStateRow, TombstoneAcknowledgementRow,
+    TombstoneRow,
 };
 use crate::tiga_policy::{
     optional_integrity_tag, validate_audit_correlation, validate_audit_evidence,
@@ -53,12 +54,6 @@ struct PayloadApplyResult {
     received_delta: bool,
     received_complete_state: bool,
     delta_commit_ids: Vec<String>,
-}
-
-#[derive(Clone, Copy)]
-enum KeyEpochMergeMode {
-    FastForward,
-    Divergent,
 }
 
 impl SyncApplyRepo {
@@ -98,7 +93,7 @@ impl SyncApplyRepo {
                 ctx,
                 "",
                 &body.state,
-                KeyEpochMergeMode::FastForward,
+                key_epoch_apply::MergeMode::FastForward,
                 false,
                 false,
             )?;
@@ -553,7 +548,7 @@ impl SyncApplyRepo {
                     ctx,
                     serialized,
                     &envelope,
-                    KeyEpochMergeMode::FastForward,
+                    key_epoch_apply::MergeMode::FastForward,
                     allow_key_epoch_changes,
                 )?;
                 result.received_delta = true;
@@ -570,7 +565,7 @@ impl SyncApplyRepo {
                     ctx,
                     &serialized.commit.commit_id,
                     &state,
-                    KeyEpochMergeMode::FastForward,
+                    key_epoch_apply::MergeMode::FastForward,
                     allow_key_epoch_changes,
                     true,
                 )?;
@@ -603,7 +598,7 @@ impl SyncApplyRepo {
                     ctx,
                     serialized,
                     &envelope,
-                    KeyEpochMergeMode::Divergent,
+                    key_epoch_apply::MergeMode::Divergent,
                     allow_key_epoch_changes,
                 )?;
                 result.received_delta = true;
@@ -620,7 +615,7 @@ impl SyncApplyRepo {
                     ctx,
                     &serialized.commit.commit_id,
                     &state,
-                    KeyEpochMergeMode::Divergent,
+                    key_epoch_apply::MergeMode::Divergent,
                     allow_key_epoch_changes,
                     true,
                 )?;
@@ -638,7 +633,7 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         serialized: &SerializedCommit,
         envelope: &SyncDeltaEnvelope,
-        merge_mode: KeyEpochMergeMode,
+        merge_mode: key_epoch_apply::MergeMode,
         allow_key_epoch_changes: bool,
     ) -> StorageResult<u32> {
         if envelope.batch_kind != SyncDeltaBatchKind::Commit {
@@ -722,13 +717,13 @@ impl SyncApplyRepo {
         ctx: &CommitContext,
         incoming_commit_id: &str,
         state: &SyncStatePayload,
-        key_epoch_merge_mode: KeyEpochMergeMode,
+        key_epoch_merge_mode: key_epoch_apply::MergeMode,
         allow_key_epoch_changes: bool,
         complete_tombstone_state: bool,
     ) -> StorageResult<u32> {
         let mut conflicts = 0;
         if let Some(key_epoch_state) = &state.key_epoch_state {
-            Self::apply_key_epoch_state(
+            key_epoch_apply::apply(
                 conn,
                 key_epoch_state,
                 key_epoch_merge_mode,
@@ -775,7 +770,10 @@ impl SyncApplyRepo {
         Self::apply_branches(conn, &state.branches)?;
         if let Some(tombstones) = &state.tombstones {
             if complete_tombstone_state
-                && matches!(key_epoch_merge_mode, KeyEpochMergeMode::FastForward)
+                && matches!(
+                    key_epoch_merge_mode,
+                    key_epoch_apply::MergeMode::FastForward
+                )
                 && conflicts == 0
             {
                 Self::apply_complete_tombstone_state(conn, tombstones)?;
@@ -787,74 +785,6 @@ impl SyncApplyRepo {
             Self::apply_tombstone_acknowledgements(conn, acknowledgements)?;
         }
         Ok(conflicts)
-    }
-
-    fn apply_key_epoch_state(
-        conn: &VaultConnection,
-        incoming: &KeyEpochState,
-        merge_mode: KeyEpochMergeMode,
-        allow_changes: bool,
-    ) -> StorageResult<()> {
-        validate_key_epoch_state(incoming)?;
-        let local = load_key_epoch_state(conn)?;
-        if same_key_epoch_state(&local, incoming) {
-            return Ok(());
-        }
-        if !allow_changes {
-            return Err(StorageError::Validation(
-                "key epoch changes require mutable sync apply".to_string(),
-            ));
-        }
-        if conn.active_key_epoch_id().is_none() {
-            return Err(StorageError::Validation(
-                "vault must be verified-unlocked before applying key epoch changes".to_string(),
-            ));
-        }
-        if incoming
-            .epochs
-            .iter()
-            .any(|row| row.kdf_profile_id == RANDOM_KEY_EPOCH_PROFILE_ID)
-            && incoming.integrity_tag.is_none()
-        {
-            return Err(StorageError::Validation(
-                "random key epoch sync state requires an integrity tag".to_string(),
-            ));
-        }
-        incoming.verify_integrity(conn)?;
-
-        let merged = merge_key_epoch_states(&local, incoming, merge_mode)?;
-        for row in &merged.epochs {
-            conn.inner().execute(
-                "INSERT INTO key_epochs
-                    (key_epoch_id, status, wrapped_epoch_key_ct, kdf_profile_id,
-                     created_at, activated_at, retired_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(key_epoch_id) DO UPDATE SET
-                    status = excluded.status,
-                    retired_at = excluded.retired_at",
-                params![
-                    row.key_epoch_id,
-                    row.status,
-                    row.wrapped_epoch_key_ct,
-                    row.kdf_profile_id,
-                    row.created_at,
-                    row.activated_at,
-                    row.retired_at,
-                ],
-            )?;
-        }
-        conn.inner().execute(
-            "UPDATE vault_meta SET active_key_epoch_id = ?1",
-            params![merged.active_key_epoch_id],
-        )?;
-        if merged
-            .epochs
-            .iter()
-            .any(|row| row.kdf_profile_id == RANDOM_KEY_EPOCH_PROFILE_ID)
-        {
-            conn.ensure_critical_extension(FIELD_KEY_EPOCHS_EXTENSION)?;
-        }
-        UnlockService::verify_key_epoch_state(conn)
     }
 
     fn apply_tiga_vault_state(
@@ -3231,176 +3161,6 @@ fn exists(
         .inner()
         .query_row(&sql, params![object_id], |row| row.get(0))?;
     Ok(count > 0)
-}
-
-fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
-    let active_key_epoch_id: String = conn.inner().query_row(
-        "SELECT active_key_epoch_id FROM vault_meta LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut stmt = conn.inner().prepare(
-        "SELECT key_epoch_id, status, wrapped_epoch_key_ct, kdf_profile_id,
-                created_at, activated_at, retired_at
-         FROM key_epochs ORDER BY key_epoch_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(KeyEpochRow {
-            key_epoch_id: row.get(0)?,
-            status: row.get(1)?,
-            wrapped_epoch_key_ct: row.get(2)?,
-            kdf_profile_id: row.get(3)?,
-            created_at: row.get(4)?,
-            activated_at: row.get(5)?,
-            retired_at: row.get(6)?,
-        })
-    })?;
-    let mut epochs = Vec::new();
-    for row in rows {
-        epochs.push(row?);
-    }
-    let state = KeyEpochState {
-        active_key_epoch_id,
-        epochs,
-        integrity_tag: None,
-    };
-    validate_key_epoch_state(&state)?;
-    Ok(state)
-}
-
-fn validate_key_epoch_state(state: &KeyEpochState) -> StorageResult<()> {
-    if state.active_key_epoch_id.is_empty() || state.epochs.is_empty() {
-        return Err(StorageError::Validation(
-            "key epoch sync state is empty".to_string(),
-        ));
-    }
-    let mut previous_id: Option<&str> = None;
-    let mut active_count = 0_u32;
-    for row in &state.epochs {
-        if row.key_epoch_id.is_empty() {
-            return Err(StorageError::Validation(
-                "key epoch sync state contains an empty ID".to_string(),
-            ));
-        }
-        if previous_id.is_some_and(|previous| previous >= row.key_epoch_id.as_str()) {
-            return Err(StorageError::Validation(
-                "key epoch sync rows must be uniquely sorted by ID".to_string(),
-            ));
-        }
-        previous_id = Some(&row.key_epoch_id);
-        match row.status.as_str() {
-            "active" => {
-                active_count += 1;
-                if row.key_epoch_id != state.active_key_epoch_id {
-                    return Err(StorageError::Validation(
-                        "active key epoch row does not match the sync state marker".to_string(),
-                    ));
-                }
-            }
-            "retired" => {}
-            other => {
-                return Err(StorageError::Validation(format!(
-                    "unsupported synchronized key epoch status: {other}"
-                )));
-            }
-        }
-    }
-    if active_count != 1 {
-        return Err(StorageError::Validation(format!(
-            "key epoch sync state contains {active_count} active rows"
-        )));
-    }
-    Ok(())
-}
-
-fn same_key_epoch_state(local: &KeyEpochState, incoming: &KeyEpochState) -> bool {
-    local.active_key_epoch_id == incoming.active_key_epoch_id && local.epochs == incoming.epochs
-}
-
-fn merge_key_epoch_states(
-    local: &KeyEpochState,
-    incoming: &KeyEpochState,
-    mode: KeyEpochMergeMode,
-) -> StorageResult<KeyEpochState> {
-    validate_key_epoch_state(local)?;
-    validate_key_epoch_state(incoming)?;
-    let mut epochs = local
-        .epochs
-        .iter()
-        .cloned()
-        .map(|row| (row.key_epoch_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-
-    for incoming_row in &incoming.epochs {
-        if let Some(local_row) = epochs.get_mut(&incoming_row.key_epoch_id) {
-            if local_row.wrapped_epoch_key_ct != incoming_row.wrapped_epoch_key_ct
-                || local_row.kdf_profile_id != incoming_row.kdf_profile_id
-                || local_row.created_at != incoming_row.created_at
-                || local_row.activated_at != incoming_row.activated_at
-            {
-                return Err(StorageError::Validation(format!(
-                    "key epoch {} immutable material was rewritten during sync",
-                    incoming_row.key_epoch_id
-                )));
-            }
-            local_row.retired_at = earliest_present(
-                local_row.retired_at.clone(),
-                incoming_row.retired_at.clone(),
-            );
-        } else {
-            epochs.insert(incoming_row.key_epoch_id.clone(), incoming_row.clone());
-        }
-    }
-
-    let active_key_epoch_id = match mode {
-        KeyEpochMergeMode::FastForward => incoming.active_key_epoch_id.clone(),
-        KeyEpochMergeMode::Divergent => {
-            let local_active = epochs.get(&local.active_key_epoch_id).ok_or_else(|| {
-                StorageError::Validation("local active key epoch row is missing".to_string())
-            })?;
-            let incoming_active = epochs.get(&incoming.active_key_epoch_id).ok_or_else(|| {
-                StorageError::Validation("incoming active key epoch row is missing".to_string())
-            })?;
-            if epoch_activation_rank(incoming_active) > epoch_activation_rank(local_active) {
-                incoming.active_key_epoch_id.clone()
-            } else {
-                local.active_key_epoch_id.clone()
-            }
-        }
-    };
-    let retirement_marker = epochs
-        .get(&active_key_epoch_id)
-        .and_then(|row| row.activated_at.clone())
-        .or_else(|| {
-            epochs
-                .get(&active_key_epoch_id)
-                .map(|row| row.created_at.clone())
-        })
-        .ok_or_else(|| StorageError::Validation("chosen key epoch row is missing".to_string()))?;
-
-    for row in epochs.values_mut() {
-        if row.key_epoch_id == active_key_epoch_id {
-            row.status = "active".to_string();
-            row.retired_at = None;
-        } else {
-            row.status = "retired".to_string();
-            if row.retired_at.is_none() {
-                row.retired_at = Some(retirement_marker.clone());
-            }
-        }
-    }
-    Ok(KeyEpochState {
-        active_key_epoch_id,
-        epochs: epochs.into_values().collect(),
-        integrity_tag: None,
-    })
-}
-
-fn epoch_activation_rank(row: &KeyEpochRow) -> (&str, &str) {
-    (
-        row.activated_at.as_deref().unwrap_or(&row.created_at),
-        &row.key_epoch_id,
-    )
 }
 
 fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, incoming: &T) -> Option<T> {
@@ -7446,10 +7206,10 @@ mod tests {
             .unwrap();
         let original_active = target.active_key_epoch_id().unwrap().to_string();
 
-        let immutable_error = SyncApplyRepo::apply_key_epoch_state(
+        let immutable_error = key_epoch_apply::apply(
             &target,
             &incoming,
-            KeyEpochMergeMode::FastForward,
+            key_epoch_apply::MergeMode::FastForward,
             false,
         )
         .unwrap_err();
@@ -7457,10 +7217,10 @@ mod tests {
 
         let mut unsigned = incoming.clone();
         unsigned.integrity_tag = None;
-        let unsigned_error = SyncApplyRepo::apply_key_epoch_state(
+        let unsigned_error = key_epoch_apply::apply(
             &target,
             &unsigned,
-            KeyEpochMergeMode::FastForward,
+            key_epoch_apply::MergeMode::FastForward,
             true,
         )
         .unwrap_err();
@@ -7468,10 +7228,10 @@ mod tests {
 
         let mut tampered = incoming;
         tampered.integrity_tag.as_mut().unwrap()[0] ^= 1;
-        let tampered_error = SyncApplyRepo::apply_key_epoch_state(
+        let tampered_error = key_epoch_apply::apply(
             &target,
             &tampered,
-            KeyEpochMergeMode::FastForward,
+            key_epoch_apply::MergeMode::FastForward,
             true,
         )
         .unwrap_err();
