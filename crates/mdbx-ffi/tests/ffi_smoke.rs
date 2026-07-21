@@ -322,6 +322,89 @@ fn write_operation_coalesces_commands_and_retries_idempotently() {
 }
 
 #[test]
+fn generic_metadata_write_operation_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("generic-metadata-operation");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "generic metadata password 12345!".to_string(),
+        "ffi-generic-metadata-device".to_string(),
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    let first_entry_id = Uuid::new_v4().to_string();
+    let second_entry_id = Uuid::new_v4().to_string();
+    let relation_id = Uuid::new_v4().to_string();
+    let label_id = Uuid::new_v4().to_string();
+    let assignment_id = Uuid::new_v4().to_string();
+    let before = count_rows(vault_path.path(), "commits");
+
+    let result = vault
+        .execute_write_operation(
+            Uuid::new_v4().to_string(),
+            "create-mail-thread".to_string(),
+            vec![
+                MdbxWriteCommand::CreateProject {
+                    project_id: project_id.clone(),
+                    title: "Mail".to_string(),
+                },
+                MdbxWriteCommand::CreateEntry {
+                    entry_id: first_entry_id.clone(),
+                    project_id: project_id.clone(),
+                    entry_type: "com.monica.mail.message".to_string(),
+                    title: "First".to_string(),
+                    payload_json: "{}".to_string(),
+                },
+                MdbxWriteCommand::CreateEntry {
+                    entry_id: second_entry_id.clone(),
+                    project_id: project_id.clone(),
+                    entry_type: "com.monica.mail.message".to_string(),
+                    title: "Second".to_string(),
+                    payload_json: "{}".to_string(),
+                },
+                MdbxWriteCommand::CreateObjectRelation {
+                    relation_id: relation_id.clone(),
+                    source_object_id: first_entry_id.clone(),
+                    target_object_id: second_entry_id,
+                    relation_kind: "com.monica.mail.reply-to".to_string(),
+                    payload_json: "{}".to_string(),
+                    payload_schema_version: 1,
+                },
+                MdbxWriteCommand::CreateObjectLabel {
+                    label_id: label_id.clone(),
+                    collection_id: project_id.clone(),
+                    name: "Important".to_string(),
+                    payload_json: "{}".to_string(),
+                    payload_schema_version: 1,
+                },
+                MdbxWriteCommand::AssignObjectLabel {
+                    assignment_id: assignment_id.clone(),
+                    object_id: first_entry_id.clone(),
+                    label_id: label_id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(count_rows(vault_path.path(), "commits"), before + 1);
+    assert_eq!(result.relation_ids, vec![relation_id.clone()]);
+    assert_eq!(result.label_ids, vec![label_id.clone()]);
+    assert_eq!(result.label_assignment_ids, vec![assignment_id.clone()]);
+    assert_eq!(
+        vault
+            .get_object_relation(relation_id)
+            .unwrap()
+            .unwrap()
+            .relation_kind,
+        "com.monica.mail.reply-to"
+    );
+    assert_eq!(vault.list_object_labels(project_id).unwrap().len(), 1);
+    assert_eq!(
+        vault.list_object_label_assignments(first_entry_id).unwrap()[0].assignment_id,
+        assignment_id
+    );
+}
+
+#[test]
 fn bounded_write_operation_accepts_namespaced_object_types() {
     let vault_path = temp_vault_path("bounded-generic-write-operation");
     let vault = create_vault(

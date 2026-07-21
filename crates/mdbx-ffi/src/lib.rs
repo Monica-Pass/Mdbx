@@ -1,7 +1,7 @@
 //! Generic UniFFI boundary for MDBX vault clients.
 //!
-//! This crate intentionally exposes vault, project, and generic entry
-//! operations only. Product-specific payloads belong in each client.
+//! This crate exposes vault, generic object, metadata, and attachment
+//! operations. Product-specific payload meaning belongs in each client.
 
 use std::io::{self, Cursor, Write};
 use std::path::Path;
@@ -682,6 +682,47 @@ pub enum MdbxWriteCommand {
         project_id: String,
         target_project_id: String,
     },
+    CreateObjectRelation {
+        relation_id: String,
+        source_object_id: String,
+        target_object_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    UpdateObjectRelation {
+        relation_id: String,
+        relation_kind: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    DeleteObjectRelation {
+        relation_id: String,
+    },
+    CreateObjectLabel {
+        label_id: String,
+        collection_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    UpdateObjectLabel {
+        label_id: String,
+        name: String,
+        payload_json: String,
+        payload_schema_version: u32,
+    },
+    DeleteObjectLabel {
+        label_id: String,
+    },
+    AssignObjectLabel {
+        assignment_id: String,
+        object_id: String,
+        label_id: String,
+    },
+    RemoveObjectLabelAssignment {
+        assignment_id: String,
+    },
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -690,6 +731,9 @@ pub struct MdbxWriteOperationResult {
     pub already_committed: bool,
     pub project_ids: Vec<String>,
     pub entry_ids: Vec<String>,
+    pub relation_ids: Vec<String>,
+    pub label_ids: Vec<String>,
+    pub label_assignment_ids: Vec<String>,
 }
 
 /// Resource contract for one generic user-level write operation.
@@ -4214,55 +4258,184 @@ fn validate_write_operation(
     }
     let mut total_payload_bytes = 0usize;
     for command in commands {
-        match command {
-            MdbxWriteCommand::CreateProject { project_id, .. } => {
-                validate_uuid(project_id, "project_id")?
+        let Some(payload_json) = validate_write_command(command)? else {
+            continue;
+        };
+        let payload_bytes = payload_json.len();
+        if payload_bytes > limits.max_payload_bytes_per_command {
+            return Err(StorageError::ResourceLimit {
+                resource: "write operation command payload bytes".to_string(),
+                actual: payload_bytes as u64,
+                limit: limits.max_payload_bytes_per_command as u64,
             }
-            MdbxWriteCommand::CreateEntry {
-                entry_id,
-                entry_type,
-                payload_json,
-                ..
-            }
-            | MdbxWriteCommand::UpdateEntry {
-                entry_id,
-                entry_type,
-                payload_json,
-                ..
-            } => {
-                validate_uuid(entry_id, "entry_id")?;
-                parse_write_object_type(entry_type)?;
-                let payload_bytes = payload_json.len();
-                if payload_bytes > limits.max_payload_bytes_per_command {
-                    return Err(StorageError::ResourceLimit {
-                        resource: "write operation command payload bytes".to_string(),
-                        actual: payload_bytes as u64,
-                        limit: limits.max_payload_bytes_per_command as u64,
-                    }
-                    .into());
-                }
-                total_payload_bytes =
-                    total_payload_bytes
-                        .checked_add(payload_bytes)
-                        .ok_or_else(|| StorageError::ResourceLimit {
-                            resource: "write operation payload bytes".to_string(),
-                            actual: u64::MAX,
-                            limit: limits.max_payload_bytes as u64,
-                        })?;
-                if total_payload_bytes > limits.max_payload_bytes {
-                    return Err(StorageError::ResourceLimit {
-                        resource: "write operation payload bytes".to_string(),
-                        actual: total_payload_bytes as u64,
-                        limit: limits.max_payload_bytes as u64,
-                    }
-                    .into());
-                }
-                parse_payload_json(payload_json)?;
-            }
-            MdbxWriteCommand::DeleteEntry { entry_id, .. }
-            | MdbxWriteCommand::RestoreEntry { entry_id, .. }
-            | MdbxWriteCommand::MoveEntry { entry_id, .. } => validate_uuid(entry_id, "entry_id")?,
+            .into());
         }
+        total_payload_bytes = total_payload_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| StorageError::ResourceLimit {
+                resource: "write operation payload bytes".to_string(),
+                actual: u64::MAX,
+                limit: limits.max_payload_bytes as u64,
+            })?;
+        if total_payload_bytes > limits.max_payload_bytes {
+            return Err(StorageError::ResourceLimit {
+                resource: "write operation payload bytes".to_string(),
+                actual: total_payload_bytes as u64,
+                limit: limits.max_payload_bytes as u64,
+            }
+            .into());
+        }
+        parse_payload_json(payload_json)?;
+    }
+    Ok(())
+}
+
+fn validate_write_command(command: &MdbxWriteCommand) -> Result<Option<&str>, MdbxFfiError> {
+    let payload_json = match command {
+        MdbxWriteCommand::CreateProject { project_id, .. } => {
+            validate_uuid(project_id, "project_id")?;
+            None
+        }
+        MdbxWriteCommand::CreateEntry {
+            entry_id,
+            project_id,
+            entry_type,
+            payload_json,
+            ..
+        }
+        | MdbxWriteCommand::UpdateEntry {
+            entry_id,
+            project_id,
+            entry_type,
+            payload_json,
+            ..
+        } => {
+            validate_uuid(entry_id, "entry_id")?;
+            validate_uuid(project_id, "project_id")?;
+            parse_write_object_type(entry_type)?;
+            Some(payload_json.as_str())
+        }
+        MdbxWriteCommand::DeleteEntry {
+            entry_id,
+            project_id,
+        }
+        | MdbxWriteCommand::RestoreEntry {
+            entry_id,
+            project_id,
+        } => {
+            validate_uuid(entry_id, "entry_id")?;
+            validate_uuid(project_id, "project_id")?;
+            None
+        }
+        MdbxWriteCommand::MoveEntry {
+            entry_id,
+            project_id,
+            target_project_id,
+        } => {
+            validate_uuid(entry_id, "entry_id")?;
+            validate_uuid(project_id, "project_id")?;
+            validate_uuid(target_project_id, "target_project_id")?;
+            None
+        }
+        MdbxWriteCommand::CreateObjectRelation {
+            relation_id,
+            source_object_id,
+            target_object_id,
+            relation_kind,
+            payload_json,
+            payload_schema_version,
+        } => {
+            validate_uuid(relation_id, "relation_id")?;
+            validate_uuid(source_object_id, "source_object_id")?;
+            validate_uuid(target_object_id, "target_object_id")?;
+            if source_object_id == target_object_id {
+                return Err(StorageError::Validation(
+                    "self relations require an explicit adapter object instead of an identity edge"
+                        .to_string(),
+                )
+                .into());
+            }
+            parse_relation_kind(relation_kind)?;
+            validate_write_payload_schema_version(*payload_schema_version)?;
+            Some(payload_json.as_str())
+        }
+        MdbxWriteCommand::UpdateObjectRelation {
+            relation_id,
+            relation_kind,
+            payload_json,
+            payload_schema_version,
+        } => {
+            validate_uuid(relation_id, "relation_id")?;
+            parse_relation_kind(relation_kind)?;
+            validate_write_payload_schema_version(*payload_schema_version)?;
+            Some(payload_json.as_str())
+        }
+        MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
+            validate_uuid(relation_id, "relation_id")?;
+            None
+        }
+        MdbxWriteCommand::CreateObjectLabel {
+            label_id,
+            collection_id,
+            name,
+            payload_json,
+            payload_schema_version,
+        } => {
+            validate_uuid(label_id, "label_id")?;
+            validate_uuid(collection_id, "collection_id")?;
+            validate_write_label_name(name)?;
+            validate_write_payload_schema_version(*payload_schema_version)?;
+            Some(payload_json.as_str())
+        }
+        MdbxWriteCommand::UpdateObjectLabel {
+            label_id,
+            name,
+            payload_json,
+            payload_schema_version,
+        } => {
+            validate_uuid(label_id, "label_id")?;
+            validate_write_label_name(name)?;
+            validate_write_payload_schema_version(*payload_schema_version)?;
+            Some(payload_json.as_str())
+        }
+        MdbxWriteCommand::DeleteObjectLabel { label_id } => {
+            validate_uuid(label_id, "label_id")?;
+            None
+        }
+        MdbxWriteCommand::AssignObjectLabel {
+            assignment_id,
+            object_id,
+            label_id,
+        } => {
+            validate_uuid(assignment_id, "assignment_id")?;
+            validate_uuid(object_id, "object_id")?;
+            validate_uuid(label_id, "label_id")?;
+            None
+        }
+        MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => {
+            validate_uuid(assignment_id, "assignment_id")?;
+            None
+        }
+    };
+    Ok(payload_json)
+}
+
+fn validate_write_payload_schema_version(value: u32) -> Result<(), MdbxFfiError> {
+    if value == 0 {
+        return Err(StorageError::Validation(
+            "payload_schema_version must be greater than zero".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_write_label_name(value: &str) -> Result<(), MdbxFfiError> {
+    if value.trim().is_empty() || value.len() > 512 {
+        return Err(StorageError::Validation(
+            "object label name must contain 1 to 512 UTF-8 bytes".to_string(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -4362,6 +4535,54 @@ fn write_operation_changes(commands: &[MdbxWriteCommand]) -> Vec<CommitChange> {
             MdbxWriteCommand::MoveEntry { entry_id, .. } => {
                 ("entry", entry_id, "move", &["project_id"])
             }
+            MdbxWriteCommand::CreateObjectRelation { relation_id, .. } => (
+                "object-relation",
+                relation_id,
+                "create",
+                &[
+                    "source_object_id",
+                    "target_object_id",
+                    "relation_kind",
+                    "payload",
+                    "payload_schema_version",
+                ],
+            ),
+            MdbxWriteCommand::UpdateObjectRelation { relation_id, .. } => (
+                "object-relation",
+                relation_id,
+                "update",
+                &["relation_kind", "payload", "payload_schema_version"],
+            ),
+            MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
+                ("object-relation", relation_id, "delete", &["deleted"])
+            }
+            MdbxWriteCommand::CreateObjectLabel { label_id, .. } => (
+                "object-label",
+                label_id,
+                "create",
+                &["collection_id", "name", "payload", "payload_schema_version"],
+            ),
+            MdbxWriteCommand::UpdateObjectLabel { label_id, .. } => (
+                "object-label",
+                label_id,
+                "update",
+                &["name", "payload", "payload_schema_version"],
+            ),
+            MdbxWriteCommand::DeleteObjectLabel { label_id } => {
+                ("object-label", label_id, "delete", &["deleted"])
+            }
+            MdbxWriteCommand::AssignObjectLabel { assignment_id, .. } => (
+                "object-label-assignment",
+                assignment_id,
+                "create",
+                &["object_id", "label_id"],
+            ),
+            MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => (
+                "object-label-assignment",
+                assignment_id,
+                "delete",
+                &["deleted"],
+            ),
         };
         let incoming = CommitChange {
             object_type: object_type.to_string(),
@@ -4472,9 +4693,104 @@ fn execute_write_commands(
                 entry_for_project(conn, project_id, entry_id)?;
                 EntryRepo::move_to_project(conn, ctx, entry_id, target_project_id)?;
             }
+            MdbxWriteCommand::CreateObjectRelation {
+                relation_id,
+                source_object_id,
+                target_object_id,
+                relation_kind,
+                payload_json,
+                payload_schema_version,
+            } => {
+                ObjectRelationRepo::create(
+                    conn,
+                    ctx,
+                    ObjectRelationCreateRequest::new(
+                        source_object_id,
+                        target_object_id,
+                        parse_relation_kind(relation_kind)
+                            .map_err(|error| StorageError::Validation(error.to_string()))?,
+                        parse_write_payload(payload_json)?,
+                    )
+                    .with_relation_id(relation_id)
+                    .with_payload_schema_version(*payload_schema_version),
+                )?;
+            }
+            MdbxWriteCommand::UpdateObjectRelation {
+                relation_id,
+                relation_kind,
+                payload_json,
+                payload_schema_version,
+            } => {
+                let mut relation = ObjectRelationRepo::get_by_id(conn, relation_id)?
+                    .ok_or_else(|| StorageError::NotFound(relation_id.clone()))?;
+                relation.relation_kind = parse_relation_kind(relation_kind)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+                relation.payload_ct = serde_json::to_vec(&parse_write_payload(payload_json)?)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+                relation.payload_schema_version = *payload_schema_version;
+                ObjectRelationRepo::update(conn, ctx, &relation)?;
+            }
+            MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
+                ObjectRelationRepo::soft_delete(conn, ctx, relation_id)?;
+            }
+            MdbxWriteCommand::CreateObjectLabel {
+                label_id,
+                collection_id,
+                name,
+                payload_json,
+                payload_schema_version,
+            } => {
+                ObjectLabelRepo::create(
+                    conn,
+                    ctx,
+                    ObjectLabelCreateRequest::new(
+                        collection_id,
+                        name,
+                        parse_write_payload(payload_json)?,
+                    )
+                    .with_label_id(label_id)
+                    .with_payload_schema_version(*payload_schema_version),
+                )?;
+            }
+            MdbxWriteCommand::UpdateObjectLabel {
+                label_id,
+                name,
+                payload_json,
+                payload_schema_version,
+            } => {
+                let mut label = ObjectLabelRepo::get_by_id(conn, label_id)?
+                    .ok_or_else(|| StorageError::NotFound(label_id.clone()))?;
+                label.name_ct = name.as_bytes().to_vec();
+                label.payload_ct = serde_json::to_vec(&parse_write_payload(payload_json)?)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+                label.payload_schema_version = *payload_schema_version;
+                ObjectLabelRepo::update(conn, ctx, &label)?;
+            }
+            MdbxWriteCommand::DeleteObjectLabel { label_id } => {
+                ObjectLabelRepo::soft_delete(conn, ctx, label_id)?;
+            }
+            MdbxWriteCommand::AssignObjectLabel {
+                assignment_id,
+                object_id,
+                label_id,
+            } => {
+                ObjectLabelAssignmentRepo::create(
+                    conn,
+                    ctx,
+                    ObjectLabelAssignmentCreateRequest::new(object_id, label_id)
+                        .with_assignment_id(assignment_id),
+                )?;
+            }
+            MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => {
+                ObjectLabelAssignmentRepo::soft_delete(conn, ctx, assignment_id)?;
+            }
         }
     }
     Ok(())
+}
+
+fn parse_write_payload(payload_json: &str) -> StorageResult<serde_json::Value> {
+    serde_json::from_str(payload_json).map_err(|error| StorageError::Validation(error.to_string()))
 }
 
 fn execute_write_operation_for_branch(
@@ -4525,10 +4841,16 @@ fn write_operation_result(
     let changes = write_operation_changes(commands);
     let mut project_ids = Vec::new();
     let mut entry_ids = Vec::new();
+    let mut relation_ids = Vec::new();
+    let mut label_ids = Vec::new();
+    let mut label_assignment_ids = Vec::new();
     for change in changes {
         match change.object_type.as_str() {
             "project" => project_ids.push(change.object_id),
             "entry" => entry_ids.push(change.object_id),
+            "object-relation" => relation_ids.push(change.object_id),
+            "object-label" => label_ids.push(change.object_id),
+            "object-label-assignment" => label_assignment_ids.push(change.object_id),
             _ => {}
         }
     }
@@ -4537,6 +4859,9 @@ fn write_operation_result(
         already_committed,
         project_ids,
         entry_ids,
+        relation_ids,
+        label_ids,
+        label_assignment_ids,
     }
 }
 
@@ -4820,7 +5145,7 @@ fn object_label_assignment_record(
 mod tests {
     use super::*;
 
-    fn attachment_test_vault() -> MdbxVault {
+    fn ffi_test_vault() -> MdbxVault {
         let mut conn = VaultConnection::open_in_memory().unwrap();
         let init = initialize_vault(&conn, &VaultInitParams::default()).unwrap();
         UnlockService::setup_password_with_mode(&mut conn, "attachment-password", TigaMode::Multi)
@@ -4832,7 +5157,7 @@ mod tests {
         }
     }
 
-    fn attachment_test_count(vault: &MdbxVault, table: &str) -> i64 {
+    fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
         let conn = vault.conn.lock().unwrap();
         conn.inner()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5052,7 +5377,7 @@ mod tests {
 
     #[test]
     fn attachment_facade_roundtrips_and_coalesces_content_commits() {
-        let vault = attachment_test_vault();
+        let vault = ffi_test_vault();
         let project = vault.create_project("Steam".to_string()).unwrap();
         let attachment_id = Uuid::new_v4().to_string();
         let operation_id = Uuid::new_v4().to_string();
@@ -5060,7 +5385,7 @@ mod tests {
             chunk_size: 3,
             max_plaintext_bytes: 64,
         };
-        let commits_before = attachment_test_count(&vault, "commits");
+        let commits_before = ffi_test_count(&vault, "commits");
 
         let created = vault
             .create_attachment_with_content(
@@ -5079,7 +5404,7 @@ mod tests {
         assert!(!created.already_committed);
         assert_eq!(created.attachment.attachment_id, attachment_id);
         assert_eq!(created.attachment.chunk_count, 2);
-        assert_eq!(attachment_test_count(&vault, "commits"), commits_before + 1);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
         assert_eq!(
             vault
                 .read_attachment_content(attachment_id.clone(), 64)
@@ -5117,7 +5442,7 @@ mod tests {
                 limits,
             )
             .is_err());
-        assert_eq!(attachment_test_count(&vault, "commits"), commits_before + 1);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
 
         let original_hash = created.attachment.content_hash;
         let replaced = vault
@@ -5163,10 +5488,10 @@ mod tests {
 
     #[test]
     fn attachment_facade_rejects_oversized_content_without_side_effects() {
-        let vault = attachment_test_vault();
+        let vault = ffi_test_vault();
         let project = vault.create_project("Mail".to_string()).unwrap();
-        let commits_before = attachment_test_count(&vault, "commits");
-        let attachments_before = attachment_test_count(&vault, "attachments");
+        let commits_before = ffi_test_count(&vault, "commits");
+        let attachments_before = ffi_test_count(&vault, "attachments");
         let result = vault.create_attachment_with_content(
             Uuid::new_v4().to_string(),
             MdbxAttachmentCreateRequest {
@@ -5186,16 +5511,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("attachment plaintext bytes"));
-        assert_eq!(attachment_test_count(&vault, "commits"), commits_before);
-        assert_eq!(
-            attachment_test_count(&vault, "attachments"),
-            attachments_before
-        );
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+        assert_eq!(ffi_test_count(&vault, "attachments"), attachments_before);
     }
 
     #[test]
     fn attachment_facade_enforces_stream_limits_and_detects_tampering() {
-        let vault = attachment_test_vault();
+        let vault = ffi_test_vault();
         let project = vault.create_project("Mail".to_string()).unwrap();
         let attachment_id = Uuid::new_v4().to_string();
         vault
@@ -5261,7 +5583,7 @@ mod tests {
 
     #[test]
     fn attachment_facade_honors_collection_capability_trimming() {
-        let vault = attachment_test_vault();
+        let vault = ffi_test_vault();
         let project = vault.create_project("Mail".to_string()).unwrap();
         vault
             .set_extension_capabilities(vec!["com.monica.mail.store".to_string()])
@@ -5277,7 +5599,7 @@ mod tests {
             )
             .unwrap();
         vault.set_extension_capabilities(Vec::new()).unwrap();
-        let commits_before = attachment_test_count(&vault, "commits");
+        let commits_before = ffi_test_count(&vault, "commits");
 
         assert!(vault
             .create_attachment_with_content(
@@ -5293,8 +5615,8 @@ mod tests {
                 default_attachment_content_limits(),
             )
             .is_err());
-        assert_eq!(attachment_test_count(&vault, "commits"), commits_before);
-        assert_eq!(attachment_test_count(&vault, "attachments"), 0);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+        assert_eq!(ffi_test_count(&vault, "attachments"), 0);
     }
 
     #[test]
@@ -5995,6 +6317,301 @@ mod tests {
     }
 
     #[test]
+    fn generic_metadata_write_operation_is_atomic_idempotent_and_lifecycle_complete() {
+        let vault = ffi_test_vault();
+        let operation_id = Uuid::new_v4().to_string();
+        let project_id = Uuid::new_v4().to_string();
+        let first_entry_id = Uuid::new_v4().to_string();
+        let second_entry_id = Uuid::new_v4().to_string();
+        let relation_id = Uuid::new_v4().to_string();
+        let label_id = Uuid::new_v4().to_string();
+        let assignment_id = Uuid::new_v4().to_string();
+        let commits_before = ffi_test_count(&vault, "commits");
+        let commands = vec![
+            MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Mail".to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id: first_entry_id.clone(),
+                project_id: project_id.clone(),
+                entry_type: "com.monica.mail.message".to_string(),
+                title: "First".to_string(),
+                payload_json: r#"{"body":"first"}"#.to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id: second_entry_id.clone(),
+                project_id: project_id.clone(),
+                entry_type: "com.monica.mail.message".to_string(),
+                title: "Second".to_string(),
+                payload_json: r#"{"body":"second"}"#.to_string(),
+            },
+            MdbxWriteCommand::CreateObjectRelation {
+                relation_id: relation_id.clone(),
+                source_object_id: first_entry_id.clone(),
+                target_object_id: second_entry_id.clone(),
+                relation_kind: "com.monica.mail.reply-to".to_string(),
+                payload_json: r#"{"position":1}"#.to_string(),
+                payload_schema_version: 1,
+            },
+            MdbxWriteCommand::CreateObjectLabel {
+                label_id: label_id.clone(),
+                collection_id: project_id.clone(),
+                name: "Important".to_string(),
+                payload_json: r#"{"color":"red"}"#.to_string(),
+                payload_schema_version: 1,
+            },
+            MdbxWriteCommand::AssignObjectLabel {
+                assignment_id: assignment_id.clone(),
+                object_id: first_entry_id.clone(),
+                label_id: label_id.clone(),
+            },
+        ];
+
+        let created = vault
+            .execute_write_operation(
+                operation_id.clone(),
+                "mail-thread-import".to_string(),
+                commands.clone(),
+            )
+            .unwrap();
+        assert!(!created.already_committed);
+        assert_eq!(created.project_ids, vec![project_id.clone()]);
+        assert_eq!(
+            created.entry_ids,
+            vec![first_entry_id.clone(), second_entry_id.clone()]
+        );
+        assert_eq!(created.relation_ids, vec![relation_id.clone()]);
+        assert_eq!(created.label_ids, vec![label_id.clone()]);
+        assert_eq!(created.label_assignment_ids, vec![assignment_id.clone()]);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+        {
+            let conn = vault.conn.lock().unwrap();
+            assert_eq!(
+                ObjectRelationRepo::get_by_id(&conn, &relation_id)
+                    .unwrap()
+                    .unwrap()
+                    .head_commit_id,
+                created.commit_id
+            );
+            assert_eq!(
+                ObjectLabelRepo::get_by_id(&conn, &label_id)
+                    .unwrap()
+                    .unwrap()
+                    .head_commit_id,
+                created.commit_id
+            );
+            assert_eq!(
+                ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment_id)
+                    .unwrap()
+                    .unwrap()
+                    .head_commit_id,
+                created.commit_id
+            );
+        }
+
+        let retry = vault
+            .execute_write_operation(
+                operation_id.clone(),
+                "mail-thread-import".to_string(),
+                commands.clone(),
+            )
+            .unwrap();
+        assert!(retry.already_committed);
+        assert_eq!(retry.commit_id, created.commit_id);
+        let mut changed_commands = commands.clone();
+        if let MdbxWriteCommand::CreateObjectRelation { payload_json, .. } =
+            &mut changed_commands[3]
+        {
+            *payload_json = r#"{"position":2}"#.to_string();
+        }
+        assert!(vault
+            .execute_write_operation(
+                operation_id,
+                "mail-thread-import".to_string(),
+                changed_commands,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("reused for a different operation"));
+
+        let updated = vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-thread-update".to_string(),
+                vec![
+                    MdbxWriteCommand::UpdateObjectRelation {
+                        relation_id: relation_id.clone(),
+                        relation_kind: "com.monica.mail.thread-member".to_string(),
+                        payload_json: r#"{"position":2}"#.to_string(),
+                        payload_schema_version: 2,
+                    },
+                    MdbxWriteCommand::UpdateObjectLabel {
+                        label_id: label_id.clone(),
+                        name: "Priority".to_string(),
+                        payload_json: r#"{"color":"orange"}"#.to_string(),
+                        payload_schema_version: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated.relation_ids, vec![relation_id.clone()]);
+        assert_eq!(updated.label_ids, vec![label_id.clone()]);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 2);
+
+        let deleted = vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-thread-delete".to_string(),
+                vec![
+                    MdbxWriteCommand::RemoveObjectLabelAssignment {
+                        assignment_id: assignment_id.clone(),
+                    },
+                    MdbxWriteCommand::DeleteObjectLabel {
+                        label_id: label_id.clone(),
+                    },
+                    MdbxWriteCommand::DeleteObjectRelation {
+                        relation_id: relation_id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(deleted.relation_ids, vec![relation_id.clone()]);
+        assert_eq!(deleted.label_ids, vec![label_id.clone()]);
+        assert_eq!(deleted.label_assignment_ids, vec![assignment_id.clone()]);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 3);
+        let conn = vault.conn.lock().unwrap();
+        assert!(
+            ObjectRelationRepo::get_by_id(&conn, &relation_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            ObjectLabelRepo::get_by_id(&conn, &label_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            ObjectLabelAssignmentRepo::get_by_id(&conn, &assignment_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+    }
+
+    #[test]
+    fn generic_metadata_write_operation_rolls_back_and_enforces_bounds() {
+        let vault = ffi_test_vault();
+        let project = vault.create_project("Mail".to_string()).unwrap();
+        let first = vault
+            .create_object(
+                project.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                "First".to_string(),
+                "{}".to_string(),
+                1,
+            )
+            .unwrap();
+        let second = vault
+            .create_object(
+                project.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                "Second".to_string(),
+                "{}".to_string(),
+                1,
+            )
+            .unwrap();
+        let rolled_back_label_id = Uuid::new_v4().to_string();
+        let commits_before = ffi_test_count(&vault, "commits");
+
+        assert!(vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-label-import".to_string(),
+                vec![
+                    MdbxWriteCommand::CreateObjectLabel {
+                        label_id: rolled_back_label_id.clone(),
+                        collection_id: project.project_id.clone(),
+                        name: "Rolled back".to_string(),
+                        payload_json: "{}".to_string(),
+                        payload_schema_version: 1,
+                    },
+                    MdbxWriteCommand::AssignObjectLabel {
+                        assignment_id: Uuid::new_v4().to_string(),
+                        object_id: Uuid::new_v4().to_string(),
+                        label_id: rolled_back_label_id.clone(),
+                    },
+                ],
+            )
+            .is_err());
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+        assert_eq!(ffi_test_count(&vault, "object_labels"), 0);
+
+        let limits = MdbxWriteOperationLimits {
+            max_commands: 1,
+            max_payload_bytes_per_command: 8,
+            max_payload_bytes: 8,
+            max_intent_bytes: 4096,
+        };
+        assert!(vault
+            .execute_write_operation_with_limits(
+                Uuid::new_v4().to_string(),
+                "mail-relation-import".to_string(),
+                vec![MdbxWriteCommand::CreateObjectRelation {
+                    relation_id: Uuid::new_v4().to_string(),
+                    source_object_id: first.object_id.clone(),
+                    target_object_id: second.object_id.clone(),
+                    relation_kind: "com.monica.mail.reply-to".to_string(),
+                    payload_json: r#"{"position":1}"#.to_string(),
+                    payload_schema_version: 1,
+                }],
+                limits,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("command payload bytes"));
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
+        assert_eq!(ffi_test_count(&vault, "object_relations"), 0);
+
+        vault
+            .set_extension_capabilities(vec!["com.monica.mail.store".to_string()])
+            .unwrap();
+        vault
+            .set_collection_profile(
+                project.project_id.clone(),
+                "com.monica.mail".to_string(),
+                b"profile".to_vec(),
+                1,
+                vec!["com.monica.mail.message".to_string()],
+                vec!["com.monica.mail.store".to_string()],
+            )
+            .unwrap();
+        vault.set_extension_capabilities(Vec::new()).unwrap();
+        let commits_before_capability_failure = ffi_test_count(&vault, "commits");
+        assert!(vault
+            .execute_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-relation-import".to_string(),
+                vec![MdbxWriteCommand::CreateObjectRelation {
+                    relation_id: Uuid::new_v4().to_string(),
+                    source_object_id: first.object_id,
+                    target_object_id: second.object_id,
+                    relation_kind: "com.monica.mail.reply-to".to_string(),
+                    payload_json: "{}".to_string(),
+                    payload_schema_version: 1,
+                }],
+            )
+            .is_err());
+        assert_eq!(
+            ffi_test_count(&vault, "commits"),
+            commits_before_capability_failure
+        );
+        assert_eq!(ffi_test_count(&vault, "object_relations"), 0);
+    }
+
+    #[test]
     fn every_write_command_has_a_typed_change_summary() {
         let commands = vec![
             MdbxWriteCommand::CreateProject {
@@ -6028,6 +6645,47 @@ mod tests {
                 project_id: "project".to_string(),
                 target_project_id: "target".to_string(),
             },
+            MdbxWriteCommand::CreateObjectRelation {
+                relation_id: "relation-created".to_string(),
+                source_object_id: "source".to_string(),
+                target_object_id: "target".to_string(),
+                relation_kind: "com.monica.test.relation".to_string(),
+                payload_json: "{}".to_string(),
+                payload_schema_version: 1,
+            },
+            MdbxWriteCommand::UpdateObjectRelation {
+                relation_id: "relation-updated".to_string(),
+                relation_kind: "com.monica.test.relation".to_string(),
+                payload_json: "{}".to_string(),
+                payload_schema_version: 2,
+            },
+            MdbxWriteCommand::DeleteObjectRelation {
+                relation_id: "relation-deleted".to_string(),
+            },
+            MdbxWriteCommand::CreateObjectLabel {
+                label_id: "label-created".to_string(),
+                collection_id: "project".to_string(),
+                name: "Created".to_string(),
+                payload_json: "{}".to_string(),
+                payload_schema_version: 1,
+            },
+            MdbxWriteCommand::UpdateObjectLabel {
+                label_id: "label-updated".to_string(),
+                name: "Updated".to_string(),
+                payload_json: "{}".to_string(),
+                payload_schema_version: 2,
+            },
+            MdbxWriteCommand::DeleteObjectLabel {
+                label_id: "label-deleted".to_string(),
+            },
+            MdbxWriteCommand::AssignObjectLabel {
+                assignment_id: "assignment-created".to_string(),
+                object_id: "created".to_string(),
+                label_id: "label-created".to_string(),
+            },
+            MdbxWriteCommand::RemoveObjectLabelAssignment {
+                assignment_id: "assignment-deleted".to_string(),
+            },
         ];
 
         let changes = write_operation_changes(&commands);
@@ -6037,7 +6695,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             actions,
-            vec!["create", "create", "update", "delete", "restore", "move"]
+            vec![
+                "create", "create", "update", "delete", "restore", "move", "create", "update",
+                "delete", "create", "update", "delete", "create", "delete"
+            ]
         );
         assert_eq!(changes[0].fields, vec!["title"]);
         assert_eq!(
@@ -6048,5 +6709,31 @@ mod tests {
         assert_eq!(changes[3].fields, vec!["deleted"]);
         assert_eq!(changes[4].fields, vec!["deleted"]);
         assert_eq!(changes[5].fields, vec!["project_id"]);
+        assert_eq!(
+            changes[6].fields,
+            vec![
+                "source_object_id",
+                "target_object_id",
+                "relation_kind",
+                "payload",
+                "payload_schema_version"
+            ]
+        );
+        assert_eq!(
+            changes[7].fields,
+            vec!["relation_kind", "payload", "payload_schema_version"]
+        );
+        assert_eq!(changes[8].fields, vec!["deleted"]);
+        assert_eq!(
+            changes[9].fields,
+            vec!["collection_id", "name", "payload", "payload_schema_version"]
+        );
+        assert_eq!(
+            changes[10].fields,
+            vec!["name", "payload", "payload_schema_version"]
+        );
+        assert_eq!(changes[11].fields, vec!["deleted"]);
+        assert_eq!(changes[12].fields, vec!["object_id", "label_id"]);
+        assert_eq!(changes[13].fields, vec!["deleted"]);
     }
 }
