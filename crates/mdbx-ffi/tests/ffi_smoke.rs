@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
-    default_attachment_batch_limits, default_write_operation_limits, inspect_vault_migration,
-    open_vault, open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    default_attachment_batch_limits, default_composite_write_operation_limits,
+    default_write_operation_limits, inspect_vault_migration, open_vault,
+    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAttachmentBatchCommand, MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome,
     MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError,
     MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
@@ -461,6 +462,67 @@ fn attachment_batch_is_available_to_external_clients() {
     assert_eq!(
         vault.read_attachment_content(first_id, 64).unwrap(),
         b"first"
+    );
+}
+
+#[test]
+fn composite_write_operation_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("composite-write-operation");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "composite password 12345!".to_string(),
+        "ffi-composite-device".to_string(),
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4().to_string();
+    let entry_id = Uuid::new_v4().to_string();
+    let attachment_id = Uuid::new_v4().to_string();
+    let before = count_rows(vault_path.path(), "commits");
+    let mut limits = default_composite_write_operation_limits();
+    limits.write_limits.max_commands = 2;
+    limits.write_limits.max_payload_bytes_per_command = 1024;
+    limits.write_limits.max_payload_bytes = 1024;
+    limits.write_limits.max_intent_bytes = 4096;
+    limits.attachment_limits.max_commands = 1;
+    limits.attachment_limits.max_plaintext_bytes_per_command = 64;
+    limits.attachment_limits.max_plaintext_bytes = 64;
+    limits.attachment_limits.chunk_size = 3;
+
+    let result = vault
+        .execute_composite_write_operation_with_limits(
+            Uuid::new_v4().to_string(),
+            "mail-import".to_string(),
+            vec![
+                MdbxWriteCommand::CreateProject {
+                    project_id: project_id.clone(),
+                    title: "Mail".to_string(),
+                },
+                MdbxWriteCommand::CreateEntry {
+                    entry_id: entry_id.clone(),
+                    project_id: project_id.clone(),
+                    entry_type: "com.monica.mail.message".to_string(),
+                    title: "Message".to_string(),
+                    payload_json: "{}".to_string(),
+                },
+            ],
+            vec![MdbxAttachmentBatchCommand::Create {
+                attachment_id: attachment_id.clone(),
+                project_id,
+                entry_id: Some(entry_id),
+                file_name: "message.eml".to_string(),
+                media_type: Some("message/rfc822".to_string()),
+                content: b"mail body".to_vec(),
+            }],
+            limits,
+        )
+        .unwrap();
+    assert_eq!(count_rows(vault_path.path(), "commits"), before + 1);
+    assert_eq!(result.operation.project_ids.len(), 1);
+    assert_eq!(result.operation.entry_ids.len(), 1);
+    assert_eq!(result.attachments[0].attachment_id, attachment_id.clone());
+    assert_eq!(
+        vault.read_attachment_content(attachment_id, 64).unwrap(),
+        b"mail body"
     );
 }
 

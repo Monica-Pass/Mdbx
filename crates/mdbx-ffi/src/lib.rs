@@ -55,6 +55,14 @@ pub fn default_write_operation_limits() -> MdbxWriteOperationLimits {
     InternalWriteOperationLimits::default().public()
 }
 
+#[uniffi::export]
+pub fn default_composite_write_operation_limits() -> MdbxCompositeWriteOperationLimits {
+    MdbxCompositeWriteOperationLimits {
+        write_limits: default_write_operation_limits(),
+        attachment_limits: default_attachment_batch_limits(),
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MdbxFfiError {
     #[error("storage error: {message}")]
@@ -672,6 +680,18 @@ pub struct MdbxAttachmentBatchResult {
     pub attachments: Vec<MdbxAttachmentRecord>,
     pub commit_id: String,
     pub already_committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxCompositeWriteOperationLimits {
+    pub write_limits: MdbxWriteOperationLimits,
+    pub attachment_limits: MdbxAttachmentBatchLimits,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCompositeWriteOperationResult {
+    pub operation: MdbxWriteOperationResult,
+    pub attachments: Vec<MdbxAttachmentRecord>,
 }
 
 const DEFAULT_ATTACHMENT_CHUNK_SIZE: usize = 256 * 1024;
@@ -3017,6 +3037,94 @@ impl MdbxVault {
         )
     }
 
+    pub fn execute_composite_write_operation(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: None,
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: InternalWriteOperationLimits::default(),
+                attachment_limits: default_attachment_batch_limits(),
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_with_limits(
+        &self,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxCompositeWriteOperationLimits,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: None,
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: limits.write_limits.into_internal()?,
+                attachment_limits: limits.attachment_limits,
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_on_branch(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: Some(branch_id),
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: InternalWriteOperationLimits::default(),
+                attachment_limits: default_attachment_batch_limits(),
+            },
+        )
+    }
+
+    pub fn execute_composite_write_operation_on_branch_with_limits(
+        &self,
+        branch_id: String,
+        operation_id: String,
+        operation_kind: String,
+        commands: Vec<MdbxWriteCommand>,
+        attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+        limits: MdbxCompositeWriteOperationLimits,
+    ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+        execute_composite_write_operation(
+            self,
+            CompositeWriteOperation {
+                branch_id: Some(branch_id),
+                operation_id,
+                operation_kind,
+                commands,
+                attachment_commands,
+                write_limits: limits.write_limits.into_internal()?,
+                attachment_limits: limits.attachment_limits,
+            },
+        )
+    }
+
     pub fn list_branches(&self) -> Result<Vec<MdbxBranchInfo>, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(BranchRepo::list(&conn)?
@@ -5327,6 +5435,116 @@ fn execute_write_operation_for_branch(
     ))
 }
 
+struct CompositeWriteOperation {
+    branch_id: Option<String>,
+    operation_id: String,
+    operation_kind: String,
+    commands: Vec<MdbxWriteCommand>,
+    attachment_commands: Vec<MdbxAttachmentBatchCommand>,
+    write_limits: InternalWriteOperationLimits,
+    attachment_limits: MdbxAttachmentBatchLimits,
+}
+
+fn execute_composite_write_operation(
+    vault: &MdbxVault,
+    request: CompositeWriteOperation,
+) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
+    if request.commands.is_empty() || request.attachment_commands.is_empty() {
+        return Err(StorageError::Validation(
+            "composite write operation requires generic and attachment commands".to_string(),
+        )
+        .into());
+    }
+    validate_write_operation(
+        &request.operation_id,
+        &request.operation_kind,
+        &request.commands,
+        request.write_limits,
+    )?;
+    let chunk_size = validate_attachment_batch_operation_inputs(
+        &request.operation_id,
+        &request.attachment_commands,
+        request.attachment_limits,
+    )?;
+    let generic_intent_hash =
+        hash_write_operation_intent(&request.commands, request.write_limits.max_intent_bytes)?;
+    let attachment_intent_hash = hash_attachment_batch_intent(
+        &request.operation_id,
+        &request.attachment_commands,
+        request.attachment_limits,
+    );
+    let intent_hash = hash_composite_write_intent(
+        &request.operation_id,
+        &request.operation_kind,
+        &generic_intent_hash,
+        &attachment_intent_hash,
+    );
+    let attachment_ids = attachment_batch_ids(&request.attachment_commands);
+    let mut changed_objects = write_operation_changes(&request.commands);
+    changed_objects.extend(attachment_batch_changes(&request.attachment_commands));
+    let mut operation = CommitOperation::new(
+        request.operation_id,
+        request.operation_kind,
+        request.branch_id.as_deref().map(|_| "").unwrap_or("main"),
+        "change",
+        write_operation_scope(&changed_objects),
+        changed_objects,
+    )
+    .with_intent_hash(intent_hash);
+    if let Some(branch_id) = request.branch_id {
+        operation = operation.with_branch_id(branch_id);
+    }
+
+    let generic_commands = request.commands;
+    let attachment_commands = request.attachment_commands;
+    let conn = vault.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+    let ctx = CommitContext::new(vault.device_id.clone());
+    let ids_for_action = attachment_ids.clone();
+    let execution = ctx.run_operation(&conn, operation, |scoped| {
+        execute_write_commands(&conn, scoped, &generic_commands)?;
+        execute_attachment_batch_commands(
+            &conn,
+            scoped,
+            attachment_commands,
+            chunk_size,
+            &ids_for_action,
+        )
+    })?;
+    let (commit_id, already_committed) = match execution {
+        OperationExecution::Applied { commit_id, .. } => (commit_id, false),
+        OperationExecution::AlreadyCommitted { commit_id } => (commit_id, true),
+    };
+    let attachments = attachment_ids
+        .iter()
+        .map(|attachment_id| {
+            AttachmentRepo::get_by_id(&conn, attachment_id)?
+                .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))
+        })
+        .collect::<StorageResult<Vec<_>>>()?
+        .iter()
+        .map(attachment_record_from_core)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MdbxCompositeWriteOperationResult {
+        operation: write_operation_result(&generic_commands, commit_id, already_committed),
+        attachments,
+    })
+}
+
+fn hash_composite_write_intent(
+    operation_id: &str,
+    operation_kind: &str,
+    generic_intent_hash: &[u8],
+    attachment_intent_hash: &[u8],
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    update_attachment_intent_part(&mut hasher, b"mdbx-ffi-composite-write-v1");
+    update_attachment_intent_part(&mut hasher, operation_id.as_bytes());
+    update_attachment_intent_part(&mut hasher, operation_kind.as_bytes());
+    update_attachment_intent_part(&mut hasher, generic_intent_hash);
+    update_attachment_intent_part(&mut hasher, attachment_intent_hash);
+    hasher.finalize().to_vec()
+}
+
 fn write_operation_result(
     commands: &[MdbxWriteCommand],
     commit_id: String,
@@ -7312,6 +7530,204 @@ mod tests {
             commits_before_capability_failure
         );
         assert_eq!(ffi_test_count(&vault, "object_relations"), 0);
+    }
+
+    #[test]
+    fn composite_write_operation_creates_parent_and_attachment_in_one_commit() {
+        let vault = ffi_test_vault();
+        let project_id = Uuid::new_v4().to_string();
+        let entry_id = Uuid::new_v4().to_string();
+        let attachment_id = Uuid::new_v4().to_string();
+        let operation_id = Uuid::new_v4().to_string();
+        let mut limits = default_composite_write_operation_limits();
+        limits.write_limits.max_commands = 2;
+        limits.write_limits.max_payload_bytes_per_command = 1024;
+        limits.write_limits.max_payload_bytes = 1024;
+        limits.write_limits.max_intent_bytes = 4096;
+        limits.attachment_limits.max_commands = 1;
+        limits.attachment_limits.max_plaintext_bytes_per_command = 64;
+        limits.attachment_limits.max_plaintext_bytes = 64;
+        limits.attachment_limits.chunk_size = 3;
+        let generic_commands = vec![
+            MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Mail".to_string(),
+            },
+            MdbxWriteCommand::CreateEntry {
+                entry_id: entry_id.clone(),
+                project_id: project_id.clone(),
+                entry_type: "com.monica.mail.message".to_string(),
+                title: "Message".to_string(),
+                payload_json: r#"{"body":"hello"}"#.to_string(),
+            },
+        ];
+        let attachment_commands = vec![MdbxAttachmentBatchCommand::Create {
+            attachment_id: attachment_id.clone(),
+            project_id: project_id.clone(),
+            entry_id: Some(entry_id.clone()),
+            file_name: "message.eml".to_string(),
+            media_type: Some("message/rfc822".to_string()),
+            content: b"mail body".to_vec(),
+        }];
+        let commits_before = ffi_test_count(&vault, "commits");
+        let first = vault
+            .execute_composite_write_operation_with_limits(
+                operation_id.clone(),
+                "mail-import".to_string(),
+                generic_commands.clone(),
+                attachment_commands.clone(),
+                limits,
+            )
+            .unwrap();
+        assert!(!first.operation.already_committed);
+        assert_eq!(first.operation.project_ids, vec![project_id.clone()]);
+        assert_eq!(first.operation.entry_ids, vec![entry_id.clone()]);
+        assert_eq!(first.attachments.len(), 1);
+        assert_eq!(first.attachments[0].attachment_id, attachment_id);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+        {
+            let conn = vault.conn.lock().unwrap();
+            let project = ProjectRepo::get_by_id(&conn, &project_id).unwrap().unwrap();
+            let entry = EntryRepo::get_by_id(&conn, &entry_id).unwrap().unwrap();
+            let attachment = AttachmentRepo::get_by_id(&conn, &attachment_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(project.head_commit_id, first.operation.commit_id);
+            assert_eq!(entry.head_commit_id, first.operation.commit_id);
+            assert_eq!(attachment.head_commit_id, first.operation.commit_id);
+        }
+        assert_eq!(
+            vault
+                .read_attachment_content(attachment_id.clone(), 64)
+                .unwrap(),
+            b"mail body"
+        );
+
+        let retry = vault
+            .execute_composite_write_operation_with_limits(
+                operation_id.clone(),
+                "mail-import".to_string(),
+                generic_commands.clone(),
+                attachment_commands.clone(),
+                limits,
+            )
+            .unwrap();
+        assert!(retry.operation.already_committed);
+        assert_eq!(retry.operation.commit_id, first.operation.commit_id);
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+
+        let changed_attachment_commands = vec![MdbxAttachmentBatchCommand::Create {
+            attachment_id,
+            project_id: project_id.clone(),
+            entry_id: Some(entry_id.clone()),
+            file_name: "message.eml".to_string(),
+            media_type: Some("message/rfc822".to_string()),
+            content: b"changed body".to_vec(),
+        }];
+        assert!(vault
+            .execute_composite_write_operation_with_limits(
+                operation_id,
+                "mail-import".to_string(),
+                generic_commands,
+                changed_attachment_commands,
+                limits,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("reused for a different operation"));
+
+        let failed_project_id = Uuid::new_v4().to_string();
+        let failed_entry_id = Uuid::new_v4().to_string();
+        let failed_attachment_id = Uuid::new_v4().to_string();
+        assert!(vault
+            .execute_composite_write_operation(
+                Uuid::new_v4().to_string(),
+                "mail-import".to_string(),
+                vec![
+                    MdbxWriteCommand::CreateProject {
+                        project_id: failed_project_id.clone(),
+                        title: "Rolled back".to_string(),
+                    },
+                    MdbxWriteCommand::CreateEntry {
+                        entry_id: failed_entry_id.clone(),
+                        project_id: failed_project_id.clone(),
+                        entry_type: "com.monica.mail.message".to_string(),
+                        title: "Failure".to_string(),
+                        payload_json: "{}".to_string(),
+                    },
+                ],
+                vec![MdbxAttachmentBatchCommand::Create {
+                    attachment_id: failed_attachment_id.clone(),
+                    project_id: failed_project_id.clone(),
+                    entry_id: Some(Uuid::new_v4().to_string()),
+                    file_name: "failure.eml".to_string(),
+                    media_type: None,
+                    content: b"failure".to_vec(),
+                }],
+            )
+            .is_err());
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+        {
+            let conn = vault.conn.lock().unwrap();
+            assert!(ProjectRepo::get_by_id(&conn, &failed_project_id)
+                .unwrap()
+                .is_none());
+            assert!(EntryRepo::get_by_id(&conn, &failed_entry_id)
+                .unwrap()
+                .is_none());
+            assert!(AttachmentRepo::get_by_id(&conn, &failed_attachment_id)
+                .unwrap()
+                .is_none());
+        }
+
+        let bounded_project_id = Uuid::new_v4().to_string();
+        let bounded_entry_id = Uuid::new_v4().to_string();
+        let mut bounded_limits = default_composite_write_operation_limits();
+        bounded_limits.write_limits.max_commands = 2;
+        bounded_limits.write_limits.max_payload_bytes_per_command = 1024;
+        bounded_limits.write_limits.max_payload_bytes = 1024;
+        bounded_limits.write_limits.max_intent_bytes = 4096;
+        bounded_limits.attachment_limits.max_commands = 1;
+        bounded_limits
+            .attachment_limits
+            .max_plaintext_bytes_per_command = 4;
+        bounded_limits.attachment_limits.max_plaintext_bytes = 4;
+        bounded_limits.attachment_limits.chunk_size = 2;
+        assert!(vault
+            .execute_composite_write_operation_with_limits(
+                Uuid::new_v4().to_string(),
+                "mail-import".to_string(),
+                vec![
+                    MdbxWriteCommand::CreateProject {
+                        project_id: bounded_project_id.clone(),
+                        title: "Bounded".to_string(),
+                    },
+                    MdbxWriteCommand::CreateEntry {
+                        entry_id: bounded_entry_id.clone(),
+                        project_id: bounded_project_id.clone(),
+                        entry_type: "com.monica.mail.message".to_string(),
+                        title: "Bounded".to_string(),
+                        payload_json: "{}".to_string(),
+                    },
+                ],
+                vec![MdbxAttachmentBatchCommand::Create {
+                    attachment_id: Uuid::new_v4().to_string(),
+                    project_id: bounded_project_id.clone(),
+                    entry_id: Some(bounded_entry_id),
+                    file_name: "oversized.eml".to_string(),
+                    media_type: None,
+                    content: b"12345".to_vec(),
+                }],
+                bounded_limits,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("command plaintext bytes"));
+        assert_eq!(ffi_test_count(&vault, "commits"), commits_before + 1);
+        let conn = vault.conn.lock().unwrap();
+        assert!(ProjectRepo::get_by_id(&conn, &bounded_project_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
