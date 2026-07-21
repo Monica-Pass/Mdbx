@@ -127,6 +127,23 @@ impl AttachmentRepo {
         ctx: &CommitContext,
         request: AttachmentCreateRequest<'_>,
     ) -> StorageResult<Attachment> {
+        let attachment_id = Uuid::new_v4().to_string();
+        Self::add_with_id(conn, ctx, &attachment_id, request)
+    }
+
+    /// Add attachment metadata with a caller-supplied stable UUID.
+    ///
+    /// This additive MDBX2 entry point supports idempotent operation facades;
+    /// MDBX1 callers can continue using `add` or `add_with_request`.
+    pub fn add_with_id(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        attachment_id: &str,
+        request: AttachmentCreateRequest<'_>,
+    ) -> StorageResult<Attachment> {
+        Uuid::parse_str(attachment_id).map_err(|_| {
+            StorageError::Validation(format!("attachment_id {attachment_id} must be a UUID"))
+        })?;
         let AttachmentCreateRequest {
             project_id,
             entry_id,
@@ -137,7 +154,7 @@ impl AttachmentRepo {
         } = request;
         conn.with_immediate_transaction(|| {
             let now = chrono::Utc::now().to_rfc3339();
-            let attachment_id = Uuid::new_v4().to_string();
+            let attachment_id = attachment_id.to_string();
 
             // 验证 project 存在且未删除
             let (p_exists, p_deleted): (bool, bool) = conn
@@ -1490,6 +1507,61 @@ mod tests {
         assert_eq!(att.storage_mode, StorageMode::EmbeddedInline);
         assert!(!att.deleted);
         assert!(!att.head_commit_id.is_empty());
+    }
+
+    #[test]
+    fn stable_attachment_id_is_additive_and_duplicate_creation_rolls_back() {
+        let (conn, ctx, project_id) = setup();
+        let attachment_id = Uuid::new_v4().to_string();
+        let request = AttachmentCreateRequest {
+            project_id: &project_id,
+            entry_id: None,
+            file_name: "stable.bin",
+            media_type: None,
+            content_hash: "",
+            original_size: 0,
+        };
+        let created = AttachmentRepo::add_with_id(&conn, &ctx, &attachment_id, request).unwrap();
+        assert_eq!(created.attachment_id, attachment_id);
+        let commit_count: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        let duplicate = AttachmentRepo::add_with_id(
+            &conn,
+            &ctx,
+            &attachment_id,
+            AttachmentCreateRequest {
+                project_id: &project_id,
+                entry_id: None,
+                file_name: "duplicate.bin",
+                media_type: None,
+                content_hash: "",
+                original_size: 0,
+            },
+        );
+        assert!(duplicate.is_err());
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count
+        );
+        assert!(AttachmentRepo::add_with_id(
+            &conn,
+            &ctx,
+            "not-a-uuid",
+            AttachmentCreateRequest {
+                project_id: &project_id,
+                entry_id: None,
+                file_name: "invalid.bin",
+                media_type: None,
+                content_hash: "",
+                original_size: 0,
+            },
+        )
+        .is_err());
     }
 
     #[test]
