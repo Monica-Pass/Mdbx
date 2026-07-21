@@ -16,6 +16,7 @@ mod write_facade;
 
 pub use attachment_facade::*;
 pub use conflict_facade::*;
+pub use history_facade::*;
 pub use lifecycle_facade::*;
 pub use object_facade::*;
 pub(crate) use object_facade::{
@@ -124,58 +125,6 @@ impl From<MigrationInfo> for MdbxMigrationInfo {
             target_schema_version: value.target_schema_version,
         }
     }
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxCommitChange {
-    pub object_type: String,
-    pub object_id: String,
-    pub action: String,
-    pub fields: Vec<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxCommitHistoryItem {
-    pub commit_id: String,
-    pub device_id: String,
-    pub local_seq: u64,
-    pub commit_kind: String,
-    pub change_scope: String,
-    pub created_at: String,
-    pub operation_id: Option<String>,
-    pub operation_kind: Option<String>,
-    pub branch_name: Option<String>,
-    pub message: Option<String>,
-    pub changes: Vec<MdbxCommitChange>,
-    pub parent_ids: Vec<String>,
-    pub legacy: bool,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxCommitHistoryPage {
-    pub items: Vec<MdbxCommitHistoryItem>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxCommitHistoryItemV2 {
-    pub item: MdbxCommitHistoryItem,
-    pub branch_id: Option<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxCommitHistoryPageV2 {
-    pub items: Vec<MdbxCommitHistoryItemV2>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct MdbxBranchInfo {
-    pub branch_id: String,
-    pub branch_name: String,
-    pub head_commit_id: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(uniffi::Object)]

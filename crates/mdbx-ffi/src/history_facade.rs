@@ -1,9 +1,58 @@
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitChange {
+    pub object_type: String,
+    pub object_id: String,
+    pub action: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryItem {
+    pub commit_id: String,
+    pub device_id: String,
+    pub local_seq: u64,
+    pub commit_kind: String,
+    pub change_scope: String,
+    pub created_at: String,
+    pub operation_id: Option<String>,
+    pub operation_kind: Option<String>,
+    pub branch_name: Option<String>,
+    pub message: Option<String>,
+    pub changes: Vec<MdbxCommitChange>,
+    pub parent_ids: Vec<String>,
+    pub legacy: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryPage {
+    pub items: Vec<MdbxCommitHistoryItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryItemV2 {
+    pub item: MdbxCommitHistoryItem,
+    pub branch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxCommitHistoryPageV2 {
+    pub items: Vec<MdbxCommitHistoryItemV2>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MdbxBranchInfo {
+    pub branch_id: String,
+    pub branch_name: String,
+    pub head_commit_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 use mdbx_storage::repo::{BranchRepo, CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 
-use super::{
-    MdbxBranchInfo, MdbxCommitChange, MdbxCommitHistoryItem, MdbxCommitHistoryItemV2,
-    MdbxCommitHistoryPage, MdbxCommitHistoryPageV2, MdbxFfiError, MdbxVault,
-};
+use super::{MdbxFfiError, MdbxVault};
 
 #[uniffi::export]
 impl MdbxVault {
