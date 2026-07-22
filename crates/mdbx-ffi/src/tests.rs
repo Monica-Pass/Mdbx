@@ -988,6 +988,176 @@ fn ffi_object_summary_by_id_is_payload_free_and_tombstone_visible() {
 }
 
 #[test]
+fn ffi_metadata_summary_pages_are_bounded_payload_free_and_compatible() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Metadata collection".to_string())
+        .unwrap();
+    let source = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Source".to_string(),
+            r#"{"body":"source"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let first_target = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Target 1".to_string(),
+            r#"{"body":"one"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let second_target = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Target 2".to_string(),
+            r#"{"body":"two"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let first_relation = vault
+        .create_object_relation(
+            source.object_id.clone(),
+            first_target.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":1}"#.to_string(),
+            2,
+        )
+        .unwrap();
+    let second_relation = vault
+        .create_object_relation(
+            source.object_id.clone(),
+            second_target.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":2}"#.to_string(),
+            2,
+        )
+        .unwrap();
+    let first_label = vault
+        .create_object_label(
+            collection.project_id.clone(),
+            "Important".to_string(),
+            r#"{"color":"red"}"#.to_string(),
+            3,
+        )
+        .unwrap();
+    let second_label = vault
+        .create_object_label(
+            collection.project_id.clone(),
+            "Later".to_string(),
+            r#"{"color":"blue"}"#.to_string(),
+            3,
+        )
+        .unwrap();
+    vault
+        .assign_object_label(source.object_id.clone(), first_label.label_id.clone())
+        .unwrap();
+    vault
+        .assign_object_label(source.object_id.clone(), second_label.label_id.clone())
+        .unwrap();
+    vault
+        .assign_object_label(first_target.object_id.clone(), first_label.label_id.clone())
+        .unwrap();
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE object_relations SET payload_ct = X'00' WHERE relation_id = ?1",
+                [&first_relation.relation_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE object_labels SET payload_ct = X'00' WHERE label_id = ?1",
+                [&first_label.label_id],
+            )
+            .unwrap();
+    }
+
+    let relation_summary = vault
+        .get_object_relation_summary(first_relation.relation_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(relation_summary.relation_kind, "com.monica.mail.reply-to");
+    assert_eq!(relation_summary.payload_schema_version, 2);
+    let first_relation_page = vault
+        .list_object_relation_summaries_from(
+            source.object_id.clone(),
+            Some("com.monica.mail.reply-to".to_string()),
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(first_relation_page.items.len(), 1);
+    let relation_cursor = first_relation_page.next_cursor.clone().unwrap();
+    let second_relation_page = vault
+        .list_object_relation_summaries_from(
+            source.object_id.clone(),
+            Some("com.monica.mail.reply-to".to_string()),
+            1,
+            Some(relation_cursor.clone()),
+        )
+        .unwrap();
+    let relation_ids = first_relation_page
+        .items
+        .into_iter()
+        .chain(second_relation_page.items)
+        .map(|item| item.relation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        relation_ids,
+        [
+            first_relation.relation_id.clone(),
+            second_relation.relation_id
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(vault
+        .list_object_relation_summaries_to(
+            first_target.object_id,
+            Some("com.monica.mail.reply-to".to_string()),
+            1,
+            Some(relation_cursor),
+        )
+        .is_err());
+
+    let label_summary = vault
+        .get_object_label_summary(first_label.label_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(label_summary.name, "Important");
+    assert_eq!(label_summary.payload_schema_version, 3);
+    let label_page = vault
+        .list_object_label_summaries(collection.project_id.clone(), 1, None)
+        .unwrap();
+    assert_eq!(label_page.items.len(), 1);
+    assert!(label_page.next_cursor.is_some());
+
+    let object_assignments = vault
+        .list_object_label_assignment_summaries_by_object(source.object_id, 10, None)
+        .unwrap();
+    assert_eq!(object_assignments.items.len(), 2);
+    let label_assignments = vault
+        .list_object_label_assignment_summaries_by_label(first_label.label_id, 10, None)
+        .unwrap();
+    assert_eq!(label_assignments.items.len(), 2);
+
+    assert!(vault
+        .get_object_relation(first_relation.relation_id)
+        .is_err());
+    assert!(vault.list_object_labels(collection.project_id).is_err());
+    assert!(vault
+        .list_object_label_summaries("missing".to_string(), 0, None)
+        .is_err());
+}
+
+#[test]
 fn ffi_object_disclosure_returns_typed_allow_and_missing_session_decisions() {
     let vault = ffi_test_vault();
     let collection = vault

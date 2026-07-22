@@ -236,6 +236,8 @@ MDBX2 同时收紧以下实现边界：
 
 既有 reveal 方法签名保持不变，并使用 8 MiB 默认明文上限。新增 `default_object_disclosure_limits`、`reveal_object_with_limits` 和 `reveal_object_with_device_context_and_limits`，允许新客户端选择更小或受控的更大资源配置，但不能超过 64 MiB 硬上限。策略允许后，storage 先通过 SQL 长度投影拒绝明显超限的 payload 密文，再认证解密并复核实际明文长度；Tiga 拒绝仍先于这些 payload 检查。MDBX1 大 payload 的数据库字节不会被迁移或改写，原有完整 payload 兼容 API 也保持行为不变。
 
+通用元数据选择采用同样的 additive 兼容规则。新客户端使用 `get_object_relation_summary`、`list_object_relation_summaries_from`、`list_object_relation_summaries_to`、`get_object_label_summary`、`list_object_label_summaries`，以及按 object/label 双向分页的 assignment summary 接口。这些 payload-free 页面每页限制为 1 到 200 项，并使用绑定查询条件的不透明游标。原有完整 relation、label 和 assignment 方法继续供已生成客户端及显式 payload 消费者使用，签名和行为不变。
+
 ### 7.6 Commit 历史读取 API
 
 原有 `MdbxCommitHistoryItem`、`list_commit_history` 与 `get_commit_history` 保持字段布局和方法语义，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxCommitHistoryItemV2`、`list_commit_history_v2` 与 `get_commit_history_v2` 读取可空的稳定分支 ID。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。

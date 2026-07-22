@@ -283,6 +283,8 @@ Monica Pass CLI、TUI、Agent stdio、未来网页收藏夹和邮件客户端都
 
 收藏夹属性、密码记录、邮件头和普通小正文可以放在对象 payload；超大正文、原始 `.eml`、网页归档和文件内容应走 attachment / encrypted blob provider 的有界流式接口，对象只保存稳定引用。客户端不得通过提高单条 JSON 上限来替代大型内容路径。
 
+邮件线程、收藏层级和标签筛选不得调用返回完整 payload 的 relation/label 旧列表来构建页面。UniFFI 客户端应使用 relation summary 的 from/to 分页、label summary 分页，以及 assignment summary 的 object/label 双向分页；游标只能原样继续使用，不能跨方向、owner 或过滤条件复用。完整 metadata API 只用于确实需要解析 payload 的兼容或领域操作。
+
 ## 5. JSON Agent 接口
 
 传输形式：

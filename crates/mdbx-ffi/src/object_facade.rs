@@ -196,6 +196,24 @@ pub struct MdbxObjectRelationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRelationSummary {
+    pub relation_id: String,
+    pub source_object_id: String,
+    pub target_object_id: String,
+    pub relation_kind: String,
+    pub payload_schema_version: u32,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRelationSummaryPage {
+    pub items: Vec<MdbxObjectRelationSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxObjectLabelRecord {
     pub label_id: String,
     pub collection_id: String,
@@ -206,6 +224,23 @@ pub struct MdbxObjectLabelRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelSummary {
+    pub label_id: String,
+    pub collection_id: String,
+    pub name: String,
+    pub payload_schema_version: u32,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelSummaryPage {
+    pub items: Vec<MdbxObjectLabelSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxObjectLabelAssignmentRecord {
     pub assignment_id: String,
     pub object_id: String,
@@ -213,8 +248,25 @@ pub struct MdbxObjectLabelAssignmentRecord {
     pub deleted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelAssignmentSummary {
+    pub assignment_id: String,
+    pub object_id: String,
+    pub label_id: String,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelAssignmentSummaryPage {
+    pub items: Vec<MdbxObjectLabelAssignmentSummary>,
+    pub next_cursor: Option<String>,
+}
+
 use mdbx_core::model::{
-    EntryType, ObjectSummary, ObjectTypeId, PayloadMigrationExecution, PayloadMigrationPlan,
+    EntryType, ObjectLabelAssignmentSummary, ObjectLabelSummary, ObjectRelationSummary,
+    ObjectSummary, ObjectTypeId, PayloadMigrationExecution, PayloadMigrationPlan,
     PayloadMigrationPlanItem, RelationKindId,
 };
 use mdbx_storage::connection::VaultConnection;
@@ -224,8 +276,8 @@ use mdbx_storage::object_disclosure::{
 };
 use mdbx_storage::repo::{
     CommitContext, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
-    ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
-    ObjectSummaryRepo, ProjectRepo,
+    ObjectLabelCreateRequest, ObjectLabelRepo, ObjectMetadataSummaryRepo,
+    ObjectRelationCreateRequest, ObjectRelationRepo, ObjectSummaryRepo, ProjectRepo,
 };
 
 use super::{
@@ -391,6 +443,19 @@ fn object_relation_record(
     })
 }
 
+fn object_relation_summary_from_core(summary: ObjectRelationSummary) -> MdbxObjectRelationSummary {
+    MdbxObjectRelationSummary {
+        relation_id: summary.relation_id,
+        source_object_id: summary.source_object_id,
+        target_object_id: summary.target_object_id,
+        relation_kind: summary.relation_kind.to_string(),
+        payload_schema_version: summary.payload_schema_version,
+        head_commit_id: summary.head_commit_id,
+        deleted: summary.deleted,
+        updated_at: summary.updated_at,
+    }
+}
+
 fn object_label_record(
     label: &mdbx_core::model::ObjectLabel,
 ) -> Result<MdbxObjectLabelRecord, MdbxFfiError> {
@@ -409,6 +474,23 @@ fn object_label_record(
     })
 }
 
+fn object_label_summary_from_core(
+    summary: ObjectLabelSummary,
+) -> Result<MdbxObjectLabelSummary, MdbxFfiError> {
+    let name = String::from_utf8(summary.name).map_err(|error| MdbxFfiError::Serialization {
+        message: error.to_string(),
+    })?;
+    Ok(MdbxObjectLabelSummary {
+        label_id: summary.label_id,
+        collection_id: summary.collection_id,
+        name,
+        payload_schema_version: summary.payload_schema_version,
+        head_commit_id: summary.head_commit_id,
+        deleted: summary.deleted,
+        updated_at: summary.updated_at,
+    })
+}
+
 fn object_label_assignment_record(
     assignment: &mdbx_core::model::ObjectLabelAssignment,
 ) -> MdbxObjectLabelAssignmentRecord {
@@ -417,6 +499,19 @@ fn object_label_assignment_record(
         object_id: assignment.object_id.clone(),
         label_id: assignment.label_id.clone(),
         deleted: assignment.deleted,
+    }
+}
+
+fn object_label_assignment_summary_from_core(
+    summary: ObjectLabelAssignmentSummary,
+) -> MdbxObjectLabelAssignmentSummary {
+    MdbxObjectLabelAssignmentSummary {
+        assignment_id: summary.assignment_id,
+        object_id: summary.object_id,
+        label_id: summary.label_id,
+        head_commit_id: summary.head_commit_id,
+        deleted: summary.deleted,
+        updated_at: summary.updated_at,
     }
 }
 
@@ -662,6 +757,18 @@ impl MdbxVault {
         object_relation_record(&relation)
     }
 
+    /// Read relation navigation metadata without selecting or decrypting its payload.
+    pub fn get_object_relation_summary(
+        &self,
+        relation_id: String,
+    ) -> Result<Option<MdbxObjectRelationSummary>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(
+            ObjectMetadataSummaryRepo::get_relation(&conn, &relation_id)?
+                .map(object_relation_summary_from_core),
+        )
+    }
+
     pub fn get_object_relation(
         &self,
         relation_id: String,
@@ -689,6 +796,35 @@ impl MdbxVault {
             .collect()
     }
 
+    pub fn list_object_relation_summaries_from(
+        &self,
+        source_object_id: String,
+        relation_kind: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectRelationSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let kind = relation_kind
+            .as_deref()
+            .map(parse_relation_kind)
+            .transpose()?;
+        let page = ObjectMetadataSummaryRepo::list_relations_from(
+            &conn,
+            &source_object_id,
+            kind.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectRelationSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_relation_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
     pub fn list_object_relations_to(
         &self,
         target_object_id: String,
@@ -703,6 +839,35 @@ impl MdbxVault {
             .iter()
             .map(object_relation_record)
             .collect()
+    }
+
+    pub fn list_object_relation_summaries_to(
+        &self,
+        target_object_id: String,
+        relation_kind: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectRelationSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let kind = relation_kind
+            .as_deref()
+            .map(parse_relation_kind)
+            .transpose()?;
+        let page = ObjectMetadataSummaryRepo::list_relations_to(
+            &conn,
+            &target_object_id,
+            kind.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectRelationSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_relation_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn update_object_relation(
@@ -749,6 +914,17 @@ impl MdbxVault {
         object_label_record(&label)
     }
 
+    /// Read label presentation metadata without selecting or decrypting its payload.
+    pub fn get_object_label_summary(
+        &self,
+        label_id: String,
+    ) -> Result<Option<MdbxObjectLabelSummary>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        ObjectMetadataSummaryRepo::get_label(&conn, &label_id)?
+            .map(object_label_summary_from_core)
+            .transpose()
+    }
+
     pub fn list_object_labels(
         &self,
         collection_id: String,
@@ -758,6 +934,29 @@ impl MdbxVault {
             .iter()
             .map(object_label_record)
             .collect()
+    }
+
+    pub fn list_object_label_summaries(
+        &self,
+        collection_id: String,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectLabelSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let page = ObjectMetadataSummaryRepo::list_labels(
+            &conn,
+            &collection_id,
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectLabelSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_label_summary_from_core)
+                .collect::<Result<Vec<_>, _>>()?,
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn update_object_label(
@@ -816,6 +1015,52 @@ impl MdbxVault {
                 .map(object_label_assignment_record)
                 .collect(),
         )
+    }
+
+    pub fn list_object_label_assignment_summaries_by_object(
+        &self,
+        object_id: String,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectLabelAssignmentSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let page = ObjectMetadataSummaryRepo::list_assignments_by_object(
+            &conn,
+            &object_id,
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectLabelAssignmentSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_label_assignment_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    pub fn list_object_label_assignment_summaries_by_label(
+        &self,
+        label_id: String,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectLabelAssignmentSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let page = ObjectMetadataSummaryRepo::list_assignments_by_label(
+            &conn,
+            &label_id,
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectLabelAssignmentSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_label_assignment_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn remove_object_label_assignment(

@@ -161,6 +161,7 @@ Tiga2 的有效策略按以下顺序解析：vault 基线、project 覆盖、ent
 MDBX2 必须把“选择对象”和“披露对象秘密”视为两个不同操作：
 
 - 列表、选择和默认详情只读取 `ObjectSummary` 所需的对象 ID、collection、类型、标题、schema 版本、head commit、删除状态和更新时间，不得查询或解密 `payload_ct`。
+- relation、label 与 label assignment 的导航也必须使用有界摘要页；relation/label 摘要不得查询 payload 密文，损坏 payload 不能阻断关系图或分类页面。
 - Tiga 策略解析只读取 project/entry 的策略上下文列，不得为了得到 scope、覆盖模式、删除状态或 object clock 而先解密标题、摘要或 payload。
 - 持久化的 Tiga 覆盖值无法解析时必须失败关闭，不得把未知值静默当作“没有覆盖”。
 - 对象秘密只能通过统一披露边界执行 `RevealSecret` 授权；只有 `allow` 或 `allow-with-constraints` 可以进入 payload 解密。

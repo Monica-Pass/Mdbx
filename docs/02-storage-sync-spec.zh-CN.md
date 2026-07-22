@@ -106,6 +106,12 @@ schema 必须支持：
 
 超大邮件正文、原始 MIME/EML、网页归档、文件与媒体内容应使用 `attachments` / `attachment_chunks` 或 encrypted blob provider。此路径必须支持有界分块、流式传输、内容 hash、归属关系和生命周期；普通对象编辑不得重写这些大型内容。
 
+## 5.2 通用元数据选择边界
+
+大型客户端页面遍历 relation、label 和 label assignment 时，必须使用有界摘要投影。relation 与 label 摘要不得查询其加密 payload 列；label 摘要可以解密经过验证的显示名称，assignment 摘要只包含稳定 ID 与因果元数据。
+
+每页只能包含 1 到 200 项，按更新时间与稳定 ID 降序执行 keyset 分页，并返回绑定方向、owner、collection 和可选 relation-kind 过滤条件的版本化不透明游标。按 ID 查询 relation/label 摘要时保留删除状态，列表页只返回 active row。完整记录 repo 继续作为兼容及显式 payload 接口，不得作为 collection 或关系图的默认遍历路径。
+
 ## 6. 写入路径要求
 
 日常小修改绝不能在逻辑层面导致整个 vault 内容被全量重写。

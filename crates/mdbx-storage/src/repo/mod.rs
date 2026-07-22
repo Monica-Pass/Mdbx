@@ -7,6 +7,7 @@ pub mod commit_inventory;
 pub mod conflict;
 pub mod entry;
 pub mod object_label;
+pub mod object_metadata_summary;
 pub mod object_relation;
 pub mod object_summary;
 pub mod object_version;
@@ -33,6 +34,9 @@ pub use entry::{EntryCreateRequest, EntryRepo};
 pub use object_label::{
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
     ObjectLabelRepo,
+};
+pub use object_metadata_summary::{
+    ObjectMetadataSummaryRepo, MAX_OBJECT_METADATA_SUMMARY_PAGE_SIZE,
 };
 pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
 pub use object_summary::{ObjectSummaryRepo, MAX_OBJECT_SUMMARY_PAGE_SIZE};

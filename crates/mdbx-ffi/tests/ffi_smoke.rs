@@ -324,7 +324,7 @@ fn write_operation_coalesces_commands_and_retries_idempotently() {
 }
 
 #[test]
-fn generic_metadata_write_operation_is_available_to_external_clients() {
+fn generic_metadata_summary_pages_are_available_to_external_clients() {
     let vault_path = temp_vault_path("generic-metadata-operation");
     let vault = create_vault(
         vault_path.as_path_string(),
@@ -366,7 +366,7 @@ fn generic_metadata_write_operation_is_available_to_external_clients() {
                 MdbxWriteCommand::CreateObjectRelation {
                     relation_id: relation_id.clone(),
                     source_object_id: first_entry_id.clone(),
-                    target_object_id: second_entry_id,
+                    target_object_id: second_entry_id.clone(),
                     relation_kind: "com.monica.mail.reply-to".to_string(),
                     payload_json: "{}".to_string(),
                     payload_schema_version: 1,
@@ -393,16 +393,75 @@ fn generic_metadata_write_operation_is_available_to_external_clients() {
     assert_eq!(result.label_assignment_ids, vec![assignment_id.clone()]);
     assert_eq!(
         vault
-            .get_object_relation(relation_id)
+            .get_object_relation(relation_id.clone())
             .unwrap()
             .unwrap()
             .relation_kind,
         "com.monica.mail.reply-to"
     );
-    assert_eq!(vault.list_object_labels(project_id).unwrap().len(), 1);
     assert_eq!(
-        vault.list_object_label_assignments(first_entry_id).unwrap()[0].assignment_id,
+        vault.list_object_labels(project_id.clone()).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        vault
+            .list_object_label_assignments(first_entry_id.clone())
+            .unwrap()[0]
+            .assignment_id,
         assignment_id
+    );
+    assert_eq!(
+        vault
+            .get_object_relation_summary(relation_id)
+            .unwrap()
+            .unwrap()
+            .target_object_id,
+        second_entry_id
+    );
+    assert_eq!(
+        vault
+            .list_object_relation_summaries_from(
+                first_entry_id.clone(),
+                Some("com.monica.mail.reply-to".to_string()),
+                10,
+                None,
+            )
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        vault
+            .get_object_label_summary(label_id.clone())
+            .unwrap()
+            .unwrap()
+            .name,
+        "Important"
+    );
+    assert_eq!(
+        vault
+            .list_object_label_summaries(project_id, 10, None)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        vault
+            .list_object_label_assignment_summaries_by_object(first_entry_id, 10, None)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        vault
+            .list_object_label_assignment_summaries_by_label(label_id, 10, None)
+            .unwrap()
+            .items
+            .len(),
+        1
     );
 }
 

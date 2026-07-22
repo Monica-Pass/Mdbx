@@ -106,6 +106,12 @@ Policy-authorized object disclosure returns at most 8 MiB of plaintext by defaul
 
 Large message bodies, raw MIME/EML, saved-page archives, files, and media SHOULD use `attachments` / `attachment_chunks` or an encrypted blob provider. That path MUST provide bounded chunks, streaming transfer, content hashes, ownership, and lifecycle, and routine object edits MUST NOT rewrite the large content.
 
+## 5.2 Generic Metadata Selection Boundary
+
+Relation, label, and label-assignment navigation MUST use bounded summary projections for large client views. Relation and label summaries MUST NOT select their encrypted payload columns. A label summary MAY decrypt its validated display name; an assignment summary contains identifiers and causal metadata only.
+
+Pages contain 1 through 200 items, use descending update time plus stable ID keyset ordering, and return a versioned opaque cursor bound to the exact direction, owner, collection, and optional relation-kind filter. By-ID relation and label summaries retain deleted-state visibility, while list pages contain active rows. Complete-record repositories remain compatibility and explicit-payload interfaces, not the default collection or graph traversal path.
+
 ## 6. Write Path Requirements
 
 Routine small edits MUST avoid full logical rewrite of the entire vault contents.
