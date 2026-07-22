@@ -384,7 +384,7 @@ enum EntryAction {
         #[arg(short, long)]
         password: Option<String>,
         /// URL
-        #[arg(short, long)]
+        #[arg(short = 'l', long)]
         url: Option<String>,
         /// 备注
         #[arg(short, long)]
@@ -405,7 +405,7 @@ enum EntryAction {
         #[arg(short, long)]
         password: Option<String>,
         /// URL
-        #[arg(short, long)]
+        #[arg(short = 'l', long)]
         url: Option<String>,
         /// 备注
         #[arg(short, long)]
@@ -3446,6 +3446,7 @@ fn parse_change_scope(value: &str) -> ChangeScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use mdbx_storage::sync_apply::SyncApplyRepo;
     use mdbx_storage::sync_state::SYNC_STATE_OBJECT_TYPE;
     use mdbx_storage::tiga::TigaService;
@@ -3529,6 +3530,90 @@ mod tests {
 
     fn entry_title(entry: &mdbx_core::model::Entry) -> String {
         String::from_utf8(entry.title_ct.clone().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn clap_command_tree_has_no_definition_conflicts() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn clap_entry_create_routes_username_and_url_options() {
+        for (username_option, url_option) in [("-u", "-l"), ("--username", "--url")] {
+            let parsed = Cli::try_parse_from([
+                "mdbx",
+                "entry",
+                "create",
+                "project-1",
+                username_option,
+                "alice",
+                url_option,
+                "https://example.com",
+            ])
+            .unwrap();
+            let Commands::Entry {
+                action:
+                    EntryAction::Create {
+                        project_id,
+                        username,
+                        url,
+                        ..
+                    },
+            } = parsed.command
+            else {
+                panic!("entry create command was not parsed");
+            };
+
+            assert_eq!(project_id, "project-1");
+            assert_eq!(username.as_deref(), Some("alice"));
+            assert_eq!(url.as_deref(), Some("https://example.com"));
+        }
+    }
+
+    #[test]
+    fn clap_entry_edit_routes_username_and_url_options() {
+        for (username_option, url_option) in [("-u", "-l"), ("--username", "--url")] {
+            let parsed = Cli::try_parse_from([
+                "mdbx",
+                "entry",
+                "edit",
+                "entry-1",
+                username_option,
+                "bob",
+                url_option,
+                "https://edited.example",
+            ])
+            .unwrap();
+            let Commands::Entry {
+                action:
+                    EntryAction::Edit {
+                        entry_id,
+                        username,
+                        url,
+                        ..
+                    },
+            } = parsed.command
+            else {
+                panic!("entry edit command was not parsed");
+            };
+
+            assert_eq!(entry_id, "entry-1");
+            assert_eq!(username.as_deref(), Some("bob"));
+            assert_eq!(url.as_deref(), Some("https://edited.example"));
+        }
+    }
+
+    #[test]
+    fn clap_entry_help_paths_render_without_panics() {
+        for args in [
+            ["mdbx", "entry", "create", "--help"],
+            ["mdbx", "entry", "edit", "--help"],
+        ] {
+            match Cli::try_parse_from(args) {
+                Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp),
+                Ok(_) => panic!("help request unexpectedly parsed as an executable command"),
+            }
+        }
     }
 
     #[test]
