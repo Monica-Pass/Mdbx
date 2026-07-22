@@ -33,6 +33,9 @@ use mdbx_storage::import::KdbxExporter;
 #[cfg(feature = "kdbx-import")]
 use mdbx_storage::import::KdbxImporter;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
+use mdbx_storage::integrity_root::{
+    IntegrityRootService, IntegrityRootState, IntegrityRootStatus, IntegrityRootVerification,
+};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 #[cfg(not(test))]
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
@@ -171,6 +174,11 @@ enum Commands {
     ContentManifest {
         #[command(subcommand)]
         action: ContentManifestAction,
+    },
+    /// 管理增量认证状态根
+    IntegrityRoot {
+        #[command(subcommand)]
+        action: IntegrityRootAction,
     },
     /// 创建经过验证的单文件 vault 备份
     Backup {
@@ -491,6 +499,18 @@ enum ContentManifestAction {
     Verify { input: PathBuf },
 }
 
+#[derive(Subcommand)]
+enum IntegrityRootAction {
+    /// 查看根状态；无凭据时只读且不认证元数据
+    Status,
+    /// 启用并建立认证状态根
+    Enable,
+    /// 验证根元数据、树节点与当前逻辑状态
+    Verify,
+    /// 从当前逻辑状态显式重建认证根
+    Rebuild,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BundleCompressionCli {
     None,
@@ -609,6 +629,18 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::ContentManifest { action } => {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_content_manifest(&conn, action)
+        }
+        Commands::IntegrityRoot {
+            action: IntegrityRootAction::Status,
+        } if unlock.password.is_none() && unlock.pin.is_none() => {
+            let status = IntegrityRootService::status_path(&cli.vault)
+                .map_err(|error| format!("failed to inspect integrity root: {error}"))?;
+            print_integrity_root_status(&status);
+            Ok(())
+        }
+        Commands::IntegrityRoot { action } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_integrity_root(&conn, action)
         }
         Commands::Backup { output } => cmd_backup(&cli.vault, output),
         #[cfg(feature = "benchmark")]
@@ -2253,6 +2285,84 @@ fn cmd_content_manifest(
     }
 }
 
+fn cmd_integrity_root(conn: &VaultConnection, action: IntegrityRootAction) -> Result<(), String> {
+    match action {
+        IntegrityRootAction::Status => {
+            let status = IntegrityRootService::status(conn)
+                .map_err(|error| format!("failed to inspect integrity root: {error}"))?;
+            print_integrity_root_status(&status);
+        }
+        IntegrityRootAction::Enable => {
+            let status = IntegrityRootService::enable(conn)
+                .map_err(|error| format!("failed to enable integrity root: {error}"))?;
+            print_integrity_root_status(&status);
+        }
+        IntegrityRootAction::Verify => {
+            let verification = IntegrityRootService::verify(conn)
+                .map_err(|error| format!("integrity root verification failed: {error}"))?;
+            print_integrity_root_verification(&verification);
+        }
+        IntegrityRootAction::Rebuild => {
+            let status = IntegrityRootService::rebuild(conn)
+                .map_err(|error| format!("failed to rebuild integrity root: {error}"))?;
+            print_integrity_root_status(&status);
+        }
+    }
+    Ok(())
+}
+
+fn print_integrity_root_status(status: &IntegrityRootStatus) {
+    let profile = status.profile.as_deref().unwrap_or("none");
+    let root_hash = status
+        .root_hash
+        .as_ref()
+        .map(|hash| encode_hex(hash))
+        .unwrap_or_else(|| "none".to_string());
+    println!(
+        "Integrity root: profile={} state={} authenticated={} generation={} leaves={} root={} commit-sequence={} delta-sequence={}",
+        profile,
+        integrity_root_state_label(status.state),
+        status.authenticated,
+        status.generation,
+        status.leaf_count,
+        root_hash,
+        status.latest_commit_seq,
+        status.latest_delta_seq
+    );
+}
+
+fn print_integrity_root_verification(verification: &IntegrityRootVerification) {
+    println!(
+        "Integrity root verified: profile={} generation={} leaves={} root={} commit-sequence={} delta-sequence={}",
+        verification.profile,
+        verification.generation,
+        verification.leaf_count,
+        encode_hex(&verification.root_hash),
+        verification.latest_commit_seq,
+        verification.latest_delta_seq
+    );
+}
+
+fn integrity_root_state_label(state: IntegrityRootState) -> &'static str {
+    match state {
+        IntegrityRootState::Disabled => "disabled",
+        IntegrityRootState::Pending => "pending",
+        IntegrityRootState::Building => "building",
+        IntegrityRootState::Established => "established",
+        IntegrityRootState::Stale => "stale",
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn write_new_synced_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -3312,6 +3422,67 @@ mod tests {
         ))
         .unwrap_err();
         assert!(oversized_error.contains("exceeds"));
+    }
+
+    #[test]
+    fn integrity_root_cli_keeps_status_readable_while_locked() {
+        let vault = TempVault::new();
+        let path = vault.path();
+
+        run(init_cli(&path)).unwrap();
+        run(locked_cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Status,
+            },
+        ))
+        .unwrap();
+
+        let locked_enable = run(locked_cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Enable,
+            },
+        ))
+        .unwrap_err();
+        assert!(locked_enable.contains("unlock"));
+
+        run(cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Enable,
+            },
+        ))
+        .unwrap();
+        run(locked_cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Status,
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Verify,
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::IntegrityRoot {
+                action: IntegrityRootAction::Rebuild,
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn integrity_root_cli_parses_all_operations() {
+        for operation in ["status", "enable", "verify", "rebuild"] {
+            let cli = Cli::try_parse_from(["mdbx", "integrity-root", operation]).unwrap();
+            assert!(matches!(cli.command, Commands::IntegrityRoot { .. }));
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod attachment_facade;
 mod conflict_facade;
 mod extension_facade;
 mod history_facade;
+mod integrity_root_facade;
 mod lifecycle_facade;
 mod object_facade;
 mod security_facade;
@@ -17,6 +18,7 @@ mod write_facade;
 pub use attachment_facade::*;
 pub use conflict_facade::*;
 pub use history_facade::*;
+pub use integrity_root_facade::*;
 pub use lifecycle_facade::*;
 pub use object_facade::*;
 pub(crate) use object_facade::{

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -292,16 +293,7 @@ impl IntegrityRootService {
 
     pub fn status(conn: &VaultConnection) -> StorageResult<IntegrityRootStatus> {
         let Some(meta) = load_meta_optional(conn)? else {
-            return Ok(IntegrityRootStatus {
-                state: IntegrityRootState::Disabled,
-                profile: None,
-                generation: 0,
-                leaf_count: 0,
-                root_hash: None,
-                latest_commit_seq: 0,
-                latest_delta_seq: 0,
-                authenticated: false,
-            });
+            return Ok(disabled_status());
         };
         let state = parse_state(&meta.state)?;
         let authenticated = if state == IntegrityRootState::Established && conn.keyring().is_some()
@@ -311,16 +303,24 @@ impl IntegrityRootService {
         } else {
             false
         };
-        Ok(IntegrityRootStatus {
-            state,
-            profile: Some(meta.profile),
-            generation: meta.generation,
-            leaf_count: meta.leaf_count,
-            root_hash: Some(meta.root_hash),
-            latest_commit_seq: meta.latest_commit_seq,
-            latest_delta_seq: meta.latest_delta_seq,
-            authenticated,
-        })
+        Ok(status_from_meta(meta, state, authenticated))
+    }
+
+    /// Reads root metadata without unlocking, migrating, or opening the vault
+    /// for writing. The returned status is intentionally unauthenticated.
+    pub fn status_path(path: &Path) -> StorageResult<IntegrityRootStatus> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let inspection = crate::migration::inspect_migration(&conn)?;
+        if !inspection.initialized {
+            return Err(StorageError::Validation(
+                "integrity root status requires an initialized MDBX vault".to_string(),
+            ));
+        }
+        let Some(meta) = load_meta_optional_connection(&conn)? else {
+            return Ok(disabled_status());
+        };
+        let state = parse_state(&meta.state)?;
+        Ok(status_from_meta(meta, state, false))
     }
 
     pub fn verify(conn: &VaultConnection) -> StorageResult<IntegrityRootVerification> {
@@ -2114,70 +2114,105 @@ fn seal_meta(
 }
 
 fn load_meta_optional(conn: &VaultConnection) -> StorageResult<Option<RootMeta>> {
-    if !table_exists(conn.inner(), "mdbx_integrity_root_meta")? {
+    load_meta_optional_connection(conn.inner())
+}
+
+fn load_meta_optional_connection(conn: &Connection) -> StorageResult<Option<RootMeta>> {
+    if !table_exists(conn, "mdbx_integrity_root_meta")? {
         return Ok(None);
     }
-    Ok(Some(load_meta(conn)?))
+    Ok(Some(load_meta_connection(conn)?))
 }
 
 fn load_meta(conn: &VaultConnection) -> StorageResult<RootMeta> {
-    conn.inner()
-        .query_row(
-            "SELECT profile, state, vault_id, schema_version, generation,
+    load_meta_connection(conn.inner())
+}
+
+fn load_meta_connection(conn: &Connection) -> StorageResult<RootMeta> {
+    conn.query_row(
+        "SELECT profile, state, vault_id, schema_version, generation,
                     leaf_count, root_hash, latest_commit_seq, latest_delta_seq,
                     updated_at, integrity_tag
              FROM mdbx_integrity_root_meta WHERE meta_id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, Option<Vec<u8>>>(10)?,
-                ))
-            },
-        )
-        .map_err(StorageError::Database)
-        .and_then(
-            |(
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
+            ))
+        },
+    )
+    .map_err(StorageError::Database)
+    .and_then(
+        |(
+            profile,
+            state,
+            vault_id,
+            schema_version,
+            generation,
+            leaf_count,
+            root_hash,
+            latest_commit_seq,
+            latest_delta_seq,
+            updated_at,
+            integrity_tag,
+        )| {
+            Ok(RootMeta {
                 profile,
                 state,
                 vault_id,
-                schema_version,
-                generation,
-                leaf_count,
-                root_hash,
-                latest_commit_seq,
-                latest_delta_seq,
+                schema_version: u32::try_from(schema_version).map_err(|_| {
+                    StorageError::Validation("integrity root schema version is invalid".to_string())
+                })?,
+                generation: nonnegative_u64(generation)?,
+                leaf_count: nonnegative_u64(leaf_count)?,
+                root_hash: to_hash(root_hash, "integrity root metadata hash")?,
+                latest_commit_seq: nonnegative_u64(latest_commit_seq)?,
+                latest_delta_seq: nonnegative_u64(latest_delta_seq)?,
                 updated_at,
                 integrity_tag,
-            )| {
-                Ok(RootMeta {
-                    profile,
-                    state,
-                    vault_id,
-                    schema_version: u32::try_from(schema_version).map_err(|_| {
-                        StorageError::Validation(
-                            "integrity root schema version is invalid".to_string(),
-                        )
-                    })?,
-                    generation: nonnegative_u64(generation)?,
-                    leaf_count: nonnegative_u64(leaf_count)?,
-                    root_hash: to_hash(root_hash, "integrity root metadata hash")?,
-                    latest_commit_seq: nonnegative_u64(latest_commit_seq)?,
-                    latest_delta_seq: nonnegative_u64(latest_delta_seq)?,
-                    updated_at,
-                    integrity_tag,
-                })
-            },
-        )
+            })
+        },
+    )
+}
+
+fn disabled_status() -> IntegrityRootStatus {
+    IntegrityRootStatus {
+        state: IntegrityRootState::Disabled,
+        profile: None,
+        generation: 0,
+        leaf_count: 0,
+        root_hash: None,
+        latest_commit_seq: 0,
+        latest_delta_seq: 0,
+        authenticated: false,
+    }
+}
+
+fn status_from_meta(
+    meta: RootMeta,
+    state: IntegrityRootState,
+    authenticated: bool,
+) -> IntegrityRootStatus {
+    IntegrityRootStatus {
+        state,
+        profile: Some(meta.profile),
+        generation: meta.generation,
+        leaf_count: meta.leaf_count,
+        root_hash: Some(meta.root_hash),
+        latest_commit_seq: meta.latest_commit_seq,
+        latest_delta_seq: meta.latest_delta_seq,
+        authenticated,
+    }
 }
 
 fn verify_meta(conn: &VaultConnection, meta: &RootMeta) -> StorageResult<()> {

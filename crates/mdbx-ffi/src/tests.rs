@@ -32,6 +32,54 @@ fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
 }
 
 #[test]
+fn integrity_root_ffi_exposes_metadata_only_status_and_locked_inspection() {
+    let path =
+        std::env::temp_dir().join(format!("mdbx-ffi-integrity-root-{}.mdbx", Uuid::new_v4()));
+    let path_string = path.to_string_lossy().into_owned();
+    let vault = create_vault(
+        path_string.clone(),
+        "integrity-root-password".to_string(),
+        "ffi-integrity-root-device".to_string(),
+    )
+    .unwrap();
+
+    let disabled = vault.integrity_root_status().unwrap();
+    assert_eq!(disabled.state, MdbxIntegrityRootState::Disabled);
+    assert!(!disabled.authenticated);
+    assert!(disabled.root_hash.is_none());
+
+    let enabled = vault.enable_integrity_root().unwrap();
+    assert_eq!(enabled.state, MdbxIntegrityRootState::Established);
+    assert!(enabled.authenticated);
+    assert_eq!(enabled.root_hash.as_ref().map(Vec::len), Some(32));
+    let verified = vault.verify_integrity_root().unwrap();
+    assert_eq!(verified.profile, "mdbx-authenticated-state-root-v1");
+    assert_eq!(verified.root_hash.len(), 32);
+
+    let rebuilt = vault.rebuild_integrity_root().unwrap();
+    assert!(rebuilt.generation > enabled.generation);
+    drop(vault);
+
+    let locked = inspect_vault_integrity_root(path_string.clone()).unwrap();
+    assert_eq!(locked.state, MdbxIntegrityRootState::Established);
+    assert!(!locked.authenticated);
+    assert_eq!(locked.root_hash.as_ref().map(Vec::len), Some(32));
+
+    let reopened = open_vault(
+        path_string,
+        "integrity-root-password".to_string(),
+        "ffi-integrity-root-device".to_string(),
+    )
+    .unwrap();
+    assert!(reopened.integrity_root_status().unwrap().authenticated);
+    drop(reopened);
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
+        let _ = std::fs::remove_file(candidate);
+    }
+}
+
+#[test]
 fn rollback_anchor_ffi_roundtrips_opaque_tokens_and_reports_advancement() {
     let vault = ffi_test_vault();
     let token = vault.create_rollback_anchor().unwrap();
