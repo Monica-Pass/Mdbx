@@ -368,7 +368,7 @@ impl TigaService {
         conn: &VaultConnection,
         project_id: &str,
     ) -> StorageResult<ResolvedTigaPolicy> {
-        let project = ProjectRepo::get_by_id(conn, project_id)?
+        let project = ProjectRepo::get_policy_context(conn, project_id)?
             .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
         let scope = TigaScope::Project {
             project_id: project_id.to_string(),
@@ -384,7 +384,7 @@ impl TigaService {
         conn: &VaultConnection,
         entry_id: &str,
     ) -> StorageResult<ResolvedTigaPolicy> {
-        let entry = EntryRepo::get_by_id(conn, entry_id)?
+        let entry = EntryRepo::get_policy_context(conn, entry_id)?
             .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
         let scope = TigaScope::Entry {
             entry_id: entry_id.to_string(),
@@ -601,7 +601,6 @@ impl TigaService {
         Ok(decision)
     }
 
-    #[cfg(feature = "kdbx-export")]
     pub(crate) fn execute_authorized<T>(
         conn: &VaultConnection,
         scope: &TigaScope,
@@ -609,9 +608,15 @@ impl TigaService {
         context: TigaAuthorizationContext<'_>,
         action: impl FnOnce() -> StorageResult<T>,
     ) -> StorageResult<(T, AuthorizationDecision)> {
-        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
-        if !decision_allows(&evaluated.decision) {
-            conn.with_immediate_transaction(|| {
+        enum Execution<T> {
+            Allowed(T, AuthorizationDecision),
+            Denied(AuthorizationDecision),
+        }
+
+        let execution = conn.with_immediate_transaction(|| {
+            let evaluated =
+                Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+            if !decision_allows(&evaluated.decision) {
                 record_authorization_event(
                     conn,
                     scope,
@@ -619,11 +624,9 @@ impl TigaService {
                     context,
                     &evaluated.decision,
                     evaluated.evidence.audit_context(None, None),
-                )
-            })?;
-            return Err(StorageError::Authorization(evaluated.decision));
-        }
-        conn.with_immediate_transaction(|| {
+                )?;
+                return Ok(Execution::Denied(evaluated.decision));
+            }
             let value = action()?;
             if evaluated.decision.audit_required {
                 record_authorization_event(
@@ -635,8 +638,13 @@ impl TigaService {
                     evaluated.evidence.audit_context(None, None),
                 )?;
             }
-            Ok((value, evaluated.decision))
-        })
+            Ok(Execution::Allowed(value, evaluated.decision))
+        })?;
+
+        match execution {
+            Execution::Allowed(value, decision) => Ok((value, decision)),
+            Execution::Denied(decision) => Err(StorageError::Authorization(decision)),
+        }
     }
 
     pub(crate) fn execute_authorized_mut<T>(
@@ -846,7 +854,7 @@ impl TigaService {
         exception: Option<&PolicyException>,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<()> {
-        let entry = EntryRepo::get_by_id(conn, entry_id)?
+        let entry = EntryRepo::get_policy_context(conn, entry_id)?
             .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
         let scope = TigaScope::Entry {
             entry_id: entry_id.to_string(),
@@ -1000,7 +1008,7 @@ fn resolve_parent_policy(
         }),
         TigaScope::Project { .. } => TigaService::resolve_vault_policy(conn),
         TigaScope::Entry { entry_id } => {
-            let entry = EntryRepo::get_by_id(conn, entry_id)?
+            let entry = EntryRepo::get_policy_context(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
             TigaService::resolve_policy_for_project(conn, &entry.project_id)
         }
@@ -1267,7 +1275,7 @@ fn track_scope_policy_change(
             commit_id
         }
         TigaScope::Project { project_id } => {
-            let project = ProjectRepo::get_by_id(conn, project_id)?
+            let project = ProjectRepo::get_policy_context(conn, project_id)?
                 .ok_or_else(|| StorageError::NotFound(project_id.clone()))?;
             if project.deleted {
                 return Err(StorageError::ConstraintViolation(
@@ -1291,7 +1299,7 @@ fn track_scope_policy_change(
             commit_id
         }
         TigaScope::Entry { entry_id } => {
-            let entry = EntryRepo::get_by_id(conn, entry_id)?
+            let entry = EntryRepo::get_policy_context(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.clone()))?;
             if entry.deleted {
                 return Err(StorageError::ConstraintViolation(
@@ -1636,6 +1644,59 @@ mod tests {
         assert_eq!(resolved.policy.profile, TigaMode::Power);
         assert!(!resolved.policy.egress.export_allowed);
         assert_eq!(resolved.compliance, PolicyCompliance::Compliant);
+    }
+
+    #[test]
+    fn entry_policy_resolution_is_metadata_only() {
+        let (conn, ctx, project_id, entry_id) = setup();
+        TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power)).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE projects SET title_ct = X'00', summary_ct = X'00'
+                 WHERE project_id = ?1",
+                [&project_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET title_ct = X'00', payload_ct = X'00'
+                 WHERE entry_id = ?1",
+                [&entry_id],
+            )
+            .unwrap();
+
+        let resolved = TigaService::resolve_policy_for_entry(&conn, &entry_id).unwrap();
+        assert_eq!(resolved.policy.profile, TigaMode::Power);
+        assert!(ProjectRepo::get_by_id(&conn, &project_id).is_err());
+        assert!(EntryRepo::get_by_id(&conn, &entry_id).is_err());
+    }
+
+    #[test]
+    fn invalid_stored_policy_context_override_fails_closed() {
+        let (conn, _, project_id, entry_id) = setup();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET tiga_mode_override = 'future-mode' WHERE entry_id = ?1",
+                [&entry_id],
+            )
+            .unwrap();
+        let entry_error = TigaService::resolve_policy_for_entry(&conn, &entry_id).unwrap_err();
+        assert!(entry_error.to_string().contains("unknown TigaMode"));
+
+        conn.inner()
+            .execute(
+                "UPDATE entries SET tiga_mode_override = NULL WHERE entry_id = ?1",
+                [&entry_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE projects SET tiga_mode_override = 'future-mode' WHERE project_id = ?1",
+                [&project_id],
+            )
+            .unwrap();
+        let project_error = TigaService::resolve_policy_for_entry(&conn, &entry_id).unwrap_err();
+        assert!(project_error.to_string().contains("unknown TigaMode"));
     }
 
     #[test]

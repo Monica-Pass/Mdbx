@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(not(feature = "external-blob-store"), test))]
 use mdbx_core::model::attachment::StorageMode;
-use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
+use mdbx_core::model::{ChangeScope, Commit, CommitKind, Entry, EntryType, ObjectSummary};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
@@ -44,6 +44,7 @@ use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::integrity_root::{
     IntegrityRootService, IntegrityRootState, IntegrityRootStatus, IntegrityRootVerification,
 };
+use mdbx_storage::object_disclosure::ObjectDisclosureService;
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 #[cfg(not(test))]
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
@@ -390,8 +391,13 @@ enum EntryAction {
         #[arg(short, long)]
         notes: Option<String>,
     },
-    /// 查看条目详情
-    Get { entry_id: String },
+    /// 查看条目详情（默认隐藏载荷）
+    Get {
+        entry_id: String,
+        /// 经 Tiga 授权后显式披露秘密载荷
+        #[arg(long)]
+        reveal: bool,
+    },
     /// 编辑条目
     Edit {
         entry_id: String,
@@ -1256,6 +1262,70 @@ fn cmd_project(conn: &mut VaultConnection, action: ProjectAction) -> Result<(), 
 // ENTRY
 // ---------------------------------------------------------------------------
 
+fn render_entry_header(
+    object_id: &str,
+    collection_id: &str,
+    object_type: &EntryType,
+    title: Option<&[u8]>,
+    deleted: bool,
+    updated_at: &str,
+) -> Vec<String> {
+    let title = title
+        .map(|value| String::from_utf8_lossy(value).to_string())
+        .unwrap_or_else(|| "(untitled)".to_string());
+    vec![
+        format!("ID:         {object_id}"),
+        format!("Project:    {collection_id}"),
+        format!("Type:       {object_type:?}"),
+        format!("Title:      {title}"),
+        format!("Deleted:    {deleted}"),
+        format!("Updated:    {updated_at}"),
+    ]
+}
+
+fn render_redacted_entry_summary(summary: &ObjectSummary) -> String {
+    let mut lines = render_entry_header(
+        &summary.object_id,
+        &summary.collection_id,
+        &summary.object_type_id,
+        summary.title.as_deref(),
+        summary.deleted,
+        &summary.updated_at,
+    );
+    lines.push("Payload:    [redacted; use --reveal]".to_string());
+    lines.join("\n")
+}
+
+fn render_disclosed_entry(entry: &Entry) -> Result<String, String> {
+    let mut lines = render_entry_header(
+        &entry.entry_id,
+        &entry.project_id,
+        &entry.entry_type,
+        entry.title_ct.as_deref(),
+        entry.deleted,
+        &entry.updated_at,
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&entry.payload_ct)
+        .map_err(|error| format!("object payload is not valid JSON: {error}"))?;
+    lines.push("Payload:".to_string());
+    if let Some(fields) = payload.as_object() {
+        if fields.is_empty() {
+            lines.push("  {}".to_string());
+        } else {
+            for (key, value) in fields {
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                lines.push(format!("  {key}: {value}"));
+            }
+        }
+    } else {
+        lines.push(format!("  {payload}"));
+    }
+    Ok(lines.join("\n"))
+}
+
 fn cmd_entry(conn: &mut VaultConnection, action: EntryAction) -> Result<(), String> {
     let ctx = ctx();
     match action {
@@ -1333,32 +1403,21 @@ fn cmd_entry(conn: &mut VaultConnection, action: EntryAction) -> Result<(), Stri
                 .map_err(|e| format!("{}", e))?;
             println!("Created entry {}", e.entry_id);
         }
-        EntryAction::Get { entry_id } => {
-            let e = EntryRepo::get_by_id(conn, &entry_id)
-                .map_err(|e| format!("{}", e))?
-                .ok_or("entry not found")?;
-            let title = e
-                .title_ct
-                .as_ref()
-                .map(|t| String::from_utf8_lossy(t).to_string())
-                .unwrap_or_else(|| "(untitled)".to_string());
-            println!("ID:         {}", e.entry_id);
-            println!("Project:    {}", e.project_id);
-            println!("Type:       {:?}", e.entry_type);
-            println!("Title:      {}", title);
-            println!("Deleted:    {}", e.deleted);
-            println!("Updated:    {}", e.updated_at);
-
-            let payload: serde_json::Value =
-                serde_json::from_slice(&e.payload_ct).unwrap_or(serde_json::Value::Null);
-            if let Some(obj) = payload.as_object() {
-                for (k, v) in obj {
-                    if let Some(s) = v.as_str() {
-                        println!("  {}: {}", k, s);
-                    } else {
-                        println!("  {}: {}", k, v);
-                    }
-                }
+        EntryAction::Get { entry_id, reveal } => {
+            if reveal {
+                let disclosed = ObjectDisclosureService::reveal_with_active_session(
+                    conn,
+                    &entry_id,
+                    &cli_device_context(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .map_err(|error| error.to_string())?;
+                println!("{}", render_disclosed_entry(&disclosed.object)?);
+            } else {
+                let summary = ObjectSummaryRepo::get(conn, &entry_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("entry not found")?;
+                println!("{}", render_redacted_entry_summary(&summary));
             }
         }
         EntryAction::Edit {
@@ -3604,10 +3663,52 @@ mod tests {
     }
 
     #[test]
+    fn clap_entry_get_routes_explicit_reveal_flag() {
+        let redacted = Cli::try_parse_from(["mdbx", "entry", "get", "entry-1"]).unwrap();
+        let Commands::Entry {
+            action: EntryAction::Get { entry_id, reveal },
+        } = redacted.command
+        else {
+            panic!("entry get command was not parsed");
+        };
+        assert_eq!(entry_id, "entry-1");
+        assert!(!reveal);
+
+        let disclosed =
+            Cli::try_parse_from(["mdbx", "entry", "get", "entry-1", "--reveal"]).unwrap();
+        let Commands::Entry {
+            action: EntryAction::Get { entry_id, reveal },
+        } = disclosed.command
+        else {
+            panic!("entry get --reveal command was not parsed");
+        };
+        assert_eq!(entry_id, "entry-1");
+        assert!(reveal);
+    }
+
+    #[test]
+    fn entry_get_default_render_is_explicitly_redacted() {
+        let rendered = render_redacted_entry_summary(&ObjectSummary {
+            object_id: "entry-1".to_string(),
+            collection_id: "project-1".to_string(),
+            object_type_id: EntryType::Login,
+            title: Some(b"Example".to_vec()),
+            payload_schema_version: 1,
+            head_commit_id: "commit-1".to_string(),
+            deleted: false,
+            updated_at: "2026-07-23T00:00:00Z".to_string(),
+        });
+        assert!(rendered.contains("Payload:    [redacted; use --reveal]"));
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
     fn clap_entry_help_paths_render_without_panics() {
         for args in [
             ["mdbx", "entry", "create", "--help"],
             ["mdbx", "entry", "edit", "--help"],
+            ["mdbx", "entry", "get", "--help"],
         ] {
             match Cli::try_parse_from(args) {
                 Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp),
@@ -4105,6 +4206,18 @@ mod tests {
             Commands::Entry {
                 action: EntryAction::Get {
                     entry_id: entry_id.clone(),
+                    reveal: false,
+                },
+            },
+        ))
+        .unwrap();
+
+        run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::Get {
+                    entry_id: entry_id.clone(),
+                    reveal: true,
                 },
             },
         ))
@@ -4211,7 +4324,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_entry_list_does_not_decrypt_object_payloads() {
+    fn cli_entry_get_and_list_do_not_decrypt_object_payloads() {
         let vault = TempVault::new();
         let path = vault.path();
         run(init_cli(&path)).unwrap();
@@ -4254,6 +4367,82 @@ mod tests {
             },
         ))
         .unwrap();
+
+        run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::Get {
+                    entry_id: entry.entry_id,
+                    reveal: false,
+                },
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_entry_get_reveal_denies_before_corrupt_payload_decryption() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Power Collection".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx(),
+            &project_id,
+            EntryType::Login,
+            Some("Denied secret"),
+            &serde_json::json!({"password": "secret"}),
+        )
+        .unwrap();
+        let session = conn.active_session().unwrap().clone();
+        let device = cli_device_context();
+        TigaService::set_vault_profile_authorized(
+            &conn,
+            &ctx(),
+            TigaMode::Power,
+            None,
+            TigaAuthorizationContext {
+                session: Some(&session),
+                device: &device,
+                now_unix_secs: chrono::Utc::now().timestamp(),
+            },
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                [&entry.entry_id],
+            )
+            .unwrap();
+        drop(conn);
+
+        let error = run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::Get {
+                    entry_id: entry.entry_id,
+                    reveal: true,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("Tiga authorization did not allow"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("crypto error"));
     }
 
     #[test]

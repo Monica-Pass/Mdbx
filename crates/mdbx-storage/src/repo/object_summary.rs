@@ -1,4 +1,5 @@
 use rusqlite::types::Type;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use mdbx_core::model::{ObjectSummary, ObjectSummaryPage, ObjectTypeId};
@@ -37,6 +38,25 @@ struct RawObjectSummary {
 pub struct ObjectSummaryRepo;
 
 impl ObjectSummaryRepo {
+    /// Read one object's display metadata without touching its encrypted payload.
+    ///
+    /// Deleted objects remain visible so callers can render tombstone state without
+    /// falling back to the plaintext-bearing legacy entry read API.
+    pub fn get(conn: &VaultConnection, object_id: &str) -> StorageResult<Option<ObjectSummary>> {
+        let raw = conn
+            .inner()
+            .query_row(
+                "SELECT entry_id, project_id, entry_type, title_ct,
+                        payload_schema_version, head_commit_id, deleted, updated_at
+                 FROM entries WHERE entry_id = ?1",
+                [object_id],
+                read_raw_summary,
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+        raw.map(|row| decode_summary(conn, row)).transpose()
+    }
+
     pub fn list(
         conn: &VaultConnection,
         collection_id: &str,
@@ -72,27 +92,7 @@ impl ObjectSummaryRepo {
                 cursor.as_ref().map(|cursor| cursor.object_id.as_str()),
                 (page_size + 1) as i64,
             ],
-            |row| {
-                let payload_schema_version = row.get::<_, i64>(4)?;
-                Ok(RawObjectSummary {
-                    object_id: row.get(0)?,
-                    collection_id: row.get(1)?,
-                    object_type_id: row.get(2)?,
-                    title_ct: row.get(3)?,
-                    payload_schema_version: u32::try_from(payload_schema_version).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                Type::Integer,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    head_commit_id: row.get(5)?,
-                    deleted: row.get::<_, i32>(6)? != 0,
-                    updated_at: row.get(7)?,
-                })
-            },
+            read_raw_summary,
         )?;
         let mut raw_items = Vec::with_capacity(page_size + 1);
         for row in rows.take(page_size + 1) {
@@ -116,6 +116,22 @@ impl ObjectSummaryRepo {
             .collect::<StorageResult<Vec<_>>>()?;
         Ok(ObjectSummaryPage { items, next_cursor })
     }
+}
+
+fn read_raw_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawObjectSummary> {
+    let payload_schema_version = row.get::<_, i64>(4)?;
+    Ok(RawObjectSummary {
+        object_id: row.get(0)?,
+        collection_id: row.get(1)?,
+        object_type_id: row.get(2)?,
+        title_ct: row.get(3)?,
+        payload_schema_version: u32::try_from(payload_schema_version).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+        })?,
+        head_commit_id: row.get(5)?,
+        deleted: row.get::<_, i32>(6)? != 0,
+        updated_at: row.get(7)?,
+    })
 }
 
 fn decode_summary(conn: &VaultConnection, row: RawObjectSummary) -> StorageResult<ObjectSummary> {
@@ -301,6 +317,36 @@ mod tests {
             Some(b"Visible title".as_slice())
         );
         assert!(EntryRepo::get_by_id(&conn, &object.entry_id).is_err());
+    }
+
+    #[test]
+    fn object_summary_get_is_metadata_only_and_includes_deleted_objects() {
+        let (conn, ctx, collection_id, _) = setup();
+        let object = EntryRepo::create(
+            &conn,
+            &ctx,
+            &collection_id,
+            ObjectTypeId::Login,
+            Some("Deleted title"),
+            &serde_json::json!({"password": "secret"}),
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &object.entry_id).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                [&object.entry_id],
+            )
+            .unwrap();
+
+        let summary = ObjectSummaryRepo::get(&conn, &object.entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.object_id, object.entry_id);
+        assert_eq!(summary.collection_id, collection_id);
+        assert_eq!(summary.title.as_deref(), Some(b"Deleted title".as_slice()));
+        assert!(summary.deleted);
+        assert!(EntryRepo::get_by_id(&conn, &summary.object_id).is_err());
     }
 
     #[test]

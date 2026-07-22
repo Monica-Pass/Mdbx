@@ -4,6 +4,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use mdbx_core::model::Project;
+use mdbx_core::tiga::TigaMode;
 
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
@@ -17,6 +18,14 @@ use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 /// `_ct` 字段在写入时加密、读取时解密。
 /// 若连接未附加 Keyring，则透传原始字节（用于测试和明文模式）。
 pub struct ProjectRepo;
+
+/// Policy resolution metadata that does not decrypt project title or summary fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectPolicyContext {
+    pub tiga_mode_override: Option<TigaMode>,
+    pub deleted: bool,
+    pub object_clock: String,
+}
 
 impl ProjectRepo {
     // -----------------------------------------------------------------------
@@ -149,6 +158,40 @@ impl ProjectRepo {
             )
             .optional()
             .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn get_policy_context(
+        conn: &VaultConnection,
+        project_id: &str,
+    ) -> StorageResult<Option<ProjectPolicyContext>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT tiga_mode_override, deleted, object_clock
+                 FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i32>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|(tiga_mode_override, deleted, object_clock)| {
+                Ok(ProjectPolicyContext {
+                    tiga_mode_override: tiga_mode_override
+                        .map(|value| value.parse().map_err(StorageError::Validation))
+                        .transpose()?,
+                    deleted,
+                    object_clock,
+                })
+            })
+            .transpose()
     }
 
     pub fn list_all(conn: &VaultConnection) -> StorageResult<Vec<Project>> {

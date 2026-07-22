@@ -4,6 +4,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use mdbx_core::model::{Entry, EntryType};
+use mdbx_core::tiga::TigaMode;
 
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
@@ -18,6 +19,15 @@ use crate::repo::TombstoneRepo;
 /// 每个 entry 必须归属于一个 project。
 /// `_ct` 字段在写入时加密、读取时解密。
 pub struct EntryRepo;
+
+/// Policy resolution metadata that is safe to read before plaintext disclosure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EntryPolicyContext {
+    pub project_id: String,
+    pub tiga_mode_override: Option<TigaMode>,
+    pub deleted: bool,
+    pub object_clock: String,
+}
 
 pub struct EntryCreateRequest<'a> {
     pub entry_id: &'a str,
@@ -251,6 +261,42 @@ impl EntryRepo {
             )
             .optional()
             .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn get_policy_context(
+        conn: &VaultConnection,
+        entry_id: &str,
+    ) -> StorageResult<Option<EntryPolicyContext>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT project_id, tiga_mode_override, deleted, object_clock
+                 FROM entries WHERE entry_id = ?1",
+                params![entry_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i32>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|(project_id, tiga_mode_override, deleted, object_clock)| {
+                Ok(EntryPolicyContext {
+                    project_id,
+                    tiga_mode_override: tiga_mode_override
+                        .map(|value| value.parse().map_err(StorageError::Validation))
+                        .transpose()?,
+                    deleted,
+                    object_clock,
+                })
+            })
+            .transpose()
     }
 
     pub fn list_by_project(conn: &VaultConnection, project_id: &str) -> StorageResult<Vec<Entry>> {
