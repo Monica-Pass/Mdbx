@@ -98,6 +98,14 @@ The schema MUST support:
 - soft delete via tombstone or delete marker
 - integrity verification
 
+## 5.1 Object Payload And Large-Content Boundary
+
+`entries.payload_ct` is the bounded structured-data plane for a generic ObjectRecord. It is suitable for password fields, bookmark properties, message headers and normalized small bodies, contacts, `mafile` documents, and versioned JSON owned by domain adapters. An object may reference large content through stable attachment or blob IDs, but arbitrary binary or source-document bytes must not all be forced into one payload.
+
+Policy-authorized object disclosure returns at most 8 MiB of plaintext by default. A client may select a resource profile from 1 byte through the 64 MiB hard ceiling. Storage checks ciphertext length before loading the BLOB and verifies the actual plaintext length after authenticated decryption. This read boundary does not alter MDBX1 complete-record compatibility APIs or existing database bytes.
+
+Large message bodies, raw MIME/EML, saved-page archives, files, and media SHOULD use `attachments` / `attachment_chunks` or an encrypted blob provider. That path MUST provide bounded chunks, streaming transfer, content hashes, ownership, and lifecycle, and routine object edits MUST NOT rewrite the large content.
+
 ## 6. Write Path Requirements
 
 Routine small edits MUST avoid full logical rewrite of the entire vault contents.

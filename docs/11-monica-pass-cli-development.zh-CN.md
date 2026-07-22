@@ -274,11 +274,14 @@ mdbx entry get <entry-id> --reveal
 
 - 默认 `entry get` 只调用 `ObjectSummaryRepo::get`，输出对象元数据和 `Payload: [redacted; use --reveal]`，不读取 `payload_ct`。即使 payload 密文损坏，默认详情仍可用于定位对象；软删除对象也可显示删除状态。
 - `--reveal` 必须通过 `ObjectDisclosureService` 使用活动解锁会话执行 `TigaOperation::RevealSecret`。策略允许后才能调用完整对象读取并解密 payload。
+- `--reveal` 使用 8 MiB 默认明文上限；storage 在载入 payload BLOB 前执行密文长度门禁，并在认证解密后复核实际明文长度。超限返回资源错误，不尝试把大型内容整块跨 CLI/FFI 分配。
 - Power 或自定义策略拒绝时，CLI 返回 Tiga 授权错误；拒绝发生在 payload 解密之前。
 - 已删除对象不能 reveal。允许结果附带 `AuthorizationDecision`，客户端不得忽略其中的执行约束。
 - `EntryRepo::get_by_id` 为 MDBX1 与既有 MDBX2 调用方保留，不作为新 UI、Agent 或默认详情的推荐接口。
 
 Monica Pass CLI、TUI、Agent stdio、未来网页收藏夹和邮件客户端都应复用同一分层：先取 metadata-only summary，再由明确的人类动作或受限能力进入 disclosure service。客户端不能各自复制“先完整读取、再判断是否显示”的逻辑。
+
+收藏夹属性、密码记录、邮件头和普通小正文可以放在对象 payload；超大正文、原始 `.eml`、网页归档和文件内容应走 attachment / encrypted blob provider 的有界流式接口，对象只保存稳定引用。客户端不得通过提高单条 JSON 上限来替代大型内容路径。
 
 ## 5. JSON Agent 接口
 

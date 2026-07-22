@@ -1038,7 +1038,102 @@ fn ffi_object_disclosure_returns_typed_allow_and_missing_session_decisions() {
 }
 
 #[test]
-fn ffi_object_disclosure_power_denial_precedes_corrupt_payload() {
+fn ffi_object_disclosure_limits_are_discoverable_and_validated() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Bounded collection".to_string())
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id,
+            "com.monica.mail.message".to_string(),
+            "Bounded message".to_string(),
+            r#"{"body":"bounded plaintext"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let defaults = default_object_disclosure_limits();
+    assert_eq!(defaults.max_payload_bytes, 8 * 1024 * 1024);
+
+    let too_small = vault
+        .reveal_object_with_limits(
+            object.object_id.clone(),
+            MdbxObjectDisclosureLimits {
+                max_payload_bytes: 8,
+            },
+        )
+        .unwrap_err();
+    assert!(too_small
+        .to_string()
+        .contains("object plaintext payload bytes"));
+
+    let allowed = vault
+        .reveal_object_with_device_context_and_limits(
+            object.object_id.clone(),
+            conservative_ffi_device_context(),
+            MdbxObjectDisclosureLimits {
+                max_payload_bytes: 1024,
+            },
+        )
+        .unwrap();
+    assert!(allowed.object.is_some());
+
+    for invalid in [0, 64 * 1024 * 1024 + 1] {
+        let error = vault
+            .reveal_object_with_limits(
+                object.object_id.clone(),
+                MdbxObjectDisclosureLimits {
+                    max_payload_bytes: invalid,
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("object disclosure max_payload_bytes must be between"));
+    }
+}
+
+#[test]
+fn ffi_object_disclosure_rejects_oversized_ciphertext_before_decryption() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Oversized collection".to_string())
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id,
+            "com.monica.mail.message".to_string(),
+            "Oversized message".to_string(),
+            r#"{"body":"small"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = zeroblob(?2) WHERE entry_id = ?1",
+                rusqlite::params![&object.object_id, 256 * 1024],
+            )
+            .unwrap();
+    }
+
+    let error = vault
+        .reveal_object_with_limits(
+            object.object_id,
+            MdbxObjectDisclosureLimits {
+                max_payload_bytes: 16,
+            },
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("object payload ciphertext bytes"));
+    assert!(!error.to_string().contains("crypto error"));
+}
+
+#[test]
+fn ffi_object_disclosure_power_denial_precedes_oversized_payload() {
     let vault = ffi_test_vault();
     let collection = vault
         .create_project("Power collection".to_string())
@@ -1064,13 +1159,20 @@ fn ffi_object_disclosure_power_denial_precedes_corrupt_payload() {
         let conn = vault.conn.lock().unwrap();
         conn.inner()
             .execute(
-                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
-                [&object.object_id],
+                "UPDATE entries SET payload_ct = zeroblob(?2) WHERE entry_id = ?1",
+                rusqlite::params![&object.object_id, 256 * 1024],
             )
             .unwrap();
     }
 
-    let denied = vault.reveal_object(object.object_id.clone()).unwrap();
+    let denied = vault
+        .reveal_object_with_limits(
+            object.object_id.clone(),
+            MdbxObjectDisclosureLimits {
+                max_payload_bytes: 16,
+            },
+        )
+        .unwrap();
     assert!(denied.object.is_none());
     assert!(!matches!(
         denied.authorization.outcome,

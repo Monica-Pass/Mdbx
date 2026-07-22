@@ -299,6 +299,36 @@ impl EntryRepo {
             .transpose()
     }
 
+    /// Return the stored payload ciphertext length without materializing the BLOB.
+    ///
+    /// This projection is intentionally separate from `get_by_id` so authorized
+    /// disclosure can enforce an allocation boundary before loading or decrypting
+    /// attacker-controlled ciphertext.
+    pub(crate) fn payload_ciphertext_len(
+        conn: &VaultConnection,
+        entry_id: &str,
+    ) -> StorageResult<Option<u64>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT length(payload_ct) FROM entries WHERE entry_id = ?1",
+                params![entry_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Validation(format!(
+                        "entry {entry_id} has a negative payload ciphertext length"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     pub fn list_by_project(conn: &VaultConnection, project_id: &str) -> StorageResult<Vec<Entry>> {
         EntryRepo::list_where(
             conn,

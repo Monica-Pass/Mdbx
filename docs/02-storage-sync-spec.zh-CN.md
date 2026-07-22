@@ -98,6 +98,14 @@ schema 必须支持：
 - 软删除或 tombstone 机制
 - 完整性校验
 
+## 5.1 Object payload 与大型内容边界
+
+`entries.payload_ct` 是通用 ObjectRecord 的有界结构化数据平面，适合密码字段、书签属性、邮件头与规范化小正文、联系人、`mafile` 文档和领域 Adapter 的版本化 JSON。对象可以通过稳定 attachment/blob ID 引用大型内容，但不能把任意大小的二进制或原始文档都塞进一条 payload。
+
+策略授权的对象披露默认最多返回 8 MiB 明文，客户端可以在 1 byte 到 64 MiB 硬上限之间选择资源配置。storage 在加载 BLOB 前检查密文长度，并在认证解密后复核实际明文长度。该上限约束读取资源，不改变 MDBX1 完整记录兼容 API 或既有数据库字节。
+
+超大邮件正文、原始 MIME/EML、网页归档、文件与媒体内容应使用 `attachments` / `attachment_chunks` 或 encrypted blob provider。此路径必须支持有界分块、流式传输、内容 hash、归属关系和生命周期；普通对象编辑不得重写这些大型内容。
+
 ## 6. 写入路径要求
 
 日常小修改绝不能在逻辑层面导致整个 vault 内容被全量重写。

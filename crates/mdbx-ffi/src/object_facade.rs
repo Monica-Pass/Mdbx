@@ -39,6 +39,19 @@ pub struct MdbxObjectRecord {
     pub deleted: bool,
 }
 
+/// Resource contract for one policy-authorized object payload disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectDisclosureLimits {
+    pub max_payload_bytes: u64,
+}
+
+#[uniffi::export]
+pub fn default_object_disclosure_limits() -> MdbxObjectDisclosureLimits {
+    MdbxObjectDisclosureLimits {
+        max_payload_bytes: ObjectDisclosureLimits::default().max_payload_bytes(),
+    }
+}
+
 /// Typed result of a Tiga-controlled object reveal.
 ///
 /// `object` is present only for Allow or AllowWithConstraints decisions.
@@ -206,7 +219,9 @@ use mdbx_core::model::{
 };
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
-use mdbx_storage::object_disclosure::{DisclosedObject, ObjectDisclosureService};
+use mdbx_storage::object_disclosure::{
+    DisclosedObject, ObjectDisclosureLimits, ObjectDisclosureService,
+};
 use mdbx_storage::repo::{
     CommitContext, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
@@ -335,6 +350,12 @@ fn object_disclosure_result(
         }),
         Err(error) => Err(error.into()),
     }
+}
+
+fn object_disclosure_limits(
+    limits: MdbxObjectDisclosureLimits,
+) -> Result<ObjectDisclosureLimits, MdbxFfiError> {
+    ObjectDisclosureLimits::new(limits.max_payload_bytes).map_err(Into::into)
 }
 
 fn object_summary_from_core(summary: ObjectSummary) -> MdbxObjectSummary {
@@ -469,7 +490,20 @@ impl MdbxVault {
         &self,
         object_id: String,
     ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
-        self.reveal_object_with_device_context(object_id, conservative_ffi_device_context())
+        self.reveal_object_with_limits(object_id, default_object_disclosure_limits())
+    }
+
+    /// Reveal with a conservative Standard device profile and an explicit bounded payload size.
+    pub fn reveal_object_with_limits(
+        &self,
+        object_id: String,
+        limits: MdbxObjectDisclosureLimits,
+    ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+        self.reveal_object_with_device_context_and_limits(
+            object_id,
+            conservative_ffi_device_context(),
+            limits,
+        )
     }
 
     /// Reveal an object through the active vault session and the supplied real device
@@ -479,14 +513,32 @@ impl MdbxVault {
         object_id: String,
         device: MdbxDeviceContext,
     ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+        self.reveal_object_with_device_context_and_limits(
+            object_id,
+            device,
+            default_object_disclosure_limits(),
+        )
+    }
+
+    /// Reveal through the active session with explicit device capabilities and payload limits.
+    pub fn reveal_object_with_device_context_and_limits(
+        &self,
+        object_id: String,
+        device: MdbxDeviceContext,
+        limits: MdbxObjectDisclosureLimits,
+    ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+        let limits = object_disclosure_limits(limits)?;
         let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         let device = device.into_core(&self.device_id);
-        object_disclosure_result(ObjectDisclosureService::reveal_with_active_session(
-            &mut conn,
-            &object_id,
-            &device,
-            unix_now(),
-        ))
+        object_disclosure_result(
+            ObjectDisclosureService::reveal_with_active_session_and_limits(
+                &mut conn,
+                &object_id,
+                &device,
+                unix_now(),
+                limits,
+            ),
+        )
     }
 
     /// MDBX1-compatible complete-payload read. New clients should prefer

@@ -4446,6 +4446,59 @@ mod tests {
     }
 
     #[test]
+    fn cli_entry_get_reveal_enforces_default_payload_limit_before_decryption() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Oversized Collection".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let conn = open_unlocked(&path);
+        let project_id = ProjectRepo::list_all(&conn).unwrap()[0].project_id.clone();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx(),
+            &project_id,
+            EntryType::Login,
+            Some("Oversized secret"),
+            &serde_json::json!({"password": "secret"}),
+        )
+        .unwrap();
+        let oversized = mdbx_storage::object_disclosure::DEFAULT_MAX_OBJECT_DISCLOSURE_PAYLOAD_BYTES
+            + 1024 * 1024;
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = zeroblob(?2) WHERE entry_id = ?1",
+                params![&entry.entry_id, oversized as i64],
+            )
+            .unwrap();
+        drop(conn);
+
+        let error = run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::Get {
+                    entry_id: entry.entry_id,
+                    reveal: true,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("object payload ciphertext bytes"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("crypto error"));
+    }
+
+    #[test]
     fn cli_can_attachment_crud_and_snapshot_roundtrip() {
         let vault = TempVault::new();
         let path = vault.path();
