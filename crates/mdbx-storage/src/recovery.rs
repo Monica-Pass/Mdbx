@@ -81,6 +81,15 @@ impl RecoveryVerifier {
             }),
         }
 
+        match Self::check_incremental_integrity_root(conn) {
+            Ok(root_issues) => issues.extend(root_issues),
+            Err(error) => issues.push(HealthIssue {
+                severity: IssueSeverity::Critical,
+                category: "incremental-integrity-root".to_string(),
+                description: format!("incremental integrity root verification failed: {error}"),
+            }),
+        }
+
         // 2. 检查 commit 链
         match Self::check_commit_chain(conn) {
             Ok(commit_issues) => issues.extend(commit_issues),
@@ -166,6 +175,47 @@ impl RecoveryVerifier {
         let healthy = error_count == 0;
 
         Ok(HealthCheckResult { healthy, issues })
+    }
+
+    pub fn check_incremental_integrity_root(
+        conn: &VaultConnection,
+    ) -> StorageResult<Vec<HealthIssue>> {
+        use crate::integrity_root::{IntegrityRootService, IntegrityRootState};
+
+        let status = IntegrityRootService::status(conn)?;
+        let issue = match status.state {
+            IntegrityRootState::Disabled => None,
+            IntegrityRootState::Pending => Some(HealthIssue {
+                severity: IssueSeverity::Warning,
+                category: "incremental-integrity-root".to_string(),
+                description: "incremental integrity root is pending its first rebuild".to_string(),
+            }),
+            IntegrityRootState::Building => Some(HealthIssue {
+                severity: IssueSeverity::Warning,
+                category: "incremental-integrity-root".to_string(),
+                description: "incremental integrity root rebuild is incomplete".to_string(),
+            }),
+            IntegrityRootState::Stale => Some(HealthIssue {
+                severity: IssueSeverity::Critical,
+                category: "incremental-integrity-root".to_string(),
+                description: "incremental integrity root is stale and requires rebuild".to_string(),
+            }),
+            IntegrityRootState::Established if !status.authenticated => Some(HealthIssue {
+                severity: IssueSeverity::Warning,
+                category: "incremental-integrity-root".to_string(),
+                description:
+                    "incremental integrity root requires an unlocked keyring for verification"
+                        .to_string(),
+            }),
+            IntegrityRootState::Established => {
+                IntegrityRootService::verify_with_limits(
+                    conn,
+                    crate::integrity_root::IntegrityRootLimits::desktop(),
+                )?;
+                None
+            }
+        };
+        Ok(issue.into_iter().collect())
     }
 
     /// 基本完整性：检查 SQLite 内部一致性。
@@ -1198,6 +1248,35 @@ mod tests {
             issue.severity == IssueSeverity::Error
                 && issue.category == "vault-header-integrity"
                 && issue.description.contains("invalidated")
+        }));
+    }
+
+    #[test]
+    fn full_health_check_verifies_an_established_incremental_root() {
+        let (mut conn, _ctx, _project_id) = setup();
+        crate::unlock::UnlockService::setup_password(&mut conn, "root-health-password").unwrap();
+        crate::integrity_root::IntegrityRootService::enable(&conn).unwrap();
+
+        let healthy = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(healthy.healthy, "unexpected issues: {:?}", healthy.issues);
+        assert!(!healthy
+            .issues
+            .iter()
+            .any(|issue| issue.category == "incremental-integrity-root"));
+
+        conn.inner()
+            .execute(
+                "UPDATE mdbx_integrity_root_leaves SET integrity_tag = zeroblob(32)
+                 WHERE key_hash = (SELECT key_hash FROM mdbx_integrity_root_leaves LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        let damaged = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(!damaged.healthy);
+        assert!(damaged.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Critical
+                && issue.category == "incremental-integrity-root"
+                && issue.description.contains("authentication")
         }));
     }
 

@@ -15,6 +15,7 @@ pub mod error;
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 pub mod import;
 pub mod init;
+pub mod integrity_root;
 pub mod key_epoch;
 pub mod migration;
 pub mod recovery;

@@ -945,6 +945,10 @@ impl UnlockService {
         let (keyring, active_key_epoch_id, epoch_keyrings) = Self::build_keyring(conn, vault_key)?;
         crate::vault_header_integrity::verify_or_initialize(conn, &keyring)?;
         conn.attach_verified_keyring(keyring, active_key_epoch_id, epoch_keyrings);
+        if let Err(error) = crate::integrity_root::verify_if_established(conn) {
+            conn.clear_session();
+            return Err(error);
+        }
         Ok(())
     }
 

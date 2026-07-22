@@ -52,10 +52,13 @@ The CLI uses bounded complete state for bootstrap and bundle v4 after a paired c
 
 Authenticated complete/incremental envelopes use versions 7/8, while their zstd representations use versions 9/10. Their existing logical payload SHA-256 trailer is followed by HMAC-SHA-256 keyed with the vault integrity subkey. The tag binds a versioned domain, magic, version, the bounded 20-byte header area, and the logical payload digest. The key is never stored in or transported with the bundle. This proves that the envelope was produced by a holder of the shared vault key and binds its metadata; it does not identify a particular device, encrypt the transport, replace inner field/delta encryption, or make a bundle safe to disclose. CLI export remains legacy v3/v4 by default, writes v5/v6 only with `--compression zstd`, and selects v7-v10 only with explicit `--authenticated`. CLI apply supplies the opened vault key automatically and continues to read v1-v6.
 
-The proposed `IncrementalIntegrityRoot` contract is additive and intentionally
-separate from the bundle capability. ADR-0022 defines a sparse Merkle root over
-synchronized logical state, updated in the same outer transaction as
-sync-delta capture. Until that profile is established, the O(vault-size)
+The implemented `IncrementalIntegrityRoot` profile is additive and intentionally
+separate from the bundle capability. It keeps schema 16 unchanged and creates
+its metadata, leaf, and sparse-node tables only after explicit verified-unlocked
+opt-in. Establishment records `authenticated-state-root-v1` as a critical
+extension, so a pre-profile MDBX2 writer rejects the vault before writable open.
+The root updates in the same outer transaction as sync-delta capture. Without
+that opt-in, current and legacy vault behavior is unchanged. The O(vault-size)
 content manifest remains the exact schema checkpoint; external Provider bytes
 and unregistered physical extension tables are not silently claimed by the
 incremental root.

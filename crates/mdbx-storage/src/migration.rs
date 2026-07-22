@@ -29,9 +29,13 @@ pub const MIGRATION_SYNC_STATE_EXTENSIONS: &str = "mdbx-2-sync-state-extensions-
 pub const MIGRATION_VAULT_HEADER_AUTH: &str = "mdbx-2-vault-header-auth-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 pub const SNAPSHOT_RECORD_AUTH_EXTENSION: &str = "snapshot-record-auth-v1";
+pub const AUTHENTICATED_STATE_ROOT_EXTENSION: &str = "authenticated-state-root-v1";
 
-const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] =
-    &[FIELD_KEY_EPOCHS_EXTENSION, SNAPSHOT_RECORD_AUTH_EXTENSION];
+const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[
+    FIELD_KEY_EPOCHS_EXTENSION,
+    SNAPSHOT_RECORD_AUTH_EXTENSION,
+    AUTHENTICATED_STATE_ROOT_EXTENSION,
+];
 const MAX_PRE_MIGRATION_INTEGRITY_ISSUES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,6 +714,14 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
     v14::validate_sync_delta_capture(conn)?;
     v15::validate_sync_state_extensions(conn)?;
     v16::validate_header_auth_schema(conn)?;
+    let critical_extensions: String = conn.query_row(
+        "SELECT critical_extensions FROM vault_meta LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_critical_extension(&critical_extensions, AUTHENTICATED_STATE_ROOT_EXTENSION)? {
+        crate::integrity_root::validate_established_schema(conn)?;
+    }
     for column in [
         "operation_id",
         "commit_id",
@@ -777,6 +789,12 @@ pub(crate) fn merge_critical_extension(value: &str, extension: &str) -> StorageR
     serde_json::to_string(&extensions).map_err(|error| {
         StorageError::Validation(format!("cannot serialize critical extensions: {}", error))
     })
+}
+
+pub(crate) fn has_critical_extension(value: &str, extension: &str) -> StorageResult<bool> {
+    Ok(parse_critical_extensions(value)?
+        .iter()
+        .any(|current| current == extension))
 }
 
 fn parse_critical_extensions(value: &str) -> StorageResult<Vec<String>> {

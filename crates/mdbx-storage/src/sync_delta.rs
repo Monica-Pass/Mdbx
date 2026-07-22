@@ -12,9 +12,9 @@ use crate::sync_state::{
     load_attachment_chunk_rows, load_attachment_rows, load_branch_rows, load_entry_rows,
     load_key_epoch_state, load_object_label_assignment_rows, load_object_label_rows,
     load_object_relation_rows, load_project_rows, load_project_tag_set_rows,
-    load_purge_receipt_rows, load_security_audit_event_rows, load_tiga_policy_exception_rows,
-    load_tiga_policy_override_rows, load_tiga_vault_state, load_tombstone_acknowledgement_rows,
-    load_tombstone_rows, SyncStatePayload, SYNC_STATE_FORMAT,
+    load_purge_receipt_rows, load_security_audit_event_rows, load_sync_state_extensions,
+    load_tiga_policy_exception_rows, load_tiga_policy_override_rows, load_tiga_vault_state,
+    load_tombstone_acknowledgement_rows, load_tombstone_rows, SyncStatePayload, SYNC_STATE_FORMAT,
 };
 use crate::tiga_policy::{optional_integrity_tag, verify_optional_integrity_tag};
 
@@ -142,11 +142,11 @@ pub struct DeletedSyncEntity {
 }
 
 #[derive(Debug, Clone)]
-struct PendingMutation {
-    mutation_seq: i64,
-    entity_kind: String,
-    entity_id: String,
-    action: String,
+pub(crate) struct PendingMutation {
+    pub(crate) mutation_seq: i64,
+    pub(crate) entity_kind: String,
+    pub(crate) entity_id: String,
+    pub(crate) action: String,
 }
 
 #[derive(Serialize)]
@@ -343,6 +343,7 @@ pub(crate) fn materialize_pending_sync_delta(
         limits,
     )?;
     persist_envelope(conn, &envelope)?;
+    crate::integrity_root::apply_sync_delta(conn, &envelope, &body, &latest)?;
     conn.inner().execute(
         "DELETE FROM sync_delta_mutations WHERE mutation_seq <= ?1",
         [last_mutation_seq],
@@ -524,7 +525,7 @@ fn load_pending_mutations(conn: &VaultConnection) -> StorageResult<Vec<PendingMu
         .collect()
 }
 
-fn deduplicate_mutations(
+pub(crate) fn deduplicate_mutations(
     mutations: &[PendingMutation],
 ) -> BTreeMap<(String, String), PendingMutation> {
     let mut latest = BTreeMap::new();
@@ -598,10 +599,20 @@ fn collect_delta_body(
     let override_ids = selected_ids(mutations, "tiga-override");
     let exception_ids = selected_ids(mutations, "tiga-exception");
     let audit_ids = selected_ids(mutations, "security-audit");
+    let extension_ids = selected_ids(mutations, "sync-extension");
+
+    let extensions = if extension_ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        load_sync_state_extensions(conn)?
+            .into_iter()
+            .filter(|(key, _)| extension_ids.contains(key))
+            .collect()
+    };
 
     let state = SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
-        extensions: BTreeMap::new(),
+        extensions,
         key_epoch_state: if selected_ids(mutations, "key-epochs").is_empty() {
             None
         } else {

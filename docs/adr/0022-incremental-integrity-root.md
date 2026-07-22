@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -19,9 +19,9 @@ already deduplicates changed logical keys, materializes final state, and runs
 before the enclosing SQLite transaction commits. A root updater can therefore
 share the same atomicity without making every repository know about hashing.
 
-## Decision direction
+## Decision
 
-The proposed profile uses a sparse Merkle tree over authenticated logical-state
+The implemented profile uses a sparse Merkle tree over authenticated logical-state
 leaves. A leaf contains only a domain-separated logical key and a digest of its
 canonical encrypted/state representation; it never stores plaintext payloads.
 The key is mapped to a fixed-depth path, and changed or deleted leaves update
@@ -33,8 +33,9 @@ The updater is one internal Module behind the sync-delta finalization seam. A
 mutation, incoming sync apply, or explicit rebuild updates the leaf index and
 root nodes in the same outer transaction. Any collection, encoding, HMAC, or
 resource-limit failure rolls back the user mutation and leaves the previous
-root valid. Rebuild is bounded and resumable; it is used for migration and
-repair, not ordinary edits.
+root valid. Rebuild is bounded, atomic, and retryable; an interruption restores
+the prior established root instead of exposing a partial tree. It is used for
+explicit opt-in and repair, not ordinary edits.
 
 ## Coverage contract
 
@@ -59,10 +60,18 @@ explicitly rebuild one after verified unlock. Once a root profile is marked
 established, a reader that cannot validate it must fail closed for trusted
 writable or synchronization operations rather than silently downgrade.
 
-The root is not added to the four mandatory incremental-sync capabilities. A
-future peer capability, `authenticated-state-root-v1`, is opt-in and only
+The root is not added to the four mandatory incremental-sync capabilities. The
+peer capability, `authenticated-state-root-v1`, is opt-in and only
 selects root exchange when both peers support the same profile. Legacy peers
 continue using existing commit/delta checkpoints and complete-state fallback.
+
+The implementation keeps schema 16 unchanged and creates the root metadata,
+leaf, and sparse-node tables only when a verified-unlocked client explicitly
+enables the profile. Establishment registers the same identifier as a critical
+extension, so older MDBX2 writers reject the vault before writable open. The
+public status and verification Interface exposes only bounded metadata,
+digests, counts, generations, and inventory anchors; Recovery/Health reports
+pending, locked, stale, or tampered states without exposing payload bytes.
 
 ## Consequences
 

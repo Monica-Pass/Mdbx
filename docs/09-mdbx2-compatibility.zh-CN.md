@@ -86,10 +86,13 @@ CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpo
 
 认证 complete/incremental 信封分别使用 v7/v8；对应的 zstd 表示使用 v9/v10。既有逻辑 payload SHA-256 trailer 之后追加 HMAC-SHA-256，密钥取自 vault integrity subkey；tag 绑定版本化 domain、magic、version、20-byte 有界 header 区和逻辑 payload 摘要。密钥绝不会写入或随 bundle 传输。该机制只能证明信封由某个持有共享 vault key 的一方生成并绑定其元数据，不能识别具体设备；它也不提供传输保密性，不替代内部字段、commit 或 delta 的加密认证，因此 bundle 仍不得视为可公开文件。CLI 默认继续输出 legacy v3/v4，显式 `--compression zstd` 才输出 v5/v6，只有显式 `--authenticated` 才选择 v7-v10；apply 会自动使用已打开 vault 的 key，同时继续读取 v1-v6。
 
-拟议的 `IncrementalIntegrityRoot` 契约是 additive 的，并与 bundle capability
-分开。ADR-0022 定义通过 sync-delta capture 在同一个外层事务中更新的 sparse Merkle
-root，覆盖同步逻辑状态。在该 profile 建立前，O(vault-size) content manifest 仍是
-精确 schema 检查点；外部 Provider 原始字节和未注册物理扩展表不会被增量 root 默默声称覆盖。
+已经实现的 `IncrementalIntegrityRoot` profile 是 additive 的，并与 bundle capability
+分开。它保持 schema 16 不变，只有 verified-unlocked 客户端显式启用后才惰性创建 metadata、
+leaf 与 sparse-node 表。建立 profile 时登记 critical extension
+`authenticated-state-root-v1`，因此不支持该 profile 的较早 MDBX2 writer 会在可写打开前
+拒绝 vault。root 与 sync-delta capture 在同一个外层事务中更新；未 opt-in 的现有和旧代
+vault 行为完全不变。O(vault-size) content manifest 仍是精确 schema 检查点；外部 Provider
+原始字节和未注册物理扩展表不会被增量 root 默默声称覆盖。
 
 ### 3.1 真实发布 Golden Vault 与旧 Reader 边界
 

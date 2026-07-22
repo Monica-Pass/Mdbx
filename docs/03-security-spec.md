@@ -197,16 +197,19 @@ the digest with the vault integrity subkey. Clients MUST persist it outside
 the vault and verify it before trusting an exact reopened state; any legitimate
 mutation invalidates the old manifest and requires reissuance. This is an
 explicit O(vault-size) operation, not a routine commit hook. External Blob
-Provider bytes, OS state, and availability remain outside its boundary; an
-automatically refreshed incremental Merkle root is a separate future design.
+Provider bytes, OS state, and availability remain outside its boundary.
 
-The contract for that future design is recorded in ADR-0022. It is an opt-in
-`IncrementalIntegrityRoot` over synchronized logical state, maintained through
-the transaction-level sync-delta seam with a sparse Merkle tree. It must not be
-implemented by recomputing the full manifest on every edit, and it must not be
-described as proof of external Provider bytes or arbitrary unregistered SQLite
-tables. Until the root profile is established, the explicit manifest and
-rollback-anchor mechanisms remain authoritative for their documented scopes.
+ADR-0022 defines the implemented opt-in `IncrementalIntegrityRoot` over
+synchronized logical state. It uses authenticated logical leaves and a fixed
+16-level sparse Merkle tree maintained through the transaction-level
+sync-delta seam. Enabling it lazily creates its tables and registers
+`authenticated-state-root-v1` as a critical extension without changing schema
+16. Routine edits update only touched buckets and paths; rebuild and complete
+verification remain bounded explicit operations. Unlock, health, and write
+finalization fail closed on stale or tampered established state. The root is
+not proof of external Provider bytes or arbitrary unregistered SQLite tables;
+the explicit manifest and rollback anchor remain authoritative for those
+documented scopes.
 
 New issuance uses manifest profile v2. V2 reads `table_xinfo`, so ordinary,
 generated, and hidden columns are all represented, and orders typed values

@@ -287,6 +287,24 @@ AFTER UPDATE ON device_heads BEGIN
 END;
 "#;
 
+pub const SYNC_STATE_EXTENSION_TRIGGERS_DDL: &str = r#"
+CREATE TRIGGER IF NOT EXISTS trg_sync_delta_sync_extension_insert
+AFTER INSERT ON sync_state_extensions BEGIN
+    INSERT INTO sync_delta_mutations(entity_kind, entity_id, action)
+    VALUES ('sync-extension', NEW.extension_key, 'upsert');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_sync_delta_sync_extension_update
+AFTER UPDATE ON sync_state_extensions BEGIN
+    INSERT INTO sync_delta_mutations(entity_kind, entity_id, action)
+    VALUES ('sync-extension', NEW.extension_key, 'upsert');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_sync_delta_sync_extension_delete
+AFTER DELETE ON sync_state_extensions BEGIN
+    INSERT INTO sync_delta_mutations(entity_kind, entity_id, action)
+    VALUES ('sync-extension', OLD.extension_key, 'delete');
+END;
+"#;
+
 pub fn create_extensions(conn: &Connection) -> StorageResult<()> {
     conn.execute_batch(SYNC_DELTA_MUTATION_DDL)
         .map_err(StorageError::Database)?;
@@ -301,6 +319,11 @@ pub fn discard_bootstrap_mutations(conn: &Connection) -> StorageResult<()> {
 pub(crate) fn discard_captured_mutations(conn: &Connection) -> StorageResult<()> {
     conn.execute("DELETE FROM sync_delta_mutations", [])?;
     Ok(())
+}
+
+pub(crate) fn ensure_sync_state_extension_triggers(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(SYNC_STATE_EXTENSION_TRIGGERS_DDL)
+        .map_err(StorageError::Database)
 }
 
 pub(crate) fn validate_sync_delta_capture(conn: &Connection) -> StorageResult<()> {

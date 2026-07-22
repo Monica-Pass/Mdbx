@@ -460,7 +460,7 @@ pub(crate) fn persist_sync_state_extensions(
     Ok(())
 }
 
-fn load_sync_state_extensions(
+pub(crate) fn load_sync_state_extensions(
     conn: &VaultConnection,
 ) -> StorageResult<BTreeMap<String, serde_json::Value>> {
     let mut statement = conn.inner().prepare(

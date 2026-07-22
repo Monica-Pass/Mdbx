@@ -218,14 +218,15 @@ vault content manifest。它在同一个 SQLite read snapshot 中哈希非内部
 和带类型的行值，未知扩展表与附加列也会自动纳入，再用 vault integrity subkey 认证摘要。
 客户端必须把清单保存在 vault 之外，并在信任精确重开状态前验证；任何合法 mutation 都会
 使旧清单失效，客户端必须重新签发。该操作是显式的 O(vault-size) 检查点，不挂在日常
-commit hook 上。外部 Blob Provider 内容、操作系统状态和可用性不在清单边界内；自动刷新
-的增量 Merkle root 属于后续独立设计。
+commit hook 上。外部 Blob Provider 内容、操作系统状态和可用性不在清单边界内。
 
-该后续设计的契约已记录在 ADR-0022：它是通过事务级 sync-delta seam
-维护的 opt-in `IncrementalIntegrityRoot`，使用 sparse Merkle tree 覆盖同步逻辑状态。
-实现不得在每次小修改时重算完整 manifest，也不得把它描述成外部 Provider 原始字节或
-任意未注册 SQLite 表的证明。在 root profile 建立前，显式 manifest 与 rollback anchor
-继续分别承担其既定范围内的完整性职责。
+ADR-0022 定义了已经实现的 opt-in `IncrementalIntegrityRoot`。它以认证逻辑叶子和固定
+16 层 sparse Merkle tree 覆盖同步逻辑状态，并通过事务级 sync-delta seam 维护。显式启用
+时才惰性创建 root 表，并在不改变 schema 16 的前提下登记 critical extension
+`authenticated-state-root-v1`。日常修改只更新命中的 bucket 与路径；rebuild 和完整 verify
+仍是显式有界操作。解锁、health 与写事务 finalization 对过期或篡改的 established root
+均 fail closed。它不是外部 Provider 原始字节或任意未注册 SQLite 表的证明；显式
+manifest 与 rollback anchor 继续分别承担其既定范围内的完整性职责。
 
 新签发清单使用 profile v2。V2 通过 `table_xinfo` 同时纳入普通列、generated column 与
 hidden column；即使 nullable primary key 或声明 collation 不能形成全序，也会按 SQLite
