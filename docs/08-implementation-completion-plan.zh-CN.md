@@ -69,6 +69,8 @@ MDBX 必须坚持：
 - project/attachment conflict resolution 已补齐 repo 写回 API：local-wins、incoming-wins、custom row 会生成 merge commit、推进对象 head、记录 object version 后再标记 resolved；attachment incoming-wins 在缺少本地内容材料时拒绝，避免伪造内容。
 - project、entry、attachment 的高风险用户可见 mutation 已包进原子事务，commit、对象行、head、object version 和 tombstone/chunk 写入会一起成功或一起回滚。
 - `project_tags` 已分类为用户可见元数据：tracked tag API 会产生 project 级 commit；sync state 携带每个 project 的完整 tag 集合；临时 FTS/search index 保持解锁会话内临时状态，不进入历史。
+- 未知非关键字段兼容矩阵已覆盖 MDBX1 `vault_meta`/`projects`/`entries` 附加列自动升级、schema 10 Tiga 策略表重建，以及 complete sync-state 顶层扩展的有界 decode/re-encode。严格 delta/bundle 记录仍拒绝未知字段。
+- UniFFI 通用原子 operation 已覆盖 project、ObjectRecord、Relation、Label 和 Assignment；Attachment 另有受命令数、单项字节数、总字节数和 chunk 大小限制的原子批量 operation。
 
 ## 3. 主要差距
 
@@ -77,7 +79,7 @@ MDBX 必须坚持：
 - `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
 - MDBX2 已加入 `MDBX-1` / `MDBX-1-DRAFT` 自动事务迁移、schema migration 记录、最低 reader/writer 版本和未知 critical extension 写入拒绝。
 - snapshot 已覆盖 project、entry、attachment metadata、project tags 和 active `attachment_chunks`；旧 snapshot 缺少新增字段时保持现有兼容数据。
-- 仍需继续扩展真实旧版本 golden vault、旧 reader 行为和未知非关键字段保留矩阵。
+- 仍需补充真实发布版本生成的 golden vault 与旧 reader 行为测试；未知字段保留已覆盖当前可验证的物理迁移和 complete sync-state 重编码边界。未知 sync-state 扩展经过 apply 后若要再次导出，仍需设计可在锁定状态工作且不会明文落盘的持久化边界。
 
 ### 3.2 同步与冲突
 
@@ -92,7 +94,7 @@ MDBX 必须坚持：
 ### 3.3 变更历史覆盖
 
 - 搜索类临时索引已明确不写 commit；用户可见 tag 修改已有 tracked API。仍需为未来新增维护操作逐项分类是否属于用户可见历史。
-- project、entry、attachment、conflict resolution、tracked tag、Tiga mutation 和 snapshot restore 已进入原子事务。UniFFI operation API 已为 project 和通用 object 提供有界、原子、幂等的批量创建、更新、删除、恢复和移动；attachment 与 relation/label 的批量命令仍需扩展。
+- project、entry、attachment、conflict resolution、tracked tag、Tiga mutation 和 snapshot restore 已进入原子事务。UniFFI operation API 已为 project、通用 object、relation、label、assignment 和 attachment 提供有界、原子、幂等的批量写入边界。
 
 ### 3.4 性能与增量
 
@@ -201,7 +203,7 @@ MDBX 必须坚持：
 
 - KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments，并扩展到真实二进制 `.kdbx` 解析/写入。
 - RFC 结构补齐：header、schema、crypto、commit、sync、snapshot、extensions。
-- 兼容性测试矩阵落地。
+- 兼容性测试矩阵已覆盖 MDBX1/DRAFT 自动升级、未知 critical extension 拒绝、未知附加列保留、schema 重建字段保留和 complete sync-state 顶层未知字段重编码；真实旧版本 golden vault 与旧 reader 行为仍需补充。
 - MDBX-1 / MDBX-1-DRAFT 到 MDBX2 的顺序自动迁移已落地；后续代际必须继续通过 migration registry 逐代升级。
 - CLI 已增加 `health`、`benchmark`、`snapshot`、`sync bundle/apply`、`import-kdbx-json`、`export-kdbx-json`；后续如要使用 `import-kdbx`/`export-kdbx` 名称，必须先实现真实二进制 `.kdbx` 支持。
 
@@ -253,10 +255,12 @@ MDBX 必须坚持：
 - 删除/修改并发会生成 `deleted` conflict：远端 tombstone 不丢，本地删除不会被远端修改复活。
 - snapshot 已恢复 attachment chunks；初始化 key epoch marker 与 active epoch wrapping 边界已收紧。
 - CollectionProfile 已进入 schema migration、Project ObjectVersion、sync state v2、snapshot、health 和 UniFFI；旧 sync state v1 缺少 profile 时保留接收端现有描述。
+- MDBX1 核心表未知附加列及其值已通过真实 `upgrade_to_latest` 路径验证；schema 10 重建 Tiga 策略表时会复制受限附加列，无法安全重建时在替换旧表前失败。
+- complete sync-state 会有界保留未知非关键顶层字段并阻止覆盖已知键；字段数、编码字节、键长度和嵌套深度均有硬限制。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：
 
-- Android custom/manual merge editor 接入 Rust core/本地 store 的 explicit merged payload API。
-- project/attachment conflict resolve 的用户选择写回 API。
-- Android `MdbxRepository` 最小 JNI/FFI 操作边界，禁止 Room 成为 MDBX 真源；同时修复现有 Android 编译断引用后恢复 Gradle 验证。
+- 设计未知 sync-state 扩展的加密持久化边界，使 `SyncApply -> collect_sync_state` 在锁定状态下也不会静默丢字段或明文落盘。
+- 固化真实历史版本生成的 MDBX1/DRAFT golden vault，并使用旧 reader 二进制验证非关键新增字段行为。
+- 形成可发布 benchmark 报告，覆盖小 entry 修改、附件改名、附件替换、snapshot 和 compaction 的时延与 delta 大小。
