@@ -229,3 +229,18 @@ MDBX2 客户端通过 Rust `KeyEpochService::rotate_authorized` 或 UniFFI `Mdbx
 完整 `SyncStatePayload` 具有独立的资源契约。默认 Rust API 接受不超过 96 MiB 的编码状态和 250,000 行；桌面调用方可以通过 `SyncStateLimits` 提高限制，但硬上限为 512 MiB 和 2,000,000 行。输出端在读取数据库行后使用有界序列化器，输入端在 JSON 解码前检查字节数，结构解析后再检查逻辑行数。
 
 `mdbx-storage/state-v1` 和旧 `mdbx-cli/state-v1` 必须同时使用 object ID `state` 与匹配的 associated data。错误身份、超限状态或超限 apply 会使完整同步事务回滚；既有 state-v1、state-v2 和旧 CLI 字段保持兼容读取。未知 ObjectPayload 类型继续由普通 opaque payload 处理。
+
+### 7.9 外部 rollback anchor
+
+内部 header HMAC 只能认证当前打开的数据库，不能发现整个文件被替换成较旧但内部自洽的
+副本。MDBX2 storage core 因此提供 `RollbackAnchorService::issue/verify`，CLI 提供
+`mdbx anchor create/verify`，UniFFI 提供 `MdbxVault.create_rollback_anchor` 与
+`verify_rollback_anchor`。token 是有界不透明字节，客户端不得解析、拼接或自行生成。
+
+客户端必须把 token 持久化在 vault 之外，并遵守以下顺序：成功解锁并确认 mutation 或同步
+已经持久化后签发 token；下次打开时先验证上一个 token，再信任数据库状态；验证成功后才用
+新签发的 token 原子替换客户端保存的 token。相同或更高的 commit/delta append-only
+inventory 水位通过，锚定行缺失、被改写、跨 vault、截断、超限或认证失败均拒绝。锚点不
+改变 MDBX1/MDBX1-DRAFT 迁移语义，也不提供可信外部时钟、可用性保证或整个 vault 的统一
+authentication root。客户端丢失 token 时，storage 无法推断此前状态；未来若要裁剪 delta
+inventory，必须先版本化 anchor 语义，不能静默删除锚定行。

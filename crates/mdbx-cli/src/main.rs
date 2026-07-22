@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -44,6 +44,7 @@ use mdbx_storage::repo::{
     CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
     SyncDeltaInventoryItem, SyncDeltaInventoryRepo, MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE,
 };
+use mdbx_storage::rollback_anchor::{RollbackAnchorService, MAX_ROLLBACK_ANCHOR_BYTES};
 #[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
 use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
@@ -156,6 +157,11 @@ enum Commands {
     },
     /// 运行 vault 健康检查
     Health,
+    /// 创建或验证由客户端持久化的外部回滚锚点
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorAction,
+    },
     /// 创建经过验证的单文件 vault 备份
     Backup {
         /// 输出 `.mdbx` 文件路径；已有文件不会被替换
@@ -459,6 +465,14 @@ enum SnapshotAction {
     Restore { snapshot_id: String },
 }
 
+#[derive(Subcommand)]
+enum AnchorAction {
+    /// 创建新的外部回滚锚点文件；已有文件不会被替换
+    Create { output: PathBuf },
+    /// 验证 vault 未回退到锚点记录的状态之前
+    Verify { input: PathBuf },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BundleCompressionCli {
     None,
@@ -566,6 +580,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Health => {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_health(&conn)
+        }
+        Commands::Anchor { action } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_anchor(&conn, action)
         }
         Commands::Backup { output } => cmd_backup(&cli.vault, output),
         #[cfg(feature = "benchmark")]
@@ -2108,6 +2126,84 @@ fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
     }
 }
 
+fn cmd_anchor(conn: &VaultConnection, action: AnchorAction) -> Result<(), String> {
+    match action {
+        AnchorAction::Create { output } => {
+            let token = RollbackAnchorService::issue(conn)
+                .map_err(|error| format!("failed to create rollback anchor: {error}"))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .map_err(|error| {
+                    format!(
+                        "failed to create rollback anchor '{}': {error}",
+                        output.display()
+                    )
+                })?;
+            let write_result = file
+                .write_all(&token)
+                .and_then(|()| file.flush())
+                .and_then(|()| file.sync_all());
+            if let Err(error) = write_result {
+                drop(file);
+                let cleanup = std::fs::remove_file(&output)
+                    .err()
+                    .map(|cleanup_error| format!("; partial file cleanup failed: {cleanup_error}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "failed to persist rollback anchor '{}': {error}{cleanup}",
+                    output.display()
+                ));
+            }
+            println!(
+                "Created rollback anchor: bytes={} -> {}",
+                token.len(),
+                output.display()
+            );
+            Ok(())
+        }
+        AnchorAction::Verify { input } => {
+            let file = std::fs::File::open(&input).map_err(|error| {
+                format!(
+                    "failed to open rollback anchor '{}': {error}",
+                    input.display()
+                )
+            })?;
+            let mut token = Vec::new();
+            file.take((MAX_ROLLBACK_ANCHOR_BYTES + 1) as u64)
+                .read_to_end(&mut token)
+                .map_err(|error| {
+                    format!(
+                        "failed to read rollback anchor '{}': {error}",
+                        input.display()
+                    )
+                })?;
+            if token.len() > MAX_ROLLBACK_ANCHOR_BYTES {
+                return Err(format!(
+                    "rollback anchor '{}' exceeds {MAX_ROLLBACK_ANCHOR_BYTES} bytes",
+                    input.display()
+                ));
+            }
+            let verification = RollbackAnchorService::verify(conn, &token)
+                .map_err(|error| format!("rollback anchor verification failed: {error}"))?;
+            println!(
+                "Rollback anchor verified: state={} commit-sequence={}->{} delta-sequence={:?}->{:?}",
+                if verification.advanced {
+                    "advanced"
+                } else {
+                    "equal"
+                },
+                verification.anchored_commit_inventory_seq,
+                verification.current_commit_inventory_seq,
+                verification.anchored_sync_delta_batch_seq,
+                verification.current_sync_delta_batch_seq
+            );
+            Ok(())
+        }
+    }
+}
+
 fn cmd_backup(source: &std::path::Path, output: PathBuf) -> Result<(), String> {
     let info = BackupService::create_portable_copy_path(source, &output)
         .map_err(|error| format!("failed to create portable backup: {error}"))?;
@@ -2935,6 +3031,123 @@ mod tests {
 
     fn entry_title(entry: &mdbx_core::model::Entry) -> String {
         String::from_utf8(entry.title_ct.clone().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rollback_anchor_cli_creates_verifies_and_preserves_files() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        let files = tempfile::tempdir().unwrap();
+        let anchor = files.path().join("vault.anchor");
+        let locked_anchor = files.path().join("locked.anchor");
+
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::Anchor {
+                action: AnchorAction::Create {
+                    output: anchor.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        let original = std::fs::read(&anchor).unwrap();
+        assert!(!original.is_empty());
+        assert!(original.len() <= MAX_ROLLBACK_ANCHOR_BYTES);
+
+        run(cli(
+            &path,
+            Commands::Anchor {
+                action: AnchorAction::Verify {
+                    input: anchor.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Advanced past anchor".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Anchor {
+                action: AnchorAction::Verify {
+                    input: anchor.clone(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let existing_error = run(cli(
+            &path,
+            Commands::Anchor {
+                action: AnchorAction::Create {
+                    output: anchor.clone(),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(existing_error.contains("failed to create rollback anchor"));
+        assert_eq!(std::fs::read(&anchor).unwrap(), original);
+
+        let locked_error = run(locked_cli(
+            &path,
+            Commands::Anchor {
+                action: AnchorAction::Create {
+                    output: locked_anchor.clone(),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(locked_error.contains("unlock"));
+        assert!(!locked_anchor.exists());
+    }
+
+    #[test]
+    fn rollback_anchor_cli_rejects_an_older_vault_copy() {
+        let source = TempVault::new();
+        let old = TempVault::new();
+        let source_path = source.path();
+        let old_path = old.path();
+        let files = tempfile::tempdir().unwrap();
+        let anchor = files.path().join("newer.anchor");
+
+        run(init_cli(&source_path)).unwrap();
+        backup_vault(&source_path, &old_path);
+        run(cli(
+            &source_path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Newer state".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &source_path,
+            Commands::Anchor {
+                action: AnchorAction::Create {
+                    output: anchor.clone(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let error = run(cli(
+            &old_path,
+            Commands::Anchor {
+                action: AnchorAction::Verify { input: anchor },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("rollback detected"));
     }
 
     #[test]

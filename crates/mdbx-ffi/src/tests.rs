@@ -32,6 +32,30 @@ fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
 }
 
 #[test]
+fn rollback_anchor_ffi_roundtrips_opaque_tokens_and_reports_advancement() {
+    let vault = ffi_test_vault();
+    let token = vault.create_rollback_anchor().unwrap();
+    let equal = vault.verify_rollback_anchor(token.clone()).unwrap();
+    assert!(!equal.advanced);
+    assert_eq!(
+        equal.anchored_commit_inventory_seq,
+        equal.current_commit_inventory_seq
+    );
+
+    vault.create_project("After anchor".to_string()).unwrap();
+    let advanced = vault.verify_rollback_anchor(token.clone()).unwrap();
+    assert!(advanced.advanced);
+    assert!(advanced.current_commit_inventory_seq > advanced.anchored_commit_inventory_seq);
+
+    let mut tampered = token.clone();
+    tampered[12] ^= 1;
+    assert!(vault.verify_rollback_anchor(tampered).is_err());
+
+    let foreign = ffi_test_vault();
+    assert!(foreign.verify_rollback_anchor(token).is_err());
+}
+
+#[test]
 fn ffi_wire_session_roundtrips_blob_messages_and_sequences() {
     let limit = default_sync_wire_payload_bytes();
     let sender = create_sync_wire_session("wire-session".to_string(), limit).unwrap();

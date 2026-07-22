@@ -165,9 +165,17 @@ because no verified vault key is available at open time. The first successful
 unlock establishes the tag. Subsequent unlocks MUST verify it before attaching
 the keyring, and health checks MUST report invalidated or mismatched tags as an
 error. A locked health check can validate tag shape but can only report keyed
-verification as pending. This mechanism does not provide an external rollback
-anchor: detecting replacement by an older, internally consistent vault still
-requires client-maintained generation or backup state.
+verification as pending. This mechanism is complemented by an external
+rollback anchor. After a successful unlock and durable mutation or sync, the
+storage core can issue a bounded opaque HMAC token through the CLI and UniFFI.
+The client MUST persist that token outside the vault, verify the previous token
+after reopening and before trusting the state, and replace the persisted token
+only after verification and a new issuance succeed. Equal or advanced
+append-only commit and sync-delta inventory heads are accepted; missing or
+rewritten anchored rows are rejected as rollback. The client owns token
+retention, backup, and replacement policy. A lost token cannot be detected by
+the database, and the anchor is not a trusted clock, an availability guarantee,
+or a whole-vault authentication root.
 
 ## 8. Attachment Security Rules
 

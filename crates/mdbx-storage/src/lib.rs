@@ -19,6 +19,7 @@ pub mod key_epoch;
 pub mod migration;
 pub mod recovery;
 pub mod repo;
+pub mod rollback_anchor;
 pub mod schema;
 #[cfg(feature = "derived-search-index")]
 pub mod search;

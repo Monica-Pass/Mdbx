@@ -449,6 +449,29 @@ pub struct MdbxKeyEpochRotationResult {
     pub rotated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxRollbackAnchorVerification {
+    pub advanced: bool,
+    pub anchored_commit_inventory_seq: u64,
+    pub current_commit_inventory_seq: u64,
+    pub anchored_sync_delta_batch_seq: Option<u64>,
+    pub current_sync_delta_batch_seq: Option<u64>,
+}
+
+impl From<mdbx_storage::rollback_anchor::RollbackAnchorVerification>
+    for MdbxRollbackAnchorVerification
+{
+    fn from(value: mdbx_storage::rollback_anchor::RollbackAnchorVerification) -> Self {
+        Self {
+            advanced: value.advanced,
+            anchored_commit_inventory_seq: value.anchored_commit_inventory_seq,
+            current_commit_inventory_seq: value.current_commit_inventory_seq,
+            anchored_sync_delta_batch_seq: value.anchored_sync_delta_batch_seq,
+            current_sync_delta_batch_seq: value.current_sync_delta_batch_seq,
+        }
+    }
+}
+
 impl From<KeyEpochRotationResult> for MdbxKeyEpochRotationResult {
     fn from(value: KeyEpochRotationResult) -> Self {
         Self {
@@ -573,6 +596,7 @@ use mdbx_core::tiga::{
 use mdbx_storage::error::StorageError;
 use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::repo::CommitContext;
+use mdbx_storage::rollback_anchor::RollbackAnchorService;
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
@@ -630,6 +654,21 @@ pub(crate) fn unix_now() -> i64 {
 
 #[uniffi::export]
 impl MdbxVault {
+    /// Returns an opaque token for the client to persist outside the vault.
+    pub fn create_rollback_anchor(&self) -> Result<Vec<u8>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(RollbackAnchorService::issue(&conn)?)
+    }
+
+    /// Verifies a previously persisted token before the client trusts the vault.
+    pub fn verify_rollback_anchor(
+        &self,
+        token: Vec<u8>,
+    ) -> Result<MdbxRollbackAnchorVerification, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(RollbackAnchorService::verify(&conn, &token)?.into())
+    }
+
     pub fn resolve_tiga_policy(
         &self,
         scope: MdbxTigaScope,

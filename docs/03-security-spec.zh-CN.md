@@ -197,9 +197,13 @@ core mutation 必须在同一事务内刷新标签。已经建立认证的 heade
 MDBX1 和较早 MDBX2 在 additive migration 时还没有已验证 vault key，因此先进入
 `pending`；首次成功解锁时建立标签。后续解锁必须在附加 Keyring 前验证标签，health
 check 必须把 invalidated 或 tag mismatch 报告为错误。锁定状态的 health check 可以
-检查标签形状，但只能提示需要解锁后做 keyed verification。该机制不提供外部 rollback
-anchor；若要发现整个文件被替换成更旧但内部自洽的版本，客户端仍需维护 generation
-或备份状态。
+检查标签形状，但只能提示需要解锁后做 keyed verification。storage core 另外通过 CLI
+和 UniFFI 提供有界、不透明的 HMAC 外部 rollback anchor。客户端在成功解锁并完成持久化
+mutation 或同步后，必须把 token 保存在 vault 之外；重新打开时必须先验证上一个 token，
+验证成功并签发新 token 后才能替换客户端保存的 token。相等或前进的 append-only
+commit/sync-delta inventory head 可以通过；锚定行缺失或被改写必须按 rollback 拒绝。
+token 的保留、备份和替换策略由客户端负责。客户端丢失 token 时数据库无法检测；anchor
+也不是可信时钟、可用性保证或整个 vault 的 authentication root。
 
 ## 8. 附件安全规则
 
