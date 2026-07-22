@@ -14,7 +14,7 @@ use crate::sync_delta::{
 };
 use crate::sync_state::{decode_sync_state_payload_with_limits, SyncStateLimits};
 
-use super::{key_epoch_apply, lifecycle_apply, state_apply, SyncApplyRepo};
+use super::{commit_graph_apply, key_epoch_apply, lifecycle_apply, state_apply};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct PayloadApplyResult {
@@ -143,7 +143,7 @@ fn apply_commit_sync_delta(
         ));
     }
     for commit_id in &envelope.commit_ids {
-        if !SyncApplyRepo::commit_exists(conn, commit_id)? {
+        if !commit_graph_apply::commit_exists(conn, commit_id)? {
             return Err(StorageError::ConstraintViolation(format!(
                 "sync delta references unavailable commit {commit_id}"
             )));
@@ -236,9 +236,12 @@ fn record_payload_conflict(
         return Ok(0);
     }
 
-    let base_commit_id =
-        SyncApplyRepo::nearest_known_common_parent(conn, local_head, &serialized.commit.commit_id)?
-            .unwrap_or_else(|| local_head.to_string());
+    let base_commit_id = commit_graph_apply::nearest_known_common_parent(
+        conn,
+        local_head,
+        &serialized.commit.commit_id,
+    )?
+    .unwrap_or_else(|| local_head.to_string());
     ConflictRepo::create(
         conn,
         ctx,

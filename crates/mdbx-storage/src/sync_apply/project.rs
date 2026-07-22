@@ -9,7 +9,9 @@ use crate::repo::{
 };
 use crate::sync_state::{ProjectRow, ProjectTagSetRow};
 
-use super::{bump_object_clock, commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
+use super::{
+    bump_object_clock, commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value,
+};
 
 pub(super) fn apply_projects(
     conn: &VaultConnection,
@@ -22,10 +24,10 @@ pub(super) fn apply_projects(
         if TombstoneRepo::is_permanently_purged(conn, "project", &row.project_id)? {
             continue;
         }
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "projects",
             "project_id",
@@ -156,7 +158,7 @@ fn merge_or_record_project_conflict(
 ) -> StorageResult<u32> {
     let incoming_commit_id = &incoming.head_commit_id;
     let Some(base_commit_id) =
-        SyncApplyRepo::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        commit_graph_apply::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
     else {
         return record_project_field_conflict(
             conn,

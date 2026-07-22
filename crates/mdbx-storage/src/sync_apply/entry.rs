@@ -10,7 +10,9 @@ use crate::repo::{
 };
 use crate::sync_state::EntryRow;
 
-use super::{bump_object_clock, commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
+use super::{
+    bump_object_clock, commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value,
+};
 
 pub(super) fn apply_entries(
     conn: &VaultConnection,
@@ -25,10 +27,10 @@ pub(super) fn apply_entries(
         }
         let object_type: ObjectTypeId = row.entry_type.parse().map_err(StorageError::Validation)?;
         CollectionProfileRepo::ensure_object_sync_allowed(conn, &row.project_id, &object_type)?;
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_entry_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "entries",
             "entry_id",
@@ -105,7 +107,7 @@ fn merge_or_record_entry_conflict(
 ) -> StorageResult<u32> {
     let incoming_commit_id = &incoming.head_commit_id;
     let Some(base_commit_id) =
-        SyncApplyRepo::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        commit_graph_apply::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
     else {
         return record_entry_field_conflict(
             conn,

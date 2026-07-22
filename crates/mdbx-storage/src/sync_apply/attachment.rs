@@ -9,7 +9,7 @@ use crate::error::StorageResult;
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{AttachmentChunkRow, AttachmentRow};
 
-use super::{commit_graph_apply::ObjectDecision, merge_value, SyncApplyRepo};
+use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value};
 
 pub(super) fn apply_attachments(
     conn: &VaultConnection,
@@ -22,10 +22,10 @@ pub(super) fn apply_attachments(
         if TombstoneRepo::is_permanently_purged(conn, "attachment", &row.attachment_id)? {
             continue;
         }
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_attachment_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "attachments",
             "attachment_id",
@@ -144,7 +144,7 @@ fn merge_or_record_attachment_conflict(
 ) -> StorageResult<AttachmentMergeResult> {
     let incoming_commit_id = &incoming.head_commit_id;
     let Some(base_commit_id) =
-        SyncApplyRepo::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        commit_graph_apply::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
     else {
         let conflict_count = record_attachment_field_conflict(
             conn,

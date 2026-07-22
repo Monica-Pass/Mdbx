@@ -8,7 +8,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, TombstoneRepo};
 use crate::sync_state::SyncStateLimits;
 
-use super::{commit_graph_apply, payload_apply, ApplyBatchResult, SyncApplyRepo};
+use super::{commit_graph_apply, payload_apply, ApplyBatchResult};
 
 pub(super) fn apply_batch_inner(
     conn: &VaultConnection,
@@ -41,7 +41,7 @@ fn apply_commit(
     allow_key_epoch_changes: bool,
     sync_limits: SyncStateLimits,
 ) -> StorageResult<ApplyOutcome> {
-    if SyncApplyRepo::commit_exists(conn, &serialized.commit.commit_id)? {
+    if commit_graph_apply::commit_exists(conn, &serialized.commit.commit_id)? {
         return conn.with_immediate_transaction(|| {
             if let Some(operation) = &serialized.operation {
                 CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
@@ -70,7 +70,7 @@ fn apply_commit(
     }
 
     for parent in &serialized.parent_ids {
-        if !SyncApplyRepo::commit_exists(conn, parent)? {
+        if !commit_graph_apply::commit_exists(conn, parent)? {
             return Ok(ApplyOutcome::MissingParent);
         }
     }

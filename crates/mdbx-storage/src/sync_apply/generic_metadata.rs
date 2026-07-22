@@ -7,7 +7,9 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow};
 
-use super::{commit_graph_apply::ObjectDecision, validate_payload_schema_version, SyncApplyRepo};
+use super::{
+    commit_graph_apply, commit_graph_apply::ObjectDecision, validate_payload_schema_version,
+};
 
 pub(super) fn apply_object_relations(
     conn: &VaultConnection,
@@ -23,10 +25,10 @@ pub(super) fn apply_object_relations(
             .parse::<mdbx_core::model::RelationKindId>()
             .map_err(StorageError::Validation)?;
         validate_payload_schema_version(row.payload_schema_version)?;
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "object_relations",
             "relation_id",
@@ -120,10 +122,10 @@ pub(super) fn apply_object_labels(
             continue;
         }
         validate_payload_schema_version(row.payload_schema_version)?;
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "object_labels",
             "label_id",
@@ -217,10 +219,10 @@ pub(super) fn apply_object_label_assignments(
         )? {
             continue;
         }
-        if SyncApplyRepo::commit_exists(conn, &row.head_commit_id)? {
+        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_label_assignment_row(conn, &row.head_commit_id, row)?;
         }
-        match SyncApplyRepo::object_apply_decision(
+        match commit_graph_apply::object_apply_decision(
             conn,
             "object_label_assignments",
             "assignment_id",
@@ -345,7 +347,7 @@ fn record_generic_metadata_conflict(
         return Ok(0);
     }
     let base_commit_id =
-        SyncApplyRepo::nearest_known_common_parent(conn, local_head, incoming_head)?
+        commit_graph_apply::nearest_known_common_parent(conn, local_head, incoming_head)?
             .unwrap_or_else(|| local_head.to_string());
     let fields = fields
         .iter()

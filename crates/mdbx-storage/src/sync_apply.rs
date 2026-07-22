@@ -28,6 +28,7 @@ use mdbx_core::tiga::TigaPolicyOverride;
 #[cfg(test)]
 use mdbx_sync::SerializedCommit;
 
+#[cfg(test)]
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 #[cfg(test)]
@@ -48,32 +49,7 @@ pub struct ApplyBatchResult {
 pub struct SyncApplyRepo;
 
 impl SyncApplyRepo {
-    fn object_apply_decision(
-        conn: &VaultConnection,
-        table: &str,
-        id_column: &str,
-        object_id: &str,
-        incoming_head: &str,
-    ) -> StorageResult<commit_graph_apply::ObjectDecision> {
-        commit_graph_apply::object_apply_decision(conn, table, id_column, object_id, incoming_head)
-    }
-
-    fn is_ancestor_commit(
-        conn: &VaultConnection,
-        ancestor: &str,
-        descendant: &str,
-    ) -> StorageResult<bool> {
-        commit_graph_apply::is_ancestor_commit(conn, ancestor, descendant)
-    }
-
-    fn nearest_known_common_parent(
-        conn: &VaultConnection,
-        left: &str,
-        right: &str,
-    ) -> StorageResult<Option<String>> {
-        commit_graph_apply::nearest_known_common_parent(conn, left, right)
-    }
-
+    #[cfg(test)]
     fn commit_exists(conn: &VaultConnection, commit_id: &str) -> StorageResult<bool> {
         commit_graph_apply::commit_exists(conn, commit_id)
     }

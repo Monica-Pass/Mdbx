@@ -6,7 +6,7 @@ use crate::repo::{PermanentPurgeReceipt, TombstoneRepo};
 use crate::sync_delta::{DeletedSyncEntity, DeviceHeadRow, SyncDeltaBody};
 use crate::sync_state::{PurgeReceiptRow, TombstoneAcknowledgementRow, TombstoneRow};
 
-use super::SyncApplyRepo;
+use super::commit_graph_apply;
 
 pub(super) fn apply_purge_receipts(
     conn: &VaultConnection,
@@ -30,8 +30,8 @@ pub(super) fn apply_purge_receipts(
         .collect::<Vec<_>>();
     receipts.sort_by_key(|receipt| purge_dependency_order(&receipt.target_object_type));
     for receipt in receipts {
-        if !SyncApplyRepo::commit_exists(conn, &receipt.delete_commit_id)?
-            || !SyncApplyRepo::commit_exists(conn, &receipt.purge_commit_id)?
+        if !commit_graph_apply::commit_exists(conn, &receipt.delete_commit_id)?
+            || !commit_graph_apply::commit_exists(conn, &receipt.purge_commit_id)?
         {
             return Err(StorageError::ConstraintViolation(format!(
                 "permanent purge receipt {} references unavailable commits",
@@ -57,7 +57,9 @@ pub(super) fn apply_complete_tombstone_state(
             continue;
         }
         let delete_commit_id = match row.delete_commit_id.as_deref() {
-            Some(commit_id) if SyncApplyRepo::commit_exists(conn, commit_id)? => Some(commit_id),
+            Some(commit_id) if commit_graph_apply::commit_exists(conn, commit_id)? => {
+                Some(commit_id)
+            }
             _ => None,
         };
         conn.inner().execute(
@@ -81,7 +83,9 @@ pub(super) fn apply_delta_tombstone_state(
             continue;
         }
         let delete_commit_id = match row.delete_commit_id.as_deref() {
-            Some(commit_id) if SyncApplyRepo::commit_exists(conn, commit_id)? => Some(commit_id),
+            Some(commit_id) if commit_graph_apply::commit_exists(conn, commit_id)? => {
+                Some(commit_id)
+            }
             Some(commit_id) => {
                 return Err(StorageError::ConstraintViolation(format!(
                     "delta tombstone {} references unavailable commit {commit_id}",
@@ -135,7 +139,7 @@ pub(super) fn apply_delta_device_heads(
     device_heads: &[DeviceHeadRow],
 ) -> StorageResult<()> {
     for incoming in device_heads {
-        if !SyncApplyRepo::commit_exists(conn, &incoming.head_commit_id)? {
+        if !commit_graph_apply::commit_exists(conn, &incoming.head_commit_id)? {
             return Err(StorageError::ConstraintViolation(format!(
                 "device head {} references unavailable commit {}",
                 incoming.device_id, incoming.head_commit_id
@@ -153,7 +157,7 @@ pub(super) fn apply_delta_device_heads(
             ),
             Some((local_head, local_seen, local_revoked)) => {
                 let head = if local_head == incoming.head_commit_id
-                    || SyncApplyRepo::is_ancestor_commit(
+                    || commit_graph_apply::is_ancestor_commit(
                         conn,
                         &local_head,
                         &incoming.head_commit_id,
