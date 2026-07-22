@@ -176,9 +176,13 @@ Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones.
 
 Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats. Bundle v4 carries bounded commit and delta inventories after a paired checkpoint, binds resumed segments by transfer ID, segment index, and the previous payload digest, and advances the receiver checkpoint only after one segment is durably applied. Commit-associated and auxiliary deltas in a segment share one database transaction. A client MUST NOT claim incremental convergence until it exchanges both checkpoint classes and preserves the segment resume state.
 
+Bundle v5 is the zstd representation of a complete v3 logical payload, and bundle v6 is the zstd representation of an incremental v4 logical payload. Their 20-byte header area stores the compressed length, the uncompressed bincode length, and four zero reserved bytes. The trailer remains SHA-256 of the uncompressed bincode payload, so an incremental resume chain has the same identity regardless of compression. Writers MUST bound both serialization and compressed output without buffering an entire maximum-size logical payload. Readers MUST validate both declared lengths before allocation and cap streaming decompression at the declared uncompressed length plus one byte. Length mismatch, expansion beyond the configured limit, compressed-stream corruption, non-zero reserved bytes, hash mismatch, and trailing data MUST fail.
+
 Complete sync-state decoders preserve bounded unknown non-critical top-level fields during decode and re-encode. Extension keys cannot shadow defined fields, and extension field count, encoded bytes, key length, and nesting depth are bounded. Versioned delta envelopes and cursor tokens remain strict protocol records and continue to reject unknown fields.
 
 Protocol-v2 peers advertise commit inventory paging, delta inventory paging, bundle v4, and incremental resume as four additive capabilities. Incremental v4 is selected only when all four are negotiated. A paging-capable Hello omits the legacy `known_commit_ids` inventory; commit and delta pages carry bounded opaque checkpoint/cursor tokens instead. Missing or partial capability sets MUST fall back to bounded complete state. The transport-neutral `SyncClient` advances its paired checkpoint only through the durable acknowledgement API, never when a segment is merely received or validated.
+
+`bundle-zstd-v1` is an independent optional capability and is not part of the four-capability incremental contract. A transport-neutral sender may select zstd only when the codec is compiled in and both peers advertise this capability. Builds without the codec preserve v1-v4 and return an explicit unsupported-feature error for v5/v6. File export requires an explicit compression choice; the CLI `sync bundle --compression` default is `none`, while apply auto-detects supported versions. This prevents a new writer from silently sending v5/v6 to an old reader, which rejects those versions.
 
 ## 10. Merge Model
 
@@ -204,7 +208,7 @@ Minimum requirements:
 
 A snapshot is a logical recovery point stored inside a vault. It is distinct from a portable backup, which creates an independently openable complete vault file, and from a sync bundle, which carries incremental commit state between replicas. None of these artifacts can be replaced by copying only the SQLite main file while WAL is active.
 
-Offline sync bundle readers MUST enforce a payload limit before allocation and deserialization. Bundle v3 stores the payload length in the header and rejects non-zero reserved bytes or data after the payload hash. Bundle v1 and v2 compatibility readers MUST cap the underlying reader rather than call an unbounded read. Resource profiles may choose a lower limit; the protocol hard ceiling remains mandatory.
+Offline sync bundle readers MUST enforce a payload limit before allocation and deserialization. Bundle v3 and v4 store the uncompressed payload length in the header and reject non-zero reserved bytes or data after the payload hash. Bundle v5 and v6 apply the same configured limit independently to compressed input and decompressed output. Bundle v1 and v2 compatibility readers MUST cap the underlying reader rather than call an unbounded read. Resource profiles may choose a lower limit; the protocol hard ceiling remains mandatory.
 
 ## 12. Attachment Storage Modes
 

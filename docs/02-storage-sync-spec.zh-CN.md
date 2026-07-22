@@ -174,9 +174,15 @@ sync state 中的 key epoch 字段必须保持可选，使 MDBX1 和早期 MDBX2
 
 delta 中的 tombstone 是稀疏集合，不得替换无关的本地 tombstone。device revocation 必须单调合并。物理删除对象或 tombstone 必须有匹配且经过认证的永久清理凭证。key epoch 变更只能通过经过验证解锁的可变 apply 路径完成；不可变兼容入口必须原子拒绝。
 
-完整 sync state 继续承担首次 bootstrap 和旧 peer fallback。bundle v1-v3 格式保持不变；客户端在同时交换 commit inventory checkpoint 与 auxiliary delta checkpoint 之前，不得宣称已经实现增量收敛。
+完整 sync state 继续承担首次 bootstrap 和旧 peer fallback。bundle v1-v3 格式保持不变。bundle v4 在取得成对 checkpoint 后携带有界 commit/delta inventory，以 transfer ID、segment index 和上一段 payload digest 绑定恢复链；接收端只有在整段持久应用后才能推进 checkpoint。同一段内的 commit 关联 delta 与 auxiliary delta 必须处于同一个数据库事务。客户端在同时交换两类 checkpoint 并保存 segment resume 状态之前，不得宣称已经实现增量收敛。
+
+bundle v5 是 complete v3 逻辑 payload 的 zstd 表示，bundle v6 是 incremental v4 逻辑 payload 的 zstd 表示。两者在 20-byte header 区域依次记录压缩长度、未压缩 bincode 长度和 4 个零保留字节。trailer 始终是未压缩 bincode payload 的 SHA-256，因此 incremental resume chain 的身份不受压缩方式影响。writer 必须同时限制序列化输入与压缩输出，且不得缓存完整的最大尺寸逻辑 payload。reader 必须在分配前检查两个声明长度，并把流式解压输出限制为声明的未压缩长度加 1 byte。长度不符、超过配置上限的扩张、压缩流损坏、非零保留字节、hash 不符和尾随数据都必须失败。
 
 完整 sync-state decoder 在解码并重新编码时会保留有界的未知非关键顶层字段。扩展键不得覆盖已定义字段，字段数量、编码字节数、键长度和嵌套深度均受限制。版本化 delta envelope 与 cursor token 仍属于严格协议记录，继续拒绝未知字段。
+
+protocol-v2 peer 将 commit inventory paging、delta inventory paging、bundle v4 和 incremental resume 作为四项附加能力；只有四项均由双方协商成功时才选择 incremental v4。支持 paging 的 Hello 省略旧的完整 `known_commit_ids`，commit/delta page 改用有界 opaque checkpoint/cursor token。能力缺失或不完整时必须回退到有界完整状态。
+
+`bundle-zstd-v1` 是独立可选能力，不属于上述四项增量契约。transport-neutral sender 只有在 codec 已编译且双方都声明该能力时才能选择 zstd。裁剪掉 codec 的构建继续支持 v1-v4，并对 v5/v6 返回明确的 unsupported-feature 错误。文件导出必须显式选择压缩；CLI `sync bundle --compression` 默认 `none`，apply 自动识别当前构建支持的版本。这样新 writer 不会静默向会拒绝新版本的旧 reader 发送 v5/v6。
 
 ## 10. 合并模型
 
@@ -202,7 +208,7 @@ MDBX 必须支持从逻辑损坏或同步中断中恢复。
 
 snapshot 是保存在 vault 内部的逻辑恢复点。可移植备份生成可独立打开的完整 vault 文件；sync bundle 在副本之间传输增量 commit 状态。三者用途不同，WAL 活跃时仅复制 SQLite 主文件也不能替代其中任何一种机制。
 
-离线同步包读取器必须在分配内存和反序列化之前执行 payload 上限。bundle v3 在头部记录 payload 长度，并拒绝非零保留字节和 payload hash 后的尾随数据。bundle v1 与 v2 兼容读取器必须限制底层 reader 的读取量，禁止无界读取。资源配置可以选择更低的上限，协议硬上限始终生效。
+离线同步包读取器必须在分配内存和反序列化之前执行 payload 上限。bundle v3/v4 在头部记录未压缩 payload 长度，并拒绝非零保留字节和 payload hash 后的尾随数据。bundle v5/v6 分别对压缩输入和解压输出应用同一配置上限。bundle v1 与 v2 兼容读取器必须限制底层 reader 的读取量，禁止无界读取。资源配置可以选择更低的上限，协议硬上限始终生效。
 
 ## 12. 附件存储模式
 

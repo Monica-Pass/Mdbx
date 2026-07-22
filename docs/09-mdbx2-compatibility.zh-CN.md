@@ -73,9 +73,9 @@ schema 15 增加 `sync_state_extensions`，用于保存 complete-state 顶层的
 
 storage core 将扩展值视为 opaque JSON：只验证、保存和转发，不解释也不解密。opaque 不等于自动加密。非敏感的能力或版本元数据可以使用普通 JSON；密码、邮件正文、token 或其他敏感材料在进入未知扩展前，MUST 由扩展生产者封装为认证密文。这样旧 reader 才能在锁定状态保存未来敏感状态，同时不会自行产生明文。
 
-storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。
+storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 及其压缩表示 v6 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v4 格式。
 
-CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4。未完成的 v4 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择 v4；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。旧 peer 或能力不完整的 peer 使用有界完整状态回退。
+CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4 语义。未完成的 v4/v6 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段逻辑 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择增量语义；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。zstd 通过独立的 `bundle-zstd-v1` 协商，不会放宽四项增量契约。旧 peer 或能力不完整的 peer 使用有界完整状态回退。CLI 导出默认写未压缩 v3/v4，只有显式 `--compression zstd` 才写 v5/v6。
 
 ### 3.1 真实发布 Golden Vault 与旧 Reader 边界
 
@@ -118,6 +118,8 @@ MDBX2 同时收紧以下实现边界：
   原子设备序列分配，不重写任何历史 commit。
 - 离线 bundle v3 增加显式 payload 长度和有界解码；MDBX2 继续转换读取没有 operation
   元数据的 v1 bundle，并继续读取携带 operation 元数据的 v2 bundle。
+- 离线 bundle v4 增加成对增量 inventory、经过认证的 base 校验、有界可恢复 segment，以及 commit 与 auxiliary 的原子应用，同时保留 v1-v3 reader。
+- 离线 bundle v5/v6 分别为 complete v3 和 incremental v4 逻辑 payload 增加可选、有界的 zstd 表示；trailer 认证未压缩 bincode payload，压缩与未压缩声明长度分别受限，裁剪构建继续支持 v1-v4 并明确拒绝 v5/v6。
 - 新 snapshot 明确携带 project tags 和 attachment chunks；旧快照缺少这些字段时不清空现有兼容数据。
 - Tiga global/project/entry mutation 的 commit、对象更新、head 和 object version 原子提交。
 - Tiga2 增加版本化策略、精确例外和类型化安全审计；策略状态、覆盖、例外和审计进入同步状态。

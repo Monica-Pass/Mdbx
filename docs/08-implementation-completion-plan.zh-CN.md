@@ -101,7 +101,7 @@ MDBX 必须坚持：
 - benchmark harness 已形成 release 发布报告；CLI 默认使用正式 Multi password、verified keyring 与 `MDBXFE2` 字段加密，并保留 compatibility 参照模式。
 - 小修改、附件改名、附件替换、snapshot、compaction 和真实 sync delta envelope 均已输出时延与操作相关字节数。
 - 有界完整状态保留为首次同步和旧 peer 回退；commit/delta 双 checkpoint、bundle v4 分段与恢复链已提供大规模增量传输。
-- 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
+- bundle v5/v6 已在现有 bincode 2 payload 上增加可裁剪、可协商的有界 zstd；CLI 默认保持未压缩 v3/v4，显式选择才输出压缩格式。没有引入第二套 MessagePack 序列化。
 - external-hash-ref 已具备有界、可恢复、密文校验的 Provider 间 Blob 传输；默认文件系统 Provider 使用带 owner/expiry 的持久 lease，另一实例的清理会观察活动 lease。
 - CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。
 
@@ -187,7 +187,7 @@ MDBX 必须坚持：
 - Provider 间 Blob 传输和跨进程 lease 协议已完成。
 - metadata-only 更新不触碰 chunk。（已完成）
 - benchmark 输出 delta size 和时延报告。（已完成；encrypted 为默认发布模式）
-- 可选 zstd 压缩和二进制 payload 序列化。
+- 可选 zstd 压缩已完成；现有 bincode 2 继续作为唯一二进制 payload 序列化，避免重复协议栈。
 
 验收：
 
