@@ -19,6 +19,7 @@ pub const CAPABILITY_DELTA_INVENTORY_PAGING_V1: &str = "delta-inventory-paging-v
 pub const CAPABILITY_INCREMENTAL_BUNDLE_V4: &str = "incremental-bundle-v4";
 pub const CAPABILITY_INCREMENTAL_RESUME_V1: &str = "incremental-resume-v1";
 pub const CAPABILITY_ZSTD_BUNDLE_V1: &str = "bundle-zstd-v1";
+pub const CAPABILITY_AUTHENTICATED_BUNDLE_V1: &str = "authenticated-bundle-v1";
 pub const CAPABILITY_BLOB_MANIFEST_PAGING_V1: &str = "blob-manifest-paging-v1";
 pub const CAPABILITY_BLOB_CHUNK_TRANSFER_V1: &str = "blob-chunk-transfer-v1";
 pub const CAPABILITY_BLOB_TRANSFER_RESUME_V1: &str = "blob-transfer-resume-v1";

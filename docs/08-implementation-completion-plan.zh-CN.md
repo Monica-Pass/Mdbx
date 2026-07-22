@@ -103,6 +103,7 @@ MDBX 必须坚持：
 - 小修改、附件改名、附件替换、snapshot、compaction 和真实 sync delta envelope 均已输出时延与操作相关字节数。
 - 有界完整状态保留为首次同步和旧 peer 回退；commit/delta 双 checkpoint、bundle v4 分段与恢复链已提供大规模增量传输。
 - bundle v5/v6 已在现有 bincode 2 payload 上增加可裁剪、可协商的有界 zstd；CLI 默认保持未压缩 v3/v4，显式选择才输出压缩格式。没有引入第二套 MessagePack 序列化。
+- bundle v7-v10 已增加基于 vault integrity subkey 的 opt-in transport HMAC；`authenticated-bundle-v1` 与 zstd、原四项增量能力分别协商，CLI 默认与旧 peer 回退仍保持 v1-v6。
 - external-hash-ref 已具备有界、可恢复、密文校验的 Provider 间 Blob 传输；默认文件系统 Provider 使用带 owner/expiry 的持久 lease，另一实例的清理会观察活动 lease。
 - CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。
 
@@ -114,7 +115,7 @@ MDBX 必须坚持：
   manifest v2 已覆盖主 schema、未知扩展表、generated/hidden columns 和 typed rows 的
   精确检查点，同时继续验证 v1 token；自动刷新的增量 whole-vault Merkle authentication
   root 仍未完成。
-- 加密上下文 AAD 已覆盖字段级，但 commit/bundle/snapshot 的认证边界还需统一记录到规范。
+- 加密上下文 AAD 已覆盖字段级；commit、bundle 与 snapshot 的认证边界已经进入兼容性规范，自动刷新的 whole-vault Merkle root 仍是下一层完整性工作。
 
 ### 3.6 Android 接入
 

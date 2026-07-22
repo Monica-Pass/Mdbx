@@ -15,5 +15,6 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 bincode = { version = "2", features = ["serde"] }
 zstd = { version = "0.13", optional = true, default-features = false }

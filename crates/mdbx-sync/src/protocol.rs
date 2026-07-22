@@ -121,6 +121,15 @@ impl SyncNegotiator {
         }
     }
 
+    /// Advertise support for keyed v7-v10 bundle envelopes.
+    ///
+    /// This capability stays independent from the four capabilities that
+    /// select incremental v4 semantics so old peers retain their established
+    /// fallback behavior.
+    pub fn enable_authenticated_bundle_capability(&mut self) -> SyncResult<()> {
+        self.enable_capability(CAPABILITY_AUTHENTICATED_BUNDLE_V1)
+    }
+
     /// Build the local Hello. New peers do not put an unbounded commit-ID
     /// inventory in this message once paging is enabled locally.
     pub fn local_hello(&self) -> SyncResult<HelloRequest> {
@@ -296,6 +305,12 @@ impl SyncNegotiator {
     pub fn bundle_compression_is_negotiated(&self) -> bool {
         cfg!(feature = "zstd-compression")
             && self.capability_is_negotiated(CAPABILITY_ZSTD_BUNDLE_V1)
+    }
+
+    /// Keyed bundle envelopes may be selected only when both peers explicitly
+    /// advertise the independent authentication capability.
+    pub fn authenticated_bundle_is_negotiated(&self) -> bool {
+        self.capability_is_negotiated(CAPABILITY_AUTHENTICATED_BUNDLE_V1)
     }
 
     pub fn negotiated_bundle_compression(&self) -> BundleCompression {
@@ -1122,6 +1137,35 @@ mod tests {
             BundleCompression::Zstd
         );
         assert_eq!(responder.transfer_mode(), SyncTransferMode::CompleteState);
+    }
+
+    #[test]
+    fn authenticated_bundle_capability_is_opt_in_and_not_an_incremental_requirement() {
+        assert!(!INCREMENTAL_SYNC_CAPABILITIES.contains(&CAPABILITY_AUTHENTICATED_BUNDLE_V1));
+
+        let mut responder =
+            SyncNegotiator::new_incremental("device-a", Vec::new(), Vec::new()).unwrap();
+        responder.enable_authenticated_bundle_capability().unwrap();
+        let mut initiator =
+            SyncNegotiator::new_incremental("device-b", Vec::new(), Vec::new()).unwrap();
+        initiator.enable_authenticated_bundle_capability().unwrap();
+
+        let response = responder
+            .on_hello(&initiator.local_hello().unwrap())
+            .unwrap();
+        initiator.on_hello_ack(&response).unwrap();
+        assert!(responder.authenticated_bundle_is_negotiated());
+        assert!(initiator.authenticated_bundle_is_negotiated());
+        assert_eq!(
+            responder.transfer_mode(),
+            SyncTransferMode::IncrementalBundleV4
+        );
+
+        let legacy_response = responder
+            .on_hello(&HelloRequest::new("legacy", Vec::new(), Vec::new()))
+            .unwrap();
+        assert!(!legacy_response.supports(CAPABILITY_AUTHENTICATED_BUNDLE_V1));
+        assert!(!responder.authenticated_bundle_is_negotiated());
     }
 
     #[cfg(not(feature = "zstd-compression"))]

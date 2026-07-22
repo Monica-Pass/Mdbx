@@ -1,3 +1,4 @@
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -8,15 +9,22 @@ use crate::message::{ObjectPayload, SerializedCommit, TombstoneRecord};
 
 /// 文件格式魔数：`MDBXSYNC`
 const BUNDLE_MAGIC: &[u8; 8] = b"MDBXSYNC";
-/// 当前格式版本
+/// 默认 legacy API 写出的未压缩 complete 格式版本。
 const BUNDLE_VERSION: u32 = 3;
 const INCREMENTAL_BUNDLE_VERSION: u32 = 4;
 const COMPRESSED_BUNDLE_VERSION: u32 = 5;
 const COMPRESSED_INCREMENTAL_BUNDLE_VERSION: u32 = 6;
+pub const AUTHENTICATED_BUNDLE_VERSION: u32 = 7;
+pub const AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION: u32 = 8;
+pub const AUTHENTICATED_COMPRESSED_BUNDLE_VERSION: u32 = 9;
+pub const AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION: u32 = 10;
 const PREVIOUS_BUNDLE_VERSION: u32 = 2;
 const LEGACY_BUNDLE_VERSION: u32 = 1;
 const BUNDLE_RESERVED_BYTES: usize = 20;
 const BUNDLE_HASH_BYTES: usize = 32;
+const BUNDLE_AUTH_TAG_BYTES: usize = 32;
+const BUNDLE_AUTH_KEY_BYTES: usize = 32;
+const BUNDLE_AUTH_DOMAIN: &[u8] = b"mdbx-sync-bundle-auth-v1";
 pub const DEFAULT_MAX_BUNDLE_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
 pub const DESKTOP_MAX_BUNDLE_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const HARD_MAX_BUNDLE_PAYLOAD_BYTES: u64 = DESKTOP_MAX_BUNDLE_PAYLOAD_BYTES;
@@ -36,6 +44,12 @@ pub enum BundleCompression {
     Zstd,
 }
 
+struct BundleBody {
+    payload: Vec<u8>,
+    stored_hash: [u8; BUNDLE_HASH_BYTES],
+    auth_tag: Option<[u8; BUNDLE_AUTH_TAG_BYTES]>,
+}
+
 /// 离线同步包。
 ///
 /// 包含一组 commit 及其关联的对象数据，用于通过文件（USB、邮件等）进行离线同步。
@@ -51,6 +65,8 @@ pub enum BundleCompression {
 /// │ hash:     [u8; 32]  SHA-256(body)   │
 /// └──────────────────────────────────────┘
 /// ```
+/// v7-v10 保留逻辑 payload SHA-256，并在其后追加绑定版本与有界 header 的
+/// HMAC-SHA-256 trailer；v9/v10 的 payload 为 zstd 表示。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncBundle {
     /// 导出时的 UTC 时间戳 (RFC 3339)
@@ -482,6 +498,20 @@ pub fn write_bundle(bundle: &SyncBundle, writer: &mut impl Write) -> SyncResult<
     write_versioned_payload(BUNDLE_VERSION, bundle, writer)
 }
 
+/// Write a complete bundle with a keyed v7 transport trailer.
+pub fn write_bundle_authenticated(
+    bundle: &SyncBundle,
+    writer: &mut impl Write,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    write_authenticated_versioned_payload(
+        AUTHENTICATED_BUNDLE_VERSION,
+        bundle,
+        writer,
+        integrity_key,
+    )
+}
+
 /// Write a complete bundle with an explicitly selected codec.
 ///
 /// `None` preserves the v3 format. `Zstd` writes v5 and is available only
@@ -499,6 +529,29 @@ pub fn write_bundle_with_compression(
     }
 }
 
+/// Write a keyed v7 or v9 complete bundle with an explicit codec.
+pub fn write_bundle_with_compression_authenticated(
+    bundle: &SyncBundle,
+    writer: &mut impl Write,
+    compression: BundleCompression,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    match compression {
+        BundleCompression::None => write_authenticated_versioned_payload(
+            AUTHENTICATED_BUNDLE_VERSION,
+            bundle,
+            writer,
+            integrity_key,
+        ),
+        BundleCompression::Zstd => write_authenticated_compressed_payload(
+            AUTHENTICATED_COMPRESSED_BUNDLE_VERSION,
+            bundle,
+            writer,
+            integrity_key,
+        ),
+    }
+}
+
 /// 将有界、可恢复的增量 bundle v4 写入文件。
 pub fn write_incremental_bundle(
     bundle: &IncrementalSyncBundle,
@@ -506,6 +559,21 @@ pub fn write_incremental_bundle(
 ) -> SyncResult<()> {
     bundle.validate()?;
     write_versioned_payload(INCREMENTAL_BUNDLE_VERSION, bundle, writer)
+}
+
+/// Write an incremental bundle with a keyed v8 transport trailer.
+pub fn write_incremental_bundle_authenticated(
+    bundle: &IncrementalSyncBundle,
+    writer: &mut impl Write,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    bundle.validate()?;
+    write_authenticated_versioned_payload(
+        AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION,
+        bundle,
+        writer,
+        integrity_key,
+    )
 }
 
 /// Write an incremental bundle with an explicitly selected codec.
@@ -528,7 +596,31 @@ pub fn write_incremental_bundle_with_compression(
     }
 }
 
-/// Return the logical payload SHA-256 written in a v4 or v6 bundle trailer.
+/// Write a keyed v8 or v10 incremental bundle with an explicit codec.
+pub fn write_incremental_bundle_with_compression_authenticated(
+    bundle: &IncrementalSyncBundle,
+    writer: &mut impl Write,
+    compression: BundleCompression,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    bundle.validate()?;
+    match compression {
+        BundleCompression::None => write_authenticated_versioned_payload(
+            AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION,
+            bundle,
+            writer,
+            integrity_key,
+        ),
+        BundleCompression::Zstd => write_authenticated_compressed_payload(
+            AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION,
+            bundle,
+            writer,
+            integrity_key,
+        ),
+    }
+}
+
+/// Return the logical payload SHA-256 written in a v4/v6/v8/v10 bundle trailer.
 ///
 /// Segment checkpoints use this digest to bind the next segment to the exact
 /// payload that was previously exported and durably applied.
@@ -556,6 +648,27 @@ fn write_versioned_payload<T: Serialize>(
     value: &T,
     writer: &mut impl Write,
 ) -> SyncResult<()> {
+    write_versioned_payload_with_auth(version, value, writer, None)
+}
+
+fn write_authenticated_versioned_payload<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    write_versioned_payload_with_auth(version, value, writer, Some(integrity_key))
+}
+
+fn write_versioned_payload_with_auth<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+    integrity_key: Option<&[u8]>,
+) -> SyncResult<()> {
+    if let Some(key) = integrity_key {
+        validate_integrity_key(key)?;
+    }
     let mut counter = LimitedCountingWriter::new(HARD_MAX_BUNDLE_PAYLOAD_BYTES);
     let encoded_len =
         bincode::serde::encode_into_std_write(value, &mut counter, bincode::config::standard())
@@ -597,6 +710,9 @@ fn write_versioned_payload<T: Serialize>(
     }
     let hash = hashing_writer.finalize();
     writer.write_all(&hash)?;
+    if let Some(key) = integrity_key {
+        writer.write_all(&compute_bundle_auth_tag(key, version, &reserved, &hash)?)?;
+    }
 
     Ok(())
 }
@@ -607,6 +723,29 @@ fn write_compressed_payload<T: Serialize>(
     value: &T,
     writer: &mut impl Write,
 ) -> SyncResult<()> {
+    write_compressed_payload_with_auth(version, value, writer, None)
+}
+
+#[cfg(feature = "zstd-compression")]
+fn write_authenticated_compressed_payload<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+    integrity_key: &[u8],
+) -> SyncResult<()> {
+    write_compressed_payload_with_auth(version, value, writer, Some(integrity_key))
+}
+
+#[cfg(feature = "zstd-compression")]
+fn write_compressed_payload_with_auth<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+    integrity_key: Option<&[u8]>,
+) -> SyncResult<()> {
+    if let Some(key) = integrity_key {
+        validate_integrity_key(key)?;
+    }
     let uncompressed_len = encoded_payload_len(value)?;
     let (compressed_len, expected_hash) = measure_compressed_payload(value)?;
 
@@ -629,6 +768,14 @@ fn write_compressed_payload<T: Serialize>(
         ));
     }
     writer.write_all(&expected_hash)?;
+    if let Some(key) = integrity_key {
+        writer.write_all(&compute_bundle_auth_tag(
+            key,
+            version,
+            &reserved,
+            &expected_hash,
+        )?)?;
+    }
     Ok(())
 }
 
@@ -637,6 +784,16 @@ fn write_compressed_payload<T: Serialize>(
     _version: u32,
     _value: &T,
     _writer: &mut impl Write,
+) -> SyncResult<()> {
+    Err(zstd_unsupported())
+}
+
+#[cfg(not(feature = "zstd-compression"))]
+fn write_authenticated_compressed_payload<T: Serialize>(
+    _version: u32,
+    _value: &T,
+    _writer: &mut impl Write,
+    _integrity_key: &[u8],
 ) -> SyncResult<()> {
     Err(zstd_unsupported())
 }
@@ -706,6 +863,68 @@ fn payload_limit_error(resource: &str, actual: u64, limit: u64) -> SyncError {
         actual,
         limit,
     }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn validate_integrity_key(integrity_key: &[u8]) -> SyncResult<()> {
+    if integrity_key.len() != BUNDLE_AUTH_KEY_BYTES {
+        return Err(SyncError::BundleFormat(format!(
+            "bundle integrity key must be {BUNDLE_AUTH_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn compute_bundle_auth_tag(
+    integrity_key: &[u8],
+    version: u32,
+    reserved: &[u8; BUNDLE_RESERVED_BYTES],
+    payload_hash: &[u8; BUNDLE_HASH_BYTES],
+) -> SyncResult<[u8; BUNDLE_AUTH_TAG_BYTES]> {
+    validate_integrity_key(integrity_key)?;
+    let mut mac = HmacSha256::new_from_slice(integrity_key)
+        .map_err(|_| SyncError::BundleFormat("invalid bundle integrity key".to_string()))?;
+    let version = version.to_le_bytes();
+    for part in [
+        BUNDLE_AUTH_DOMAIN,
+        BUNDLE_MAGIC.as_slice(),
+        version.as_slice(),
+        reserved.as_slice(),
+        payload_hash.as_slice(),
+    ] {
+        mac.update(&(part.len() as u64).to_le_bytes());
+        mac.update(part);
+    }
+    let tag = mac.finalize().into_bytes();
+    let mut output = [0_u8; BUNDLE_AUTH_TAG_BYTES];
+    output.copy_from_slice(&tag);
+    Ok(output)
+}
+
+fn verify_bundle_auth_tag(
+    integrity_key: &[u8],
+    version: u32,
+    reserved: &[u8; BUNDLE_RESERVED_BYTES],
+    payload_hash: &[u8; BUNDLE_HASH_BYTES],
+    expected_tag: &[u8; BUNDLE_AUTH_TAG_BYTES],
+) -> SyncResult<()> {
+    validate_integrity_key(integrity_key)?;
+    let mut mac = HmacSha256::new_from_slice(integrity_key)
+        .map_err(|_| SyncError::BundleFormat("invalid bundle integrity key".to_string()))?;
+    let version = version.to_le_bytes();
+    for part in [
+        BUNDLE_AUTH_DOMAIN,
+        BUNDLE_MAGIC.as_slice(),
+        version.as_slice(),
+        reserved.as_slice(),
+        payload_hash.as_slice(),
+    ] {
+        mac.update(&(part.len() as u64).to_le_bytes());
+        mac.update(part);
+    }
+    mac.verify_slice(expected_tag)
+        .map_err(|_| SyncError::BundleIntegrity("HMAC-SHA-256 mismatch".to_string()))
 }
 
 fn map_bundle_encode_error(error: bincode::error::EncodeError) -> SyncError {
@@ -847,9 +1066,27 @@ pub fn bundle_to_bytes(bundle: &SyncBundle) -> SyncResult<Vec<u8>> {
     Ok(buf)
 }
 
+pub fn bundle_to_bytes_authenticated(
+    bundle: &SyncBundle,
+    integrity_key: &[u8],
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_bundle_authenticated(bundle, &mut buf, integrity_key)?;
+    Ok(buf)
+}
+
 pub fn incremental_bundle_to_bytes(bundle: &IncrementalSyncBundle) -> SyncResult<Vec<u8>> {
     let mut buf = Vec::new();
     write_incremental_bundle(bundle, &mut buf)?;
+    Ok(buf)
+}
+
+pub fn incremental_bundle_to_bytes_authenticated(
+    bundle: &IncrementalSyncBundle,
+    integrity_key: &[u8],
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_incremental_bundle_authenticated(bundle, &mut buf, integrity_key)?;
     Ok(buf)
 }
 
@@ -862,12 +1099,37 @@ pub fn bundle_to_bytes_with_compression(
     Ok(buf)
 }
 
+pub fn bundle_to_bytes_with_compression_authenticated(
+    bundle: &SyncBundle,
+    compression: BundleCompression,
+    integrity_key: &[u8],
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_bundle_with_compression_authenticated(bundle, &mut buf, compression, integrity_key)?;
+    Ok(buf)
+}
+
 pub fn incremental_bundle_to_bytes_with_compression(
     bundle: &IncrementalSyncBundle,
     compression: BundleCompression,
 ) -> SyncResult<Vec<u8>> {
     let mut buf = Vec::new();
     write_incremental_bundle_with_compression(bundle, &mut buf, compression)?;
+    Ok(buf)
+}
+
+pub fn incremental_bundle_to_bytes_with_compression_authenticated(
+    bundle: &IncrementalSyncBundle,
+    compression: BundleCompression,
+    integrity_key: &[u8],
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_incremental_bundle_with_compression_authenticated(
+        bundle,
+        &mut buf,
+        compression,
+        integrity_key,
+    )?;
     Ok(buf)
 }
 
@@ -892,7 +1154,34 @@ pub fn read_bundle_with_limits(
     }
 }
 
-/// Reads complete v1-v3 or incremental v4 bundles without changing the legacy API.
+/// Read a complete bundle with the vault integrity key when the envelope is
+/// authenticated. Legacy v1-v6 bundles remain accepted by this API.
+pub fn read_bundle_authenticated(
+    reader: &mut impl Read,
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundle> {
+    read_bundle_with_limits_authenticated(reader, BundleReadLimits::default(), integrity_key)
+}
+
+/// Read a complete bundle with bounded allocation and a supplied envelope key.
+///
+/// The legacy API passes no key and therefore continues to support v1-v6. An
+/// authenticated v7-v10 envelope is rejected unless a valid key is supplied.
+pub fn read_bundle_with_limits_authenticated(
+    reader: &mut impl Read,
+    limits: BundleReadLimits,
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundle> {
+    match read_bundle_file_with_limits_authenticated(reader, limits, integrity_key)? {
+        SyncBundleFile::Complete(bundle) => Ok(bundle),
+        SyncBundleFile::Incremental(_) => Err(SyncError::BundleFormat(
+            "incremental bundle requires read_bundle_file_with_limits_authenticated".to_string(),
+        )),
+    }
+}
+
+/// Reads complete v1-v3/v5/v7/v9 or incremental v4/v6/v8/v10 bundles without
+/// changing the legacy API. Authenticated versions require the keyed helper.
 pub fn read_bundle_file(reader: &mut impl Read) -> SyncResult<SyncBundleFile> {
     read_bundle_file_with_limits(reader, BundleReadLimits::default())
 }
@@ -901,11 +1190,36 @@ pub fn read_bundle_file_with_limits(
     reader: &mut impl Read,
     limits: BundleReadLimits,
 ) -> SyncResult<SyncBundleFile> {
-    let (version, payload_data) = read_bundle_payload(reader, limits)?;
+    read_bundle_file_with_limits_and_key(reader, limits, None)
+}
 
-    let bundle = if version == INCREMENTAL_BUNDLE_VERSION
-        || version == COMPRESSED_INCREMENTAL_BUNDLE_VERSION
-    {
+/// Read any supported bundle, supplying the vault integrity key for v7-v10.
+/// Legacy v1-v6 bundles are still accepted so callers can transparently apply
+/// old exports while migrating to authenticated transport.
+pub fn read_bundle_file_authenticated(
+    reader: &mut impl Read,
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundleFile> {
+    read_bundle_file_with_limits_authenticated(reader, BundleReadLimits::default(), integrity_key)
+}
+
+pub fn read_bundle_file_with_limits_authenticated(
+    reader: &mut impl Read,
+    limits: BundleReadLimits,
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundleFile> {
+    validate_integrity_key(integrity_key)?;
+    read_bundle_file_with_limits_and_key(reader, limits, Some(integrity_key))
+}
+
+fn read_bundle_file_with_limits_and_key(
+    reader: &mut impl Read,
+    limits: BundleReadLimits,
+    integrity_key: Option<&[u8]>,
+) -> SyncResult<SyncBundleFile> {
+    let (version, payload_data) = read_bundle_payload(reader, limits, integrity_key)?;
+
+    let bundle = if is_incremental_bundle_version(version) {
         let (bundle, bytes_read): (IncrementalSyncBundle, usize) =
             bincode::serde::decode_from_slice(
                 &payload_data,
@@ -955,6 +1269,7 @@ pub fn read_bundle_file_with_limits(
 fn read_bundle_payload(
     reader: &mut impl Read,
     limits: BundleReadLimits,
+    integrity_key: Option<&[u8]>,
 ) -> SyncResult<(u32, Vec<u8>)> {
     // 读取 magic
     let mut magic = [0u8; 8];
@@ -967,44 +1282,67 @@ fn read_bundle_payload(
     let mut version_buf = [0u8; 4];
     reader.read_exact(&mut version_buf)?;
     let version = u32::from_le_bytes(version_buf);
-    if version != BUNDLE_VERSION
-        && version != PREVIOUS_BUNDLE_VERSION
-        && version != LEGACY_BUNDLE_VERSION
-        && version != INCREMENTAL_BUNDLE_VERSION
-        && version != COMPRESSED_BUNDLE_VERSION
-        && version != COMPRESSED_INCREMENTAL_BUNDLE_VERSION
-    {
+    if !is_supported_bundle_version(version) {
         return Err(SyncError::BundleFormat(format!(
-            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION} through {COMPRESSED_INCREMENTAL_BUNDLE_VERSION}"
+            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION} through {AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION}"
         )));
     }
+
+    let authenticated = is_authenticated_bundle_version(version);
+    let authenticated_key = if authenticated {
+        let key = integrity_key.ok_or_else(|| {
+            SyncError::BundleIntegrity("authenticated bundle requires an integrity key".to_string())
+        })?;
+        validate_integrity_key(key)?;
+        Some(key)
+    } else {
+        None
+    };
 
     let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
     reader.read_exact(&mut reserved)?;
 
-    let (payload_data, stored_hash) = match version {
+    let body = match version {
         BUNDLE_VERSION | INCREMENTAL_BUNDLE_VERSION => {
-            read_length_prefixed_body(reader, &reserved, limits)?
+            read_length_prefixed_body(reader, &reserved, limits, false)?
         }
         COMPRESSED_BUNDLE_VERSION | COMPRESSED_INCREMENTAL_BUNDLE_VERSION => {
-            read_compressed_body(reader, &reserved, limits)?
+            read_compressed_body(reader, &reserved, limits, false)?
+        }
+        AUTHENTICATED_BUNDLE_VERSION | AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION => {
+            read_length_prefixed_body(reader, &reserved, limits, true)?
+        }
+        AUTHENTICATED_COMPRESSED_BUNDLE_VERSION
+        | AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION => {
+            read_compressed_body(reader, &reserved, limits, true)?
         }
         _ => read_legacy_body(reader, limits)?,
     };
 
+    if let Some(key) = authenticated_key {
+        let tag = body.auth_tag.as_ref().ok_or_else(|| {
+            SyncError::BundleFormat("authenticated bundle is missing its HMAC trailer".to_string())
+        })?;
+        verify_bundle_auth_tag(key, version, &reserved, &body.stored_hash, tag)?;
+    } else if body.auth_tag.is_some() {
+        return Err(SyncError::BundleFormat(
+            "legacy bundle unexpectedly contains an HMAC trailer".to_string(),
+        ));
+    }
+
     // 验证 hash
     let computed = {
         let mut h = Sha256::new();
-        h.update(&payload_data);
+        h.update(&body.payload);
         h.finalize()
     };
-    if stored_hash.as_slice() != computed.as_slice() {
+    if body.stored_hash.as_slice() != computed.as_slice() {
         return Err(SyncError::BundleIntegrity(
             "SHA-256 hash mismatch".to_string(),
         ));
     }
 
-    Ok((version, payload_data))
+    Ok((version, body.payload))
 }
 
 #[cfg(feature = "zstd-compression")]
@@ -1012,7 +1350,8 @@ fn read_compressed_body(
     reader: &mut impl Read,
     reserved: &[u8; BUNDLE_RESERVED_BYTES],
     limits: BundleReadLimits,
-) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    authenticated: bool,
+) -> SyncResult<BundleBody> {
     if reserved[16..].iter().any(|byte| *byte != 0) {
         return Err(SyncError::BundleFormat(
             "non-zero reserved compressed bundle header bytes".to_string(),
@@ -1031,7 +1370,11 @@ fn read_compressed_body(
         limits.max_payload_bytes(),
     )?;
 
-    let (compressed, stored_hash) = read_exact_body(reader, compressed_len, limits)?;
+    let BundleBody {
+        payload: compressed,
+        stored_hash,
+        auth_tag,
+    } = read_exact_body(reader, compressed_len, limits, authenticated)?;
     let output_read_limit = uncompressed_len
         .checked_add(1)
         .ok_or_else(|| SyncError::BundleFormat("bundle size limit overflow".to_string()))?;
@@ -1054,7 +1397,11 @@ fn read_compressed_body(
             "compressed bundle expanded to {actual_len} bytes; header declares {uncompressed_len} bytes"
         )));
     }
-    Ok((payload, stored_hash))
+    Ok(BundleBody {
+        payload,
+        stored_hash,
+        auth_tag,
+    })
 }
 
 #[cfg(not(feature = "zstd-compression"))]
@@ -1062,7 +1409,8 @@ fn read_compressed_body(
     _reader: &mut impl Read,
     _reserved: &[u8; BUNDLE_RESERVED_BYTES],
     _limits: BundleReadLimits,
-) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    _authenticated: bool,
+) -> SyncResult<BundleBody> {
     Err(zstd_unsupported())
 }
 
@@ -1076,7 +1424,8 @@ fn read_exact_body(
     reader: &mut impl Read,
     payload_len: u64,
     limits: BundleReadLimits,
-) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    authenticated: bool,
+) -> SyncResult<BundleBody> {
     let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
         payload_limit_error(
             "sync bundle payload",
@@ -1097,20 +1446,32 @@ fn read_exact_body(
     reader.read_exact(&mut payload)?;
     let mut stored_hash = [0u8; BUNDLE_HASH_BYTES];
     reader.read_exact(&mut stored_hash)?;
+    let auth_tag = if authenticated {
+        let mut tag = [0u8; BUNDLE_AUTH_TAG_BYTES];
+        reader.read_exact(&mut tag)?;
+        Some(tag)
+    } else {
+        None
+    };
     let mut trailing = [0u8; 1];
     if reader.read(&mut trailing)? != 0 {
         return Err(SyncError::BundleFormat(
-            "trailing bytes after bundle hash".to_string(),
+            "trailing bytes after bundle trailer".to_string(),
         ));
     }
-    Ok((payload, stored_hash))
+    Ok(BundleBody {
+        payload,
+        stored_hash,
+        auth_tag,
+    })
 }
 
 fn read_length_prefixed_body(
     reader: &mut impl Read,
     reserved: &[u8; BUNDLE_RESERVED_BYTES],
     limits: BundleReadLimits,
-) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    authenticated: bool,
+) -> SyncResult<BundleBody> {
     if reserved[8..].iter().any(|byte| *byte != 0) {
         return Err(SyncError::BundleFormat(
             "non-zero reserved bundle header bytes".to_string(),
@@ -1118,13 +1479,10 @@ fn read_length_prefixed_body(
     }
     let payload_len = header_u64(&reserved[..8]);
     ensure_payload_within_limit(payload_len, limits.max_payload_bytes())?;
-    read_exact_body(reader, payload_len, limits)
+    read_exact_body(reader, payload_len, limits, authenticated)
 }
 
-fn read_legacy_body(
-    reader: &mut impl Read,
-    limits: BundleReadLimits,
-) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+fn read_legacy_body(reader: &mut impl Read, limits: BundleReadLimits) -> SyncResult<BundleBody> {
     let body_limit = limits
         .max_payload_bytes()
         .checked_add(BUNDLE_HASH_BYTES as u64)
@@ -1151,7 +1509,47 @@ fn read_legacy_body(
     stored_hash.copy_from_slice(&body[hash_offset..]);
     body.truncate(hash_offset);
     ensure_payload_within_limit(body.len() as u64, limits.max_payload_bytes())?;
-    Ok((body, stored_hash))
+    Ok(BundleBody {
+        payload: body,
+        stored_hash,
+        auth_tag: None,
+    })
+}
+
+fn is_supported_bundle_version(version: u32) -> bool {
+    matches!(
+        version,
+        LEGACY_BUNDLE_VERSION
+            | PREVIOUS_BUNDLE_VERSION
+            | BUNDLE_VERSION
+            | INCREMENTAL_BUNDLE_VERSION
+            | COMPRESSED_BUNDLE_VERSION
+            | COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+            | AUTHENTICATED_BUNDLE_VERSION
+            | AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+            | AUTHENTICATED_COMPRESSED_BUNDLE_VERSION
+            | AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+    )
+}
+
+fn is_authenticated_bundle_version(version: u32) -> bool {
+    matches!(
+        version,
+        AUTHENTICATED_BUNDLE_VERSION
+            | AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+            | AUTHENTICATED_COMPRESSED_BUNDLE_VERSION
+            | AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+    )
+}
+
+fn is_incremental_bundle_version(version: u32) -> bool {
+    matches!(
+        version,
+        INCREMENTAL_BUNDLE_VERSION
+            | COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+            | AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+            | AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+    )
 }
 
 fn ensure_payload_within_limit(actual: u64, limit: u64) -> SyncResult<()> {
@@ -1171,9 +1569,25 @@ pub fn bundle_from_bytes(data: &[u8]) -> SyncResult<SyncBundle> {
     read_bundle(&mut cursor)
 }
 
+pub fn bundle_from_bytes_authenticated(
+    data: &[u8],
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundle> {
+    let mut cursor = std::io::Cursor::new(data);
+    read_bundle_authenticated(&mut cursor, integrity_key)
+}
+
 pub fn bundle_file_from_bytes(data: &[u8]) -> SyncResult<SyncBundleFile> {
     let mut cursor = std::io::Cursor::new(data);
     read_bundle_file(&mut cursor)
+}
+
+pub fn bundle_file_from_bytes_authenticated(
+    data: &[u8],
+    integrity_key: &[u8],
+) -> SyncResult<SyncBundleFile> {
+    let mut cursor = std::io::Cursor::new(data);
+    read_bundle_file_authenticated(&mut cursor, integrity_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1763,10 @@ mod tests {
         u64::from_le_bytes(value)
     }
 
+    fn auth_test_key() -> [u8; BUNDLE_AUTH_KEY_BYTES] {
+        [0x42; BUNDLE_AUTH_KEY_BYTES]
+    }
+
     #[cfg(feature = "zstd-compression")]
     fn declared_uncompressed_len(bytes: &[u8]) -> u64 {
         let mut value = [0u8; 8];
@@ -1369,6 +1787,103 @@ mod tests {
         assert_eq!(restored.source_device_id, bundle.source_device_id);
         assert_eq!(restored.commits.len(), 1);
         assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+    }
+
+    #[test]
+    fn authenticated_v7_complete_round_trip_and_tamper_detection() {
+        let bundle = sample_bundle();
+        let key = auth_test_key();
+        let bytes = bundle_to_bytes_authenticated(&bundle, &key).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            AUTHENTICATED_BUNDLE_VERSION
+        );
+        assert_eq!(declared_payload_len(&bytes) as usize, bytes.len() - 96);
+
+        let restored = bundle_from_bytes_authenticated(&bytes, &key).unwrap();
+        assert_eq!(restored.vault_id, bundle.vault_id);
+        assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+
+        let missing_key = bundle_from_bytes(&bytes).unwrap_err();
+        assert!(missing_key.to_string().contains("integrity key"));
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&bytes, &[0_u8; BUNDLE_AUTH_KEY_BYTES]),
+            Err(SyncError::BundleIntegrity(_))
+        ));
+
+        let mut tampered_tag = bytes.clone();
+        *tampered_tag.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&tampered_tag, &key),
+            Err(SyncError::BundleIntegrity(_))
+        ));
+
+        let mut tampered_payload = bytes.clone();
+        tampered_payload[32] ^= 1;
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&tampered_payload, &key),
+            Err(SyncError::BundleIntegrity(_))
+        ));
+
+        let mut tampered_version = bytes;
+        tampered_version[8..12]
+            .copy_from_slice(&AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION.to_le_bytes());
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&tampered_version, &key),
+            Err(SyncError::BundleIntegrity(_))
+        ));
+
+        let mut tampered_header = bundle_to_bytes_authenticated(&bundle, &key).unwrap();
+        tampered_header[20] = 1;
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&tampered_header, &key),
+            Err(SyncError::BundleFormat(_))
+        ));
+
+        let mut trailing = bundle_to_bytes_authenticated(&bundle, &key).unwrap();
+        trailing.push(0);
+        assert!(bundle_from_bytes_authenticated(&trailing, &key)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing bytes"));
+    }
+
+    #[test]
+    fn authenticated_v8_incremental_round_trip_and_legacy_fallback() {
+        let bundle = sample_incremental_bundle();
+        let key = auth_test_key();
+        let bytes = incremental_bundle_to_bytes_authenticated(&bundle, &key).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+        );
+        assert_eq!(declared_payload_len(&bytes) as usize, bytes.len() - 96);
+
+        match bundle_file_from_bytes_authenticated(&bytes, &key).unwrap() {
+            SyncBundleFile::Incremental(restored) => {
+                assert_eq!(restored.manifest.transfer_id, "transfer-1");
+                assert_eq!(restored.commits.len(), 1);
+            }
+            SyncBundleFile::Complete(_) => panic!("v8 decoded as complete"),
+        }
+
+        for legacy in [
+            legacy_bundle_bytes(),
+            previous_v2_bundle_bytes(),
+            bundle_to_bytes(&sample_bundle()).unwrap(),
+        ] {
+            match bundle_file_from_bytes_authenticated(&legacy, &key).unwrap() {
+                SyncBundleFile::Complete(restored) => assert_eq!(restored.commits.len(), 1),
+                SyncBundleFile::Incremental(_) => panic!("legacy complete decoded as incremental"),
+            }
+        }
+        let legacy_incremental = incremental_bundle_to_bytes(&bundle).unwrap();
+        match bundle_file_from_bytes_authenticated(&legacy_incremental, &key).unwrap() {
+            SyncBundleFile::Incremental(restored) => {
+                assert_eq!(restored.manifest.transfer_id, "transfer-1");
+            }
+            SyncBundleFile::Complete(_) => panic!("v4 decoded as complete"),
+        }
     }
 
     #[test]
@@ -1445,6 +1960,79 @@ mod tests {
             }
             SyncBundleFile::Complete(_) => panic!("v6 decoded as a complete bundle"),
         }
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn authenticated_v9_and_v10_zstd_bundles_round_trip() {
+        let key = auth_test_key();
+        let complete = sample_bundle();
+        let complete_bytes = bundle_to_bytes_with_compression_authenticated(
+            &complete,
+            BundleCompression::Zstd,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(complete_bytes[8..12].try_into().unwrap()),
+            AUTHENTICATED_COMPRESSED_BUNDLE_VERSION
+        );
+        assert_eq!(
+            declared_payload_len(&complete_bytes) as usize,
+            complete_bytes.len() - 96
+        );
+        let restored = bundle_from_bytes_authenticated(&complete_bytes, &key).unwrap();
+        assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+
+        let incremental = sample_incremental_bundle();
+        let incremental_bytes = incremental_bundle_to_bytes_with_compression_authenticated(
+            &incremental,
+            BundleCompression::Zstd,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(incremental_bytes[8..12].try_into().unwrap()),
+            AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+        );
+        assert_eq!(
+            incremental_bundle_payload_sha256(&incremental).unwrap(),
+            incremental_bytes[incremental_bytes.len() - 64..incremental_bytes.len() - 32]
+        );
+        match bundle_file_from_bytes_authenticated(&incremental_bytes, &key).unwrap() {
+            SyncBundleFile::Incremental(restored) => {
+                assert_eq!(restored.manifest.transfer_id, "transfer-1");
+            }
+            SyncBundleFile::Complete(_) => panic!("v10 decoded as complete"),
+        }
+
+        let legacy_complete =
+            bundle_to_bytes_with_compression(&complete, BundleCompression::Zstd).unwrap();
+        assert!(matches!(
+            bundle_file_from_bytes_authenticated(&legacy_complete, &key).unwrap(),
+            SyncBundleFile::Complete(_)
+        ));
+        let legacy_incremental =
+            incremental_bundle_to_bytes_with_compression(&incremental, BundleCompression::Zstd)
+                .unwrap();
+        assert!(matches!(
+            bundle_file_from_bytes_authenticated(&legacy_incremental, &key).unwrap(),
+            SyncBundleFile::Incremental(_)
+        ));
+    }
+
+    #[test]
+    fn authenticated_bundle_rejects_invalid_key_lengths() {
+        let bundle = sample_bundle();
+        assert!(matches!(
+            bundle_to_bytes_authenticated(&bundle, &[1, 2, 3]),
+            Err(SyncError::BundleFormat(message)) if message.contains("32 bytes")
+        ));
+        let bytes = bundle_to_bytes_authenticated(&bundle, &auth_test_key()).unwrap();
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&bytes, &[1, 2, 3]),
+            Err(SyncError::BundleFormat(message)) if message.contains("32 bytes")
+        ));
     }
 
     #[test]
@@ -1538,6 +2126,14 @@ mod tests {
             bundle_to_bytes_with_compression(&sample_bundle(), BundleCompression::Zstd),
             Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
         ));
+        assert!(matches!(
+            bundle_to_bytes_with_compression_authenticated(
+                &sample_bundle(),
+                BundleCompression::Zstd,
+                &auth_test_key(),
+            ),
+            Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
+        ));
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(BUNDLE_MAGIC);
@@ -1545,6 +2141,12 @@ mod tests {
         bytes.extend_from_slice(&[0u8; BUNDLE_RESERVED_BYTES]);
         assert!(matches!(
             bundle_from_bytes(&bytes),
+            Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
+        ));
+
+        bytes[8..12].copy_from_slice(&AUTHENTICATED_COMPRESSED_BUNDLE_VERSION.to_le_bytes());
+        assert!(matches!(
+            bundle_from_bytes_authenticated(&bytes, &auth_test_key()),
             Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
         ));
     }

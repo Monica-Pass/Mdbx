@@ -80,9 +80,11 @@ schema 16 为 `vault_meta` 增加 `header_integrity_profile` 和
 
 storage core 将扩展值视为 opaque JSON：只验证、保存和转发，不解释也不解密。opaque 不等于自动加密。非敏感的能力或版本元数据可以使用普通 JSON；密码、邮件正文、token 或其他敏感材料在进入未知扩展前，MUST 由扩展生产者封装为认证密文。这样旧 reader 才能在锁定状态保存未来敏感状态，同时不会自行产生明文。
 
-storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 及其压缩表示 v6 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v4 格式。
+storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 及其压缩表示 v6，以及对应的认证信封 v8/v10，会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v6 格式。
 
-CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4 语义。未完成的 v4/v6 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段逻辑 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择增量语义；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。zstd 通过独立的 `bundle-zstd-v1` 协商，不会放宽四项增量契约。旧 peer 或能力不完整的 peer 使用有界完整状态回退。CLI 导出默认写未压缩 v3/v4，只有显式 `--compression zstd` 才写 v5/v6。
+CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4 语义。未完成的 v4/v6/v8/v10 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段逻辑 payload 摘要；认证和压缩都不会改变该逻辑 SHA-256 身份。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择增量语义；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。zstd 通过独立的 `bundle-zstd-v1` 协商；keyed transport authentication 则通过独立的 `authenticated-bundle-v1` 协商，故意不把它加入原有四项增量必选能力。旧 peer 或能力不完整的 peer 继续使用有界完整状态和 v1-v6 回退。
+
+认证 complete/incremental 信封分别使用 v7/v8；对应的 zstd 表示使用 v9/v10。既有逻辑 payload SHA-256 trailer 之后追加 HMAC-SHA-256，密钥取自 vault integrity subkey；tag 绑定版本化 domain、magic、version、20-byte 有界 header 区和逻辑 payload 摘要。密钥绝不会写入或随 bundle 传输。该机制只能证明信封由某个持有共享 vault key 的一方生成并绑定其元数据，不能识别具体设备；它也不提供传输保密性，不替代内部字段、commit 或 delta 的加密认证，因此 bundle 仍不得视为可公开文件。CLI 默认继续输出 legacy v3/v4，显式 `--compression zstd` 才输出 v5/v6，只有显式 `--authenticated` 才选择 v7-v10；apply 会自动使用已打开 vault 的 key，同时继续读取 v1-v6。
 
 ### 3.1 真实发布 Golden Vault 与旧 Reader 边界
 
@@ -131,6 +133,7 @@ MDBX2 同时收紧以下实现边界：
   元数据的 v1 bundle，并继续读取携带 operation 元数据的 v2 bundle。
 - 离线 bundle v4 增加成对增量 inventory、经过认证的 base 校验、有界可恢复 segment，以及 commit 与 auxiliary 的原子应用，同时保留 v1-v3 reader。
 - 离线 bundle v5/v6 分别为 complete v3 和 incremental v4 逻辑 payload 增加可选、有界的 zstd 表示；trailer 认证未压缩 bincode payload，压缩与未压缩声明长度分别受限，裁剪构建继续支持 v1-v4 并明确拒绝 v5/v6。
+- 离线 bundle v7/v8 分别为 complete 与 incremental payload 增加 keyed HMAC-SHA-256 信封，v9/v10 将同一认证契约与 zstd 组合。认证 trailer 绑定版本化有界 header 和逻辑 payload 摘要，增量 resume 摘要保持稳定；reader 继续支持 v1-v6，而 v7-v10 在没有匹配 vault integrity key 时必须 fail closed。
 - 新 snapshot 明确携带 project tags 和 attachment chunks；旧快照缺少这些字段时不清空现有兼容数据。
 - Tiga global/project/entry mutation 的 commit、对象更新、head 和 object version 原子提交。
 - Tiga2 增加版本化策略、精确例外和类型化安全审计；策略状态、覆盖、例外和审计进入同步状态。

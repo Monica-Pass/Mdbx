@@ -59,12 +59,14 @@ use mdbx_storage::vault_content_manifest::{
     VaultContentManifestService, MAX_VAULT_CONTENT_MANIFEST_BYTES,
 };
 use mdbx_sync::{
-    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits,
-    write_bundle_with_compression, write_incremental_bundle_with_compression, BundleCompression,
-    BundleReadLimits, CommitBatch, CommitOperationMetadata, IncrementalBundleCheckpoint,
-    IncrementalBundleManifest, IncrementalBundleResume, IncrementalCommitInventoryEntry,
-    IncrementalDeltaInventoryEntry, IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit,
-    SyncBundleFile, TombstoneRecord, INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
+    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits_authenticated,
+    write_bundle_with_compression, write_bundle_with_compression_authenticated,
+    write_incremental_bundle_with_compression,
+    write_incremental_bundle_with_compression_authenticated, BundleCompression, BundleReadLimits,
+    CommitBatch, CommitOperationMetadata, IncrementalBundleCheckpoint, IncrementalBundleManifest,
+    IncrementalBundleResume, IncrementalCommitInventoryEntry, IncrementalDeltaInventoryEntry,
+    IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit, SyncBundleFile, TombstoneRecord,
+    INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
 };
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -520,6 +522,9 @@ enum SyncAction {
         /// Bundle 压缩格式；默认保持兼容的未压缩 v3/v4
         #[arg(long, value_enum, default_value = "none")]
         compression: BundleCompressionCli,
+        /// 使用当前 vault 完整性子密钥写入 v7-v10 认证 envelope
+        #[arg(long)]
+        authenticated: bool,
     },
     /// 导入同步包
     Apply {
@@ -2013,16 +2018,32 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
             base_checkpoint,
             result_checkpoint,
             compression,
+            authenticated,
         } => {
             let compression = resolve_bundle_compression(compression)?;
+            let integrity_key = if authenticated {
+                Some(sync_bundle_integrity_key(conn)?)
+            } else {
+                None
+            };
             let mut file = std::fs::File::create(&output)
                 .map_err(|e| format!("failed to create bundle '{}': {}", output.display(), e))?;
             if let Some(base_path) = base_checkpoint {
                 let base = read_cli_sync_checkpoint(&base_path, &vault_id(conn)?)?;
                 let bundle =
                     export_incremental_sync_segment(conn, &base.checkpoint, base.resume.as_ref())?;
-                write_incremental_bundle_with_compression(&bundle, &mut file, compression)
-                    .map_err(|e| format!("incremental bundle write failed: {e}"))?;
+                match integrity_key {
+                    Some(key) => write_incremental_bundle_with_compression_authenticated(
+                        &bundle,
+                        &mut file,
+                        compression,
+                        key,
+                    ),
+                    None => {
+                        write_incremental_bundle_with_compression(&bundle, &mut file, compression)
+                    }
+                }
+                .map_err(|e| format!("incremental bundle write failed: {e}"))?;
                 file.sync_all()
                     .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
                 if let Some(path) = result_checkpoint {
@@ -2044,8 +2065,16 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
                 );
             } else {
                 let bundle = export_sync_bundle(conn)?;
-                write_bundle_with_compression(&bundle, &mut file, compression)
-                    .map_err(|e| format!("bundle write failed: {e}"))?;
+                match integrity_key {
+                    Some(key) => write_bundle_with_compression_authenticated(
+                        &bundle,
+                        &mut file,
+                        compression,
+                        key,
+                    ),
+                    None => write_bundle_with_compression(&bundle, &mut file, compression),
+                }
+                .map_err(|e| format!("bundle write failed: {e}"))?;
                 file.sync_all()
                     .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
                 if let Some(path) = result_checkpoint {
@@ -2063,8 +2092,13 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
         SyncAction::Apply { file, checkpoint } => {
             let mut input = std::fs::File::open(&file)
                 .map_err(|e| format!("failed to open bundle '{}': {}", file.display(), e))?;
-            let bundle = read_bundle_file_with_limits(&mut input, BundleReadLimits::desktop())
-                .map_err(|e| format!("bundle read failed: {}", e))?;
+            let integrity_key = sync_bundle_integrity_key(conn)?;
+            let bundle = read_bundle_file_with_limits_authenticated(
+                &mut input,
+                BundleReadLimits::desktop(),
+                integrity_key,
+            )
+            .map_err(|e| format!("bundle read failed: {}", e))?;
             let summary = match bundle {
                 SyncBundleFile::Complete(bundle) => apply_sync_bundle(conn, &bundle)?,
                 SyncBundleFile::Incremental(bundle) => {
@@ -2113,6 +2147,12 @@ fn resolve_bundle_compression(
         );
     }
     Ok(compression)
+}
+
+fn sync_bundle_integrity_key(conn: &VaultConnection) -> Result<&[u8], String> {
+    conn.keyring()
+        .map(|keyring| keyring.integrity_subkey.as_slice())
+        .ok_or_else(|| "sync bundle authentication requires an unlocked vault keyring".to_string())
 }
 
 fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
@@ -4716,6 +4756,7 @@ mod tests {
                     base_checkpoint: None,
                     result_checkpoint: None,
                     compression: BundleCompressionCli::None,
+                    authenticated: false,
                 },
             },
         ))
@@ -4780,6 +4821,86 @@ mod tests {
             EntryRepo::list_by_project(&core_target_conn, &core_project.project_id).unwrap();
         assert_eq!(core_entries.len(), 1);
         assert_eq!(entry_title(&core_entries[0]), "Synced Login");
+
+        let _ = std::fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn cli_authenticated_bundle_requires_matching_vault_integrity_key() {
+        let source = TempVault::new();
+        let matching_target = TempVault::new();
+        let unrelated_target = TempVault::new();
+        let source_path = source.path();
+        let matching_target_path = matching_target.path();
+        let unrelated_target_path = unrelated_target.path();
+        let bundle_path = sync_bundle_path();
+
+        run(init_cli(&source_path)).unwrap();
+        backup_vault(&source_path, &matching_target_path);
+        run(init_cli(&unrelated_target_path)).unwrap();
+        run(cli(
+            &source_path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "Authenticated Sync Project".to_string(),
+                    group: Some("authenticated".to_string()),
+                },
+            },
+        ))
+        .unwrap();
+
+        run(cli(
+            &source_path,
+            Commands::Sync {
+                action: SyncAction::Bundle {
+                    output: bundle_path.clone(),
+                    base_checkpoint: None,
+                    result_checkpoint: None,
+                    compression: BundleCompressionCli::None,
+                    authenticated: true,
+                },
+            },
+        ))
+        .unwrap();
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            mdbx_sync::AUTHENTICATED_BUNDLE_VERSION
+        );
+
+        run(cli(
+            &matching_target_path,
+            Commands::Sync {
+                action: SyncAction::Apply {
+                    file: bundle_path.clone(),
+                    checkpoint: None,
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            ProjectRepo::list_all(&open_unlocked(&matching_target_path))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let error = run(cli(
+            &unrelated_target_path,
+            Commands::Sync {
+                action: SyncAction::Apply {
+                    file: bundle_path.clone(),
+                    checkpoint: None,
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(error.contains("HMAC-SHA-256 mismatch"));
+        assert!(
+            ProjectRepo::list_all(&open_unlocked(&unrelated_target_path))
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = std::fs::remove_file(bundle_path);
     }
@@ -5049,6 +5170,7 @@ mod tests {
                     base_checkpoint: Some(sender_base.clone()),
                     result_checkpoint: Some(sender_first.clone()),
                     compression: BundleCompressionCli::Zstd,
+                    authenticated: true,
                 },
             },
         ))
@@ -5056,7 +5178,7 @@ mod tests {
         let first_bundle_bytes = std::fs::read(&first_bundle).unwrap();
         assert_eq!(
             u32::from_le_bytes(first_bundle_bytes[8..12].try_into().unwrap()),
-            6
+            mdbx_sync::AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
         );
         let first_result = read_cli_sync_checkpoint(&sender_first, &vault_id).unwrap();
         assert!(first_result.resume.is_some());
@@ -5105,10 +5227,16 @@ mod tests {
                     base_checkpoint: Some(sender_first.clone()),
                     result_checkpoint: Some(sender_second.clone()),
                     compression: BundleCompressionCli::None,
+                    authenticated: true,
                 },
             },
         ))
         .unwrap();
+        let second_bundle_bytes = std::fs::read(&second_bundle).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(second_bundle_bytes[8..12].try_into().unwrap()),
+            mdbx_sync::AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+        );
         run(cli(
             &target_path,
             Commands::Sync {
@@ -5162,25 +5290,44 @@ mod tests {
     }
 
     #[test]
-    fn sync_bundle_cli_defaults_to_none_and_accepts_zstd() {
+    fn sync_bundle_cli_defaults_to_legacy_and_accepts_authenticated_zstd() {
         let default = Cli::try_parse_from(["mdbx", "sync", "bundle"]).unwrap();
         let Commands::Sync {
-            action: SyncAction::Bundle { compression, .. },
+            action:
+                SyncAction::Bundle {
+                    compression,
+                    authenticated,
+                    ..
+                },
         } = default.command
         else {
             panic!("sync bundle command was not parsed");
         };
         assert_eq!(compression, BundleCompressionCli::None);
+        assert!(!authenticated);
 
-        let compressed =
-            Cli::try_parse_from(["mdbx", "sync", "bundle", "--compression", "zstd"]).unwrap();
+        let compressed = Cli::try_parse_from([
+            "mdbx",
+            "sync",
+            "bundle",
+            "--compression",
+            "zstd",
+            "--authenticated",
+        ])
+        .unwrap();
         let Commands::Sync {
-            action: SyncAction::Bundle { compression, .. },
+            action:
+                SyncAction::Bundle {
+                    compression,
+                    authenticated,
+                    ..
+                },
         } = compressed.command
         else {
             panic!("compressed sync bundle command was not parsed");
         };
         assert_eq!(compression, BundleCompressionCli::Zstd);
+        assert!(authenticated);
     }
 
     #[cfg(not(feature = "sync-compression"))]
