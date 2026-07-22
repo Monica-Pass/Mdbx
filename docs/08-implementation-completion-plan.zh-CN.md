@@ -1,6 +1,6 @@
 # MDBX 实现补完计划
 
-版本：`MDBX-1-DRAFT`
+版本：`MDBX2 / MDBX-2`
 
 本文是执行文档。它把原始设计清单、现有 `mdbx/` Rust 实现、后续 Monica Android 接入放到同一张路线图里。后续开发应优先更新本文，再按本文推进代码。
 
@@ -30,7 +30,7 @@ MDBX 必须坚持：
 - Unlock storage core 支持密码/PIN/security key/password_security_key，Argon2id 参数按 Tiga 区分，密码做 Unicode NFC；CLI 当前只支持密码/PIN 解锁，真实 FIDO/WebAuthn/security-key 交互仍是客户端后续边界。
 - KDBX JSON import/export 具备基本回环；这是互操作 JSON 中间表示，不是完整二进制 `.kdbx` 解析/写入。
 - conflict detector 支持 JSON 三方字段合并。
-- snapshot、recovery、benchmark harness 已有 MVP 骨架。
+- snapshot、recovery 与 benchmark harness 已形成可验证实现；benchmark 发布报告覆盖 encrypted/compatibility 双模式。
 
 上一轮已补强：
 
@@ -98,11 +98,11 @@ MDBX 必须坚持：
 
 ### 3.4 性能与增量
 
-- benchmark harness 已有，但还没有形成可发布报告。
-- 缺少云盘 delta 观测：小修改、附件改名、附件替换、snapshot、compaction。
-- 完整同步状态已经增加独立的字节和行数限制；大规模 vault 后续仍需增量状态传输协议。
+- benchmark harness 已形成 release 发布报告；CLI 默认使用正式 Multi password、verified keyring 与 `MDBXFE2` 字段加密，并保留 compatibility 参照模式。
+- 小修改、附件改名、附件替换、snapshot、compaction 和真实 sync delta envelope 均已输出时延与操作相关字节数。
+- 有界完整状态保留为首次同步和旧 peer 回退；commit/delta 双 checkpoint、bundle v4 分段与恢复链已提供大规模增量传输。
 - 尚未引入 zstd/MessagePack 等二进制序列化/压缩策略。
-- external-hash-ref 的 Provider 间 Blob 传输尚未实现；跨进程清理与导入的强协调仍需 Provider lease 协议。
+- external-hash-ref 已具备有界、可恢复、密文校验的 Provider 间 Blob 传输；默认文件系统 Provider 使用带 owner/expiry 的持久 lease，另一实例的清理会观察活动 lease。
 - CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。
 
 ### 3.5 安全
@@ -184,9 +184,9 @@ MDBX 必须坚持：
 - external-hash-ref 模式已完成。
 - 附件 Blob 内容寻址目录和可插拔加密 Blob Provider 已完成。
 - 显式引用扫描和加密孤儿回收已完成。
-- 增加 Provider 间 Blob 传输和跨进程 lease 协议。
-- metadata-only 更新不触碰 chunk。
-- benchmark 输出 delta size 和时延报告。
+- Provider 间 Blob 传输和跨进程 lease 协议已完成。
+- metadata-only 更新不触碰 chunk。（已完成）
+- benchmark 输出 delta size 和时延报告。（已完成；encrypted 为默认发布模式）
 - 可选 zstd 压缩和二进制 payload 序列化。
 
 验收：
