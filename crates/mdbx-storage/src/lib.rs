@@ -19,6 +19,7 @@ pub mod integrity_root;
 pub mod key_epoch;
 pub mod migration;
 pub mod object_disclosure;
+pub mod object_metadata_disclosure;
 pub mod recovery;
 pub mod repo;
 pub mod rollback_anchor;

@@ -112,6 +112,14 @@ schema 必须支持：
 
 每页只能包含 1 到 200 项，按更新时间与稳定 ID 降序执行 keyset 分页，并返回绑定方向、owner、collection 和可选 relation-kind 过滤条件的版本化不透明游标。按 ID 查询 relation/label 摘要时保留删除状态，列表页只返回 active row。完整记录 repo 继续作为兼容及显式 payload 接口，不得作为 collection 或关系图的默认遍历路径。
 
+## 5.3 通用元数据披露边界
+
+显式读取 relation payload 时，必须同时对 source Entry 与 target Entry 执行 `RevealSecret` 授权，并分别保留两个决定；显式读取 label payload 时，必须使用所属 collection 的 Project scope。该规则复用既有 scope，不能仅为了披露 payload 就把 Relation/Label 新增为持久化 scope 类型。
+
+scope 路由可以查询稳定的 endpoint/collection ID，但不得查询 payload 密文。路由、全部 scope 求值、拒绝或成功审计、删除状态检查、资源门禁和认证解密必须位于同一个 immediate transaction。任一必需 scope 不允许时，结果返回全部 scoped decision 且 payload 为空；不得检查删除状态、调用 `length(payload_ct)`、载入 BLOB 或解密。relation 的关联决定使用同一个无 commit 的 operation ID。
+
+relation 与 label 披露共同使用 8 MiB 默认明文上限、64 MiB 硬上限、带 128 KiB 信封预留的载入前密文长度门禁，以及解密后的实际明文复核。只有真正返回明文时才能续期活动会话。原有完整 metadata 读取继续保持字节/API 兼容，不能被重新宣称为策略感知接口。
+
 ## 6. 写入路径要求
 
 日常小修改绝不能在逻辑层面导致整个 vault 内容被全量重写。

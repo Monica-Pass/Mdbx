@@ -288,6 +288,22 @@ impl From<AuthorizationDecision> for MdbxAuthorizationDecision {
     }
 }
 
+/// One authorization decision together with the exact existing Tiga scope that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxScopedAuthorizationDecision {
+    pub scope: MdbxTigaScope,
+    pub decision: MdbxAuthorizationDecision,
+}
+
+impl From<ScopedAuthorizationDecision> for MdbxScopedAuthorizationDecision {
+    fn from(value: ScopedAuthorizationDecision) -> Self {
+        Self {
+            scope: scope_from_core(value.scope),
+            decision: value.decision.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum MdbxPolicyCompliance {
     Compliant,
@@ -617,7 +633,9 @@ use mdbx_storage::key_epoch::{KeyEpochRotationResult, KeyEpochService};
 use mdbx_storage::repo::CommitContext;
 use mdbx_storage::rollback_anchor::RollbackAnchorService;
 use mdbx_storage::tiga::TigaService;
-use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
+use mdbx_storage::tiga_policy::{
+    ScopedAuthorizationDecision, SecurityAuditEvent, TigaAuthorizationContext,
+};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
 use mdbx_storage::vault_content_manifest::VaultContentManifestService;
 use uuid::Uuid;

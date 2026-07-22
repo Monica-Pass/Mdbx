@@ -120,6 +120,20 @@ When switching to a weaker mode, the UI MUST:
 - require explicit confirmation
 - show which protections become weaker
 
+### 5.1 Per-operation Authorization
+
+Sensitive operations MUST use the policy engine rather than branch directly on a Tiga mode. The stable outcomes are `allow`, `allow-with-constraints`, `require-fresh-authentication`, `require-additional-factor`, and `deny`. Clients MUST enforce returned constraints such as clipboard expiry, clipboard-history exclusion, screen-capture protection, and no plaintext persistence.
+
+### 5.2 Authorization Before Plaintext
+
+MDBX2 treats metadata selection and encrypted payload disclosure as different operations. Object, relation, label, and label-assignment navigation uses bounded summaries; relation and label summaries never select payload ciphertext. Complete-record APIs remain compatibility interfaces and are not safe default disclosure boundaries.
+
+An object payload reveal authorizes its Entry scope. A relation payload reveal authorizes both source and target Entry scopes and preserves both decisions. A label payload reveal authorizes its collection Project scope. Relation and Label are not new persisted Tiga scope types. If any required scope does not allow, no deleted-state check, payload length query, BLOB load, or decrypt may run, and the typed result contains no payload.
+
+Policy routing, all required evaluations, audit recording, deletion checks, resource gates, and authenticated decryption MUST share one immediate transaction. Related relation audit decisions use one non-commit operation ID. Active-session idle time renews only after plaintext is returned.
+
+Object, relation, and label inline payload disclosure defaults to 8 MiB of plaintext and accepts explicit limits only from 1 byte through the 64 MiB hard ceiling. After authorization and deletion checks, storage uses SQL `length(payload_ct)` with a 128 KiB compatible envelope allowance before loading ciphertext, then checks exact plaintext length after authenticated decryption. Large bodies and files use attachment or encrypted-blob streaming boundaries.
+
 ## 6. Key Hierarchy
 
 A compliant implementation SHOULD use a layered hierarchy:

@@ -112,6 +112,14 @@ Relation, label, and label-assignment navigation MUST use bounded summary projec
 
 Pages contain 1 through 200 items, use descending update time plus stable ID keyset ordering, and return a versioned opaque cursor bound to the exact direction, owner, collection, and optional relation-kind filter. By-ID relation and label summaries retain deleted-state visibility, while list pages contain active rows. Complete-record repositories remain compatibility and explicit-payload interfaces, not the default collection or graph traversal path.
 
+## 5.3 Generic Metadata Disclosure Boundary
+
+An explicit relation payload read MUST authorize `RevealSecret` against both endpoint Entry scopes, preserving the source and target decisions independently. An explicit label payload read MUST authorize the owning collection's Project scope. These rules reuse existing scopes; Relation and Label MUST NOT be persisted as new scope types merely to implement payload disclosure.
+
+Scope routing may select stable endpoint or collection IDs, but it MUST NOT select payload ciphertext. Routing, all scope evaluations, denial or success audit rows, deleted-state checks, size gates, and authenticated decryption MUST share one immediate transaction. If any required scope does not allow, the result contains every scoped decision and no payload; deletion state, `length(payload_ct)`, BLOB materialization, and decryption are skipped. Related relation decisions use one shared non-commit operation ID.
+
+Relation and label disclosure share an 8 MiB default plaintext limit, a 64 MiB hard ceiling, the pre-load ciphertext-length gate with 128 KiB envelope allowance, and the post-decrypt exact plaintext check. Active-session idle time is renewed only when plaintext is returned. Existing complete metadata reads remain byte/API compatible and are not reclassified as policy-aware methods.
+
 ## 6. Write Path Requirements
 
 Routine small edits MUST avoid full logical rewrite of the entire vault contents.

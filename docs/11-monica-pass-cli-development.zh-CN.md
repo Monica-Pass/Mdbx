@@ -285,6 +285,8 @@ Monica Pass CLI、TUI、Agent stdio、未来网页收藏夹和邮件客户端都
 
 邮件线程、收藏层级和标签筛选不得调用返回完整 payload 的 relation/label 旧列表来构建页面。UniFFI 客户端应使用 relation summary 的 from/to 分页、label summary 分页，以及 assignment summary 的 object/label 双向分页；游标只能原样继续使用，不能跨方向、owner 或过滤条件复用。完整 metadata API 只用于确实需要解析 payload 的兼容或领域操作。
 
+确实需要 relation payload 时，客户端调用 `reveal_object_relation*`，并分别处理 source/target 两个 scoped decision；任一端要求新鲜认证、额外因素或更高设备能力时都不能显示 payload。需要 label payload 时调用 `reveal_object_label*`，其权限继承 collection Project。两类结果在拒绝时 payload 都为 `None`，客户端不得退回旧完整 API 绕过决定。默认 limits 为 8 MiB，可显式收紧但不能超过 64 MiB；大型邮件或网页内容仍必须走 blob/attachment 流式路径。
+
 ## 5. JSON Agent 接口
 
 传输形式：

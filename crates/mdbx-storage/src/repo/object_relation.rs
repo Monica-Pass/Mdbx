@@ -52,6 +52,13 @@ impl ObjectRelationCreateRequest {
 
 pub struct ObjectRelationRepo;
 
+/// Stable endpoint IDs used to resolve relation disclosure policies without reading payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectRelationAuthorizationContext {
+    pub source_object_id: String,
+    pub target_object_id: String,
+}
+
 impl ObjectRelationRepo {
     pub fn create(
         conn: &VaultConnection,
@@ -141,6 +148,66 @@ impl ObjectRelationRepo {
             )
             .optional()
             .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn get_authorization_context(
+        conn: &VaultConnection,
+        relation_id: &str,
+    ) -> StorageResult<Option<ObjectRelationAuthorizationContext>> {
+        conn.inner()
+            .query_row(
+                "SELECT source_object_id, target_object_id
+                 FROM object_relations WHERE relation_id = ?1",
+                params![relation_id],
+                |row| {
+                    Ok(ObjectRelationAuthorizationContext {
+                        source_object_id: row.get(0)?,
+                        target_object_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn is_deleted(
+        conn: &VaultConnection,
+        relation_id: &str,
+    ) -> StorageResult<Option<bool>> {
+        conn.inner()
+            .query_row(
+                "SELECT deleted FROM object_relations WHERE relation_id = ?1",
+                params![relation_id],
+                |row| Ok(row.get::<_, i32>(0)? != 0),
+            )
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    /// Return stored payload ciphertext length without materializing the BLOB.
+    pub(crate) fn payload_ciphertext_len(
+        conn: &VaultConnection,
+        relation_id: &str,
+    ) -> StorageResult<Option<u64>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT length(payload_ct) FROM object_relations WHERE relation_id = ?1",
+                params![relation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Validation(format!(
+                        "object relation {relation_id} has a negative payload ciphertext length"
+                    ))
+                })
+            })
+            .transpose()
     }
 
     pub fn list_from_object(

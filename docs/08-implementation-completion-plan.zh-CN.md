@@ -59,7 +59,7 @@ MDBX 必须坚持：
 - `mdbx-cli` 已接入 `health`、`benchmark`、`import-kdbx-json`、`export-kdbx-json`；已有 `snapshot create/list/restore` 与 `sync bundle/apply`。
 - 配置过 unlock method 的 vault 在 `mdbx-cli` 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则拒绝执行，防止生产入口静默走 storage legacy/test 明文兼容路径。
 - `mdbx-ffi` 已进入 workspace，作为非 Rust 客户端的通用 UniFFI 边界；当前覆盖 vault/project/generic entry、完整 Tiga2 策略读取与逐操作授权、真实设备能力、迁移检查/显式升级、显式 Tiga 创建、安全密钥材料解锁、组合因素整改和已解锁状态下重设主密码，后续 tag、attachment、sync、conflict、snapshot、diagnostics 等跨语言能力应继续扩展 facade，而不是让客户端直接写表。
-- UniFFI 对象读取已区分 metadata-only selection 与 Tiga disclosure：`get_object_summary`/`list_object_summaries` 不读取 payload，`reveal_object*` 仅在允许决定后返回 `ObjectRecord`，非允许结果保留类型化原因与约束；旧 `get_object`/`list_objects`/`list_entries` 继续作为完整 payload 兼容接口。
+- UniFFI 读取已区分 metadata-only selection 与 Tiga disclosure：`get_object_summary`/`list_object_summaries` 及 relation/label/assignment summary 页面不读取 payload；`reveal_object*` 仅在 Entry 决定允许后返回 `ObjectRecord`；`reveal_object_relation*` 同时保留 source/target Entry 决定；`reveal_object_label*` 继承 collection Project 决定。非允许结果保留类型化原因与约束且不含 payload；旧完整读取继续作为兼容接口。
 - 初始化 `key_epochs.wrapped_epoch_key_ct` 不再写固定 `X'00'` 占位；初始化阶段使用 `mdbx-init-marker-v1` 随机兼容标记，配置或变更 unlock method 后会绑定 `mdbx-active-key-epoch-v1` active epoch wrapping。随机 key rotation、retirement、历史读取、同步合并、Tiga 授权与 UniFFI 已闭环。
 - snapshot payload 已包含 `attachment_chunks`，恢复时可重建 inline/chunked 附件内容；旧的 metadata-only snapshot 仍通过默认空 chunk 列表保持兼容。
 - `external-hash-ref` 已通过通用 `EncryptedBlobStore` 接口实现；默认 CLI 使用 `<vault>.blobs` 内容寻址目录，core 裁剪构建保留引用格式和 Provider 接口并移除文件系统实现。数据库、snapshot 和同步状态携带加密引用，Blob 本体由 Provider 负责传输与保留。

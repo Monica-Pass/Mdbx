@@ -34,4 +34,4 @@ No serialized sync, snapshot, commit, conflict, or object-version shape changes.
 
 Mail threads, bookmark graphs, and classification screens can grow without decrypting every metadata payload or constructing an unbounded result vector. Relation or label payload corruption no longer blocks enough metadata to identify and navigate the affected record; the preserved complete read still reports its authentication failure.
 
-Label names remain decrypted presentation metadata. This ADR does not define Tiga ownership or plaintext disclosure for relation/label payloads; clients that need those payloads still use the complete compatibility methods until a separate multi-scope disclosure contract is designed.
+Label names remain decrypted presentation metadata. Tiga ownership and explicit relation/label payload disclosure are defined separately by ADR-0026; the complete methods remain compatibility interfaces rather than the recommended policy boundary.

@@ -71,6 +71,12 @@ impl ObjectLabelAssignmentCreateRequest {
 
 pub struct ObjectLabelRepo;
 
+/// Collection identity used to resolve label disclosure policy without reading encrypted fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectLabelAuthorizationContext {
+    pub collection_id: String,
+}
+
 impl ObjectLabelRepo {
     pub fn create(
         conn: &VaultConnection,
@@ -154,6 +160,64 @@ impl ObjectLabelRepo {
             )
             .optional()
             .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn get_authorization_context(
+        conn: &VaultConnection,
+        label_id: &str,
+    ) -> StorageResult<Option<ObjectLabelAuthorizationContext>> {
+        conn.inner()
+            .query_row(
+                "SELECT collection_id FROM object_labels WHERE label_id = ?1",
+                params![label_id],
+                |row| {
+                    Ok(ObjectLabelAuthorizationContext {
+                        collection_id: row.get(0)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    pub(crate) fn is_deleted(
+        conn: &VaultConnection,
+        label_id: &str,
+    ) -> StorageResult<Option<bool>> {
+        conn.inner()
+            .query_row(
+                "SELECT deleted FROM object_labels WHERE label_id = ?1",
+                params![label_id],
+                |row| Ok(row.get::<_, i32>(0)? != 0),
+            )
+            .optional()
+            .map_err(StorageError::Database)
+    }
+
+    /// Return stored payload ciphertext length without materializing the BLOB.
+    pub(crate) fn payload_ciphertext_len(
+        conn: &VaultConnection,
+        label_id: &str,
+    ) -> StorageResult<Option<u64>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT length(payload_ct) FROM object_labels WHERE label_id = ?1",
+                params![label_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Validation(format!(
+                        "object label {label_id} has a negative payload ciphertext length"
+                    ))
+                })
+            })
+            .transpose()
     }
 
     pub fn list_by_collection(

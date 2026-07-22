@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
     default_attachment_batch_limits, default_composite_write_operation_limits,
-    default_write_operation_limits, inspect_vault_migration, open_vault,
-    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
-    MdbxAttachmentBatchCommand, MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome,
-    MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError,
+    default_object_metadata_disclosure_limits, default_write_operation_limits,
+    inspect_vault_migration, open_vault, open_vault_with_password_security_key,
+    open_vault_with_security_key, upgrade_vault, MdbxAttachmentBatchCommand,
+    MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
+    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxObjectMetadataDisclosureLimits,
     MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
     MdbxUnlockMethodType, MdbxWriteCommand,
 };
@@ -985,6 +986,96 @@ fn ffi_object_disclosure_is_typed_and_policy_first() {
         .filter(|event| event.operation == MdbxTigaOperation::RevealSecret)
         .collect::<Vec<_>>();
     assert_eq!(reveal_events.len(), 2);
+}
+
+#[test]
+fn ffi_metadata_disclosure_is_typed_for_external_clients() {
+    let vault_path = temp_vault_path("metadata-disclosure");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "metadata disclosure password 12345!".to_string(),
+        "ffi-metadata-disclosure-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let source = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Source".to_string(),
+            r#"{"body":"source"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let target = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Target".to_string(),
+            r#"{"body":"target"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let relation = vault
+        .create_object_relation(
+            source.object_id.clone(),
+            target.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":1}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let label = vault
+        .create_object_label(
+            collection.project_id.clone(),
+            "Important".to_string(),
+            r#"{"color":"red"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(
+        default_object_metadata_disclosure_limits().max_payload_bytes,
+        8 * 1024 * 1024
+    );
+    let relation_result = vault
+        .reveal_object_relation_with_device_context_and_limits(
+            relation.relation_id,
+            standard_device(),
+            MdbxObjectMetadataDisclosureLimits {
+                max_payload_bytes: 1024,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        relation_result.relation.unwrap().payload_json,
+        r#"{"position":1}"#
+    );
+    assert_eq!(
+        relation_result.source_authorization.scope.scope_type,
+        MdbxTigaScopeType::Entry
+    );
+    assert_eq!(
+        relation_result.source_authorization.scope.scope_id,
+        Some(source.object_id)
+    );
+    assert_eq!(
+        relation_result.target_authorization.scope.scope_id,
+        Some(target.object_id)
+    );
+
+    let label_result = vault.reveal_object_label(label.label_id).unwrap();
+    assert_eq!(
+        label_result.label.unwrap().payload_json,
+        r#"{"color":"red"}"#
+    );
+    assert_eq!(
+        label_result.project_authorization.scope,
+        MdbxTigaScope {
+            scope_type: MdbxTigaScopeType::Project,
+            scope_id: Some(collection.project_id),
+        }
+    );
 }
 
 #[test]

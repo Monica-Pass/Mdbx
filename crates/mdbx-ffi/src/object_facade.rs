@@ -52,6 +52,19 @@ pub fn default_object_disclosure_limits() -> MdbxObjectDisclosureLimits {
     }
 }
 
+/// Resource contract shared by policy-authorized relation and label payload disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectMetadataDisclosureLimits {
+    pub max_payload_bytes: u64,
+}
+
+#[uniffi::export]
+pub fn default_object_metadata_disclosure_limits() -> MdbxObjectMetadataDisclosureLimits {
+    MdbxObjectMetadataDisclosureLimits {
+        max_payload_bytes: ObjectMetadataDisclosureLimits::default().max_payload_bytes(),
+    }
+}
+
 /// Typed result of a Tiga-controlled object reveal.
 ///
 /// `object` is present only for Allow or AllowWithConstraints decisions.
@@ -195,6 +208,14 @@ pub struct MdbxObjectRelationRecord {
     pub deleted: bool,
 }
 
+/// Typed dual-scope result. `relation` is absent unless both Entry scopes allow disclosure.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectRelationDisclosureResult {
+    pub relation: Option<MdbxObjectRelationRecord>,
+    pub source_authorization: MdbxScopedAuthorizationDecision,
+    pub target_authorization: MdbxScopedAuthorizationDecision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxObjectRelationSummary {
     pub relation_id: String,
@@ -221,6 +242,13 @@ pub struct MdbxObjectLabelRecord {
     pub payload_json: String,
     pub payload_schema_version: u32,
     pub deleted: bool,
+}
+
+/// Typed collection-policy result. `label` is absent unless the Project scope allows disclosure.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectLabelDisclosureResult {
+    pub label: Option<MdbxObjectLabelRecord>,
+    pub project_authorization: MdbxScopedAuthorizationDecision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -274,6 +302,11 @@ use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::object_disclosure::{
     DisclosedObject, ObjectDisclosureLimits, ObjectDisclosureService,
 };
+use mdbx_storage::object_metadata_disclosure::{
+    ObjectLabelDisclosureResult as StorageObjectLabelDisclosureResult,
+    ObjectMetadataDisclosureLimits, ObjectMetadataDisclosureService,
+    ObjectRelationDisclosureResult as StorageObjectRelationDisclosureResult,
+};
 use mdbx_storage::repo::{
     CommitContext, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectMetadataSummaryRepo,
@@ -282,7 +315,7 @@ use mdbx_storage::repo::{
 
 use super::{
     conservative_ffi_device_context, unix_now, MdbxAuthorizationDecision, MdbxDeviceContext,
-    MdbxFfiError, MdbxVault,
+    MdbxFfiError, MdbxScopedAuthorizationDecision, MdbxVault,
 };
 
 pub(crate) fn entry_for_project(
@@ -410,6 +443,12 @@ fn object_disclosure_limits(
     ObjectDisclosureLimits::new(limits.max_payload_bytes).map_err(Into::into)
 }
 
+fn object_metadata_disclosure_limits(
+    limits: MdbxObjectMetadataDisclosureLimits,
+) -> Result<ObjectMetadataDisclosureLimits, MdbxFfiError> {
+    ObjectMetadataDisclosureLimits::new(limits.max_payload_bytes).map_err(Into::into)
+}
+
 fn object_summary_from_core(summary: ObjectSummary) -> MdbxObjectSummary {
     MdbxObjectSummary {
         object_id: summary.object_id,
@@ -443,6 +482,20 @@ fn object_relation_record(
     })
 }
 
+fn object_relation_disclosure_result(
+    result: StorageObjectRelationDisclosureResult,
+) -> Result<MdbxObjectRelationDisclosureResult, MdbxFfiError> {
+    Ok(MdbxObjectRelationDisclosureResult {
+        relation: result
+            .relation
+            .as_ref()
+            .map(object_relation_record)
+            .transpose()?,
+        source_authorization: result.source_authorization.into(),
+        target_authorization: result.target_authorization.into(),
+    })
+}
+
 fn object_relation_summary_from_core(summary: ObjectRelationSummary) -> MdbxObjectRelationSummary {
     MdbxObjectRelationSummary {
         relation_id: summary.relation_id,
@@ -471,6 +524,15 @@ fn object_label_record(
         payload_json: serde_json::to_string(&payload)?,
         payload_schema_version: label.payload_schema_version,
         deleted: label.deleted,
+    })
+}
+
+fn object_label_disclosure_result(
+    result: StorageObjectLabelDisclosureResult,
+) -> Result<MdbxObjectLabelDisclosureResult, MdbxFfiError> {
+    Ok(MdbxObjectLabelDisclosureResult {
+        label: result.label.as_ref().map(object_label_record).transpose()?,
+        project_authorization: result.project_authorization.into(),
     })
 }
 
@@ -769,6 +831,63 @@ impl MdbxVault {
         )
     }
 
+    /// Reveal a relation payload only after both endpoint Entry policies allow it.
+    pub fn reveal_object_relation(
+        &self,
+        relation_id: String,
+    ) -> Result<MdbxObjectRelationDisclosureResult, MdbxFfiError> {
+        self.reveal_object_relation_with_limits(
+            relation_id,
+            default_object_metadata_disclosure_limits(),
+        )
+    }
+
+    pub fn reveal_object_relation_with_limits(
+        &self,
+        relation_id: String,
+        limits: MdbxObjectMetadataDisclosureLimits,
+    ) -> Result<MdbxObjectRelationDisclosureResult, MdbxFfiError> {
+        self.reveal_object_relation_with_device_context_and_limits(
+            relation_id,
+            conservative_ffi_device_context(),
+            limits,
+        )
+    }
+
+    pub fn reveal_object_relation_with_device_context(
+        &self,
+        relation_id: String,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxObjectRelationDisclosureResult, MdbxFfiError> {
+        self.reveal_object_relation_with_device_context_and_limits(
+            relation_id,
+            device,
+            default_object_metadata_disclosure_limits(),
+        )
+    }
+
+    pub fn reveal_object_relation_with_device_context_and_limits(
+        &self,
+        relation_id: String,
+        device: MdbxDeviceContext,
+        limits: MdbxObjectMetadataDisclosureLimits,
+    ) -> Result<MdbxObjectRelationDisclosureResult, MdbxFfiError> {
+        let limits = object_metadata_disclosure_limits(limits)?;
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let device = device.into_core(&self.device_id);
+        object_relation_disclosure_result(
+            ObjectMetadataDisclosureService::reveal_relation_with_active_session_and_limits(
+                &mut conn,
+                &relation_id,
+                &device,
+                unix_now(),
+                limits,
+            )?,
+        )
+    }
+
+    /// MDBX1/MDBX2-compatible complete-payload read. New clients should use the summary and
+    /// explicit multi-scope disclosure methods.
     pub fn get_object_relation(
         &self,
         relation_id: String,
@@ -925,6 +1044,60 @@ impl MdbxVault {
             .transpose()
     }
 
+    /// Reveal a label payload only after its collection Project policy allows it.
+    pub fn reveal_object_label(
+        &self,
+        label_id: String,
+    ) -> Result<MdbxObjectLabelDisclosureResult, MdbxFfiError> {
+        self.reveal_object_label_with_limits(label_id, default_object_metadata_disclosure_limits())
+    }
+
+    pub fn reveal_object_label_with_limits(
+        &self,
+        label_id: String,
+        limits: MdbxObjectMetadataDisclosureLimits,
+    ) -> Result<MdbxObjectLabelDisclosureResult, MdbxFfiError> {
+        self.reveal_object_label_with_device_context_and_limits(
+            label_id,
+            conservative_ffi_device_context(),
+            limits,
+        )
+    }
+
+    pub fn reveal_object_label_with_device_context(
+        &self,
+        label_id: String,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxObjectLabelDisclosureResult, MdbxFfiError> {
+        self.reveal_object_label_with_device_context_and_limits(
+            label_id,
+            device,
+            default_object_metadata_disclosure_limits(),
+        )
+    }
+
+    pub fn reveal_object_label_with_device_context_and_limits(
+        &self,
+        label_id: String,
+        device: MdbxDeviceContext,
+        limits: MdbxObjectMetadataDisclosureLimits,
+    ) -> Result<MdbxObjectLabelDisclosureResult, MdbxFfiError> {
+        let limits = object_metadata_disclosure_limits(limits)?;
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let device = device.into_core(&self.device_id);
+        object_label_disclosure_result(
+            ObjectMetadataDisclosureService::reveal_label_with_active_session_and_limits(
+                &mut conn,
+                &label_id,
+                &device,
+                unix_now(),
+                limits,
+            )?,
+        )
+    }
+
+    /// MDBX1/MDBX2-compatible complete-payload list. New clients should use label summaries and
+    /// explicit policy-aware disclosure.
     pub fn list_object_labels(
         &self,
         collection_id: String,

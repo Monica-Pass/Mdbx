@@ -238,6 +238,8 @@ MDBX2 同时收紧以下实现边界：
 
 通用元数据选择采用同样的 additive 兼容规则。新客户端使用 `get_object_relation_summary`、`list_object_relation_summaries_from`、`list_object_relation_summaries_to`、`get_object_label_summary`、`list_object_label_summaries`，以及按 object/label 双向分页的 assignment summary 接口。这些 payload-free 页面每页限制为 1 到 200 项，并使用绑定查询条件的不透明游标。原有完整 relation、label 和 assignment 方法继续供已生成客户端及显式 payload 消费者使用，签名和行为不变。
 
+显式 relation/label payload 访问同样只增加新接口。`reveal_object_relation*` 返回按 source、target 排列的两个 Entry 决定，只有两端都允许时才包含 relation；`reveal_object_label*` 返回 collection Project 决定，只有允许时才包含 label。`default_object_metadata_disclosure_limits` 与显式 limits 变体使用 8 MiB 默认值和 64 MiB 硬上限。relation 的复合审计行共享可空的无 commit operation ID。实现没有增加 Relation/Label Tiga scope、schema row、sync 字段或数据库重写，旧完整 metadata 方法仍保持精确行为。
+
 ### 7.6 Commit 历史读取 API
 
 原有 `MdbxCommitHistoryItem`、`list_commit_history` 与 `get_commit_history` 保持字段布局和方法语义，供上一版生成的客户端继续使用。MDBX2 客户端通过 `MdbxCommitHistoryItemV2`、`list_commit_history_v2` 与 `get_commit_history_v2` 读取可空的稳定分支 ID。返回内容包含 operation 信息、分支、parent、类型化变更摘要和兼容标志；没有 operation 元数据的 MDBX1 commit 仍以兼容摘要显示。游标只能由 storage 返回值继续使用，客户端不得按 offset 重建分页。

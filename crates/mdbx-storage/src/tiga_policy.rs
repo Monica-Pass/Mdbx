@@ -74,7 +74,17 @@ impl AuthorizationEvidence {
         AuditRecordContext {
             evidence: self,
             exception_id,
+            operation_id: None,
             commit_id,
+        }
+    }
+
+    fn audit_context_with_operation<'a>(&'a self, operation_id: &'a str) -> AuditRecordContext<'a> {
+        AuditRecordContext {
+            evidence: self,
+            exception_id: None,
+            operation_id: Some(operation_id),
+            commit_id: None,
         }
     }
 }
@@ -82,6 +92,7 @@ impl AuthorizationEvidence {
 struct AuditRecordContext<'a> {
     evidence: &'a AuthorizationEvidence,
     exception_id: Option<&'a str>,
+    operation_id: Option<&'a str>,
     commit_id: Option<&'a str>,
 }
 
@@ -90,6 +101,20 @@ struct EvaluatedAuthorization {
     decision: AuthorizationDecision,
     evidence: AuthorizationEvidence,
 }
+
+/// One authorization decision kept together with the exact scope that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedAuthorizationDecision {
+    pub scope: TigaScope,
+    pub decision: AuthorizationDecision,
+}
+
+pub(crate) struct CompositeAuthorizationExecution<T> {
+    pub value: Option<T>,
+    pub decisions: Vec<ScopedAuthorizationDecision>,
+}
+
+const MAX_COMPOSITE_AUTHORIZATION_SCOPES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredPolicyOverride {
@@ -647,6 +672,84 @@ impl TigaService {
         }
     }
 
+    /// Evaluate several existing Tiga scopes as one authorization boundary.
+    ///
+    /// Scope order is preserved in the returned decisions. If any scope denies, the plaintext
+    /// action is skipped and every component decision is audited with one shared operation ID.
+    /// Successful executions audit only the component policies that request auditing.
+    pub(crate) fn execute_authorized_scopes<T>(
+        conn: &VaultConnection,
+        scopes: &[TigaScope],
+        operation: TigaOperation,
+        context: TigaAuthorizationContext<'_>,
+        action: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<CompositeAuthorizationExecution<T>> {
+        if scopes.is_empty() || scopes.len() > MAX_COMPOSITE_AUTHORIZATION_SCOPES {
+            return Err(StorageError::Validation(format!(
+                "composite Tiga authorization requires between 1 and {MAX_COMPOSITE_AUTHORIZATION_SCOPES} scopes"
+            )));
+        }
+        for (index, scope) in scopes.iter().enumerate() {
+            if scopes[..index].contains(scope) {
+                return Err(StorageError::Validation(
+                    "composite Tiga authorization scopes must be unique".to_string(),
+                ));
+            }
+        }
+
+        conn.with_immediate_transaction(|| {
+            let evaluated = scopes
+                .iter()
+                .map(|scope| {
+                    Self::evaluate_operation_with_evidence(conn, scope, operation, context)
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            let all_allowed = evaluated
+                .iter()
+                .all(|authorization| decision_allows(&authorization.decision));
+            let operation_id = uuid::Uuid::new_v4().to_string();
+
+            if !all_allowed {
+                for (scope, authorization) in scopes.iter().zip(&evaluated) {
+                    record_authorization_event(
+                        conn,
+                        scope,
+                        operation,
+                        context,
+                        &authorization.decision,
+                        authorization
+                            .evidence
+                            .audit_context_with_operation(&operation_id),
+                    )?;
+                }
+                return Ok(CompositeAuthorizationExecution {
+                    value: None,
+                    decisions: scoped_decisions(scopes, evaluated),
+                });
+            }
+
+            let value = action()?;
+            for (scope, authorization) in scopes.iter().zip(&evaluated) {
+                if authorization.decision.audit_required {
+                    record_authorization_event(
+                        conn,
+                        scope,
+                        operation,
+                        context,
+                        &authorization.decision,
+                        authorization
+                            .evidence
+                            .audit_context_with_operation(&operation_id),
+                    )?;
+                }
+            }
+            Ok(CompositeAuthorizationExecution {
+                value: Some(value),
+                decisions: scoped_decisions(scopes, evaluated),
+            })
+        })
+    }
+
     pub(crate) fn execute_authorized_mut<T>(
         conn: &mut VaultConnection,
         scope: &TigaScope,
@@ -1069,6 +1172,21 @@ fn decision_allows(decision: &AuthorizationDecision) -> bool {
     )
 }
 
+fn scoped_decisions(
+    scopes: &[TigaScope],
+    evaluated: Vec<EvaluatedAuthorization>,
+) -> Vec<ScopedAuthorizationDecision> {
+    scopes
+        .iter()
+        .cloned()
+        .zip(evaluated)
+        .map(|(scope, authorization)| ScopedAuthorizationDecision {
+            scope,
+            decision: authorization.decision,
+        })
+        .collect()
+}
+
 fn record_resolution_denial(
     conn: &VaultConnection,
     scope: &TigaScope,
@@ -1123,10 +1241,17 @@ fn record_authorization_event(
     decision: &AuthorizationDecision,
     audit: AuditRecordContext<'_>,
 ) -> StorageResult<()> {
-    let operation_id = audit
-        .commit_id
-        .map(|commit_id| operation_id_for_commit(conn, commit_id))
-        .transpose()?;
+    let operation_id = match (audit.operation_id, audit.commit_id) {
+        (Some(operation_id), None) => Some(operation_id.to_string()),
+        (None, Some(commit_id)) => Some(operation_id_for_commit(conn, commit_id)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(StorageError::Validation(
+                "security audit context cannot supply both an operation ID and a commit"
+                    .to_string(),
+            ));
+        }
+    };
     let event = SecurityAuditEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         occurred_at: chrono::DateTime::from_timestamp(context.now_unix_secs, 0)

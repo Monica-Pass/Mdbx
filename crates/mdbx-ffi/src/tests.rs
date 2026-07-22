@@ -1364,6 +1364,236 @@ fn ffi_object_disclosure_power_denial_precedes_oversized_payload() {
 }
 
 #[test]
+fn ffi_metadata_disclosure_returns_typed_scopes_payloads_and_limits() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Metadata disclosure collection".to_string())
+        .unwrap();
+    let source = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Source".to_string(),
+            r#"{"body":"source"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let target = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Target".to_string(),
+            r#"{"body":"target"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let relation = vault
+        .create_object_relation(
+            source.object_id.clone(),
+            target.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":1}"#.to_string(),
+            2,
+        )
+        .unwrap();
+    let label = vault
+        .create_object_label(
+            collection.project_id.clone(),
+            "Important".to_string(),
+            r#"{"color":"red"}"#.to_string(),
+            3,
+        )
+        .unwrap();
+
+    assert_eq!(
+        default_object_metadata_disclosure_limits().max_payload_bytes,
+        8 * 1024 * 1024
+    );
+    let relation_result = vault.reveal_object_relation(relation.relation_id).unwrap();
+    assert_eq!(
+        relation_result.relation.unwrap().payload_json,
+        r#"{"position":1}"#
+    );
+    assert_eq!(
+        relation_result.source_authorization.scope.scope_type,
+        MdbxTigaScopeType::Entry
+    );
+    assert_eq!(
+        relation_result.source_authorization.scope.scope_id,
+        Some(source.object_id)
+    );
+    assert_eq!(
+        relation_result.target_authorization.scope.scope_type,
+        MdbxTigaScopeType::Entry
+    );
+    assert_eq!(
+        relation_result.target_authorization.scope.scope_id,
+        Some(target.object_id)
+    );
+
+    let too_small = vault
+        .reveal_object_label_with_limits(
+            label.label_id.clone(),
+            MdbxObjectMetadataDisclosureLimits {
+                max_payload_bytes: 4,
+            },
+        )
+        .unwrap_err();
+    assert!(too_small
+        .to_string()
+        .contains("object label plaintext payload bytes"));
+    let label_result = vault.reveal_object_label(label.label_id.clone()).unwrap();
+    assert_eq!(
+        label_result.label.unwrap().payload_json,
+        r#"{"color":"red"}"#
+    );
+    assert_eq!(
+        label_result.project_authorization.scope.scope_type,
+        MdbxTigaScopeType::Project
+    );
+    assert_eq!(
+        label_result.project_authorization.scope.scope_id,
+        Some(collection.project_id)
+    );
+
+    for invalid in [0, 64 * 1024 * 1024 + 1] {
+        let error = vault
+            .reveal_object_label_with_limits(
+                label.label_id.clone(),
+                MdbxObjectMetadataDisclosureLimits {
+                    max_payload_bytes: invalid,
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("object metadata disclosure max_payload_bytes must be between"));
+    }
+}
+
+#[test]
+fn ffi_metadata_disclosure_denial_precedes_corrupted_payloads() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Metadata denial collection".to_string())
+        .unwrap();
+    let source = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Source".to_string(),
+            r#"{"body":"source"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let target = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Target".to_string(),
+            r#"{"body":"target"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let relation = vault
+        .create_object_relation(
+            source.object_id.clone(),
+            target.object_id.clone(),
+            "com.monica.mail.reply-to".to_string(),
+            r#"{"position":1}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    let label = vault
+        .create_object_label(
+            collection.project_id.clone(),
+            "Denied".to_string(),
+            r#"{"color":"red"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET tiga_mode_override = 'power' WHERE entry_id = ?1",
+                [&target.object_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE object_relations SET payload_ct = zeroblob(?2) WHERE relation_id = ?1",
+                rusqlite::params![&relation.relation_id, 256 * 1024],
+            )
+            .unwrap();
+    }
+
+    let denied_relation = vault
+        .reveal_object_relation_with_limits(
+            relation.relation_id.clone(),
+            MdbxObjectMetadataDisclosureLimits {
+                max_payload_bytes: 16,
+            },
+        )
+        .unwrap();
+    assert!(denied_relation.relation.is_none());
+    assert!(matches!(
+        denied_relation.source_authorization.decision.outcome,
+        MdbxAuthorizationOutcome::Allow | MdbxAuthorizationOutcome::AllowWithConstraints
+    ));
+    assert!(!matches!(
+        denied_relation.target_authorization.decision.outcome,
+        MdbxAuthorizationOutcome::Allow | MdbxAuthorizationOutcome::AllowWithConstraints
+    ));
+    assert!(vault
+        .get_object_relation(relation.relation_id)
+        .unwrap_err()
+        .to_string()
+        .contains("crypto error"));
+    let relation_events = vault
+        .list_security_audit_events_v2(10)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.operation == MdbxTigaOperation::RevealSecret)
+        .collect::<Vec<_>>();
+    assert_eq!(relation_events.len(), 2);
+    let operation_id = relation_events[0].operation_id.as_ref().unwrap();
+    assert!(relation_events
+        .iter()
+        .all(|event| event.operation_id.as_ref() == Some(operation_id)));
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE projects SET tiga_mode_override = 'power' WHERE project_id = ?1",
+                [&collection.project_id],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE object_labels SET payload_ct = X'00' WHERE label_id = ?1",
+                [&label.label_id],
+            )
+            .unwrap();
+    }
+    let denied_label = vault.reveal_object_label(label.label_id.clone()).unwrap();
+    assert!(denied_label.label.is_none());
+    assert_eq!(
+        denied_label.project_authorization.scope,
+        MdbxTigaScope {
+            scope_type: MdbxTigaScopeType::Project,
+            scope_id: Some(collection.project_id.clone()),
+        }
+    );
+    assert!(vault
+        .list_object_labels(collection.project_id)
+        .unwrap_err()
+        .to_string()
+        .contains("crypto error"));
+}
+
+#[test]
 fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
     let conn = VaultConnection::open_in_memory().unwrap();
     initialize_vault(&conn, &VaultInitParams::default()).unwrap();
