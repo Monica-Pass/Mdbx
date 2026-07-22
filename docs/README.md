@@ -31,6 +31,11 @@ Chinese versions are provided for direct review and planning:
 - `09-mdbx2-compatibility.md` / `09-mdbx2-compatibility.zh-CN.md`
 - `11-monica-pass-cli-development.zh-CN.md`
 
+Measured implementation reports:
+
+- `benchmark-report.md`
+  - Reproducible release benchmark metadata, results, dataset, and interpretation limits.
+
 ## Reading Order
 
 If you are a lower-capability implementation model, read these files in order and obey them strictly:
@@ -90,6 +95,9 @@ If you are a Chinese-speaking reviewer, read these files in order:
 
 - `11-monica-pass-cli-development.zh-CN.md`
   - Monica Pass CLI development and integration notes.
+
+- `benchmark-report.md`
+  - Measured release benchmark results and reproducibility notes. This is an implementation report, not a normative specification.
 
 ## Non-Negotiable Principles
 

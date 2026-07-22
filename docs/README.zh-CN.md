@@ -55,6 +55,11 @@ MDBX 是一种本地优先的高级加密数据库格式与参考架构。密码
 10. `09-mdbx2-compatibility.zh-CN.md`
 11. `11-monica-pass-cli-development.zh-CN.md`
 
+实测实现报告：
+
+- `benchmark-report.md`
+  - release benchmark 的运行环境、结果、固定数据集与解释限制。
+
 ## 文档职责
 
 - `00-agent-rules.md` / `00-agent-rules.zh-CN.md`
@@ -90,6 +95,9 @@ MDBX 是一种本地优先的高级加密数据库格式与参考架构。密码
 
 - `11-monica-pass-cli-development.zh-CN.md`
   - Monica Pass CLI 开发与接入说明。
+
+- `benchmark-report.md`
+  - release benchmark 实测结果与复现说明，属于实现报告，不构成规范性要求。
 
 ## 不可妥协原则
 
