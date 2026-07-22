@@ -601,6 +601,7 @@ fn collect_delta_body(
 
     let state = SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
+        extensions: BTreeMap::new(),
         key_epoch_state: if selected_ids(mutations, "key-epochs").is_empty() {
             None
         } else {

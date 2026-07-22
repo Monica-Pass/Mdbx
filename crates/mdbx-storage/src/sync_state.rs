@@ -16,6 +16,10 @@ pub const DEFAULT_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 96 * 1024 * 1024;
 pub const DEFAULT_MAX_SYNC_STATE_ROWS: usize = 250_000;
 pub const HARD_MAX_SYNC_STATE_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 pub const HARD_MAX_SYNC_STATE_ROWS: usize = 2_000_000;
+const MAX_SYNC_STATE_EXTENSION_FIELDS: usize = 256;
+const MAX_SYNC_STATE_EXTENSION_KEY_BYTES: usize = 128;
+const MAX_SYNC_STATE_EXTENSION_BYTES: usize = 64 * 1024;
+const MAX_SYNC_STATE_EXTENSION_DEPTH: usize = 16;
 pub(crate) const SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v2";
 const PREVIOUS_SYNC_STATE_FORMAT: &str = "mdbx-storage-sync-state-v1";
 const LEGACY_CLI_SYNC_STATE_FORMAT: &str = "mdbx-cli-sync-state-v1";
@@ -101,6 +105,13 @@ pub struct SyncStatePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_receipts: Option<Vec<PurgeReceiptRow>>,
     pub branches: Vec<BranchRow>,
+    /// Unknown non-critical top-level fields from a newer sync-state reader.
+    ///
+    /// Complete-state payloads are forwarded through older storage versions,
+    /// so dropping these fields during a decode/re-encode cycle would strand
+    /// newer metadata. Delta wire envelopes intentionally remain strict.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -397,6 +408,7 @@ pub fn collect_sync_state_with_limits(
     validate_row_limit(count_source_rows(conn)?, limits)?;
     let state = SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
+        extensions: BTreeMap::new(),
         key_epoch_state: Some(load_key_epoch_state(conn)?),
         tiga_vault_state: Some(load_tiga_vault_state(conn)?),
         tiga_policy_overrides: Some(load_tiga_policy_override_rows(conn)?),
@@ -639,7 +651,50 @@ pub fn decode_sync_state_payload_with_limits(
 
 impl SyncStatePayload {
     pub fn validate_resource_limits(&self, limits: SyncStateLimits) -> StorageResult<()> {
+        self.validate_extensions()?;
         validate_row_limit(self.total_rows()?, limits)
+    }
+
+    fn validate_extensions(&self) -> StorageResult<()> {
+        if self.extensions.len() > MAX_SYNC_STATE_EXTENSION_FIELDS {
+            return Err(StorageError::ResourceLimit {
+                resource: "sync state extension fields".to_string(),
+                actual: self.extensions.len() as u64,
+                limit: MAX_SYNC_STATE_EXTENSION_FIELDS as u64,
+            });
+        }
+        let mut total_bytes = 0usize;
+        for (key, value) in &self.extensions {
+            if key.is_empty() || key.len() > MAX_SYNC_STATE_EXTENSION_KEY_BYTES {
+                return Err(StorageError::Validation(format!(
+                    "sync state extension key must contain 1 to {MAX_SYNC_STATE_EXTENSION_KEY_BYTES} bytes"
+                )));
+            }
+            if is_sync_state_known_field(key) {
+                return Err(StorageError::Validation(format!(
+                    "sync state extension cannot shadow known field {key}"
+                )));
+            }
+            validate_extension_value(value, 0)?;
+            let encoded = serde_json::to_vec(value)
+                .map_err(|error| StorageError::SchemaCreation(error.to_string()))?;
+            total_bytes = total_bytes
+                .checked_add(key.len())
+                .and_then(|size| size.checked_add(encoded.len()))
+                .ok_or_else(|| StorageError::ResourceLimit {
+                    resource: "sync state extension bytes".to_string(),
+                    actual: u64::MAX,
+                    limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
+                })?;
+            if total_bytes > MAX_SYNC_STATE_EXTENSION_BYTES {
+                return Err(StorageError::ResourceLimit {
+                    resource: "sync state extension bytes".to_string(),
+                    actual: total_bytes as u64,
+                    limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn total_rows(&self) -> StorageResult<usize> {
@@ -686,6 +741,62 @@ impl SyncStatePayload {
         add(self.branches.len())?;
         Ok(total)
     }
+}
+
+fn is_sync_state_known_field(field: &str) -> bool {
+    matches!(
+        field,
+        "format"
+            | "key_epoch_state"
+            | "tiga_vault_state"
+            | "tiga_policy_overrides"
+            | "tiga_policy_exceptions"
+            | "security_audit_events"
+            | "projects"
+            | "entries"
+            | "object_relations"
+            | "object_labels"
+            | "object_label_assignments"
+            | "attachments"
+            | "attachment_chunks"
+            | "project_tags"
+            | "tombstones"
+            | "tombstone_acknowledgements"
+            | "purge_receipts"
+            | "branches"
+    )
+}
+
+fn validate_extension_value(value: &serde_json::Value, depth: usize) -> StorageResult<()> {
+    if depth > MAX_SYNC_STATE_EXTENSION_DEPTH {
+        return Err(StorageError::ResourceLimit {
+            resource: "sync state extension depth".to_string(),
+            actual: depth as u64,
+            limit: MAX_SYNC_STATE_EXTENSION_DEPTH as u64,
+        });
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_extension_value(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if key.len() > MAX_SYNC_STATE_EXTENSION_KEY_BYTES {
+                    return Err(StorageError::Validation(format!(
+                        "sync state extension object key exceeds {MAX_SYNC_STATE_EXTENSION_KEY_BYTES} bytes"
+                    )));
+                }
+                validate_extension_value(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+    Ok(())
 }
 
 fn count_source_rows(conn: &VaultConnection) -> StorageResult<usize> {
@@ -1292,6 +1403,80 @@ mod tests {
         writer.write_all(b"1234").unwrap();
         assert!(writer.write_all(b"5").is_err());
         assert_eq!(writer.bytes, b"1234");
+    }
+
+    #[test]
+    fn unknown_top_level_fields_survive_sync_state_reencoding() {
+        let (conn, _) = setup();
+        let mut payload = collect_sync_state_payload(&conn).unwrap();
+        let mut encoded: serde_json::Value = serde_json::from_slice(&payload.ciphertext).unwrap();
+        encoded.as_object_mut().unwrap().insert(
+            "com.example.future-metadata".to_string(),
+            serde_json::json!({"revision": 3, "flags": ["a", "b"]}),
+        );
+        payload.ciphertext = serde_json::to_vec(&encoded).unwrap();
+
+        let decoded = decode_sync_state_payload(&payload).unwrap().unwrap();
+        assert_eq!(
+            decoded.extensions.get("com.example.future-metadata"),
+            Some(&serde_json::json!({"revision": 3, "flags": ["a", "b"]}))
+        );
+
+        let reencoded = serialize_state_bounded(&decoded, SyncStateLimits::default()).unwrap();
+        let reencoded: serde_json::Value = serde_json::from_slice(&reencoded).unwrap();
+        assert_eq!(
+            reencoded.get("com.example.future-metadata"),
+            encoded.get("com.example.future-metadata")
+        );
+    }
+
+    #[test]
+    fn sync_state_extensions_are_bounded_and_cannot_shadow_known_fields() {
+        let (conn, _) = setup();
+        let mut state = collect_sync_state(&conn).unwrap();
+        state
+            .extensions
+            .insert("projects".to_string(), serde_json::json!([]));
+        assert!(state
+            .validate_resource_limits(SyncStateLimits::default())
+            .unwrap_err()
+            .to_string()
+            .contains("cannot shadow known field"));
+
+        state.extensions.clear();
+        for index in 0..=MAX_SYNC_STATE_EXTENSION_FIELDS {
+            state
+                .extensions
+                .insert(format!("future-{index}"), serde_json::Value::Null);
+        }
+        assert!(matches!(
+            state.validate_resource_limits(SyncStateLimits::default()),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state extension fields"
+        ));
+
+        state.extensions.clear();
+        state.extensions.insert(
+            "future-large".to_string(),
+            serde_json::Value::String("x".repeat(MAX_SYNC_STATE_EXTENSION_BYTES)),
+        );
+        assert!(matches!(
+            state.validate_resource_limits(SyncStateLimits::default()),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state extension bytes"
+        ));
+
+        state.extensions.clear();
+        let mut nested = serde_json::Value::Null;
+        for _ in 0..=MAX_SYNC_STATE_EXTENSION_DEPTH {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        state.extensions.insert("future-deep".to_string(), nested);
+        assert!(matches!(
+            state.validate_resource_limits(SyncStateLimits::default()),
+            Err(StorageError::ResourceLimit { resource, .. })
+                if resource == "sync state extension depth"
+        ));
     }
 
     #[cfg(feature = "derived-search-index")]
