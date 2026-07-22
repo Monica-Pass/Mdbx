@@ -9,7 +9,7 @@ use crate::error::StorageResult;
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{AttachmentChunkRow, AttachmentRow};
 
-use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value};
+use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, object_merge_apply};
 
 pub(super) fn apply_attachments(
     conn: &VaultConnection,
@@ -189,7 +189,7 @@ fn merge_or_record_attachment_conflict(
     if local_row.deleted != incoming.deleted {
         structural_conflicts.push("deleted".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.project_id,
         &local_row.project_id,
         &incoming.project_id,
@@ -198,10 +198,12 @@ fn merge_or_record_attachment_conflict(
     {
         structural_conflicts.push("project_id".to_string());
     }
-    if merge_value(&base_row.entry_id, &local_row.entry_id, &incoming.entry_id).is_none() {
+    if object_merge_apply::merge_value(&base_row.entry_id, &local_row.entry_id, &incoming.entry_id)
+        .is_none()
+    {
         structural_conflicts.push("entry_id".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.file_name_ct,
         &local_row.file_name_ct,
         &incoming.file_name_ct,
@@ -210,7 +212,7 @@ fn merge_or_record_attachment_conflict(
     {
         structural_conflicts.push("file_name_ct".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.media_type_ct,
         &local_row.media_type_ct,
         &incoming.media_type_ct,
@@ -313,17 +315,21 @@ fn apply_merged_attachment(
          WHERE attachment_id = ?1",
         params![
             incoming.attachment_id,
-            merge_value(&base.project_id, &local.project_id, &incoming.project_id)
-                .unwrap_or_else(|| local.project_id.clone()),
-            merge_value(&base.entry_id, &local.entry_id, &incoming.entry_id)
+            object_merge_apply::merge_value(
+                &base.project_id,
+                &local.project_id,
+                &incoming.project_id
+            )
+            .unwrap_or_else(|| local.project_id.clone()),
+            object_merge_apply::merge_value(&base.entry_id, &local.entry_id, &incoming.entry_id)
                 .unwrap_or_else(|| local.entry_id.clone()),
-            merge_value(
+            object_merge_apply::merge_value(
                 &base.file_name_ct,
                 &local.file_name_ct,
                 &incoming.file_name_ct,
             )
             .unwrap_or_else(|| local.file_name_ct.clone()),
-            merge_value(
+            object_merge_apply::merge_value(
                 &base.media_type_ct,
                 &local.media_type_ct,
                 &incoming.media_type_ct,

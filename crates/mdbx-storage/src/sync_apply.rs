@@ -14,6 +14,8 @@ mod generic_metadata_apply;
 mod key_epoch_apply;
 #[path = "sync_apply/lifecycle.rs"]
 mod lifecycle_apply;
+#[path = "sync_apply/object_merge.rs"]
+mod object_merge_apply;
 #[path = "sync_apply/payload.rs"]
 mod payload_apply;
 #[path = "sync_apply/project.rs"]
@@ -30,6 +32,7 @@ use mdbx_sync::SerializedCommit;
 
 #[cfg(test)]
 use crate::connection::VaultConnection;
+#[cfg(test)]
 use crate::error::{StorageError, StorageResult};
 #[cfg(test)]
 use crate::repo::CommitContext;
@@ -78,33 +81,6 @@ impl SyncApplyRepo {
     ) -> StorageResult<Option<String>> {
         commit_graph_apply::current_branch_head(conn, branch_id, branch_name)
     }
-}
-
-fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, incoming: &T) -> Option<T> {
-    if local == incoming || incoming == base {
-        Some(local.clone())
-    } else if local == base && incoming != base {
-        Some(incoming.clone())
-    } else {
-        None
-    }
-}
-
-fn bump_object_clock(clock: &str) -> String {
-    let counter: u64 = serde_json::from_str::<serde_json::Value>(clock)
-        .ok()
-        .and_then(|v| v.get("counter")?.as_u64())
-        .unwrap_or(0);
-    format!(r#"{{"counter":{}}}"#, counter + 1)
-}
-
-fn validate_payload_schema_version(value: u32) -> StorageResult<()> {
-    if value == 0 {
-        return Err(StorageError::Validation(
-            "payload_schema_version must be greater than zero".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -7,9 +7,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow};
 
-use super::{
-    commit_graph_apply, commit_graph_apply::ObjectDecision, validate_payload_schema_version,
-};
+use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, object_merge_apply};
 
 pub(super) fn apply_object_relations(
     conn: &VaultConnection,
@@ -24,7 +22,7 @@ pub(super) fn apply_object_relations(
         row.relation_kind
             .parse::<mdbx_core::model::RelationKindId>()
             .map_err(StorageError::Validation)?;
-        validate_payload_schema_version(row.payload_schema_version)?;
+        object_merge_apply::validate_payload_schema_version(row.payload_schema_version)?;
         if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
         }
@@ -121,7 +119,7 @@ pub(super) fn apply_object_labels(
         if TombstoneRepo::is_permanently_purged(conn, "object-label", &row.label_id)? {
             continue;
         }
-        validate_payload_schema_version(row.payload_schema_version)?;
+        object_merge_apply::validate_payload_schema_version(row.payload_schema_version)?;
         if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
         }

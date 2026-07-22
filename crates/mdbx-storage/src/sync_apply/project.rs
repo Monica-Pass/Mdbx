@@ -9,9 +9,7 @@ use crate::repo::{
 };
 use crate::sync_state::{ProjectRow, ProjectTagSetRow};
 
-use super::{
-    bump_object_clock, commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value,
-};
+use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, object_merge_apply};
 
 pub(super) fn apply_projects(
     conn: &VaultConnection,
@@ -204,10 +202,12 @@ fn merge_or_record_project_conflict(
     if local_row.deleted != incoming.deleted {
         structural_conflicts.push("deleted".to_string());
     }
-    if merge_value(&base_row.title_ct, &local_row.title_ct, &incoming.title_ct).is_none() {
+    if object_merge_apply::merge_value(&base_row.title_ct, &local_row.title_ct, &incoming.title_ct)
+        .is_none()
+    {
         structural_conflicts.push("title_ct".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.summary_ct,
         &local_row.summary_ct,
         &incoming.summary_ct,
@@ -216,19 +216,27 @@ fn merge_or_record_project_conflict(
     {
         structural_conflicts.push("summary_ct".to_string());
     }
-    if merge_value(&base_row.group_id, &local_row.group_id, &incoming.group_id).is_none() {
+    if object_merge_apply::merge_value(&base_row.group_id, &local_row.group_id, &incoming.group_id)
+        .is_none()
+    {
         structural_conflicts.push("group_id".to_string());
     }
-    if merge_value(&base_row.icon_ref, &local_row.icon_ref, &incoming.icon_ref).is_none() {
+    if object_merge_apply::merge_value(&base_row.icon_ref, &local_row.icon_ref, &incoming.icon_ref)
+        .is_none()
+    {
         structural_conflicts.push("icon_ref".to_string());
     }
-    if merge_value(&base_row.favorite, &local_row.favorite, &incoming.favorite).is_none() {
+    if object_merge_apply::merge_value(&base_row.favorite, &local_row.favorite, &incoming.favorite)
+        .is_none()
+    {
         structural_conflicts.push("favorite".to_string());
     }
-    if merge_value(&base_row.archived, &local_row.archived, &incoming.archived).is_none() {
+    if object_merge_apply::merge_value(&base_row.archived, &local_row.archived, &incoming.archived)
+        .is_none()
+    {
         structural_conflicts.push("archived".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.tiga_mode_override,
         &local_row.tiga_mode_override,
         &incoming.tiga_mode_override,
@@ -237,7 +245,7 @@ fn merge_or_record_project_conflict(
     {
         structural_conflicts.push("tiga_mode_override".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.collection_profile,
         &local_profile,
         &incoming_profile,
@@ -292,7 +300,7 @@ fn apply_merged_project(
         &parents,
     )?;
     let now = chrono::Utc::now().to_rfc3339();
-    let attachment_count = merge_value(
+    let attachment_count = object_merge_apply::merge_value(
         &base.attachment_count,
         &local.attachment_count,
         &incoming.attachment_count,
@@ -306,9 +314,12 @@ fn apply_merged_project(
         .collection_profile
         .clone()
         .or_else(|| base.collection_profile.clone());
-    let collection_profile =
-        merge_value(&base.collection_profile, &local_profile, &incoming_profile)
-            .unwrap_or(local_profile);
+    let collection_profile = object_merge_apply::merge_value(
+        &base.collection_profile,
+        &local_profile,
+        &incoming_profile,
+    )
+    .unwrap_or(local_profile);
 
     conn.inner().execute(
         "UPDATE projects SET title_ct = ?2, summary_ct = ?3, group_id = ?4,
@@ -318,26 +329,30 @@ fn apply_merged_project(
          WHERE project_id = ?1",
         params![
             incoming.project_id,
-            merge_value(&base.title_ct, &local.title_ct, &incoming.title_ct)
+            object_merge_apply::merge_value(&base.title_ct, &local.title_ct, &incoming.title_ct)
                 .unwrap_or_else(|| local.title_ct.clone()),
-            merge_value(&base.summary_ct, &local.summary_ct, &incoming.summary_ct)
-                .unwrap_or_else(|| local.summary_ct.clone()),
-            merge_value(&base.group_id, &local.group_id, &incoming.group_id)
+            object_merge_apply::merge_value(
+                &base.summary_ct,
+                &local.summary_ct,
+                &incoming.summary_ct
+            )
+            .unwrap_or_else(|| local.summary_ct.clone()),
+            object_merge_apply::merge_value(&base.group_id, &local.group_id, &incoming.group_id)
                 .unwrap_or_else(|| local.group_id.clone()),
-            merge_value(&base.icon_ref, &local.icon_ref, &incoming.icon_ref)
+            object_merge_apply::merge_value(&base.icon_ref, &local.icon_ref, &incoming.icon_ref)
                 .unwrap_or_else(|| local.icon_ref.clone()),
-            merge_value(&base.favorite, &local.favorite, &incoming.favorite)
+            object_merge_apply::merge_value(&base.favorite, &local.favorite, &incoming.favorite)
                 .unwrap_or(local.favorite) as i32,
-            merge_value(&base.archived, &local.archived, &incoming.archived)
+            object_merge_apply::merge_value(&base.archived, &local.archived, &incoming.archived)
                 .unwrap_or(local.archived) as i32,
             local.deleted as i32,
-            merge_value(
+            object_merge_apply::merge_value(
                 &base.tiga_mode_override,
                 &local.tiga_mode_override,
                 &incoming.tiga_mode_override,
             )
             .unwrap_or_else(|| local.tiga_mode_override.clone()),
-            bump_object_clock(&local.object_clock),
+            object_merge_apply::bump_object_clock(&local.object_clock),
             commit_id,
             attachment_count as i64,
             now,

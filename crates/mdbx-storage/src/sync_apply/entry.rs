@@ -10,9 +10,7 @@ use crate::repo::{
 };
 use crate::sync_state::EntryRow;
 
-use super::{
-    bump_object_clock, commit_graph_apply, commit_graph_apply::ObjectDecision, merge_value,
-};
+use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, object_merge_apply};
 
 pub(super) fn apply_entries(
     conn: &VaultConnection,
@@ -142,7 +140,7 @@ fn merge_or_record_entry_conflict(
     if local_row.deleted != incoming.deleted {
         structural_conflicts.push("deleted".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.project_id,
         &local_row.project_id,
         &incoming.project_id,
@@ -151,7 +149,7 @@ fn merge_or_record_entry_conflict(
     {
         structural_conflicts.push("project_id".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.entry_type,
         &local_row.entry_type,
         &incoming.entry_type,
@@ -160,10 +158,12 @@ fn merge_or_record_entry_conflict(
     {
         structural_conflicts.push("entry_type".to_string());
     }
-    if merge_value(&base_row.title_ct, &local_row.title_ct, &incoming.title_ct).is_none() {
+    if object_merge_apply::merge_value(&base_row.title_ct, &local_row.title_ct, &incoming.title_ct)
+        .is_none()
+    {
         structural_conflicts.push("title_ct".to_string());
     }
-    if merge_value(
+    if object_merge_apply::merge_value(
         &base_row.tiga_mode_override,
         &local_row.tiga_mode_override,
         &incoming.tiga_mode_override,
@@ -247,13 +247,16 @@ fn apply_merged_entry(
         .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
     let payload_ct = EntryRepo::encrypt_payload_blob(conn, &incoming.entry_id, &payload_plain)?;
     let now = chrono::Utc::now().to_rfc3339();
-    let project_id = merge_value(&base.project_id, &local.project_id, &incoming.project_id)
-        .unwrap_or_else(|| local.project_id.clone());
-    let entry_type = merge_value(&base.entry_type, &local.entry_type, &incoming.entry_type)
-        .unwrap_or_else(|| local.entry_type.clone());
-    let title_ct = merge_value(&base.title_ct, &local.title_ct, &incoming.title_ct)
-        .unwrap_or_else(|| local.title_ct.clone());
-    let tiga_mode_override = merge_value(
+    let project_id =
+        object_merge_apply::merge_value(&base.project_id, &local.project_id, &incoming.project_id)
+            .unwrap_or_else(|| local.project_id.clone());
+    let entry_type =
+        object_merge_apply::merge_value(&base.entry_type, &local.entry_type, &incoming.entry_type)
+            .unwrap_or_else(|| local.entry_type.clone());
+    let title_ct =
+        object_merge_apply::merge_value(&base.title_ct, &local.title_ct, &incoming.title_ct)
+            .unwrap_or_else(|| local.title_ct.clone());
+    let tiga_mode_override = object_merge_apply::merge_value(
         &base.tiga_mode_override,
         &local.tiga_mode_override,
         &incoming.tiga_mode_override,
@@ -277,7 +280,7 @@ fn apply_merged_entry(
                 incoming.payload_schema_version
             ) as i64,
             tiga_mode_override,
-            bump_object_clock(&local.object_clock),
+            object_merge_apply::bump_object_clock(&local.object_clock),
             commit_id,
             now,
             ctx.device_id,
