@@ -29,4 +29,5 @@ pub mod sync_state;
 pub mod tiga;
 pub mod tiga_policy;
 pub mod unlock;
+pub mod vault_content_manifest;
 pub(crate) mod vault_header_integrity;

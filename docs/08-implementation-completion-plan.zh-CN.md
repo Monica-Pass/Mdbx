@@ -110,8 +110,9 @@ MDBX 必须坚持：
 
 - Keyring、Argon2id/HKDF 输出、vault/epoch 解包结果的自动内存清零基线已完成；明文驻留最小化、密钥文件、真实硬件密钥协议、生物识别封装仍需扩展。
 - vault header 元数据 HMAC 基线已完成；外部 rollback anchor 已通过 storage、CLI 和
-  UniFFI 提供，用于检测 append-only inventory 回退；跨所有内容族的单一 whole-vault
-  authentication root 仍未完成。
+  UniFFI 提供，用于检测 append-only inventory 回退；显式 O(vault-size) vault content
+  manifest 已覆盖主 schema、未知扩展表和 typed rows 的精确检查点；自动刷新的增量
+  whole-vault Merkle authentication root 仍未完成。
 - 加密上下文 AAD 已覆盖字段级，但 commit/bundle/snapshot 的认证边界还需统一记录到规范。
 
 ### 3.6 Android 接入

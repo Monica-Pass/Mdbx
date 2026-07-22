@@ -56,6 +56,22 @@ fn rollback_anchor_ffi_roundtrips_opaque_tokens_and_reports_advancement() {
 }
 
 #[test]
+fn content_manifest_ffi_roundtrips_and_rejects_stale_state() {
+    let vault = ffi_test_vault();
+    let token = vault.create_content_manifest().unwrap();
+    let equal = vault.verify_content_manifest(token.clone()).unwrap();
+    assert!(equal.table_count > 0);
+    assert!(equal.row_count > 0);
+
+    vault
+        .create_project("Manifest FFI change".to_string())
+        .unwrap();
+    assert!(vault.verify_content_manifest(token).is_err());
+    let replacement = vault.create_content_manifest().unwrap();
+    assert!(vault.verify_content_manifest(replacement).is_ok());
+}
+
+#[test]
 fn ffi_wire_session_roundtrips_blob_messages_and_sequences() {
     let limit = default_sync_wire_payload_bytes();
     let sender = create_sync_wire_session("wire-session".to_string(), limit).unwrap();

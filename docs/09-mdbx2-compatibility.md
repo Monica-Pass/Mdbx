@@ -145,3 +145,20 @@ A present `commit_id` always requires a matching `operation_id`. Storage validat
 MDBX2 clients request rotation through Rust `KeyEpochService::rotate_authorized` or UniFFI `MdbxVault.rotate_key_epoch`. The returned `previous_epoch_id`, `active_epoch_id`, `commit_id`, and `rotated_at` are the stable result of one rotation. This is an additive interface and does not change any MDBX1-compatible method signature.
 
 Rotation does not use ordinary operation-idempotency retries. When a response is unknown, inspect commit history or `MdbxSecurityAuditEventV2` commit correlation before calling again; another call creates another epoch and commit. The key epoch field in sync payloads remains optional, so older payloads continue to deserialize and preserve local epoch state.
+
+### Exact Vault Content Manifest
+
+Clients that need an exact content checkpoint, rather than only an append-only
+watermark, can use `VaultContentManifestService::issue/verify`, the CLI
+`mdbx content-manifest create/verify` commands, or the UniFFI
+`MdbxVault.create_content_manifest` and `verify_content_manifest` methods. The
+bounded opaque token covers non-internal schema objects, column definitions,
+and typed values from every main table, including unknown extension tables and
+additive columns.
+
+This is an explicit O(vault-size) checkpoint for backup publication, migration
+completion, device handoff, or suspected direct rewriting; it is not part of
+the routine small-mutation commit path. Any legitimate write invalidates the
+old token and requires client-side reissuance. External Blob Provider bodies,
+OS state, and availability remain outside the manifest, and the operation does
+not change MDBX1/MDBX1-DRAFT reading or migration semantics.

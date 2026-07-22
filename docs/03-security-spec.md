@@ -177,6 +177,17 @@ retention, backup, and replacement policy. A lost token cannot be detected by
 the database, and the anchor is not a trusted clock, an availability guarantee,
 or a whole-vault authentication root.
 
+For an explicit exact-state checkpoint, MDBX2 also provides a bounded opaque
+vault content manifest through storage, the CLI, and UniFFI. It hashes the
+non-internal main schema, columns, and typed row values in one read snapshot,
+including unknown extension tables and additive columns, then authenticates
+the digest with the vault integrity subkey. Clients MUST persist it outside
+the vault and verify it before trusting an exact reopened state; any legitimate
+mutation invalidates the old manifest and requires reissuance. This is an
+explicit O(vault-size) operation, not a routine commit hook. External Blob
+Provider bytes, OS state, and availability remain outside its boundary; an
+automatically refreshed incremental Merkle root is a separate future design.
+
 ## 8. Attachment Security Rules
 
 Attachments are first-class sensitive data.

@@ -472,6 +472,25 @@ impl From<mdbx_storage::rollback_anchor::RollbackAnchorVerification>
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxVaultContentManifestVerification {
+    pub table_count: u64,
+    pub row_count: u64,
+    pub hashed_bytes: u64,
+}
+
+impl From<mdbx_storage::vault_content_manifest::VaultContentManifestVerification>
+    for MdbxVaultContentManifestVerification
+{
+    fn from(value: mdbx_storage::vault_content_manifest::VaultContentManifestVerification) -> Self {
+        Self {
+            table_count: value.table_count,
+            row_count: value.row_count,
+            hashed_bytes: value.hashed_bytes,
+        }
+    }
+}
+
 impl From<KeyEpochRotationResult> for MdbxKeyEpochRotationResult {
     fn from(value: KeyEpochRotationResult) -> Self {
         Self {
@@ -600,6 +619,7 @@ use mdbx_storage::rollback_anchor::RollbackAnchorService;
 use mdbx_storage::tiga::TigaService;
 use mdbx_storage::tiga_policy::{SecurityAuditEvent, TigaAuthorizationContext};
 use mdbx_storage::unlock::{TigaUnlockAssessment, UnlockService};
+use mdbx_storage::vault_content_manifest::VaultContentManifestService;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -667,6 +687,21 @@ impl MdbxVault {
     ) -> Result<MdbxRollbackAnchorVerification, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(RollbackAnchorService::verify(&conn, &token)?.into())
+    }
+
+    /// Returns an opaque exact-state manifest for client-side persistence.
+    pub fn create_content_manifest(&self) -> Result<Vec<u8>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(VaultContentManifestService::issue(&conn)?)
+    }
+
+    /// Verifies an exact-state manifest before the client trusts the vault.
+    pub fn verify_content_manifest(
+        &self,
+        token: Vec<u8>,
+    ) -> Result<MdbxVaultContentManifestVerification, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(VaultContentManifestService::verify(&conn, &token)?.into())
     }
 
     pub fn resolve_tiga_policy(

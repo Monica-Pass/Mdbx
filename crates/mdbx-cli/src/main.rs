@@ -55,6 +55,9 @@ use mdbx_storage::sync_delta::{
 use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_state_payload;
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
+use mdbx_storage::vault_content_manifest::{
+    VaultContentManifestService, MAX_VAULT_CONTENT_MANIFEST_BYTES,
+};
 use mdbx_sync::{
     build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits,
     write_bundle_with_compression, write_incremental_bundle_with_compression, BundleCompression,
@@ -161,6 +164,11 @@ enum Commands {
     Anchor {
         #[command(subcommand)]
         action: AnchorAction,
+    },
+    /// 创建或验证 vault 全库内容的精确认证清单
+    ContentManifest {
+        #[command(subcommand)]
+        action: ContentManifestAction,
     },
     /// 创建经过验证的单文件 vault 备份
     Backup {
@@ -473,6 +481,14 @@ enum AnchorAction {
     Verify { input: PathBuf },
 }
 
+#[derive(Subcommand)]
+enum ContentManifestAction {
+    /// 创建新的全库内容清单文件；已有文件不会被替换
+    Create { output: PathBuf },
+    /// 验证 vault 的精确 schema 与行内容仍匹配清单
+    Verify { input: PathBuf },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BundleCompressionCli {
     None,
@@ -584,6 +600,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Anchor { action } => {
             let conn = open_or_create_vault(&cli.vault, unlock)?;
             cmd_anchor(&conn, action)
+        }
+        Commands::ContentManifest { action } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_content_manifest(&conn, action)
         }
         Commands::Backup { output } => cmd_backup(&cli.vault, output),
         #[cfg(feature = "benchmark")]
@@ -2131,31 +2151,7 @@ fn cmd_anchor(conn: &VaultConnection, action: AnchorAction) -> Result<(), String
         AnchorAction::Create { output } => {
             let token = RollbackAnchorService::issue(conn)
                 .map_err(|error| format!("failed to create rollback anchor: {error}"))?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&output)
-                .map_err(|error| {
-                    format!(
-                        "failed to create rollback anchor '{}': {error}",
-                        output.display()
-                    )
-                })?;
-            let write_result = file
-                .write_all(&token)
-                .and_then(|()| file.flush())
-                .and_then(|()| file.sync_all());
-            if let Err(error) = write_result {
-                drop(file);
-                let cleanup = std::fs::remove_file(&output)
-                    .err()
-                    .map(|cleanup_error| format!("; partial file cleanup failed: {cleanup_error}"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "failed to persist rollback anchor '{}': {error}{cleanup}",
-                    output.display()
-                ));
-            }
+            write_new_synced_file(&output, &token, "rollback anchor")?;
             println!(
                 "Created rollback anchor: bytes={} -> {}",
                 token.len(),
@@ -2164,27 +2160,7 @@ fn cmd_anchor(conn: &VaultConnection, action: AnchorAction) -> Result<(), String
             Ok(())
         }
         AnchorAction::Verify { input } => {
-            let file = std::fs::File::open(&input).map_err(|error| {
-                format!(
-                    "failed to open rollback anchor '{}': {error}",
-                    input.display()
-                )
-            })?;
-            let mut token = Vec::new();
-            file.take((MAX_ROLLBACK_ANCHOR_BYTES + 1) as u64)
-                .read_to_end(&mut token)
-                .map_err(|error| {
-                    format!(
-                        "failed to read rollback anchor '{}': {error}",
-                        input.display()
-                    )
-                })?;
-            if token.len() > MAX_ROLLBACK_ANCHOR_BYTES {
-                return Err(format!(
-                    "rollback anchor '{}' exceeds {MAX_ROLLBACK_ANCHOR_BYTES} bytes",
-                    input.display()
-                ));
-            }
+            let token = read_bounded_file(&input, MAX_ROLLBACK_ANCHOR_BYTES, "rollback anchor")?;
             let verification = RollbackAnchorService::verify(conn, &token)
                 .map_err(|error| format!("rollback anchor verification failed: {error}"))?;
             println!(
@@ -2202,6 +2178,79 @@ fn cmd_anchor(conn: &VaultConnection, action: AnchorAction) -> Result<(), String
             Ok(())
         }
     }
+}
+
+fn cmd_content_manifest(
+    conn: &VaultConnection,
+    action: ContentManifestAction,
+) -> Result<(), String> {
+    match action {
+        ContentManifestAction::Create { output } => {
+            let token = VaultContentManifestService::issue(conn)
+                .map_err(|error| format!("failed to create vault content manifest: {error}"))?;
+            write_new_synced_file(&output, &token, "vault content manifest")?;
+            println!(
+                "Created vault content manifest: bytes={} -> {}",
+                token.len(),
+                output.display()
+            );
+            Ok(())
+        }
+        ContentManifestAction::Verify { input } => {
+            let token = read_bounded_file(
+                &input,
+                MAX_VAULT_CONTENT_MANIFEST_BYTES,
+                "vault content manifest",
+            )?;
+            let verification = VaultContentManifestService::verify(conn, &token)
+                .map_err(|error| format!("vault content manifest verification failed: {error}"))?;
+            println!(
+                "Vault content manifest verified: tables={} rows={} hashed-bytes={}",
+                verification.table_count, verification.row_count, verification.hashed_bytes
+            );
+            Ok(())
+        }
+    }
+}
+
+fn write_new_synced_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("failed to create {label} '{}': {error}", path.display()))?;
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        drop(file);
+        let cleanup = std::fs::remove_file(path)
+            .err()
+            .map(|cleanup_error| format!("; partial file cleanup failed: {cleanup_error}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "failed to persist {label} '{}': {error}{cleanup}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum: usize, label: &str) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("failed to open {label} '{}': {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {label} '{}': {error}", path.display()))?;
+    if bytes.len() > maximum {
+        return Err(format!(
+            "{label} '{}' exceeds {maximum} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 fn cmd_backup(source: &std::path::Path, output: PathBuf) -> Result<(), String> {
@@ -3148,6 +3197,81 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("rollback detected"));
+    }
+
+    #[test]
+    fn content_manifest_cli_roundtrips_and_rejects_stale_state() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        let files = tempfile::tempdir().unwrap();
+        let manifest = files.path().join("vault.manifest");
+        let oversized = files.path().join("oversized.manifest");
+
+        run(init_cli(&path)).unwrap();
+        run(cli(
+            &path,
+            Commands::ContentManifest {
+                action: ContentManifestAction::Create {
+                    output: manifest.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        let original = std::fs::read(&manifest).unwrap();
+        assert!(!original.is_empty());
+        assert!(original.len() <= MAX_VAULT_CONTENT_MANIFEST_BYTES);
+
+        run(cli(
+            &path,
+            Commands::ContentManifest {
+                action: ContentManifestAction::Verify {
+                    input: manifest.clone(),
+                },
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &path,
+            Commands::Project {
+                action: ProjectAction::Create {
+                    title: "After content manifest".to_string(),
+                    group: None,
+                },
+            },
+        ))
+        .unwrap();
+        let stale = run(cli(
+            &path,
+            Commands::ContentManifest {
+                action: ContentManifestAction::Verify {
+                    input: manifest.clone(),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(stale.contains("does not match"));
+
+        let existing = run(cli(
+            &path,
+            Commands::ContentManifest {
+                action: ContentManifestAction::Create {
+                    output: manifest.clone(),
+                },
+            },
+        ))
+        .unwrap_err();
+        assert!(existing.contains("failed to create vault content manifest"));
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+
+        std::fs::write(&oversized, vec![0_u8; MAX_VAULT_CONTENT_MANIFEST_BYTES + 1]).unwrap();
+        let oversized_error = run(cli(
+            &path,
+            Commands::ContentManifest {
+                action: ContentManifestAction::Verify { input: oversized },
+            },
+        ))
+        .unwrap_err();
+        assert!(oversized_error.contains("exceeds"));
     }
 
     #[test]
