@@ -33,8 +33,8 @@ MVP MUST include:
 - append-friendly history records
 - basic conflict detection metadata
 - snapshot or equivalent recovery checkpoint
-- KDBX import
-- KDBX export or clearly scoped export bridge plan
+- bounded KDBX3/KDBX4 binary import behind an optional Adapter
+- KDBX4 binary export with no-clobber publication behind an optional Adapter
 - benchmark harness against KDBX
 - one reference client implementation
 
@@ -170,8 +170,10 @@ The verification plan SHOULD include:
 - older reader opens newer non-critical vault
 - newer reader opens older vault
 - unknown fields preserved through rewrite
-- KDBX import round-trip sanity checks
-- attachment metadata retained through export and import where supported
+- real encrypted KDBX4 export/import round-trip with fields, groups, and attachments
+- KDBX3/KDBX4 wrong-password, malformed-input, KDF-limit, and decoded-resource failures before MDBX mutation
+- existing KDBX export destinations remain unchanged
+- attachment names and bytes retained through export and import where supported
 
 ## 10. Done Criteria For The Spec Phase
 

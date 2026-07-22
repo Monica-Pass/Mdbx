@@ -214,3 +214,37 @@ opening the selected path. It does not replace process-local Collection Adapter
 registration, critical-extension validation for writable open, or Hello/HelloAck
 negotiation with a peer. Existing clients that never request the report retain
 their exact behavior.
+
+### Binary KDBX Adapter
+
+Binary KDBX interoperability is an optional Adapter and does not change the
+MDBX1/MDBX2 schema, migration, synchronization, or JSON bridge. The independent
+`kdbx-binary-import` and `kdbx-binary-export` features advertise
+`mdbx.storage.kdbx-binary-import` and
+`mdbx.storage.kdbx-binary-export`. Existing `kdbx-import`, `kdbx-export`,
+`import-kdbx-json`, and `export-kdbx-json` identifiers retain their original
+JSON meaning.
+
+Import accepts KDBX3 and KDBX4. It bounds encrypted source bytes and preflights
+KDBX3 AES rounds or KDBX4 AES/Argon2 memory, iteration, and parallelism values
+before password derivation. After decryption, entry, field, attachment, group
+depth, per-item byte, and aggregate projected-byte limits are checked before
+`KdbxImporter` can mutate a vault. Wrong credentials, malformed headers,
+unsupported KDFs, and limit violations therefore leave MDBX unchanged.
+
+Export writes KDBX4 with Argon2id, 64 MiB memory, three iterations, and two
+lanes. CLI passwords come from a hidden prompt or one bounded UTF-8 line on
+standard input; there is no password argument. Publication uses a synchronized
+temporary sibling and a no-clobber persist operation, so an existing destination
+is retained.
+
+The Adapter preserves title, username, password, URL, notes, OTP value, custom
+fields, attachments, group paths, UUIDs, built-in icons, and timestamps when
+representable. It does not promise complete preservation of history, autotype,
+custom icons, recycle-bin state, plugin fields, or passkey plugin structures.
+The selected `keepass` parser decompresses gzip content internally before the
+Adapter can enforce projected plaintext limits. Encrypted source size and the
+returned projection are bounded, while peak memory during gzip decompression is
+not independently bounded by this Adapter version. Untrusted-file services that
+require a strict process-memory ceiling must add process isolation or a parser
+with bounded streaming decompression.

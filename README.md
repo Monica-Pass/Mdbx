@@ -113,9 +113,10 @@ cargo run -p mdbx-cli -- --help
 - `health`
 - `capabilities` / `capabilities --json`
 - `benchmark`
+- `import-kdbx` / `export-kdbx`
 - `import-kdbx-json` / `export-kdbx-json`
 
-注意：`import-kdbx-json` / `export-kdbx-json` 使用的是 KDBX 互操作 JSON 中间表示，不是完整二进制 `.kdbx` 文件解析/写入。配过解锁方式的 vault 在 CLI 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`；否则命令会拒绝继续，避免把生产写入静默降级到明文兼容路径。
+`import-kdbx` 读取 KDBX3/KDBX4，`export-kdbx` 写入使用 Argon2id 的 KDBX4。KDBX 密码仅从隐藏交互输入或 `--password-stdin` 获取；输出使用同目录临时文件发布，已有目标文件会被保留。`import-kdbx-json` / `export-kdbx-json` 继续提供原有 JSON 中间表示，命令和 feature 语义保持不变。配过解锁方式的 vault 在 CLI 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`；否则命令会拒绝继续，避免把生产写入静默降级到明文兼容路径。
 
 `mdbx capabilities` 不打开 vault，报告当前二进制实际编译的 storage 与 sync 模块；`--json` 适合客户端安装检查。它只描述构建内容，不替代 Collection Adapter 注册、vault critical extension 检查或同步会话能力协商。
 

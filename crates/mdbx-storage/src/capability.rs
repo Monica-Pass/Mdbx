@@ -54,6 +54,8 @@ pub struct CapabilitySet {
     pub filesystem_blob_store: bool,
     pub kdbx_import: bool,
     pub kdbx_export: bool,
+    pub kdbx_binary_import: bool,
+    pub kdbx_binary_export: bool,
     pub benchmarks: bool,
     pub derived_search_index: bool,
 }
@@ -100,6 +102,8 @@ impl CapabilitySet {
             filesystem_blob_store: cfg!(feature = "filesystem-blob-store"),
             kdbx_import: cfg!(feature = "kdbx-import"),
             kdbx_export: cfg!(feature = "kdbx-export"),
+            kdbx_binary_import: cfg!(feature = "kdbx-binary-import"),
+            kdbx_binary_export: cfg!(feature = "kdbx-binary-export"),
             benchmarks: cfg!(feature = "benchmarks"),
             derived_search_index: cfg!(feature = "derived-search-index"),
         }
@@ -124,6 +128,8 @@ impl CapabilitySet {
             ),
             ("mdbx.storage.kdbx-json-export", self.kdbx_export),
             ("mdbx.storage.kdbx-json-import", self.kdbx_import),
+            ("mdbx.storage.kdbx-binary-export", self.kdbx_binary_export),
+            ("mdbx.storage.kdbx-binary-import", self.kdbx_binary_import),
         ];
         for (capability, is_enabled) in optional_capabilities {
             if is_enabled {
@@ -195,6 +201,14 @@ mod tests {
         );
         assert_eq!(capabilities.kdbx_import, cfg!(feature = "kdbx-import"));
         assert_eq!(capabilities.kdbx_export, cfg!(feature = "kdbx-export"));
+        assert_eq!(
+            capabilities.kdbx_binary_import,
+            cfg!(feature = "kdbx-binary-import")
+        );
+        assert_eq!(
+            capabilities.kdbx_binary_export,
+            cfg!(feature = "kdbx-binary-export")
+        );
         assert_eq!(capabilities.benchmarks, cfg!(feature = "benchmarks"));
         assert_eq!(
             capabilities.derived_search_index,
@@ -233,6 +247,13 @@ mod tests {
                 .disabled_optional_capability_ids
                 .contains(&"mdbx.storage.kdbx-json-import".to_string()),
             !cfg!(feature = "kdbx-import")
+        );
+        assert_eq!(
+            manifest
+                .storage
+                .enabled_capability_ids
+                .contains(&"mdbx.storage.kdbx-binary-export".to_string()),
+            cfg!(feature = "kdbx-binary-export")
         );
     }
 }

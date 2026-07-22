@@ -27,12 +27,19 @@ use mdbx_storage::blob_transfer::{
 };
 use mdbx_storage::capability::{BuildCapabilityManifest, CapabilitySet};
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
-#[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
+#[cfg(any(
+    feature = "kdbx-import",
+    feature = "kdbx-export",
+    feature = "kdbx-binary-import",
+    feature = "kdbx-binary-export"
+))]
 use mdbx_storage::import::KdbxEntry;
 #[cfg(feature = "kdbx-export")]
 use mdbx_storage::import::KdbxExporter;
 #[cfg(feature = "kdbx-import")]
 use mdbx_storage::import::KdbxImporter;
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+use mdbx_storage::import::{KdbxBinaryAdapter, KdbxBinaryLimits};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::integrity_root::{
     IntegrityRootService, IntegrityRootState, IntegrityRootStatus, IntegrityRootVerification,
@@ -74,6 +81,8 @@ use mdbx_sync::{
 };
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+use zeroize::Zeroizing;
 
 fn prompt(prompt_text: &str) -> String {
     eprint!("{}", prompt_text);
@@ -84,6 +93,69 @@ fn prompt(prompt_text: &str) -> String {
 
 fn prompt_password(prompt_text: &str) -> String {
     rpassword::prompt_password(prompt_text).unwrap()
+}
+
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+const MAX_KDBX_PASSWORD_BYTES: usize = 4096;
+
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+fn read_kdbx_password(password_stdin: bool, confirm: bool) -> Result<Zeroizing<String>, String> {
+    if password_stdin {
+        return read_kdbx_password_from(&mut std::io::stdin().lock());
+    }
+
+    let password = Zeroizing::new(
+        rpassword::prompt_password("KDBX password: ")
+            .map_err(|error| format!("failed to read KDBX password: {error}"))?,
+    );
+    validate_kdbx_password_length(&password)?;
+    if confirm {
+        let confirmation = Zeroizing::new(
+            rpassword::prompt_password("Confirm KDBX password: ")
+                .map_err(|error| format!("failed to confirm KDBX password: {error}"))?,
+        );
+        validate_kdbx_password_length(&confirmation)?;
+        if password.as_str() != confirmation.as_str() {
+            return Err("KDBX password confirmation does not match".to_string());
+        }
+    }
+    Ok(password)
+}
+
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+fn read_kdbx_password_from(reader: &mut dyn Read) -> Result<Zeroizing<String>, String> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    reader
+        .take((MAX_KDBX_PASSWORD_BYTES + 3) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read KDBX password from stdin: {error}"))?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err("KDBX password stdin must contain exactly one line".to_string());
+    }
+    if bytes.len() > MAX_KDBX_PASSWORD_BYTES {
+        return Err(format!(
+            "KDBX password exceeds {MAX_KDBX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    let password =
+        std::str::from_utf8(&bytes).map_err(|_| "KDBX password stdin must be UTF-8".to_string())?;
+    Ok(Zeroizing::new(password.to_string()))
+}
+
+#[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+fn validate_kdbx_password_length(password: &str) -> Result<(), String> {
+    if password.len() > MAX_KDBX_PASSWORD_BYTES {
+        return Err(format!(
+            "KDBX password exceeds {MAX_KDBX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok(())
 }
 
 /// Monica DataBase eXchange — 离线优先密码管理器 CLI
@@ -207,6 +279,24 @@ enum Commands {
         /// 将报告写入指定文件
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// 从加密 KDBX3/KDBX4 文件导入
+    #[cfg(feature = "kdbx-binary-import")]
+    ImportKdbx {
+        /// 输入 KDBX 文件
+        file: PathBuf,
+        /// 从标准输入读取密码；省略时使用隐藏交互输入
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// 导出为加密 KDBX4 文件
+    #[cfg(feature = "kdbx-binary-export")]
+    ExportKdbx {
+        /// 输出 KDBX 文件；已有文件不会被替换
+        output: PathBuf,
+        /// 从标准输入读取密码；省略时使用隐藏交互输入并确认
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// 从 KDBX JSON 互操作文件导入
     #[cfg(feature = "kdbx-import")]
@@ -658,6 +748,22 @@ fn run(cli: Cli) -> Result<(), String> {
             json,
             output,
         } => cmd_benchmark(iterations, mode, json, output),
+        #[cfg(feature = "kdbx-binary-import")]
+        Commands::ImportKdbx {
+            file,
+            password_stdin,
+        } => {
+            let mut conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_import_kdbx(&mut conn, file, password_stdin)
+        }
+        #[cfg(feature = "kdbx-binary-export")]
+        Commands::ExportKdbx {
+            output,
+            password_stdin,
+        } => {
+            let conn = open_or_create_vault(&cli.vault, unlock)?;
+            cmd_export_kdbx(&conn, output, password_stdin)
+        }
         #[cfg(feature = "kdbx-import")]
         Commands::ImportKdbxJson { file } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -2521,6 +2627,150 @@ fn cmd_benchmark(
     Ok(())
 }
 
+#[cfg(feature = "kdbx-binary-import")]
+fn cmd_import_kdbx(
+    conn: &mut VaultConnection,
+    file: PathBuf,
+    password_stdin: bool,
+) -> Result<(), String> {
+    let password = read_kdbx_password(password_stdin, false)?;
+    import_kdbx_with_password(conn, file, password.as_str())
+}
+
+#[cfg(feature = "kdbx-binary-import")]
+fn import_kdbx_with_password(
+    conn: &mut VaultConnection,
+    file: PathBuf,
+    password: &str,
+) -> Result<(), String> {
+    let source = std::fs::File::open(&file)
+        .map_err(|error| format!("failed to open KDBX '{}': {error}", file.display()))?;
+    let document = KdbxBinaryAdapter::decode(
+        &mut std::io::BufReader::new(source),
+        password,
+        KdbxBinaryLimits::default(),
+    )
+    .map_err(|error| format!("failed to decode KDBX '{}': {error}", file.display()))?;
+    let result = KdbxImporter::import_entries(conn, &ctx(), &document.entries);
+
+    println!(
+        "Imported {}: projects={} entries={} attachments={} skipped={}",
+        document.format_version,
+        result.projects_created,
+        result.entries_created,
+        result.attachments_created,
+        result.entries_skipped
+    );
+    for warning in result.warnings {
+        println!("  warning: {warning}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kdbx-binary-export")]
+fn cmd_export_kdbx(
+    conn: &VaultConnection,
+    output: PathBuf,
+    password_stdin: bool,
+) -> Result<(), String> {
+    let password = read_kdbx_password(password_stdin, true)?;
+    export_kdbx_with_password(conn, output, password.as_str())
+}
+
+#[cfg(feature = "kdbx-binary-export")]
+fn export_kdbx_with_password(
+    conn: &VaultConnection,
+    output: PathBuf,
+    password: &str,
+) -> Result<(), String> {
+    if output
+        .try_exists()
+        .map_err(|error| format!("failed to inspect KDBX '{}': {error}", output.display()))?
+    {
+        return Err(format!(
+            "failed to publish KDBX '{}' without replacing an existing file",
+            output.display()
+        ));
+    }
+    let (entries, attachments_exported, projects_skipped, warnings) = collect_kdbx_entries(conn)?;
+    let bytes = KdbxBinaryAdapter::encode(&entries, password, KdbxBinaryLimits::default())
+        .map_err(|error| format!("failed to encode KDBX4: {error}"))?;
+    publish_kdbx_noclobber(&output, &bytes)?;
+
+    println!(
+        "Exported KDBX4: entries={} attachments={} skipped={} -> {}",
+        entries.len(),
+        attachments_exported,
+        projects_skipped,
+        output.display()
+    );
+    for warning in warnings {
+        println!("  warning: {warning}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kdbx-export")]
+fn collect_kdbx_entries(
+    conn: &VaultConnection,
+) -> Result<(Vec<KdbxEntry>, u32, u32, Vec<String>), String> {
+    let mut entries: Vec<KdbxEntry> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut attachments_exported = 0u32;
+    let mut projects_skipped = 0u32;
+
+    let device = cli_device_context();
+    let session = conn
+        .active_session()
+        .ok_or_else(|| "KDBX export requires an active unlock session".to_string())?;
+    let authorization = TigaAuthorizationContext {
+        session: Some(session),
+        device: &device,
+        now_unix_secs: chrono::Utc::now().timestamp(),
+    };
+    for project in ProjectRepo::list_all(conn).map_err(|error| error.to_string())? {
+        match KdbxExporter::export_one_authorized(conn, &project, authorization) {
+            Ok(((entry, attachment_count, project_warnings), _decision)) => {
+                entries.push(entry);
+                attachments_exported += attachment_count;
+                warnings.extend(project_warnings);
+            }
+            Err(error) => {
+                projects_skipped += 1;
+                warnings.push(format!("skipped project '{}': {error}", project.project_id));
+            }
+        }
+    }
+    Ok((entries, attachments_exported, projects_skipped, warnings))
+}
+
+#[cfg(feature = "kdbx-binary-export")]
+fn publish_kdbx_noclobber(output: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".mdbx-kdbx-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to create temporary KDBX output: {error}"))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file_mut().flush())
+        .and_then(|()| temporary.as_file_mut().sync_all())
+        .map_err(|error| format!("failed to synchronize temporary KDBX output: {error}"))?;
+    temporary
+        .persist_noclobber(output)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "failed to publish KDBX '{}' without replacing an existing file: {}",
+                output.display(),
+                error.error
+            )
+        })
+}
+
 #[cfg(feature = "kdbx-import")]
 fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(), String> {
     let bytes =
@@ -2544,33 +2794,7 @@ fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(),
 
 #[cfg(feature = "kdbx-export")]
 fn cmd_export_kdbx_json(conn: &VaultConnection, output: PathBuf) -> Result<(), String> {
-    let mut entries: Vec<KdbxEntry> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-    let mut attachments_exported = 0u32;
-    let mut projects_skipped = 0u32;
-
-    let device = cli_device_context();
-    let session = conn
-        .active_session()
-        .ok_or_else(|| "KDBX export requires an active unlock session".to_string())?;
-    let authorization = TigaAuthorizationContext {
-        session: Some(session),
-        device: &device,
-        now_unix_secs: chrono::Utc::now().timestamp(),
-    };
-    for project in ProjectRepo::list_all(conn).map_err(|e| format!("{}", e))? {
-        match KdbxExporter::export_one_authorized(conn, &project, authorization) {
-            Ok(((entry, attachment_count, project_warnings), _decision)) => {
-                entries.push(entry);
-                attachments_exported += attachment_count;
-                warnings.extend(project_warnings);
-            }
-            Err(e) => {
-                projects_skipped += 1;
-                warnings.push(format!("skipped project '{}': {}", project.project_id, e));
-            }
-        }
-    }
+    let (entries, attachments_exported, projects_skipped, warnings) = collect_kdbx_entries(conn)?;
 
     let json = serde_json::to_vec_pretty(&entries)
         .map_err(|e| format!("failed to serialize KDBX JSON: {}", e))?;
@@ -3321,6 +3545,20 @@ mod tests {
                 .enabled_capability_ids
                 .contains(&"mdbx.storage.filesystem-blob-store".to_string()),
             cfg!(feature = "external-blob-store")
+        );
+        assert_eq!(
+            manifest
+                .storage
+                .enabled_capability_ids
+                .contains(&"mdbx.storage.kdbx-binary-import".to_string()),
+            cfg!(feature = "kdbx-binary-import")
+        );
+        assert_eq!(
+            manifest
+                .storage
+                .enabled_capability_ids
+                .contains(&"mdbx.storage.kdbx-binary-export".to_string()),
+            cfg!(feature = "kdbx-binary-export")
         );
         assert_eq!(
             manifest
@@ -5667,6 +5905,106 @@ mod tests {
         assert_eq!(report["metadata"]["field_encryption"], true);
         assert_eq!(report["results"].as_array().unwrap().len(), 11);
         std::fs::remove_file(report_path).unwrap();
+    }
+
+    #[cfg(all(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+    #[test]
+    fn kdbx_binary_cli_roundtrips_and_fails_before_mutation_or_replacement() {
+        let parsed =
+            Cli::try_parse_from(["mdbx", "import-kdbx", "input.kdbx", "--password-stdin"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::ImportKdbx {
+                password_stdin: true,
+                ..
+            }
+        ));
+
+        let files = tempfile::tempdir().unwrap();
+        let kdbx = files.path().join("vault.kdbx");
+        let malformed = files.path().join("malformed.kdbx");
+        std::fs::write(&malformed, b"not a KDBX database").unwrap();
+
+        let source = TempVault::new();
+        let source_path = source.path();
+        run(init_cli(&source_path)).unwrap();
+        let source_conn = open_unlocked(&source_path);
+        let imported = KdbxImporter::import_entries(
+            &source_conn,
+            &ctx(),
+            &[KdbxEntry {
+                uuid: "64bf8267-f3df-40c2-b895-8408e59fd9c2".to_string(),
+                title: "Binary Mail".to_string(),
+                username: "alice@example.com".to_string(),
+                password: "mail-secret".to_string(),
+                url: "https://mail.example.com".to_string(),
+                notes: "binary note".to_string(),
+                totp_seed: Some("JBSWY3DPEHPK3PXP".to_string()),
+                custom_fields: vec![("account-id".to_string(), "42".to_string())],
+                attachments: vec![mdbx_storage::import::KdbxAttachment {
+                    name: "message.eml".to_string(),
+                    data: b"From: alice@example.com\r\n\r\nHello".to_vec(),
+                }],
+                group_path: vec!["Mail".to_string(), "Archive".to_string()],
+                icon_id: Some(19),
+                created_at: "2026-07-23T00:00:00Z".to_string(),
+                updated_at: "2026-07-23T00:01:00Z".to_string(),
+            }],
+        );
+        assert_eq!(imported.projects_created, 1);
+        assert_eq!(imported.attachments_created, 1);
+
+        export_kdbx_with_password(&source_conn, kdbx.clone(), "binary-password").unwrap();
+        let encrypted = std::fs::read(&kdbx).unwrap();
+        assert_eq!(&encrypted[..4], &[0x03, 0xd9, 0xa2, 0x9a]);
+
+        let no_clobber_error =
+            export_kdbx_with_password(&source_conn, kdbx.clone(), "binary-password").unwrap_err();
+        assert!(no_clobber_error.contains("without replacing"));
+        assert_eq!(std::fs::read(&kdbx).unwrap(), encrypted);
+
+        let destination = TempVault::new();
+        let destination_path = destination.path();
+        run(init_cli(&destination_path)).unwrap();
+        let mut destination_conn = open_unlocked(&destination_path);
+        let wrong_password =
+            import_kdbx_with_password(&mut destination_conn, kdbx.clone(), "wrong-password")
+                .unwrap_err();
+        assert!(wrong_password.contains("failed to decode KDBX"));
+        assert!(ProjectRepo::list_all(&destination_conn).unwrap().is_empty());
+
+        let malformed_error =
+            import_kdbx_with_password(&mut destination_conn, malformed, "binary-password")
+                .unwrap_err();
+        assert!(malformed_error.contains("failed to decode KDBX"));
+        assert!(ProjectRepo::list_all(&destination_conn).unwrap().is_empty());
+
+        import_kdbx_with_password(&mut destination_conn, kdbx, "binary-password").unwrap();
+        let projects = ProjectRepo::list_all(&destination_conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(project_title(&projects[0]), "Binary Mail");
+        assert_eq!(projects[0].group_id.as_deref(), Some("Mail/Archive"));
+        let attachments =
+            AttachmentRepo::list_by_project(&destination_conn, &projects[0].project_id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            AttachmentRepo::read_content(&destination_conn, &attachments[0].attachment_id).unwrap(),
+            b"From: alice@example.com\r\n\r\nHello"
+        );
+    }
+
+    #[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
+    #[test]
+    fn kdbx_binary_password_stdin_is_single_line_and_bounded() {
+        let password = read_kdbx_password_from(&mut b"correct horse\r\n".as_slice()).unwrap();
+        assert_eq!(password.as_str(), "correct horse");
+
+        let multiple = read_kdbx_password_from(&mut b"first\nsecond\n".as_slice()).unwrap_err();
+        assert!(multiple.contains("exactly one line"));
+
+        let oversized = vec![b'x'; MAX_KDBX_PASSWORD_BYTES + 1];
+        let error = read_kdbx_password_from(&mut oversized.as_slice()).unwrap_err();
+        assert!(error.contains("exceeds"));
     }
 
     #[cfg(all(feature = "kdbx-import", feature = "kdbx-export"))]

@@ -113,9 +113,10 @@ The current `mdbx-cli` is a development and validation entry point for this Rust
 - `health`
 - `capabilities` / `capabilities --json`
 - `benchmark`
+- `import-kdbx` / `export-kdbx`
 - `import-kdbx-json` / `export-kdbx-json`
 
-Note: `import-kdbx-json` / `export-kdbx-json` use a KDBX interoperability JSON intermediate representation. They are not full binary `.kdbx` parsing or writing. Once a vault has unlock methods configured, normal CLI operations must pass `--unlock-password` or `--unlock-pin`; otherwise the command is rejected so production writes do not silently fall back to the legacy plaintext compatibility path.
+`import-kdbx` reads KDBX3/KDBX4 and `export-kdbx` writes KDBX4 with Argon2id. A KDBX password is accepted only through a hidden interactive prompt or `--password-stdin`. Export publishes from a temporary sibling and preserves an existing destination. `import-kdbx-json` / `export-kdbx-json` retain the existing JSON intermediate representation and unchanged feature semantics. Once a vault has unlock methods configured, normal CLI operations must pass `--unlock-password` or `--unlock-pin`; otherwise the command is rejected so production writes do not silently fall back to the legacy plaintext compatibility path.
 
 `mdbx capabilities` does not open a vault. It reports the storage and sync
 modules compiled into the current binary; `--json` is suitable for installation

@@ -10,6 +10,8 @@ default = [
     "benchmark",
     "kdbx-import",
     "kdbx-export",
+    "kdbx-binary-import",
+    "kdbx-binary-export",
     "external-blob-store",
     "sync-compression",
 ]
@@ -20,6 +22,8 @@ search = ["mdbx-storage/derived-search-index"]
 benchmark = ["mdbx-storage/benchmarks"]
 kdbx-import = ["mdbx-storage/kdbx-import"]
 kdbx-export = ["mdbx-storage/kdbx-export"]
+kdbx-binary-import = ["kdbx-import", "mdbx-storage/kdbx-binary-import"]
+kdbx-binary-export = ["kdbx-export", "mdbx-storage/kdbx-binary-export"]
 
 [[bin]]
 name = "mdbx"
@@ -38,3 +42,4 @@ sha2 = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
+zeroize = { workspace = true }
