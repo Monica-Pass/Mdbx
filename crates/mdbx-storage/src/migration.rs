@@ -993,6 +993,71 @@ mod tests {
     }
 
     #[test]
+    fn mdbx1_upgrade_preserves_unknown_additive_columns_and_values() {
+        let conn = v1_database();
+        conn.execute_batch(
+            "ALTER TABLE vault_meta ADD COLUMN future_vault_state TEXT;
+             ALTER TABLE projects ADD COLUMN future_project_state BLOB;
+             ALTER TABLE entries ADD COLUMN future_entry_state TEXT DEFAULT 'future-default';
+             UPDATE vault_meta SET future_vault_state = 'keep-vault';
+             INSERT INTO projects
+                (project_id, title_ct, object_clock, head_commit_id,
+                 created_at, updated_at, created_by_device_id,
+                 updated_by_device_id, future_project_state)
+             VALUES ('future-project', X'01', '{}', 'legacy-head',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                     'legacy-device', 'legacy-device', X'A1B2');
+             INSERT INTO entries
+                (entry_id, project_id, entry_type, payload_ct, object_clock,
+                 head_commit_id, created_at, updated_at,
+                 created_by_device_id, updated_by_device_id,
+                 future_entry_state)
+             VALUES ('future-entry', 'future-project', 'note', X'02', '{}',
+                     'legacy-head', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 'legacy-device',
+                     'legacy-device', 'keep-entry');",
+        )
+        .unwrap();
+
+        upgrade_to_latest(&conn).unwrap().unwrap();
+
+        for (table, column) in [
+            ("vault_meta", "future_vault_state"),
+            ("projects", "future_project_state"),
+            ("entries", "future_entry_state"),
+        ] {
+            assert!(
+                v2::column_exists(&conn, table, column).unwrap(),
+                "missing {table}.{column} after upgrade"
+            );
+        }
+        let vault_value: String = conn
+            .query_row("SELECT future_vault_state FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let project_value: Vec<u8> = conn
+            .query_row(
+                "SELECT future_project_state FROM projects
+                 WHERE project_id = 'future-project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry_value: String = conn
+            .query_row(
+                "SELECT future_entry_state FROM entries
+                 WHERE entry_id = 'future-entry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vault_value, "keep-vault");
+        assert_eq!(project_value, vec![0xA1, 0xB2]);
+        assert_eq!(entry_value, "keep-entry");
+    }
+
+    #[test]
     fn v1_upgrade_backfills_tombstone_delete_proof_and_deleting_device_ack() {
         let conn = v1_database();
         conn.execute(
