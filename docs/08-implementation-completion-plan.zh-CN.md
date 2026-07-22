@@ -79,7 +79,7 @@ MDBX 必须坚持：
 - `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
 - MDBX2 已加入 `MDBX-1` / `MDBX-1-DRAFT` 自动事务迁移、schema migration 记录、最低 reader/writer 版本和未知 critical extension 写入拒绝。
 - snapshot 已覆盖 project、entry、attachment metadata、project tags 和 active `attachment_chunks`；旧 snapshot 缺少新增字段时保持现有兼容数据。
-- 已冻结由真实 `MDBX1.0` tag 生成的磁盘 golden vault，并验证只读 inspection、schema 1 升级、原凭据解锁、project/entry/tag/attachment/snapshot、commit/object-version 身份保留和幂等。旧 `MDBX1.0` CLI 可读取升级后的兼容投影，但不得作为 MDBX2 writer；MDBX1-DRAFT 与后续真实发布版本 fixture 仍需继续补充。未知字段保留已覆盖当前可验证的物理迁移，以及 complete sync-state 的 apply/collect 回环。schema 15 在锁定状态保存 opaque JSON；敏感扩展值必须由生产者预先封装为认证密文。
+- 已冻结由真实 `MDBX1.0` tag 生成的 release golden vault，以及由同一历史 reader 固化 marker 的 `MDBX-1-DRAFT` golden vault；两者共享只读 inspection、schema 1 升级、原凭据解锁、project/entry/tag/attachment/snapshot、commit/object-version 身份保留和幂等回归。旧 `MDBX1.0` CLI 可读取兼容投影，但不得作为 MDBX2 writer；后续真实发布版本仍需按相同规则继续追加 fixture。未知字段保留已覆盖当前可验证的物理迁移，以及 complete sync-state 的 apply/collect 回环。
 
 ### 3.2 同步与冲突
 
@@ -203,7 +203,7 @@ MDBX 必须坚持：
 
 - KDBX import/export 覆盖 passkey、totp、ssh key、custom fields、attachments，并扩展到真实二进制 `.kdbx` 解析/写入。
 - RFC 结构补齐：header、schema、crypto、commit、sync、snapshot、extensions。
-- 兼容性测试矩阵已覆盖 MDBX1/DRAFT 自动升级、`MDBX1.0` 真实 golden vault、旧 reader 对升级后兼容投影的读取观察、未知 critical extension 拒绝、未知附加列保留、schema 重建字段保留，以及 complete sync-state 顶层未知字段的事务持久化与重编码；MDBX1-DRAFT 与未来发布版本仍需按同样方式增加 fixture。
+- 兼容性测试矩阵已覆盖 MDBX1/DRAFT 自动升级、`MDBX1.0` release 与 DRAFT 真实磁盘 golden vault、旧 reader 对兼容投影的读取观察、未知 critical extension 拒绝、未知附加列保留、schema 重建字段保留，以及 complete sync-state 顶层未知字段的事务持久化与重编码；未来发布版本仍需按同样方式增加 fixture。
 - MDBX-1 / MDBX-1-DRAFT 到 MDBX2 的顺序自动迁移已落地；后续代际必须继续通过 migration registry 逐代升级。
 - CLI 已增加 `health`、`benchmark`、`snapshot`、`sync bundle/apply`、`import-kdbx-json`、`export-kdbx-json`；后续如要使用 `import-kdbx`/`export-kdbx` 名称，必须先实现真实二进制 `.kdbx` 支持。
 
@@ -261,5 +261,5 @@ MDBX 必须坚持：
 
 下一刀建议：
 
-- 继续固化 MDBX1-DRAFT 与未来发布版本 golden vault，并使用对应旧 reader 二进制验证只读兼容投影；旧 writer 继续受 `min_writer_version` 边界约束。
+- 每次发布新代际时继续固化对应 golden vault，并使用上一代 reader 二进制验证只读兼容投影；旧 writer 始终受 `min_writer_version` 边界约束。
 - 形成可发布 benchmark 报告，覆盖小 entry 修改、附件改名、附件替换、snapshot 和 compaction 的时延与 delta 大小。
