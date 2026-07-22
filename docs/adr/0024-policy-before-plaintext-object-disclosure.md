@@ -28,6 +28,8 @@ Existing `EntryRepo::get_by_id`, list APIs, MDBX1 data, and callers keep their c
 
 New client and FFI surfaces should expose summary reads and authorized disclosure rather than presenting the compatible complete-record APIs as safe defaults.
 
+UniFFI implements this decision additively through `get_object_summary`, `reveal_object`, `reveal_object_with_device_context`, and `MdbxObjectDisclosureResult`. Existing `get_object`, `list_objects`, and `list_entries` remain complete-record compatibility methods.
+
 ## Consequences
 
 Tiga denials are decided before payload decryption, policy resolution survives unrelated ciphertext corruption, and default details no longer extend secret lifetime. Clients receive the authorization decision together with plaintext and remain responsible for enforcing constraints such as screen-capture protection.

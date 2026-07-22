@@ -157,6 +157,12 @@ Every create command carries a client-generated stable UUID. The client reuses t
 
 The existing single-mutation FFI methods remain available as the MDBX1-compatible projection and simple-call entry points. A client action that must appear as one history node should use the operation API.
 
+### Object Summary and Disclosure Read API
+
+Existing UniFFI `get_object`, `list_objects`, and `list_entries` signatures and complete-payload behavior remain unchanged for MDBX1 and already generated clients. MDBX2 clients use additive `get_object_summary(object_id)` for metadata-only details and `list_object_summaries` for bounded collection screens.
+
+An explicit plaintext action uses `reveal_object` or `reveal_object_with_device_context`. The returned `MdbxObjectDisclosureResult` contains `object` only for `Allow` or `AllowWithConstraints`, and always contains the typed Tiga authorization decision. Missing/stale sessions and policy denials therefore remain actionable client states without returning payload or allowing corrupt ciphertext to take precedence. Deleted objects and non-authorization storage failures remain errors.
+
 ### Commit History Read API
 
 The original `MdbxCommitHistoryItem`, `list_commit_history`, and `get_commit_history` interfaces remain unchanged for generated clients from the previous interface generation. MDBX2 clients use `MdbxCommitHistoryItemV2`, `list_commit_history_v2`, and `get_commit_history_v2` to read the optional stable branch ID. Results include operation metadata, branch, parents, typed change summaries, and a compatibility flag; MDBX1 commits without operation metadata remain visible through a compatibility summary. Clients must treat the storage-returned keyset cursor as opaque and must not recreate pagination with offsets.

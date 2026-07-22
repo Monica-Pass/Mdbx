@@ -39,6 +39,15 @@ pub struct MdbxObjectRecord {
     pub deleted: bool,
 }
 
+/// Typed result of a Tiga-controlled object reveal.
+///
+/// `object` is present only for Allow or AllowWithConstraints decisions.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxObjectDisclosureResult {
+    pub object: Option<MdbxObjectRecord>,
+    pub authorization: MdbxAuthorizationDecision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxPayloadMigrationPlanItem {
     pub object_id: String,
@@ -197,13 +206,17 @@ use mdbx_core::model::{
 };
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
+use mdbx_storage::object_disclosure::{DisclosedObject, ObjectDisclosureService};
 use mdbx_storage::repo::{
     CommitContext, EntryRepo, ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo,
     ObjectLabelCreateRequest, ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo,
     ObjectSummaryRepo, ProjectRepo,
 };
 
-use super::{MdbxFfiError, MdbxVault};
+use super::{
+    conservative_ffi_device_context, unix_now, MdbxAuthorizationDecision, MdbxDeviceContext,
+    MdbxFfiError, MdbxVault,
+};
 
 pub(crate) fn entry_for_project(
     conn: &VaultConnection,
@@ -306,6 +319,22 @@ fn object_record_from_entry(
         payload_schema_version: entry.payload_schema_version,
         deleted: entry.deleted,
     })
+}
+
+fn object_disclosure_result(
+    result: StorageResult<DisclosedObject>,
+) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+    match result {
+        Ok(disclosed) => Ok(MdbxObjectDisclosureResult {
+            object: Some(object_record_from_entry(&disclosed.object)?),
+            authorization: disclosed.authorization.into(),
+        }),
+        Err(StorageError::Authorization(decision)) => Ok(MdbxObjectDisclosureResult {
+            object: None,
+            authorization: decision.into(),
+        }),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn object_summary_from_core(summary: ObjectSummary) -> MdbxObjectSummary {
@@ -426,6 +455,42 @@ impl MdbxVault {
         object_record_from_entry(&object)
     }
 
+    /// Read one object's presentation metadata without selecting or decrypting its payload.
+    pub fn get_object_summary(
+        &self,
+        object_id: String,
+    ) -> Result<Option<MdbxObjectSummary>, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(ObjectSummaryRepo::get(&conn, &object_id)?.map(object_summary_from_core))
+    }
+
+    /// Reveal an object using a conservative Standard device profile.
+    pub fn reveal_object(
+        &self,
+        object_id: String,
+    ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+        self.reveal_object_with_device_context(object_id, conservative_ffi_device_context())
+    }
+
+    /// Reveal an object through the active vault session and the supplied real device
+    /// capabilities. A non-allow Tiga decision returns `object = None` instead of plaintext.
+    pub fn reveal_object_with_device_context(
+        &self,
+        object_id: String,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxObjectDisclosureResult, MdbxFfiError> {
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let device = device.into_core(&self.device_id);
+        object_disclosure_result(ObjectDisclosureService::reveal_with_active_session(
+            &mut conn,
+            &object_id,
+            &device,
+            unix_now(),
+        ))
+    }
+
+    /// MDBX1-compatible complete-payload read. New clients should prefer
+    /// `get_object_summary` and an authorized disclosure method.
     pub fn get_object(
         &self,
         collection_id: String,
@@ -441,6 +506,8 @@ impl MdbxVault {
         Ok(Some(object_record_from_entry(&object)?))
     }
 
+    /// MDBX1-compatible complete-payload list. New collection screens should
+    /// use `list_object_summaries`.
     pub fn list_objects(
         &self,
         collection_id: String,

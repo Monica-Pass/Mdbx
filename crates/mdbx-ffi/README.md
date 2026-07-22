@@ -151,7 +151,17 @@ The compatibility methods default to 256 commands, 1 MiB per JSON payload, 8 MiB
 
 Use `list_object_summaries` for collection and search-result screens. It returns a bounded page containing object identity, type, title, payload schema version, head commit, and update time without reading or decrypting `payload_json`.
 
-The opaque `next_cursor` is bound to the requested collection and optional object type. Reusing it with different filters returns an error. Page sizes must be between 1 and 200. Existing `list_objects` and `list_entries` remain available when a caller intentionally needs complete payloads.
+Use `get_object_summary(object_id)` for a metadata-only detail screen. It also avoids `payload_json` and can return the metadata of a soft-deleted object, which lets a client identify a damaged or deleted record without first decrypting its payload.
+
+The opaque `next_cursor` is bound to the requested collection and optional object type. Reusing it with different filters returns an error. Page sizes must be between 1 and 200.
+
+### Authorized Object Disclosure
+
+Use `reveal_object(object_id)` only after an explicit user disclosure action. It uses the active vault session, a conservative Standard device profile, and storage `TigaOperation::RevealSecret`. Clients with real platform protection can call `reveal_object_with_device_context` and report those capabilities explicitly.
+
+Both methods return `MdbxObjectDisclosureResult`. `object` is present only for `Allow` or `AllowWithConstraints`; `authorization` always contains the typed outcome, reasons, constraints, and audit requirement. A missing/stale session or policy denial is therefore not flattened into an error and never carries `payload_json`. The client must satisfy or execute the returned constraints.
+
+Existing `get_object`, `list_objects`, `list_entries`, and their complete-payload behavior remain unchanged for MDBX1 and already generated clients. They are compatibility APIs, not the default read path for new user interfaces.
 
 ### Payload JSON
 
@@ -185,6 +195,8 @@ All exported functions return `Result<_, MdbxFfiError>`.
 
 Common constraint errors include updating a deleted entry, deleting an already deleted entry, restoring an active entry, moving a deleted entry, or using an entry ID that does not belong to the supplied project ID.
 
+`reveal_object*` treats a Tiga non-allow decision as a typed `MdbxObjectDisclosureResult` with `object = None`. Missing objects, deleted-object disclosure, invalid stored JSON, crypto failure after an allowed decision, and other storage failures still return `MdbxFfiError`.
+
 ## Rust Usage Example
 
 The Rust tests exercise the same facade that UniFFI exports:
@@ -207,8 +219,11 @@ fn main() -> Result<(), MdbxFfiError> {
         r#"{"kind":"password","schemaVersion":1,"username":"alice"}"#.to_string(),
     )?;
 
-    let entries = vault.list_entries(project.project_id.clone(), Some("login".to_string()))?;
-    assert_eq!(entries[0].entry_id, entry.entry_id);
+    let summary = vault.get_object_summary(entry.entry_id.clone())?.unwrap();
+    assert_eq!(summary.title, "Example");
+
+    let disclosed = vault.reveal_object(entry.entry_id.clone())?;
+    assert!(disclosed.object.is_some());
 
     drop(vault);
     let reopened = open_vault(path, password, device_id)?;

@@ -944,6 +944,154 @@ fn collection_profile_facade_registers_capabilities_and_guards_object_types() {
 }
 
 #[test]
+fn ffi_object_summary_by_id_is_payload_free_and_tombstone_visible() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Summary collection".to_string())
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Visible subject".to_string(),
+            r#"{"body":"secret body"}"#.to_string(),
+            3,
+        )
+        .unwrap();
+    vault
+        .delete_entry(collection.project_id.clone(), object.object_id.clone())
+        .unwrap();
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                [&object.object_id],
+            )
+            .unwrap();
+    }
+
+    let summary = vault
+        .get_object_summary(object.object_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.object_id, object.object_id);
+    assert_eq!(summary.collection_id, collection.project_id);
+    assert_eq!(summary.object_type_id, "com.monica.mail.message");
+    assert_eq!(summary.title, "Visible subject");
+    assert_eq!(summary.payload_schema_version, 3);
+    assert!(summary.deleted);
+
+    assert!(vault
+        .get_object(summary.collection_id, summary.object_id)
+        .is_err());
+}
+
+#[test]
+fn ffi_object_disclosure_returns_typed_allow_and_missing_session_decisions() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Disclosure collection".to_string())
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id,
+            "com.monica.mail.message".to_string(),
+            "Message".to_string(),
+            r#"{"body":"allowed plaintext"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+
+    let allowed = vault.reveal_object(object.object_id.clone()).unwrap();
+    assert_eq!(
+        allowed.authorization.outcome,
+        MdbxAuthorizationOutcome::Allow
+    );
+    assert_eq!(
+        allowed.object.as_ref().unwrap().payload_json,
+        r#"{"body":"allowed plaintext"}"#
+    );
+
+    {
+        let mut conn = vault.conn.lock().unwrap();
+        conn.clear_session();
+    }
+    let missing = vault.reveal_object(object.object_id).unwrap();
+    assert!(missing.object.is_none());
+    assert_eq!(
+        missing.authorization.outcome,
+        MdbxAuthorizationOutcome::RequireFreshAuthentication
+    );
+    assert!(missing
+        .authorization
+        .reasons
+        .contains(&MdbxAuthorizationReason::SessionMissing));
+
+    let reveal_events = vault
+        .list_security_audit_events(10)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.operation == MdbxTigaOperation::RevealSecret)
+        .collect::<Vec<_>>();
+    assert_eq!(reveal_events.len(), 2);
+}
+
+#[test]
+fn ffi_object_disclosure_power_denial_precedes_corrupt_payload() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Power collection".to_string())
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Denied message".to_string(),
+            r#"{"body":"must not decrypt"}"#.to_string(),
+            1,
+        )
+        .unwrap();
+    vault
+        .set_tiga_profile(
+            MdbxTigaMode::Power,
+            None,
+            None,
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                [&object.object_id],
+            )
+            .unwrap();
+    }
+
+    let denied = vault.reveal_object(object.object_id.clone()).unwrap();
+    assert!(denied.object.is_none());
+    assert!(!matches!(
+        denied.authorization.outcome,
+        MdbxAuthorizationOutcome::Allow | MdbxAuthorizationOutcome::AllowWithConstraints
+    ));
+    assert!(vault
+        .get_object(collection.project_id, object.object_id)
+        .unwrap_err()
+        .to_string()
+        .contains("crypto error"));
+
+    let reveal_event = vault
+        .list_security_audit_events(10)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.operation == MdbxTigaOperation::RevealSecret)
+        .unwrap();
+    assert_ne!(reveal_event.outcome, MdbxAuthorizationOutcome::Allow);
+}
+
+#[test]
 fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
     let conn = VaultConnection::open_in_memory().unwrap();
     initialize_vault(&conn, &VaultInitParams::default()).unwrap();

@@ -860,6 +860,75 @@ fn generic_object_summaries_are_paginated_and_query_bound() {
 }
 
 #[test]
+fn ffi_object_disclosure_is_typed_and_policy_first() {
+    let vault_path = temp_vault_path("object-disclosure");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "disclosure password 12345!".to_string(),
+        "ffi-disclosure-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Subject".to_string(),
+            r#"{"body":"secret body"}"#.to_string(),
+            2,
+        )
+        .unwrap();
+
+    let summary = vault
+        .get_object_summary(object.object_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.title, "Subject");
+    assert_eq!(summary.payload_schema_version, 2);
+
+    let allowed = vault.reveal_object(object.object_id.clone()).unwrap();
+    assert_eq!(
+        allowed.authorization.outcome,
+        MdbxAuthorizationOutcome::Allow
+    );
+    assert_eq!(
+        allowed.object.unwrap().payload_json,
+        r#"{"body":"secret body"}"#
+    );
+
+    vault
+        .set_tiga_profile(MdbxTigaMode::Power, None, None, standard_device())
+        .unwrap();
+    rusqlite::Connection::open(vault_path.path())
+        .unwrap()
+        .execute(
+            "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+            [&object.object_id],
+        )
+        .unwrap();
+
+    let denied = vault
+        .reveal_object_with_device_context(object.object_id.clone(), standard_device())
+        .unwrap();
+    assert!(denied.object.is_none());
+    assert!(!matches!(
+        denied.authorization.outcome,
+        MdbxAuthorizationOutcome::Allow | MdbxAuthorizationOutcome::AllowWithConstraints
+    ));
+    assert!(vault
+        .get_object(collection.project_id, object.object_id)
+        .is_err());
+
+    let reveal_events = vault
+        .list_security_audit_events(20)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.operation == MdbxTigaOperation::RevealSecret)
+        .collect::<Vec<_>>();
+    assert_eq!(reveal_events.len(), 2);
+}
+
+#[test]
 fn updates_deletes_restores_and_moves_generic_entry() {
     let vault_path = temp_vault_path("mutation");
     let path = vault_path.as_path_string();
