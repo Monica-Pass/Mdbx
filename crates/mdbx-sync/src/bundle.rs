@@ -11,6 +11,8 @@ const BUNDLE_MAGIC: &[u8; 8] = b"MDBXSYNC";
 /// 当前格式版本
 const BUNDLE_VERSION: u32 = 3;
 const INCREMENTAL_BUNDLE_VERSION: u32 = 4;
+const COMPRESSED_BUNDLE_VERSION: u32 = 5;
+const COMPRESSED_INCREMENTAL_BUNDLE_VERSION: u32 = 6;
 const PREVIOUS_BUNDLE_VERSION: u32 = 2;
 const LEGACY_BUNDLE_VERSION: u32 = 1;
 const BUNDLE_RESERVED_BYTES: usize = 20;
@@ -24,6 +26,15 @@ pub const MAX_INCREMENTAL_BUNDLE_COMMITS: usize = 4096;
 pub const MAX_INCREMENTAL_BUNDLE_DELTAS: usize = 4096;
 pub const MAX_INCREMENTAL_BUNDLE_TOKEN_BYTES: usize = 4096;
 const MAX_INCREMENTAL_BUNDLE_ID_BYTES: usize = 256;
+#[cfg(feature = "zstd-compression")]
+const ZSTD_COMPRESSION_LEVEL: i32 = 0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BundleCompression {
+    #[default]
+    None,
+    Zstd,
+}
 
 /// 离线同步包。
 ///
@@ -471,6 +482,23 @@ pub fn write_bundle(bundle: &SyncBundle, writer: &mut impl Write) -> SyncResult<
     write_versioned_payload(BUNDLE_VERSION, bundle, writer)
 }
 
+/// Write a complete bundle with an explicitly selected codec.
+///
+/// `None` preserves the v3 format. `Zstd` writes v5 and is available only
+/// when the crate is built with `zstd-compression`.
+pub fn write_bundle_with_compression(
+    bundle: &SyncBundle,
+    writer: &mut impl Write,
+    compression: BundleCompression,
+) -> SyncResult<()> {
+    match compression {
+        BundleCompression::None => write_bundle(bundle, writer),
+        BundleCompression::Zstd => {
+            write_compressed_payload(COMPRESSED_BUNDLE_VERSION, bundle, writer)
+        }
+    }
+}
+
 /// 将有界、可恢复的增量 bundle v4 写入文件。
 pub fn write_incremental_bundle(
     bundle: &IncrementalSyncBundle,
@@ -480,7 +508,27 @@ pub fn write_incremental_bundle(
     write_versioned_payload(INCREMENTAL_BUNDLE_VERSION, bundle, writer)
 }
 
-/// Return the SHA-256 digest written in a v4 bundle trailer.
+/// Write an incremental bundle with an explicitly selected codec.
+///
+/// `None` preserves the v4 format. `Zstd` writes v6 while retaining the
+/// SHA-256 identity of the uncompressed bincode payload.
+pub fn write_incremental_bundle_with_compression(
+    bundle: &IncrementalSyncBundle,
+    writer: &mut impl Write,
+    compression: BundleCompression,
+) -> SyncResult<()> {
+    bundle.validate()?;
+    match compression {
+        BundleCompression::None => {
+            write_versioned_payload(INCREMENTAL_BUNDLE_VERSION, bundle, writer)
+        }
+        BundleCompression::Zstd => {
+            write_compressed_payload(COMPRESSED_INCREMENTAL_BUNDLE_VERSION, bundle, writer)
+        }
+    }
+}
+
+/// Return the logical payload SHA-256 written in a v4 or v6 bundle trailer.
 ///
 /// Segment checkpoints use this digest to bind the next segment to the exact
 /// payload that was previously exported and durably applied.
@@ -553,6 +601,113 @@ fn write_versioned_payload<T: Serialize>(
     Ok(())
 }
 
+#[cfg(feature = "zstd-compression")]
+fn write_compressed_payload<T: Serialize>(
+    version: u32,
+    value: &T,
+    writer: &mut impl Write,
+) -> SyncResult<()> {
+    let uncompressed_len = encoded_payload_len(value)?;
+    let (compressed_len, expected_hash) = measure_compressed_payload(value)?;
+
+    writer.write_all(BUNDLE_MAGIC)?;
+    writer.write_all(&version.to_le_bytes())?;
+    let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
+    reserved[..8].copy_from_slice(&compressed_len.to_le_bytes());
+    reserved[8..16].copy_from_slice(&uncompressed_len.to_le_bytes());
+    writer.write_all(&reserved)?;
+
+    let mut forwarding_writer = LimitedForwardingWriter::new(writer, compressed_len);
+    let (written, actual_hash) = encode_compressed_payload(value, &mut forwarding_writer)?;
+    if forwarding_writer.exceeded_at().is_some()
+        || forwarding_writer.bytes_written() != compressed_len
+        || written != uncompressed_len
+        || actual_hash != expected_hash
+    {
+        return Err(SyncError::BundleFormat(
+            "bundle changed while it was being compressed".to_string(),
+        ));
+    }
+    writer.write_all(&expected_hash)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "zstd-compression"))]
+fn write_compressed_payload<T: Serialize>(
+    _version: u32,
+    _value: &T,
+    _writer: &mut impl Write,
+) -> SyncResult<()> {
+    Err(zstd_unsupported())
+}
+
+#[cfg(feature = "zstd-compression")]
+fn encoded_payload_len<T: Serialize>(value: &T) -> SyncResult<u64> {
+    let mut counter = LimitedCountingWriter::new(HARD_MAX_BUNDLE_PAYLOAD_BYTES);
+    let encoded_len =
+        bincode::serde::encode_into_std_write(value, &mut counter, bincode::config::standard())
+            .map_err(|error| {
+                if let Some(actual) = counter.exceeded_at() {
+                    payload_limit_error("sync bundle payload", actual, counter.limit)
+                } else {
+                    map_bundle_encode_error(error)
+                }
+            })?;
+    let payload_len = counter.bytes_written();
+    if encoded_len as u64 != payload_len {
+        return Err(SyncError::BundleFormat(
+            "bundle encoder reported an inconsistent payload length".to_string(),
+        ));
+    }
+    Ok(payload_len)
+}
+
+#[cfg(feature = "zstd-compression")]
+fn measure_compressed_payload<T: Serialize>(value: &T) -> SyncResult<(u64, [u8; 32])> {
+    let mut counter = LimitedCountingWriter::new(HARD_MAX_BUNDLE_PAYLOAD_BYTES);
+    let result = encode_compressed_payload(value, &mut counter);
+    if let Some(actual) = counter.exceeded_at() {
+        return Err(payload_limit_error(
+            "compressed sync bundle payload",
+            actual,
+            HARD_MAX_BUNDLE_PAYLOAD_BYTES,
+        ));
+    }
+    let (_, hash) = result?;
+    Ok((counter.bytes_written(), hash))
+}
+
+#[cfg(feature = "zstd-compression")]
+fn encode_compressed_payload<T: Serialize>(
+    value: &T,
+    writer: &mut impl Write,
+) -> SyncResult<(u64, [u8; BUNDLE_HASH_BYTES])> {
+    let mut encoder = zstd::stream::write::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
+    let mut hashing_writer = HashingWriter::new(&mut encoder);
+    let written = bincode::serde::encode_into_std_write(
+        value,
+        &mut hashing_writer,
+        bincode::config::standard(),
+    )
+    .map_err(map_bundle_encode_error)?;
+    let hash = hashing_writer.finalize();
+    encoder.finish()?;
+    Ok((written as u64, hash))
+}
+
+#[cfg(not(feature = "zstd-compression"))]
+fn zstd_unsupported() -> SyncError {
+    SyncError::UnsupportedFeature("zstd-compression".to_string())
+}
+
+fn payload_limit_error(resource: &str, actual: u64, limit: u64) -> SyncError {
+    SyncError::ResourceLimit {
+        resource: resource.to_string(),
+        actual,
+        limit,
+    }
+}
+
 fn map_bundle_encode_error(error: bincode::error::EncodeError) -> SyncError {
     match error {
         bincode::error::EncodeError::Io { inner, .. } => SyncError::IoError(inner),
@@ -606,6 +761,57 @@ struct HashingWriter<'a, W> {
     hasher: Sha256,
 }
 
+#[cfg(feature = "zstd-compression")]
+struct LimitedForwardingWriter<'a, W> {
+    inner: &'a mut W,
+    bytes_written: u64,
+    limit: u64,
+    exceeded_at: Option<u64>,
+}
+
+#[cfg(feature = "zstd-compression")]
+impl<'a, W: Write> LimitedForwardingWriter<'a, W> {
+    fn new(inner: &'a mut W, limit: u64) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+            limit,
+            exceeded_at: None,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn exceeded_at(&self) -> Option<u64> {
+        self.exceeded_at
+    }
+}
+
+#[cfg(feature = "zstd-compression")]
+impl<W: Write> Write for LimitedForwardingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let incoming = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        let next = self.bytes_written.saturating_add(incoming);
+        if next > self.limit {
+            self.exceeded_at = Some(next);
+            return Err(std::io::Error::other(
+                "compressed sync bundle payload length changed",
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl<'a, W: Write> HashingWriter<'a, W> {
     fn new(inner: &'a mut W) -> Self {
         Self {
@@ -647,6 +853,24 @@ pub fn incremental_bundle_to_bytes(bundle: &IncrementalSyncBundle) -> SyncResult
     Ok(buf)
 }
 
+pub fn bundle_to_bytes_with_compression(
+    bundle: &SyncBundle,
+    compression: BundleCompression,
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_bundle_with_compression(bundle, &mut buf, compression)?;
+    Ok(buf)
+}
+
+pub fn incremental_bundle_to_bytes_with_compression(
+    bundle: &IncrementalSyncBundle,
+    compression: BundleCompression,
+) -> SyncResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_incremental_bundle_with_compression(bundle, &mut buf, compression)?;
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // 文件读取
 // ---------------------------------------------------------------------------
@@ -663,7 +887,7 @@ pub fn read_bundle_with_limits(
     match read_bundle_file_with_limits(reader, limits)? {
         SyncBundleFile::Complete(bundle) => Ok(bundle),
         SyncBundleFile::Incremental(_) => Err(SyncError::BundleFormat(
-            "incremental bundle v4 requires read_bundle_file_with_limits".to_string(),
+            "incremental bundle requires read_bundle_file_with_limits".to_string(),
         )),
     }
 }
@@ -679,7 +903,9 @@ pub fn read_bundle_file_with_limits(
 ) -> SyncResult<SyncBundleFile> {
     let (version, payload_data) = read_bundle_payload(reader, limits)?;
 
-    let bundle = if version == INCREMENTAL_BUNDLE_VERSION {
+    let bundle = if version == INCREMENTAL_BUNDLE_VERSION
+        || version == COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+    {
         let (bundle, bytes_read): (IncrementalSyncBundle, usize) =
             bincode::serde::decode_from_slice(
                 &payload_data,
@@ -745,21 +971,26 @@ fn read_bundle_payload(
         && version != PREVIOUS_BUNDLE_VERSION
         && version != LEGACY_BUNDLE_VERSION
         && version != INCREMENTAL_BUNDLE_VERSION
+        && version != COMPRESSED_BUNDLE_VERSION
+        && version != COMPRESSED_INCREMENTAL_BUNDLE_VERSION
     {
         return Err(SyncError::BundleFormat(format!(
-            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION}, {PREVIOUS_BUNDLE_VERSION}, {BUNDLE_VERSION}, and {INCREMENTAL_BUNDLE_VERSION}"
+            "unsupported version: {version}; supported versions are {LEGACY_BUNDLE_VERSION} through {COMPRESSED_INCREMENTAL_BUNDLE_VERSION}"
         )));
     }
 
     let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
     reader.read_exact(&mut reserved)?;
 
-    let (payload_data, stored_hash) =
-        if version == BUNDLE_VERSION || version == INCREMENTAL_BUNDLE_VERSION {
+    let (payload_data, stored_hash) = match version {
+        BUNDLE_VERSION | INCREMENTAL_BUNDLE_VERSION => {
             read_length_prefixed_body(reader, &reserved, limits)?
-        } else {
-            read_legacy_body(reader, limits)?
-        };
+        }
+        COMPRESSED_BUNDLE_VERSION | COMPRESSED_INCREMENTAL_BUNDLE_VERSION => {
+            read_compressed_body(reader, &reserved, limits)?
+        }
+        _ => read_legacy_body(reader, limits)?,
+    };
 
     // 验证 hash
     let computed = {
@@ -776,24 +1007,82 @@ fn read_bundle_payload(
     Ok((version, payload_data))
 }
 
-fn read_length_prefixed_body(
+#[cfg(feature = "zstd-compression")]
+fn read_compressed_body(
     reader: &mut impl Read,
     reserved: &[u8; BUNDLE_RESERVED_BYTES],
     limits: BundleReadLimits,
 ) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
-    if reserved[8..].iter().any(|byte| *byte != 0) {
+    if reserved[16..].iter().any(|byte| *byte != 0) {
         return Err(SyncError::BundleFormat(
-            "non-zero reserved bundle header bytes".to_string(),
+            "non-zero reserved compressed bundle header bytes".to_string(),
         ));
     }
-    let mut payload_len_bytes = [0u8; 8];
-    payload_len_bytes.copy_from_slice(&reserved[..8]);
-    let payload_len = u64::from_le_bytes(payload_len_bytes);
-    ensure_payload_within_limit(payload_len, limits.max_payload_bytes())?;
-    let payload_len_usize = usize::try_from(payload_len).map_err(|_| SyncError::ResourceLimit {
-        resource: "sync bundle payload".to_string(),
-        actual: payload_len,
-        limit: limits.max_payload_bytes(),
+    let compressed_len = header_u64(&reserved[..8]);
+    let uncompressed_len = header_u64(&reserved[8..16]);
+    ensure_payload_resource_within_limit(
+        "compressed sync bundle payload",
+        compressed_len,
+        limits.max_payload_bytes(),
+    )?;
+    ensure_payload_resource_within_limit(
+        "uncompressed sync bundle payload",
+        uncompressed_len,
+        limits.max_payload_bytes(),
+    )?;
+
+    let (compressed, stored_hash) = read_exact_body(reader, compressed_len, limits)?;
+    let output_read_limit = uncompressed_len
+        .checked_add(1)
+        .ok_or_else(|| SyncError::BundleFormat("bundle size limit overflow".to_string()))?;
+    let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))?;
+    let mut payload = Vec::new();
+    decoder
+        .by_ref()
+        .take(output_read_limit)
+        .read_to_end(&mut payload)?;
+    let actual_len = payload.len() as u64;
+    if actual_len != uncompressed_len {
+        if actual_len > limits.max_payload_bytes() {
+            return Err(payload_limit_error(
+                "uncompressed sync bundle payload",
+                actual_len,
+                limits.max_payload_bytes(),
+            ));
+        }
+        return Err(SyncError::BundleFormat(format!(
+            "compressed bundle expanded to {actual_len} bytes; header declares {uncompressed_len} bytes"
+        )));
+    }
+    Ok((payload, stored_hash))
+}
+
+#[cfg(not(feature = "zstd-compression"))]
+fn read_compressed_body(
+    _reader: &mut impl Read,
+    _reserved: &[u8; BUNDLE_RESERVED_BYTES],
+    _limits: BundleReadLimits,
+) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    Err(zstd_unsupported())
+}
+
+fn header_u64(bytes: &[u8]) -> u64 {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(bytes);
+    u64::from_le_bytes(value)
+}
+
+fn read_exact_body(
+    reader: &mut impl Read,
+    payload_len: u64,
+    limits: BundleReadLimits,
+) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
+        payload_limit_error(
+            "sync bundle payload",
+            payload_len,
+            limits.max_payload_bytes(),
+        )
     })?;
     let mut payload = Vec::new();
     payload
@@ -815,6 +1104,21 @@ fn read_length_prefixed_body(
         ));
     }
     Ok((payload, stored_hash))
+}
+
+fn read_length_prefixed_body(
+    reader: &mut impl Read,
+    reserved: &[u8; BUNDLE_RESERVED_BYTES],
+    limits: BundleReadLimits,
+) -> SyncResult<(Vec<u8>, [u8; BUNDLE_HASH_BYTES])> {
+    if reserved[8..].iter().any(|byte| *byte != 0) {
+        return Err(SyncError::BundleFormat(
+            "non-zero reserved bundle header bytes".to_string(),
+        ));
+    }
+    let payload_len = header_u64(&reserved[..8]);
+    ensure_payload_within_limit(payload_len, limits.max_payload_bytes())?;
+    read_exact_body(reader, payload_len, limits)
 }
 
 fn read_legacy_body(
@@ -851,12 +1155,12 @@ fn read_legacy_body(
 }
 
 fn ensure_payload_within_limit(actual: u64, limit: u64) -> SyncResult<()> {
+    ensure_payload_resource_within_limit("sync bundle payload", actual, limit)
+}
+
+fn ensure_payload_resource_within_limit(resource: &str, actual: u64, limit: u64) -> SyncResult<()> {
     if actual > limit {
-        return Err(SyncError::ResourceLimit {
-            resource: "sync bundle payload".to_string(),
-            actual,
-            limit,
-        });
+        return Err(payload_limit_error(resource, actual, limit));
     }
     Ok(())
 }
@@ -1045,6 +1349,13 @@ mod tests {
         u64::from_le_bytes(value)
     }
 
+    #[cfg(feature = "zstd-compression")]
+    fn declared_uncompressed_len(bytes: &[u8]) -> u64 {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&bytes[20..28]);
+        u64::from_le_bytes(value)
+    }
+
     #[test]
     fn test_bundle_roundtrip() {
         let bundle = sample_bundle();
@@ -1093,6 +1404,149 @@ mod tests {
             SyncBundleFile::Complete(restored) => assert_eq!(restored.commits.len(), 1),
             SyncBundleFile::Incremental(_) => panic!("v3 decoded as incremental"),
         }
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_v5_complete_bundle_round_trips() {
+        let bundle = sample_bundle();
+        let bytes = bundle_to_bytes_with_compression(&bundle, BundleCompression::Zstd).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            COMPRESSED_BUNDLE_VERSION
+        );
+        assert_eq!(declared_payload_len(&bytes) as usize, bytes.len() - 64);
+        assert!(declared_uncompressed_len(&bytes) > 0);
+
+        let restored = bundle_from_bytes(&bytes).unwrap();
+        assert_eq!(restored.vault_id, bundle.vault_id);
+        assert_eq!(restored.commits[0].commit.commit_id, "commit-1");
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_v6_incremental_bundle_round_trips_with_logical_hash() {
+        let bundle = sample_incremental_bundle();
+        let bytes =
+            incremental_bundle_to_bytes_with_compression(&bundle, BundleCompression::Zstd).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+        );
+        assert_eq!(
+            incremental_bundle_payload_sha256(&bundle).unwrap(),
+            bytes[bytes.len() - BUNDLE_HASH_BYTES..]
+        );
+
+        match bundle_file_from_bytes(&bytes).unwrap() {
+            SyncBundleFile::Incremental(restored) => {
+                assert_eq!(restored.manifest.transfer_id, "transfer-1");
+                assert_eq!(restored.manifest.commit_inventory.len(), 1);
+            }
+            SyncBundleFile::Complete(_) => panic!("v6 decoded as a complete bundle"),
+        }
+    }
+
+    #[test]
+    fn legacy_writer_versions_remain_v3_and_v4() {
+        let complete = bundle_to_bytes(&sample_bundle()).unwrap();
+        let incremental = incremental_bundle_to_bytes(&sample_incremental_bundle()).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(complete[8..12].try_into().unwrap()),
+            BUNDLE_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes(incremental[8..12].try_into().unwrap()),
+            INCREMENTAL_BUNDLE_VERSION
+        );
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_bundle_enforces_both_declared_lengths_before_allocation() {
+        let bytes =
+            bundle_to_bytes_with_compression(&sample_bundle(), BundleCompression::Zstd).unwrap();
+        let compressed_len = declared_payload_len(&bytes);
+        let uncompressed_len = declared_uncompressed_len(&bytes);
+
+        let compressed_limit = BundleReadLimits::new(compressed_len - 1).unwrap();
+        assert!(matches!(
+            read_bundle_with_limits(&mut std::io::Cursor::new(&bytes), compressed_limit),
+            Err(SyncError::ResourceLimit { ref resource, .. })
+                if resource == "compressed sync bundle payload"
+        ));
+
+        let uncompressed_limit = BundleReadLimits::new(uncompressed_len - 1).unwrap();
+        assert!(matches!(
+            read_bundle_with_limits(&mut std::io::Cursor::new(&bytes), uncompressed_limit),
+            Err(SyncError::ResourceLimit { ref resource, .. })
+                if resource == "uncompressed sync bundle payload"
+        ));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_bundle_rejects_tampered_uncompressed_length() {
+        let mut bytes =
+            bundle_to_bytes_with_compression(&sample_bundle(), BundleCompression::Zstd).unwrap();
+        let tampered = declared_uncompressed_len(&bytes) + 1;
+        bytes[20..28].copy_from_slice(&tampered.to_le_bytes());
+
+        let error = bundle_from_bytes(&bytes).unwrap_err();
+        assert!(error.to_string().contains("header declares"));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_bundle_caps_decompression_expansion() {
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(vec![0u8; 256]), 0).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BUNDLE_MAGIC);
+        bytes.extend_from_slice(&COMPRESSED_BUNDLE_VERSION.to_le_bytes());
+        let mut reserved = [0u8; BUNDLE_RESERVED_BYTES];
+        reserved[..8].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+        reserved[8..16].copy_from_slice(&64_u64.to_le_bytes());
+        bytes.extend_from_slice(&reserved);
+        bytes.extend_from_slice(&compressed);
+        bytes.extend_from_slice(&[0u8; BUNDLE_HASH_BYTES]);
+
+        let limits = BundleReadLimits::new(64).unwrap();
+        let error = read_bundle_with_limits(&mut std::io::Cursor::new(bytes), limits).unwrap_err();
+        assert!(matches!(
+            error,
+            SyncError::ResourceLimit {
+                ref resource,
+                actual: 65,
+                limit: 64
+            } if resource == "uncompressed sync bundle payload"
+        ));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn compressed_bundle_rejects_corrupted_stream() {
+        let mut bytes =
+            bundle_to_bytes_with_compression(&sample_bundle(), BundleCompression::Zstd).unwrap();
+        bytes[32] ^= 0xff;
+        assert!(bundle_from_bytes(&bytes).is_err());
+    }
+
+    #[cfg(not(feature = "zstd-compression"))]
+    #[test]
+    fn compressed_bundle_requires_optional_feature() {
+        assert!(matches!(
+            bundle_to_bytes_with_compression(&sample_bundle(), BundleCompression::Zstd),
+            Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
+        ));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BUNDLE_MAGIC);
+        bytes.extend_from_slice(&COMPRESSED_BUNDLE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; BUNDLE_RESERVED_BYTES]);
+        assert!(matches!(
+            bundle_from_bytes(&bytes),
+            Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
+        ));
     }
 
     #[test]

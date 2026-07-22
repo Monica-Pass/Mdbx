@@ -35,6 +35,9 @@ pub enum SyncError {
         actual: u64,
         limit: u64,
     },
+
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
 }
 
 pub type SyncResult<T> = Result<T, SyncError>;
