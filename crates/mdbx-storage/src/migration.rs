@@ -1614,25 +1614,24 @@ mod tests {
         assert!(table_exists(&conn, "sync_state_extensions").unwrap());
     }
 
-    #[test]
-    fn real_mdbx1_release_fixture_upgrades_and_preserves_all_record_families() {
+    fn assert_real_mdbx1_fixture_upgrades_and_preserves_all_record_families(
+        fixture: &[u8],
+        manifest_json: &str,
+    ) {
         use crate::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
         use crate::unlock::UnlockService;
         use rusqlite::OpenFlags;
         use sha2::{Digest, Sha256};
 
-        const FIXTURE: &[u8] = include_bytes!("../test-data/mdbx1-release-1.0.mdbx");
-        const MANIFEST: &str = include_str!("../test-data/mdbx1-release-1.0.manifest.json");
-
-        let manifest: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(manifest_json).unwrap();
         let mut digest = Sha256::new();
-        digest.update(FIXTURE);
+        digest.update(fixture);
         assert_eq!(
             format!("{:X}", digest.finalize()),
             manifest["fixture_sha256"].as_str().unwrap()
         );
         assert_eq!(
-            FIXTURE.len(),
+            fixture.len(),
             manifest["fixture_bytes"].as_u64().unwrap() as usize
         );
 
@@ -1640,7 +1639,7 @@ mod tests {
             "mdbx1-release-golden-{}.mdbx",
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&path, FIXTURE).unwrap();
+        std::fs::write(&path, fixture).unwrap();
 
         let before = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let format: String = before
@@ -1648,7 +1647,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(format, FORMAT_V1);
+        assert_eq!(format, manifest["format"].as_str().unwrap());
         let before_counts: (i64, i64, i64, i64, i64) = before
             .query_row(
                 "SELECT
@@ -1698,7 +1697,7 @@ mod tests {
 
         let plan = inspect_migration_path(&path).unwrap();
         assert!(plan.requires_upgrade);
-        assert_eq!(plan.format_version.as_deref(), Some(FORMAT_V1));
+        assert_eq!(plan.format_version.as_deref(), manifest["format"].as_str());
         assert_eq!(plan.schema_version, Some(1));
         let inspected_bytes = std::fs::read(&path).unwrap();
         let mut inspected_digest = Sha256::new();
@@ -1834,6 +1833,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("mdbx-wal"));
         let _ = std::fs::remove_file(path.with_extension("mdbx-shm"));
+    }
+
+    #[test]
+    fn real_mdbx1_release_fixture_upgrades_and_preserves_all_record_families() {
+        assert_real_mdbx1_fixture_upgrades_and_preserves_all_record_families(
+            include_bytes!("../test-data/mdbx1-release-1.0.mdbx"),
+            include_str!("../test-data/mdbx1-release-1.0.manifest.json"),
+        );
+    }
+
+    #[test]
+    fn real_mdbx1_draft_fixture_upgrades_and_preserves_all_record_families() {
+        assert_real_mdbx1_fixture_upgrades_and_preserves_all_record_families(
+            include_bytes!("../test-data/mdbx1-draft-golden.mdbx"),
+            include_str!("../test-data/mdbx1-draft-golden.manifest.json"),
+        );
     }
 
     #[test]
