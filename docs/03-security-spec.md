@@ -211,6 +211,16 @@ not proof of external Provider bytes or arbitrary unregistered SQLite tables;
 the explicit manifest and rollback anchor remain authoritative for those
 documented scopes.
 
+When both peers negotiate `authenticated-state-root-v1`, protocol-v2 Hello and
+HelloAck may carry a bounded peer checkpoint. Storage signs it with a separate
+HMAC domain that implicitly binds the local vault ID and schema version; the
+wire value contains only the profile, generation, leaf count, root hash,
+commit/delta anchors, and authentication tag. Clients MUST verify it with the
+opened vault and persist the last trusted value outside the vault, per peer.
+A lower generation, lower anchor, same-generation field change, foreign-vault
+checkpoint, or invalid tag MUST fail closed. Root equality is not a mandatory
+replica-convergence test because inventory ordering can be local.
+
 New issuance uses manifest profile v2. V2 reads `table_xinfo`, so ordinary,
 generated, and hidden columns are all represented, and orders typed values
 canonically even when nullable primary keys or declared collations do not form

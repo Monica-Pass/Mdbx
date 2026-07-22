@@ -53,6 +53,8 @@ pub struct SyncNegotiator {
     /// 本方与对方声明的可选协议能力。
     local_capabilities: HashSet<String>,
     remote_capabilities: HashSet<String>,
+    local_authenticated_state_root: Option<AuthenticatedStateRootCheckpoint>,
+    remote_authenticated_state_root: Option<AuthenticatedStateRootCheckpoint>,
 
     /// 本地分支 head。
     local_heads: Vec<BranchHead>,
@@ -74,6 +76,8 @@ impl SyncNegotiator {
             remote_known_commit_ids: HashSet::new(),
             local_capabilities: HashSet::new(),
             remote_capabilities: HashSet::new(),
+            local_authenticated_state_root: None,
+            remote_authenticated_state_root: None,
             local_heads,
             remote_heads: Vec::new(),
         }
@@ -130,6 +134,18 @@ impl SyncNegotiator {
         self.enable_capability(CAPABILITY_AUTHENTICATED_BUNDLE_V1)
     }
 
+    /// Advertise an authenticated state-root checkpoint. Protocol validation
+    /// checks only structure; the storage adapter must verify its HMAC.
+    pub fn enable_authenticated_state_root_checkpoint(
+        &mut self,
+        checkpoint: AuthenticatedStateRootCheckpoint,
+    ) -> SyncResult<()> {
+        checkpoint.validate()?;
+        self.enable_capability(CAPABILITY_AUTHENTICATED_STATE_ROOT_V1)?;
+        self.local_authenticated_state_root = Some(checkpoint);
+        Ok(())
+    }
+
     /// Build the local Hello. New peers do not put an unbounded commit-ID
     /// inventory in this message once paging is enabled locally.
     pub fn local_hello(&self) -> SyncResult<HelloRequest> {
@@ -141,8 +157,12 @@ impl SyncNegotiator {
         } else {
             self.known_commit_ids.iter().cloned().collect()
         };
-        HelloRequest::new(&self.device_id, self.local_heads.clone(), known_commit_ids)
-            .with_capabilities(self.local_capabilities.iter().cloned().collect())
+        let hello = HelloRequest::new(&self.device_id, self.local_heads.clone(), known_commit_ids)
+            .with_capabilities(self.local_capabilities.iter().cloned().collect())?;
+        match self.local_authenticated_state_root.clone() {
+            Some(checkpoint) => hello.with_authenticated_state_root(checkpoint),
+            None => Ok(hello),
+        }
     }
 
     /// 处理对方的 Hello 消息并生成己方的 Hello 响应。
@@ -153,12 +173,13 @@ impl SyncNegotiator {
                 remote: hello.protocol_version,
             });
         }
-        validate_capabilities(&hello.capabilities)?;
+        hello.validate()?;
 
         self.remote_heads = hello.heads.clone();
         self.remote_known_commit_ids = hello.known_commit_ids.iter().cloned().collect();
 
         self.remote_capabilities = hello.capabilities.iter().cloned().collect();
+        self.remote_authenticated_state_root = hello.authenticated_state_root.clone();
         let negotiated = self
             .local_capabilities
             .intersection(&self.remote_capabilities)
@@ -171,8 +192,19 @@ impl SyncNegotiator {
             } else {
                 self.known_commit_ids.iter().cloned().collect()
             };
-        HelloResponse::new(&self.device_id, self.local_heads.clone(), known_commit_ids)
-            .with_capabilities(negotiated)
+        let response =
+            HelloResponse::new(&self.device_id, self.local_heads.clone(), known_commit_ids)
+                .with_capabilities(negotiated)?;
+        if self.authenticated_state_root_is_negotiated() {
+            let checkpoint = self.local_authenticated_state_root.clone().ok_or_else(|| {
+                SyncError::Protocol(
+                    "negotiated authenticated state-root checkpoint is missing".to_string(),
+                )
+            })?;
+            response.with_authenticated_state_root(checkpoint)
+        } else {
+            Ok(response)
+        }
     }
 
     /// 处理对方的 Hello 响应。
@@ -183,11 +215,12 @@ impl SyncNegotiator {
                 remote: response.protocol_version,
             });
         }
-        validate_capabilities(&response.capabilities)?;
+        response.validate()?;
 
         self.remote_heads = response.heads.clone();
         self.remote_known_commit_ids = response.known_commit_ids.iter().cloned().collect();
         self.remote_capabilities = response.capabilities.iter().cloned().collect();
+        self.remote_authenticated_state_root = response.authenticated_state_root.clone();
         Ok(())
     }
 
@@ -311,6 +344,21 @@ impl SyncNegotiator {
     /// advertise the independent authentication capability.
     pub fn authenticated_bundle_is_negotiated(&self) -> bool {
         self.capability_is_negotiated(CAPABILITY_AUTHENTICATED_BUNDLE_V1)
+    }
+
+    /// Root exchange is active only when the capability and both bounded
+    /// checkpoints are present. The remote value remains untrusted until the
+    /// storage adapter verifies its HMAC.
+    pub fn authenticated_state_root_is_negotiated(&self) -> bool {
+        self.capability_is_negotiated(CAPABILITY_AUTHENTICATED_STATE_ROOT_V1)
+            && self.local_authenticated_state_root.is_some()
+            && self.remote_authenticated_state_root.is_some()
+    }
+
+    pub fn remote_authenticated_state_root(&self) -> Option<&AuthenticatedStateRootCheckpoint> {
+        self.authenticated_state_root_is_negotiated()
+            .then_some(self.remote_authenticated_state_root.as_ref())
+            .flatten()
     }
 
     pub fn negotiated_bundle_compression(&self) -> BundleCompression {
@@ -1013,6 +1061,19 @@ mod tests {
         }
     }
 
+    fn root_checkpoint(generation: u64, marker: u8) -> AuthenticatedStateRootCheckpoint {
+        AuthenticatedStateRootCheckpoint::new(
+            AUTHENTICATED_STATE_ROOT_PROFILE_V1.to_string(),
+            generation,
+            10,
+            vec![marker; AUTHENTICATED_STATE_ROOT_HASH_BYTES],
+            generation + 2,
+            generation + 3,
+            vec![marker.wrapping_add(1); AUTHENTICATED_STATE_ROOT_HASH_BYTES],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_already_synced() {
         let heads = vec![make_head("main", "abc123")];
@@ -1166,6 +1227,57 @@ mod tests {
             .unwrap();
         assert!(!legacy_response.supports(CAPABILITY_AUTHENTICATED_BUNDLE_V1));
         assert!(!responder.authenticated_bundle_is_negotiated());
+    }
+
+    #[test]
+    fn authenticated_state_root_checkpoint_requires_mutual_opt_in() {
+        assert!(!INCREMENTAL_SYNC_CAPABILITIES.contains(&CAPABILITY_AUTHENTICATED_STATE_ROOT_V1));
+        let responder_checkpoint = root_checkpoint(5, 5);
+        let initiator_checkpoint = root_checkpoint(7, 7);
+        let mut responder = SyncNegotiator::new("root-a", Vec::new(), Vec::new());
+        responder
+            .enable_authenticated_state_root_checkpoint(responder_checkpoint.clone())
+            .unwrap();
+        let mut initiator = SyncNegotiator::new("root-b", Vec::new(), Vec::new());
+        initiator
+            .enable_authenticated_state_root_checkpoint(initiator_checkpoint.clone())
+            .unwrap();
+
+        let hello = initiator.local_hello().unwrap();
+        assert_eq!(
+            hello.authenticated_state_root,
+            Some(initiator_checkpoint.clone())
+        );
+        let response = responder.on_hello(&hello).unwrap();
+        assert_eq!(
+            response.authenticated_state_root,
+            Some(responder_checkpoint.clone())
+        );
+        initiator.on_hello_ack(&response).unwrap();
+        assert!(responder.authenticated_state_root_is_negotiated());
+        assert!(initiator.authenticated_state_root_is_negotiated());
+        assert_eq!(
+            responder.remote_authenticated_state_root(),
+            Some(&initiator_checkpoint)
+        );
+        assert_eq!(
+            initiator.remote_authenticated_state_root(),
+            Some(&responder_checkpoint)
+        );
+
+        let legacy_response = responder
+            .on_hello(&HelloRequest::new("legacy", Vec::new(), Vec::new()))
+            .unwrap();
+        assert!(legacy_response.authenticated_state_root.is_none());
+        assert!(!legacy_response.supports(CAPABILITY_AUTHENTICATED_STATE_ROOT_V1));
+        assert!(!responder.authenticated_state_root_is_negotiated());
+
+        let capability_only = HelloRequest::new("capability-only", Vec::new(), Vec::new())
+            .with_capabilities(vec![CAPABILITY_AUTHENTICATED_STATE_ROOT_V1.to_string()])
+            .unwrap();
+        let response = responder.on_hello(&capability_only).unwrap();
+        assert!(response.authenticated_state_root.is_none());
+        assert!(!responder.authenticated_state_root_is_negotiated());
     }
 
     #[cfg(not(feature = "zstd-compression"))]

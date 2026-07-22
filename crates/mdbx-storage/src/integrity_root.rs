@@ -5,6 +5,8 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use mdbx_sync::AuthenticatedStateRootCheckpoint;
+
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::migration::AUTHENTICATED_STATE_ROOT_EXTENSION;
@@ -14,8 +16,9 @@ use crate::sync_state::{
 };
 use crate::vault_header_integrity::{self, VaultHeaderIntegrityStatus};
 
-pub const INTEGRITY_ROOT_PROFILE_V1: &str = "mdbx-authenticated-state-root-v1";
-pub const AUTHENTICATED_STATE_ROOT_CAPABILITY: &str = "authenticated-state-root-v1";
+pub const INTEGRITY_ROOT_PROFILE_V1: &str = mdbx_sync::AUTHENTICATED_STATE_ROOT_PROFILE_V1;
+pub const AUTHENTICATED_STATE_ROOT_CAPABILITY: &str =
+    mdbx_sync::CAPABILITY_AUTHENTICATED_STATE_ROOT_V1;
 
 pub const DEFAULT_MAX_INTEGRITY_ROOT_LEAVES: usize = 250_000;
 pub const HARD_MAX_INTEGRITY_ROOT_LEAVES: usize = 2_000_000;
@@ -36,6 +39,7 @@ const NODE_HASH_DOMAIN: &[u8] = b"mdbx-integrity-root-node-v1";
 const LEAF_AUTH_DOMAIN: &[u8] = b"mdbx-integrity-root-leaf-auth-v1";
 const NODE_AUTH_DOMAIN: &[u8] = b"mdbx-integrity-root-node-auth-v1";
 const META_AUTH_DOMAIN: &[u8] = b"mdbx-integrity-root-meta-auth-v1";
+const PEER_CHECKPOINT_AUTH_DOMAIN: &[u8] = b"mdbx-integrity-root-peer-checkpoint-auth-v1";
 
 type NodeMap = BTreeMap<(u8, u32), [u8; HASH_LEN]>;
 
@@ -160,6 +164,13 @@ pub struct IntegrityRootVerification {
     pub root_hash: [u8; HASH_LEN],
     pub latest_commit_seq: u64,
     pub latest_delta_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntegrityRootCheckpointRelation {
+    Unchanged,
+    Advanced,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +362,108 @@ impl IntegrityRootService {
                 latest_delta_seq: meta.latest_delta_seq,
             })
         })
+    }
+
+    /// Issues an O(1) authenticated checkpoint for peer rollback tracking.
+    /// Unlock already verifies an established tree, and every later mutation
+    /// advances the authenticated metadata in the same transaction.
+    pub fn issue_checkpoint(
+        conn: &VaultConnection,
+    ) -> StorageResult<AuthenticatedStateRootCheckpoint> {
+        require_verified_unlocked(conn)?;
+        let status = Self::status(conn)?;
+        if status.state != IntegrityRootState::Established || !status.authenticated {
+            return Err(StorageError::Validation(
+                "peer checkpoint issuance requires an established authenticated integrity root"
+                    .to_string(),
+            ));
+        }
+        let root_hash = status.root_hash.ok_or_else(|| {
+            StorageError::Validation(
+                "established integrity root is missing its root hash".to_string(),
+            )
+        })?;
+        let profile = status.profile.ok_or_else(|| {
+            StorageError::Validation(
+                "established integrity root is missing its profile".to_string(),
+            )
+        })?;
+        let authentication_tag = compute_peer_checkpoint_tag(
+            conn,
+            &profile,
+            status.generation,
+            status.leaf_count,
+            &root_hash,
+            status.latest_commit_seq,
+            status.latest_delta_seq,
+        )?;
+        AuthenticatedStateRootCheckpoint::new(
+            profile,
+            status.generation,
+            status.leaf_count,
+            root_hash.to_vec(),
+            status.latest_commit_seq,
+            status.latest_delta_seq,
+            authentication_tag,
+        )
+        .map_err(|error| StorageError::Validation(error.to_string()))
+    }
+
+    /// Verifies a peer checkpoint against this vault's identity, schema, and
+    /// integrity subkey. It does not compare the peer root with the local root.
+    pub fn verify_checkpoint(
+        conn: &VaultConnection,
+        checkpoint: &AuthenticatedStateRootCheckpoint,
+    ) -> StorageResult<IntegrityRootVerification> {
+        require_verified_unlocked(conn)?;
+        checkpoint
+            .validate()
+            .map_err(|error| StorageError::Validation(error.to_string()))?;
+        verify_peer_checkpoint_tag(conn, checkpoint)?;
+        Ok(IntegrityRootVerification {
+            profile: checkpoint.profile.clone(),
+            generation: checkpoint.generation,
+            leaf_count: checkpoint.leaf_count,
+            root_hash: checkpoint.root_hash.clone().try_into().map_err(|_| {
+                StorageError::Validation(
+                    "authenticated state-root hash must be 32 bytes".to_string(),
+                )
+            })?,
+            latest_commit_seq: checkpoint.latest_commit_sequence,
+            latest_delta_seq: checkpoint.latest_delta_sequence,
+        })
+    }
+
+    /// Compares two authenticated checkpoints previously associated with the
+    /// same peer identity by the client.
+    pub fn compare_checkpoints(
+        conn: &VaultConnection,
+        previous: &AuthenticatedStateRootCheckpoint,
+        candidate: &AuthenticatedStateRootCheckpoint,
+    ) -> StorageResult<IntegrityRootCheckpointRelation> {
+        Self::verify_checkpoint(conn, previous)?;
+        Self::verify_checkpoint(conn, candidate)?;
+        match candidate.generation.cmp(&previous.generation) {
+            std::cmp::Ordering::Less => Err(StorageError::Validation(
+                "authenticated peer integrity-root checkpoint rolled back its generation"
+                    .to_string(),
+            )),
+            std::cmp::Ordering::Equal if candidate != previous => Err(StorageError::Validation(
+                "authenticated peer integrity-root checkpoint changed within one generation"
+                    .to_string(),
+            )),
+            std::cmp::Ordering::Equal => Ok(IntegrityRootCheckpointRelation::Unchanged),
+            std::cmp::Ordering::Greater
+                if candidate.latest_commit_sequence < previous.latest_commit_sequence
+                    || candidate.latest_delta_sequence < previous.latest_delta_sequence =>
+            {
+                Err(StorageError::Validation(
+                    "authenticated peer integrity-root checkpoint rolled back an inventory anchor"
+                        .to_string(),
+                ))
+            }
+            std::cmp::Ordering::Greater => Ok(IntegrityRootCheckpointRelation::Advanced),
+        }
     }
 }
 
@@ -2302,6 +2415,80 @@ fn compute_meta_tag(
     .map_err(StorageError::Crypto)
 }
 
+fn compute_peer_checkpoint_tag(
+    conn: &VaultConnection,
+    profile: &str,
+    generation: u64,
+    leaf_count: u64,
+    root_hash: &[u8],
+    latest_commit_sequence: u64,
+    latest_delta_sequence: u64,
+) -> StorageResult<Vec<u8>> {
+    let keyring = conn.keyring().ok_or_else(|| {
+        StorageError::Validation(
+            "peer integrity-root checkpoint requires a verified unlock".to_string(),
+        )
+    })?;
+    let (vault_id, schema_version) = vault_identity(conn)?;
+    let schema_version = schema_version.to_le_bytes();
+    let generation = generation.to_le_bytes();
+    let leaf_count = leaf_count.to_le_bytes();
+    let latest_commit_sequence = latest_commit_sequence.to_le_bytes();
+    let latest_delta_sequence = latest_delta_sequence.to_le_bytes();
+    mdbx_crypto::integrity::hmac_sha256(
+        &keyring.integrity_subkey,
+        &[
+            PEER_CHECKPOINT_AUTH_DOMAIN,
+            vault_id.as_bytes(),
+            &schema_version,
+            profile.as_bytes(),
+            &generation,
+            &leaf_count,
+            root_hash,
+            &latest_commit_sequence,
+            &latest_delta_sequence,
+        ],
+    )
+    .map_err(StorageError::Crypto)
+}
+
+fn verify_peer_checkpoint_tag(
+    conn: &VaultConnection,
+    checkpoint: &AuthenticatedStateRootCheckpoint,
+) -> StorageResult<()> {
+    let keyring = conn.keyring().ok_or_else(|| {
+        StorageError::Validation(
+            "peer integrity-root checkpoint requires a verified unlock".to_string(),
+        )
+    })?;
+    let (vault_id, schema_version) = vault_identity(conn)?;
+    let schema_version = schema_version.to_le_bytes();
+    let generation = checkpoint.generation.to_le_bytes();
+    let leaf_count = checkpoint.leaf_count.to_le_bytes();
+    let latest_commit_sequence = checkpoint.latest_commit_sequence.to_le_bytes();
+    let latest_delta_sequence = checkpoint.latest_delta_sequence.to_le_bytes();
+    mdbx_crypto::integrity::verify_hmac_sha256(
+        &keyring.integrity_subkey,
+        &[
+            PEER_CHECKPOINT_AUTH_DOMAIN,
+            vault_id.as_bytes(),
+            &schema_version,
+            checkpoint.profile.as_bytes(),
+            &generation,
+            &leaf_count,
+            &checkpoint.root_hash,
+            &latest_commit_sequence,
+            &latest_delta_sequence,
+        ],
+        &checkpoint.authentication_tag,
+    )
+    .map_err(|_| {
+        StorageError::Validation(
+            "authenticated peer integrity-root checkpoint verification failed".to_string(),
+        )
+    })
+}
+
 fn current_anchors(conn: &VaultConnection) -> StorageResult<(u64, u64)> {
     let commit_seq: i64 = conn.inner().query_row(
         "SELECT COALESCE(MAX(inventory_seq), 0) FROM commit_inventory",
@@ -2470,12 +2657,92 @@ mod tests {
         conn
     }
 
+    fn resign_checkpoint(
+        conn: &VaultConnection,
+        checkpoint: &mut AuthenticatedStateRootCheckpoint,
+    ) {
+        checkpoint.authentication_tag = compute_peer_checkpoint_tag(
+            conn,
+            &checkpoint.profile,
+            checkpoint.generation,
+            checkpoint.leaf_count,
+            &checkpoint.root_hash,
+            checkpoint.latest_commit_sequence,
+            checkpoint.latest_delta_sequence,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn root_is_disabled_until_explicitly_enabled() {
         let conn = setup_unlocked();
         let status = IntegrityRootService::status(&conn).unwrap();
         assert_eq!(status.state, IntegrityRootState::Disabled);
         assert!(!status.authenticated);
+    }
+
+    #[test]
+    fn integrity_root_checkpoint_authenticates_and_rejects_peer_rollback() {
+        let conn = setup_unlocked();
+        IntegrityRootService::enable(&conn).unwrap();
+        let first = IntegrityRootService::issue_checkpoint(&conn).unwrap();
+        let verified = IntegrityRootService::verify_checkpoint(&conn, &first).unwrap();
+        assert_eq!(verified.root_hash.as_slice(), first.root_hash);
+        assert_eq!(
+            IntegrityRootService::compare_checkpoints(&conn, &first, &first).unwrap(),
+            IntegrityRootCheckpointRelation::Unchanged
+        );
+
+        ProjectRepo::create(
+            &conn,
+            &CommitContext::new("checkpoint-device".to_string()),
+            "checkpoint advance",
+            None,
+            None,
+        )
+        .unwrap();
+        let advanced = IntegrityRootService::issue_checkpoint(&conn).unwrap();
+        assert_eq!(
+            IntegrityRootService::compare_checkpoints(&conn, &first, &advanced).unwrap(),
+            IntegrityRootCheckpointRelation::Advanced
+        );
+        assert!(
+            IntegrityRootService::compare_checkpoints(&conn, &advanced, &first)
+                .unwrap_err()
+                .to_string()
+                .contains("rolled back its generation")
+        );
+
+        let mut tampered = advanced.clone();
+        tampered.root_hash[0] ^= 1;
+        assert!(IntegrityRootService::verify_checkpoint(&conn, &tampered)
+            .unwrap_err()
+            .to_string()
+            .contains("verification failed"));
+
+        let mut equivocated = first.clone();
+        equivocated.root_hash[0] ^= 1;
+        resign_checkpoint(&conn, &mut equivocated);
+        assert!(
+            IntegrityRootService::compare_checkpoints(&conn, &first, &equivocated)
+                .unwrap_err()
+                .to_string()
+                .contains("changed within one generation")
+        );
+
+        let mut anchor_rollback = advanced.clone();
+        anchor_rollback.generation += 1;
+        anchor_rollback.latest_commit_sequence = 0;
+        resign_checkpoint(&conn, &mut anchor_rollback);
+        assert!(
+            IntegrityRootService::compare_checkpoints(&conn, &advanced, &anchor_rollback)
+                .unwrap_err()
+                .to_string()
+                .contains("rolled back an inventory anchor")
+        );
+
+        let foreign = setup_unlocked();
+        assert!(IntegrityRootService::verify_checkpoint(&foreign, &advanced).is_err());
     }
 
     #[test]

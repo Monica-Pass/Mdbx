@@ -20,6 +20,10 @@ pub const CAPABILITY_INCREMENTAL_BUNDLE_V4: &str = "incremental-bundle-v4";
 pub const CAPABILITY_INCREMENTAL_RESUME_V1: &str = "incremental-resume-v1";
 pub const CAPABILITY_ZSTD_BUNDLE_V1: &str = "bundle-zstd-v1";
 pub const CAPABILITY_AUTHENTICATED_BUNDLE_V1: &str = "authenticated-bundle-v1";
+pub const CAPABILITY_AUTHENTICATED_STATE_ROOT_V1: &str = "authenticated-state-root-v1";
+pub const AUTHENTICATED_STATE_ROOT_PROFILE_V1: &str = "mdbx-authenticated-state-root-v1";
+pub const AUTHENTICATED_STATE_ROOT_HASH_BYTES: usize = 32;
+pub const MAX_AUTHENTICATED_STATE_ROOT_PROFILE_BYTES: usize = 128;
 pub const CAPABILITY_BLOB_MANIFEST_PAGING_V1: &str = "blob-manifest-paging-v1";
 pub const CAPABILITY_BLOB_CHUNK_TRANSFER_V1: &str = "blob-chunk-transfer-v1";
 pub const CAPABILITY_BLOB_TRANSFER_RESUME_V1: &str = "blob-transfer-resume-v1";
@@ -97,6 +101,70 @@ pub enum SyncMessage {
     Error(SyncErrorMessage),
 }
 
+/// Bounded root metadata whose authentication tag is verified by the storage
+/// adapter with the vault integrity subkey.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedStateRootCheckpoint {
+    pub profile: String,
+    pub generation: u64,
+    pub leaf_count: u64,
+    pub root_hash: Vec<u8>,
+    pub latest_commit_sequence: u64,
+    pub latest_delta_sequence: u64,
+    pub authentication_tag: Vec<u8>,
+}
+
+impl AuthenticatedStateRootCheckpoint {
+    pub fn new(
+        profile: String,
+        generation: u64,
+        leaf_count: u64,
+        root_hash: Vec<u8>,
+        latest_commit_sequence: u64,
+        latest_delta_sequence: u64,
+        authentication_tag: Vec<u8>,
+    ) -> SyncResult<Self> {
+        let checkpoint = Self {
+            profile,
+            generation,
+            leaf_count,
+            root_hash,
+            latest_commit_sequence,
+            latest_delta_sequence,
+            authentication_tag,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        if self.profile != AUTHENTICATED_STATE_ROOT_PROFILE_V1
+            || self.profile.len() > MAX_AUTHENTICATED_STATE_ROOT_PROFILE_BYTES
+        {
+            return Err(SyncError::InvalidMessage(
+                "unsupported authenticated state-root profile".to_string(),
+            ));
+        }
+        if self.generation == 0 {
+            return Err(SyncError::InvalidMessage(
+                "authenticated state-root generation must be positive".to_string(),
+            ));
+        }
+        if self.root_hash.len() != AUTHENTICATED_STATE_ROOT_HASH_BYTES {
+            return Err(SyncError::InvalidMessage(format!(
+                "authenticated state-root hash must be {AUTHENTICATED_STATE_ROOT_HASH_BYTES} bytes"
+            )));
+        }
+        if self.authentication_tag.len() != AUTHENTICATED_STATE_ROOT_HASH_BYTES {
+            return Err(SyncError::InvalidMessage(format!(
+                "authenticated state-root tag must be {AUTHENTICATED_STATE_ROOT_HASH_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hello
 // ---------------------------------------------------------------------------
@@ -120,6 +188,8 @@ pub struct HelloRequest {
     /// 可选扩展能力。空列表不序列化，保持旧 protocol-v2 JSON 形状。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_state_root: Option<AuthenticatedStateRootCheckpoint>,
 }
 
 /// 单个分支的 head 信息。
@@ -140,6 +210,8 @@ pub struct HelloResponse {
     pub known_commit_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_state_root: Option<AuthenticatedStateRootCheckpoint>,
 }
 
 // ---------------------------------------------------------------------------
@@ -425,8 +497,14 @@ impl SyncMessage {
 
     pub fn validate(&self) -> SyncResult<()> {
         match self {
-            Self::Hello(hello) => validate_capabilities(&hello.capabilities),
-            Self::HelloAck(hello) => validate_capabilities(&hello.capabilities),
+            Self::Hello(hello) => validate_hello_advertisement(
+                &hello.capabilities,
+                hello.authenticated_state_root.as_ref(),
+            ),
+            Self::HelloAck(hello) => validate_hello_advertisement(
+                &hello.capabilities,
+                hello.authenticated_state_root.as_ref(),
+            ),
             Self::CommitInventoryPageRequest(request) => request.validate(),
             Self::CommitInventoryPageResponse(response) => response.validate(),
             Self::DeltaInventoryPageRequest(request) => request.validate(),
@@ -448,6 +526,7 @@ impl HelloRequest {
             heads,
             known_commit_ids,
             capabilities: Vec::new(),
+            authenticated_state_root: None,
         }
     }
 
@@ -457,8 +536,26 @@ impl HelloRequest {
         Ok(self)
     }
 
+    pub fn with_authenticated_state_root(
+        mut self,
+        checkpoint: AuthenticatedStateRootCheckpoint,
+    ) -> SyncResult<Self> {
+        checkpoint.validate()?;
+        if !self.supports(CAPABILITY_AUTHENTICATED_STATE_ROOT_V1) {
+            return Err(SyncError::InvalidMessage(
+                "authenticated state-root checkpoint requires its capability".to_string(),
+            ));
+        }
+        self.authenticated_state_root = Some(checkpoint);
+        Ok(self)
+    }
+
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_hello_advertisement(&self.capabilities, self.authenticated_state_root.as_ref())
     }
 }
 
@@ -470,6 +567,7 @@ impl HelloResponse {
             heads,
             known_commit_ids,
             capabilities: Vec::new(),
+            authenticated_state_root: None,
         }
     }
 
@@ -479,8 +577,26 @@ impl HelloResponse {
         Ok(self)
     }
 
+    pub fn with_authenticated_state_root(
+        mut self,
+        checkpoint: AuthenticatedStateRootCheckpoint,
+    ) -> SyncResult<Self> {
+        checkpoint.validate()?;
+        if !self.supports(CAPABILITY_AUTHENTICATED_STATE_ROOT_V1) {
+            return Err(SyncError::InvalidMessage(
+                "authenticated state-root checkpoint requires its capability".to_string(),
+            ));
+        }
+        self.authenticated_state_root = Some(checkpoint);
+        Ok(self)
+    }
+
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
+    }
+
+    pub fn validate(&self) -> SyncResult<()> {
+        validate_hello_advertisement(&self.capabilities, self.authenticated_state_root.as_ref())
     }
 }
 
@@ -867,6 +983,25 @@ pub(crate) fn validate_capabilities(capabilities: &[String]) -> SyncResult<()> {
     Ok(())
 }
 
+fn validate_hello_advertisement(
+    capabilities: &[String],
+    checkpoint: Option<&AuthenticatedStateRootCheckpoint>,
+) -> SyncResult<()> {
+    validate_capabilities(capabilities)?;
+    if let Some(checkpoint) = checkpoint {
+        if !capabilities
+            .iter()
+            .any(|value| value == CAPABILITY_AUTHENTICATED_STATE_ROOT_V1)
+        {
+            return Err(SyncError::InvalidMessage(
+                "authenticated state-root checkpoint requires its capability".to_string(),
+            ));
+        }
+        checkpoint.validate()?;
+    }
+    Ok(())
+}
+
 fn canonical_capabilities(mut capabilities: Vec<String>) -> Vec<String> {
     capabilities.sort_unstable();
     capabilities
@@ -997,6 +1132,8 @@ mod tests {
         let response: HelloResponse = serde_json::from_str(response_json).unwrap();
         assert!(request.capabilities.is_empty());
         assert!(response.capabilities.is_empty());
+        assert!(request.authenticated_state_root.is_none());
+        assert!(response.authenticated_state_root.is_none());
 
         let request_value = serde_json::to_value(HelloRequest::new(
             "legacy-request",
@@ -1012,6 +1149,40 @@ mod tests {
         .unwrap();
         assert!(request_value.get("capabilities").is_none());
         assert!(response_value.get("capabilities").is_none());
+        assert!(request_value.get("authenticated_state_root").is_none());
+        assert!(response_value.get("authenticated_state_root").is_none());
+    }
+
+    #[test]
+    fn authenticated_state_root_checkpoint_roundtrips_additively() {
+        let checkpoint = AuthenticatedStateRootCheckpoint::new(
+            AUTHENTICATED_STATE_ROOT_PROFILE_V1.to_string(),
+            7,
+            42,
+            vec![3; AUTHENTICATED_STATE_ROOT_HASH_BYTES],
+            11,
+            13,
+            vec![5; AUTHENTICATED_STATE_ROOT_HASH_BYTES],
+        )
+        .unwrap();
+        let hello = HelloRequest::new("root-device", Vec::new(), Vec::new())
+            .with_capabilities(vec![CAPABILITY_AUTHENTICATED_STATE_ROOT_V1.to_string()])
+            .unwrap()
+            .with_authenticated_state_root(checkpoint.clone())
+            .unwrap();
+        let message = SyncMessage::Hello(hello);
+        let restored = SyncMessage::from_bytes(&message.to_bytes().unwrap()).unwrap();
+        let SyncMessage::Hello(restored) = restored else {
+            panic!("expected Hello");
+        };
+        assert_eq!(restored.authenticated_state_root, Some(checkpoint.clone()));
+
+        assert!(HelloRequest::new("invalid", Vec::new(), Vec::new())
+            .with_authenticated_state_root(checkpoint.clone())
+            .is_err());
+        let mut malformed = checkpoint;
+        malformed.root_hash.pop();
+        assert!(malformed.validate().is_err());
     }
 
     #[test]

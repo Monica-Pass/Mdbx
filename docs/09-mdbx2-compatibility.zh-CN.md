@@ -94,6 +94,13 @@ leaf 与 sparse-node 表。建立 profile 时登记 critical extension
 vault 行为完全不变。O(vault-size) content manifest 仍是精确 schema 检查点；外部 Provider
 原始字节和未注册物理扩展表不会被增量 root 默默声称覆盖。
 
+protocol-v2 root exchange 保持 additive：只有配置 `authenticated-state-root-v1` 且双方都
+提供有界 checkpoint 时，Hello/HelloAck 才携带该字段。legacy JSON 形状不变，该 capability
+也不加入四项强制 incremental-sync capability。checkpoint 的 vault-key HMAC 认证和按 peer
+单调 generation/inventory anchor 检查由 storage 而不是 transport parser 执行。客户端把上次
+验证的远端值保存在 vault 外；由于不同 replica 的 inventory 顺序可能不同，不要求本地与远端
+root hash 相等。
+
 ### 3.1 真实发布 Golden Vault 与旧 Reader 边界
 
 仓库同时冻结 `crates/mdbx-storage/test-data/mdbx1-release-1.0.mdbx` 与 `mdbx1-draft-golden.mdbx`。release fixture 由历史 `MDBX1.0` tag（commit `1a43fa9e8e87eebf6d0e1b84543c3291d0b25142`）真实生成；DRAFT fixture 由同一个历史 reader 只修改 `vault_meta.format_version` 后 checkpoint 得到。两份 manifest 都记录不可变 SHA-256、测试专用解锁凭据，以及 project、entry、attachment 和 snapshot 的稳定 ID。

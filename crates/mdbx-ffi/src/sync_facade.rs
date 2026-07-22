@@ -7,7 +7,7 @@ use mdbx_sync::{
     SyncWireLimits, SyncWireResume, SyncWireSession,
 };
 
-use super::MdbxFfiError;
+use super::{MdbxAuthenticatedStateRootCheckpoint, MdbxFfiError};
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxSyncBranchHead {
@@ -77,6 +77,7 @@ impl MdbxSyncHello {
             heads: self.heads.into_iter().map(Into::into).collect(),
             known_commit_ids: self.known_commit_ids,
             capabilities: self.capabilities,
+            authenticated_state_root: None,
         }
     }
 
@@ -87,7 +88,80 @@ impl MdbxSyncHello {
             heads: self.heads.into_iter().map(Into::into).collect(),
             known_commit_ids: self.known_commit_ids,
             capabilities: self.capabilities,
+            authenticated_state_root: None,
         }
+    }
+}
+
+/// Additive Hello shape for authenticated root exchange. Existing
+/// `MdbxSyncHello` callers keep their original constructor unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIntegrityRootSyncHello {
+    pub device_id: String,
+    pub protocol_version: u32,
+    pub heads: Vec<MdbxSyncBranchHead>,
+    pub known_commit_ids: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub authenticated_state_root: Option<MdbxAuthenticatedStateRootCheckpoint>,
+}
+
+impl From<HelloRequest> for MdbxIntegrityRootSyncHello {
+    fn from(value: HelloRequest) -> Self {
+        Self {
+            device_id: value.device_id,
+            protocol_version: value.protocol_version,
+            heads: value.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: value.known_commit_ids,
+            capabilities: value.capabilities,
+            authenticated_state_root: value.authenticated_state_root.map(Into::into),
+        }
+    }
+}
+
+impl From<HelloResponse> for MdbxIntegrityRootSyncHello {
+    fn from(value: HelloResponse) -> Self {
+        Self {
+            device_id: value.device_id,
+            protocol_version: value.protocol_version,
+            heads: value.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: value.known_commit_ids,
+            capabilities: value.capabilities,
+            authenticated_state_root: value.authenticated_state_root.map(Into::into),
+        }
+    }
+}
+
+impl MdbxIntegrityRootSyncHello {
+    fn into_request(self) -> Result<HelloRequest, MdbxFfiError> {
+        let hello = HelloRequest {
+            device_id: self.device_id,
+            protocol_version: self.protocol_version,
+            heads: self.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: self.known_commit_ids,
+            capabilities: self.capabilities,
+            authenticated_state_root: self
+                .authenticated_state_root
+                .map(MdbxAuthenticatedStateRootCheckpoint::into_core)
+                .transpose()?,
+        };
+        hello.validate()?;
+        Ok(hello)
+    }
+
+    fn into_response(self) -> Result<HelloResponse, MdbxFfiError> {
+        let hello = HelloResponse {
+            device_id: self.device_id,
+            protocol_version: self.protocol_version,
+            heads: self.heads.into_iter().map(Into::into).collect(),
+            known_commit_ids: self.known_commit_ids,
+            capabilities: self.capabilities,
+            authenticated_state_root: self
+                .authenticated_state_root
+                .map(MdbxAuthenticatedStateRootCheckpoint::into_core)
+                .transpose()?,
+        };
+        hello.validate()?;
+        Ok(hello)
     }
 }
 
@@ -379,6 +453,13 @@ pub struct MdbxSyncWireHello {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxSyncWireIntegrityRootHello {
+    pub sequence: u64,
+    pub in_reply_to: Option<u64>,
+    pub hello: MdbxIntegrityRootSyncHello,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxSyncWireManifestPageRequest {
     pub sequence: u64,
     pub in_reply_to: Option<u64>,
@@ -418,6 +499,13 @@ pub struct MdbxSyncWireSession {
 #[derive(uniffi::Object)]
 pub struct MdbxBlobSyncSession {
     client: Mutex<SyncClient>,
+}
+
+/// Protocol-only authenticated root negotiation. The application persists the
+/// last verified remote checkpoint outside the vault and owns transport.
+#[derive(uniffi::Object)]
+pub struct MdbxIntegrityRootSyncSession {
+    negotiator: Mutex<SyncNegotiator>,
 }
 
 #[uniffi::export]
@@ -466,6 +554,22 @@ impl MdbxSyncWireSession {
         self.encode(SyncMessage::HelloAck(hello.into_response()), in_reply_to)
     }
 
+    pub fn encode_integrity_root_hello(
+        &self,
+        hello: MdbxIntegrityRootSyncHello,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(SyncMessage::Hello(hello.into_request()?), in_reply_to)
+    }
+
+    pub fn encode_integrity_root_hello_ack(
+        &self,
+        hello: MdbxIntegrityRootSyncHello,
+        in_reply_to: Option<u64>,
+    ) -> Result<Vec<u8>, MdbxFfiError> {
+        self.encode(SyncMessage::HelloAck(hello.into_response()?), in_reply_to)
+    }
+
     pub fn encode_blob_manifest_page_request(
         &self,
         request: MdbxBlobManifestPageRequest,
@@ -510,7 +614,27 @@ impl MdbxSyncWireSession {
     pub fn accept_hello(&self, bytes: Vec<u8>) -> Result<MdbxSyncWireHello, MdbxFfiError> {
         let frame = self.accept(bytes)?;
         match frame.message {
-            SyncMessage::Hello(hello) => Ok(MdbxSyncWireHello {
+            SyncMessage::Hello(hello) if hello.authenticated_state_root.is_none() => {
+                Ok(MdbxSyncWireHello {
+                    sequence: frame.sequence,
+                    in_reply_to: frame.in_reply_to,
+                    hello: hello.into(),
+                })
+            }
+            SyncMessage::Hello(_) => {
+                self.reject_wrong_message(frame.sequence, "Hello without integrity root")
+            }
+            _ => self.reject_wrong_message(frame.sequence, "Hello"),
+        }
+    }
+
+    pub fn accept_integrity_root_hello(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireIntegrityRootHello, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::Hello(hello) => Ok(MdbxSyncWireIntegrityRootHello {
                 sequence: frame.sequence,
                 in_reply_to: frame.in_reply_to,
                 hello: hello.into(),
@@ -522,7 +646,27 @@ impl MdbxSyncWireSession {
     pub fn accept_hello_ack(&self, bytes: Vec<u8>) -> Result<MdbxSyncWireHello, MdbxFfiError> {
         let frame = self.accept(bytes)?;
         match frame.message {
-            SyncMessage::HelloAck(hello) => Ok(MdbxSyncWireHello {
+            SyncMessage::HelloAck(hello) if hello.authenticated_state_root.is_none() => {
+                Ok(MdbxSyncWireHello {
+                    sequence: frame.sequence,
+                    in_reply_to: frame.in_reply_to,
+                    hello: hello.into(),
+                })
+            }
+            SyncMessage::HelloAck(_) => {
+                self.reject_wrong_message(frame.sequence, "HelloAck without integrity root")
+            }
+            _ => self.reject_wrong_message(frame.sequence, "HelloAck"),
+        }
+    }
+
+    pub fn accept_integrity_root_hello_ack(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<MdbxSyncWireIntegrityRootHello, MdbxFfiError> {
+        let frame = self.accept(bytes)?;
+        match frame.message {
+            SyncMessage::HelloAck(hello) => Ok(MdbxSyncWireIntegrityRootHello {
                 sequence: frame.sequence,
                 in_reply_to: frame.in_reply_to,
                 hello: hello.into(),
@@ -615,6 +759,60 @@ impl MdbxSyncWireSession {
         Err(MdbxFfiError::SyncProtocol {
             message: format!("expected {expected} message in sync wire frame"),
         })
+    }
+}
+
+#[uniffi::export]
+impl MdbxIntegrityRootSyncSession {
+    pub fn hello(&self) -> Result<MdbxIntegrityRootSyncHello, MdbxFfiError> {
+        let negotiator = self
+            .negotiator
+            .lock()
+            .map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(negotiator.local_hello()?.into())
+    }
+
+    pub fn accept_hello(
+        &self,
+        hello: MdbxIntegrityRootSyncHello,
+    ) -> Result<MdbxIntegrityRootSyncHello, MdbxFfiError> {
+        let hello = hello.into_request()?;
+        let mut negotiator = self
+            .negotiator
+            .lock()
+            .map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(negotiator.on_hello(&hello)?.into())
+    }
+
+    pub fn accept_hello_ack(&self, hello: MdbxIntegrityRootSyncHello) -> Result<(), MdbxFfiError> {
+        let hello = hello.into_response()?;
+        let mut negotiator = self
+            .negotiator
+            .lock()
+            .map_err(|_| MdbxFfiError::LockPoisoned)?;
+        negotiator.on_hello_ack(&hello)?;
+        Ok(())
+    }
+
+    pub fn integrity_root_is_negotiated(&self) -> Result<bool, MdbxFfiError> {
+        let negotiator = self
+            .negotiator
+            .lock()
+            .map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(negotiator.authenticated_state_root_is_negotiated())
+    }
+
+    pub fn remote_integrity_root_checkpoint(
+        &self,
+    ) -> Result<Option<MdbxAuthenticatedStateRootCheckpoint>, MdbxFfiError> {
+        let negotiator = self
+            .negotiator
+            .lock()
+            .map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(negotiator
+            .remote_authenticated_state_root()
+            .cloned()
+            .map(Into::into))
     }
 }
 
@@ -738,6 +936,18 @@ impl MdbxBlobSyncSession {
         client.restart_blob_transfer_after_abort(&blob_id, total_size)?;
         Ok(())
     }
+}
+
+#[uniffi::export]
+pub fn create_integrity_root_sync_session(
+    device_id: String,
+    checkpoint: MdbxAuthenticatedStateRootCheckpoint,
+) -> Result<Arc<MdbxIntegrityRootSyncSession>, MdbxFfiError> {
+    let mut negotiator = SyncNegotiator::new(&device_id, Vec::new(), Vec::new());
+    negotiator.enable_authenticated_state_root_checkpoint(checkpoint.into_core()?)?;
+    Ok(Arc::new(MdbxIntegrityRootSyncSession {
+        negotiator: Mutex::new(negotiator),
+    }))
 }
 
 #[uniffi::export]

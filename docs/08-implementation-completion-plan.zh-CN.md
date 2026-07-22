@@ -113,9 +113,11 @@ MDBX 必须坚持：
 - vault header 元数据 HMAC 基线已完成；外部 rollback anchor 已通过 storage、CLI 和
   UniFFI 提供，用于检测 append-only inventory 回退；显式 O(vault-size) vault content
   manifest v2 已覆盖主 schema、未知扩展表、generated/hidden columns 和 typed rows 的
-  精确检查点，同时继续验证 v1 token；自动刷新的增量 whole-vault Merkle authentication
-  root 仍未完成；覆盖契约已先记录在 ADR-0022，等待事务级 sparse-root 实现。
-- 加密上下文 AAD 已覆盖字段级；commit、bundle 与 snapshot 的认证边界已经进入兼容性规范，自动刷新的 whole-vault Merkle root 仍是下一层完整性工作。
+  精确检查点，同时继续验证 v1 token；ADR-0022 的 opt-in 增量 sparse Merkle root 已实现，
+  通过 sync-delta seam 原子更新，并已覆盖 unlock、health、CLI、UniFFI 与 peer checkpoint。
+- 加密上下文 AAD 已覆盖字段级；commit、bundle、snapshot、vault header、增量 root 和对端
+  root checkpoint 的认证边界已经进入兼容性规范。外部 Provider 原始字节和未注册扩展表
+  仍由各自 Provider 校验与显式 content manifest 覆盖，不能扩大增量 root 的声明范围。
 
 ### 3.6 Android 接入
 

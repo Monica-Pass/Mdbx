@@ -80,6 +80,74 @@ fn integrity_root_ffi_exposes_metadata_only_status_and_locked_inspection() {
 }
 
 #[test]
+fn integrity_root_checkpoint_ffi_authenticates_negotiates_and_roundtrips_wire() {
+    let vault = ffi_test_vault();
+    vault.enable_integrity_root().unwrap();
+    let first = vault.create_integrity_root_checkpoint().unwrap();
+    let verified = vault
+        .verify_integrity_root_checkpoint(first.clone())
+        .unwrap();
+    assert_eq!(verified.root_hash, first.root_hash);
+
+    vault
+        .create_project("checkpoint advance".to_string())
+        .unwrap();
+    let advanced = vault.create_integrity_root_checkpoint().unwrap();
+    assert_eq!(
+        vault
+            .compare_integrity_root_checkpoints(first.clone(), advanced.clone())
+            .unwrap(),
+        MdbxIntegrityRootCheckpointRelation::Advanced
+    );
+    assert!(vault
+        .compare_integrity_root_checkpoints(advanced.clone(), first.clone())
+        .is_err());
+
+    let initiator =
+        create_integrity_root_sync_session("root-initiator".to_string(), first.clone()).unwrap();
+    let responder =
+        create_integrity_root_sync_session("root-responder".to_string(), advanced.clone()).unwrap();
+    let hello = initiator.hello().unwrap();
+    assert_eq!(hello.authenticated_state_root, Some(first.clone()));
+
+    let sender =
+        create_sync_wire_session("root-wire".to_string(), default_sync_wire_payload_bytes())
+            .unwrap();
+    let receiver =
+        create_sync_wire_session("root-wire".to_string(), default_sync_wire_payload_bytes())
+            .unwrap();
+    let bytes = sender
+        .encode_integrity_root_hello(hello.clone(), None)
+        .unwrap();
+    let decoded = receiver.accept_integrity_root_hello(bytes).unwrap();
+    assert_eq!(decoded.hello, hello);
+    receiver.acknowledge_inbound(decoded.sequence).unwrap();
+
+    let ack = responder.accept_hello(decoded.hello).unwrap();
+    let ack_bytes = receiver
+        .encode_integrity_root_hello_ack(ack, Some(decoded.sequence))
+        .unwrap();
+    let decoded_ack = sender.accept_integrity_root_hello_ack(ack_bytes).unwrap();
+    assert_eq!(decoded_ack.in_reply_to, Some(decoded.sequence));
+    sender.acknowledge_inbound(decoded_ack.sequence).unwrap();
+    initiator.accept_hello_ack(decoded_ack.hello).unwrap();
+    assert!(initiator.integrity_root_is_negotiated().unwrap());
+    assert!(responder.integrity_root_is_negotiated().unwrap());
+    assert_eq!(
+        initiator.remote_integrity_root_checkpoint().unwrap(),
+        Some(advanced.clone())
+    );
+    assert_eq!(
+        responder.remote_integrity_root_checkpoint().unwrap(),
+        Some(first.clone())
+    );
+
+    let mut tampered = advanced;
+    tampered.authentication_tag[0] ^= 1;
+    assert!(vault.verify_integrity_root_checkpoint(tampered).is_err());
+}
+
+#[test]
 fn rollback_anchor_ffi_roundtrips_opaque_tokens_and_reports_advancement() {
     let vault = ffi_test_vault();
     let token = vault.create_rollback_anchor().unwrap();

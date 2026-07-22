@@ -65,6 +65,20 @@ peer capability, `authenticated-state-root-v1`, is opt-in and only
 selects root exchange when both peers support the same profile. Legacy peers
 continue using existing commit/delta checkpoints and complete-state fallback.
 
+The exchanged checkpoint is authenticated under a separate peer-checkpoint
+domain with the vault ID and schema version as implicit context. It contains
+only profile, generation, leaf count, root hash, commit/delta anchors, and the
+tag. Clients persist the last verified value outside the vault, keyed by peer
+identity. A later value may keep the same generation only when every field is
+identical; a higher generation must not decrease either inventory anchor.
+Rollback, same-generation equivocation, foreign-vault values, and tampering
+fail closed.
+
+This checkpoint is a rollback/resume anchor for one remote replica, not a
+general convergence oracle between replicas. Local inventory ordering may
+differ after concurrent offline work, so clients must not require the local
+and remote root hashes or inventory sequence numbers to be equal before sync.
+
 The implementation keeps schema 16 unchanged and creates the root metadata,
 leaf, and sparse-node tables only when a verified-unlocked client explicitly
 enables the profile. Establishment registers the same identifier as a critical

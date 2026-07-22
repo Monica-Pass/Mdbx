@@ -63,6 +63,15 @@ content manifest remains the exact schema checkpoint; external Provider bytes
 and unregistered physical extension tables are not silently claimed by the
 incremental root.
 
+Protocol-v2 root exchange is additive: Hello and HelloAck omit the checkpoint
+unless `authenticated-state-root-v1` is configured and both peers provide a
+bounded checkpoint. Legacy JSON remains unchanged, and the capability is not
+added to the four mandatory incremental-sync capabilities. Storage, not the
+transport parser, authenticates the checkpoint under the vault integrity key
+and checks per-peer monotonic generation and inventory anchors. Clients retain
+the last verified remote value outside the vault; local and remote root hashes
+are not required to match because inventory order can differ across replicas.
+
 Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 executes `MDBX-1 -> MDBX-2 -> MDBX-3`.
 
 ### Release Golden Vault and Old Reader Boundary
