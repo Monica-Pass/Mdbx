@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+use std::{env, process::Command};
 
 use mdbx_core::model::EntryType;
 
@@ -76,6 +77,62 @@ impl BenchSuite {
             );
         }
         println!();
+    }
+
+    /// Return a stable, machine-readable report for publication and CI.
+    pub fn json_report(&self, iterations: u32) -> serde_json::Value {
+        let rustc = Command::new("rustc")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let git_commit = env::var("MDBX_BENCH_GIT_COMMIT").ok().or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        });
+
+        serde_json::json!({
+            "format": "mdbx-benchmark-report-v1",
+            "suite_name": self.suite_name,
+            "metadata": {
+                "iterations": iterations,
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "os": env::consts::OS,
+                "arch": env::consts::ARCH,
+                "rustc": rustc,
+                "git_commit": git_commit,
+                "dataset": {
+                    "search_projects": 100,
+                    "snapshot_projects": 20,
+                    "compaction_blob_bytes": 64 * 16 * 1024,
+                    "sync_delta_objects": 1,
+                },
+            },
+            "results": self.results.iter().map(|result| serde_json::json!({
+                "name": result.name,
+                "duration_us": result.duration.as_secs_f64() * 1_000_000.0,
+                "ops": result.ops,
+                "ops_per_sec": result.ops_per_sec,
+                "output_bytes": result.output_bytes,
+                "output_bytes_per_op": if result.ops == 0 {
+                    0.0
+                } else {
+                    result.output_bytes as f64 / result.ops as f64
+                },
+            })).collect::<Vec<_>>(),
+            "total_duration_ms": self.total_duration.as_secs_f64() * 1_000.0,
+            "limitations": [
+                "Results are wall-clock measurements from one host and are not a capacity guarantee.",
+                "KDBX reference numbers in the source are estimates and are not measured in this report.",
+                "vault_compaction uses SQLite WAL checkpoint plus VACUUM on a synthetic fragmentation table.",
+                "output_bytes is operation-specific: it is encoded payload bytes for sync and stored content bytes for attachment writes.",
+            ],
+        })
     }
 }
 
@@ -707,6 +764,24 @@ mod tests {
 
         // 验证可以打印
         suite.print();
+    }
+
+    #[test]
+    fn json_report_contains_reproducibility_metadata() {
+        let suite = BenchSuite {
+            suite_name: "metadata test".to_string(),
+            results: vec![bench_result("sample", Duration::from_millis(2), 2, 128)],
+            total_duration: Duration::from_millis(2),
+        };
+
+        let report = suite.json_report(2);
+        assert_eq!(report["format"], "mdbx-benchmark-report-v1");
+        assert_eq!(report["metadata"]["iterations"], 2);
+        assert!(report["metadata"]["os"].is_string());
+        assert!(report["metadata"]["rustc"].is_string());
+        assert_eq!(report["results"][0]["output_bytes"], 128);
+        assert_eq!(report["results"][0]["output_bytes_per_op"], 64.0);
+        assert_eq!(report["limitations"].as_array().unwrap().len(), 4);
     }
 
     #[test]

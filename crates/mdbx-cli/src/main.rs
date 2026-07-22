@@ -167,6 +167,12 @@ enum Commands {
         /// 每个 benchmark 的迭代次数
         #[arg(short, long, default_value_t = 20)]
         iterations: u32,
+        /// 以机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 将报告写入指定文件
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// 从 KDBX JSON 互操作文件导入
     #[cfg(feature = "kdbx-import")]
@@ -525,7 +531,11 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Backup { output } => cmd_backup(&cli.vault, output),
         #[cfg(feature = "benchmark")]
-        Commands::Benchmark { iterations } => cmd_benchmark(iterations),
+        Commands::Benchmark {
+            iterations,
+            json,
+            output,
+        } => cmd_benchmark(iterations, json, output),
         #[cfg(feature = "kdbx-import")]
         Commands::ImportKdbxJson { file } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -2068,12 +2078,25 @@ fn severity_label(severity: IssueSeverity) -> &'static str {
 }
 
 #[cfg(feature = "benchmark")]
-fn cmd_benchmark(iterations: u32) -> Result<(), String> {
+fn cmd_benchmark(iterations: u32, json: bool, output: Option<PathBuf>) -> Result<(), String> {
     if iterations == 0 {
         return Err("iterations must be greater than zero".to_string());
     }
     let suite = BenchmarkRunner::run_full_suite(iterations);
-    suite.print();
+    if json || output.is_some() {
+        let report = suite.json_report(iterations);
+        let encoded = serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("failed to encode benchmark report: {error}"))?;
+        if let Some(path) = output {
+            std::fs::write(&path, format!("{encoded}\n"))
+                .map_err(|error| format!("failed to write '{}': {error}", path.display()))?;
+        }
+        if json {
+            println!("{encoded}");
+        }
+    } else {
+        suite.print();
+    }
     Ok(())
 }
 
@@ -4738,10 +4761,25 @@ mod tests {
     fn cli_exposes_health_and_benchmark() {
         let vault = TempVault::new();
         let path = vault.path();
+        let report_path = path.with_extension("benchmark.json");
         run(init_cli(&path)).unwrap();
 
         run(cli(&path, Commands::Health)).unwrap();
-        run(cli(&path, Commands::Benchmark { iterations: 1 })).unwrap();
+        run(cli(
+            &path,
+            Commands::Benchmark {
+                iterations: 1,
+                json: false,
+                output: Some(report_path.clone()),
+            },
+        ))
+        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["format"], "mdbx-benchmark-report-v1");
+        assert_eq!(report["metadata"]["iterations"], 1);
+        assert_eq!(report["results"].as_array().unwrap().len(), 11);
+        std::fs::remove_file(report_path).unwrap();
     }
 
     #[cfg(all(feature = "kdbx-import", feature = "kdbx-export"))]
