@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{
-    incremental_bundle_payload_sha256, IncrementalBundleCheckpoint, IncrementalBundleResume,
-    IncrementalSyncBundle,
+    incremental_bundle_payload_sha256, BundleCompression, IncrementalBundleCheckpoint,
+    IncrementalBundleResume, IncrementalSyncBundle,
 };
 use crate::error::{SyncError, SyncResult};
 use crate::message::*;
@@ -105,6 +105,20 @@ impl SyncNegotiator {
             self.enable_capability(capability)?;
         }
         Ok(())
+    }
+
+    /// Advertise support for v5/v6 zstd bundles when the codec is compiled in.
+    pub fn enable_bundle_compression_capability(&mut self) -> SyncResult<()> {
+        #[cfg(feature = "zstd-compression")]
+        {
+            self.enable_capability(CAPABILITY_ZSTD_BUNDLE_V1)
+        }
+        #[cfg(not(feature = "zstd-compression"))]
+        {
+            Err(SyncError::UnsupportedFeature(
+                "zstd-compression".to_string(),
+            ))
+        }
     }
 
     /// Build the local Hello. New peers do not put an unbounded commit-ID
@@ -275,6 +289,21 @@ impl SyncNegotiator {
         BLOB_SYNC_CAPABILITIES
             .iter()
             .all(|capability| self.capability_is_negotiated(capability))
+    }
+
+    /// Compression is usable only when the codec is present and both peers
+    /// advertised the independent zstd bundle capability.
+    pub fn bundle_compression_is_negotiated(&self) -> bool {
+        cfg!(feature = "zstd-compression")
+            && self.capability_is_negotiated(CAPABILITY_ZSTD_BUNDLE_V1)
+    }
+
+    pub fn negotiated_bundle_compression(&self) -> BundleCompression {
+        if self.bundle_compression_is_negotiated() {
+            BundleCompression::Zstd
+        } else {
+            BundleCompression::None
+        }
     }
 
     pub fn transfer_mode(&self) -> SyncTransferMode {
@@ -1062,6 +1091,52 @@ mod tests {
         let legacy_response = responder.on_hello(&legacy_hello).unwrap();
         assert!(legacy_response.capabilities.is_empty());
         assert!(!responder.capability_is_negotiated(CAPABILITY_COMMIT_INVENTORY_PAGING_V1));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn bundle_compression_requires_both_peers_and_stays_independent() {
+        let mut responder = SyncNegotiator::new("device-a", Vec::new(), Vec::new());
+        responder.enable_bundle_compression_capability().unwrap();
+
+        let legacy = HelloRequest::new("legacy", Vec::new(), Vec::new());
+        let legacy_response = responder.on_hello(&legacy).unwrap();
+        assert!(!legacy_response.supports(CAPABILITY_ZSTD_BUNDLE_V1));
+        assert!(!responder.bundle_compression_is_negotiated());
+        assert_eq!(
+            responder.negotiated_bundle_compression(),
+            BundleCompression::None
+        );
+
+        let mut initiator = SyncNegotiator::new("device-b", Vec::new(), Vec::new());
+        initiator.enable_bundle_compression_capability().unwrap();
+        let hello = initiator.local_hello().unwrap();
+        let response = responder.on_hello(&hello).unwrap();
+        initiator.on_hello_ack(&response).unwrap();
+
+        assert!(response.supports(CAPABILITY_ZSTD_BUNDLE_V1));
+        assert!(responder.bundle_compression_is_negotiated());
+        assert!(initiator.bundle_compression_is_negotiated());
+        assert_eq!(
+            responder.negotiated_bundle_compression(),
+            BundleCompression::Zstd
+        );
+        assert_eq!(responder.transfer_mode(), SyncTransferMode::CompleteState);
+    }
+
+    #[cfg(not(feature = "zstd-compression"))]
+    #[test]
+    fn trimmed_build_cannot_enable_bundle_compression() {
+        let mut negotiator = SyncNegotiator::new("device-a", Vec::new(), Vec::new());
+        assert!(matches!(
+            negotiator.enable_bundle_compression_capability(),
+            Err(SyncError::UnsupportedFeature(ref feature)) if feature == "zstd-compression"
+        ));
+        assert!(!negotiator.bundle_compression_is_negotiated());
+        assert_eq!(
+            negotiator.negotiated_bundle_compression(),
+            BundleCompression::None
+        );
     }
 
     #[test]
