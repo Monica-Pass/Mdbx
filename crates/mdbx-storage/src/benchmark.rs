@@ -7,6 +7,8 @@ use crate::repo::attachment::AttachmentRepo;
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::project::ProjectRepo;
+use crate::repo::snapshot::SnapshotRepo;
+use crate::sync_delta::{materialize_pending_sync_delta, SyncDeltaLimits};
 
 /// 单个 benchmark 结果。
 #[derive(Debug, Clone)]
@@ -15,6 +17,8 @@ pub struct BenchResult {
     pub duration: Duration,
     pub ops: u32,
     pub ops_per_sec: f64,
+    /// Measured bytes produced or processed by successful operations.
+    pub output_bytes: u64,
 }
 
 /// Benchmark 套件结果。
@@ -30,11 +34,12 @@ impl BenchSuite {
         println!("=== {} ===", self.suite_name);
         for r in &self.results {
             println!(
-                "  {:40} {:>8} ops  {:>12.3} µs/op  {:>10.1} ops/s",
+                "  {:40} {:>8} ops  {:>12.3} µs/op  {:>10.1} ops/s  {:>12} bytes",
                 r.name,
                 r.ops,
                 r.duration.as_micros() as f64 / r.ops.max(1) as f64,
                 r.ops_per_sec,
+                r.output_bytes,
             );
         }
         println!(
@@ -47,7 +52,14 @@ impl BenchSuite {
     /// 与另一组对照结果比较。
     pub fn compare(&self, other: &BenchSuite, label_a: &str, label_b: &str) {
         println!("=== Comparison: {} vs {} ===", label_a, label_b);
-        for (a, b) in self.results.iter().zip(other.results.iter()) {
+        for a in &self.results {
+            let Some(b) = other
+                .results
+                .iter()
+                .find(|candidate| candidate.name == a.name)
+            else {
+                continue;
+            };
             let ratio = if b.ops_per_sec > 0.0 {
                 a.ops_per_sec / b.ops_per_sec
             } else {
@@ -71,11 +83,13 @@ impl BenchSuite {
 ///
 /// 覆盖以下操作：
 /// - vault 创建
-/// - entry 保存
+/// - entry 创建与小修改
 /// - project 搜索
-/// - 附件写入
+/// - 附件创建、重命名与内容替换
+/// - snapshot 创建
 /// - vault 打开
-/// - 同步 delta 计算
+/// - vault 文件压缩
+/// - 同步 delta 物化与编码
 pub struct BenchmarkRunner;
 
 impl BenchmarkRunner {
@@ -86,9 +100,14 @@ impl BenchmarkRunner {
 
         results.push(Self::bench_create_vault(iterations));
         results.push(Self::bench_save_entry(iterations));
+        results.push(Self::bench_edit_entry(iterations));
         results.push(Self::bench_search(iterations));
         results.push(Self::bench_attachment_write(iterations));
+        results.push(Self::bench_attachment_rename(iterations));
+        results.push(Self::bench_attachment_replace(iterations));
+        results.push(Self::bench_snapshot(iterations));
         results.push(Self::bench_open_vault(iterations));
+        results.push(Self::bench_compaction(iterations));
         results.push(Self::bench_sync_delta(iterations));
 
         let total = start.elapsed();
@@ -114,12 +133,7 @@ impl BenchmarkRunner {
         }
 
         let duration = start.elapsed();
-        BenchResult {
-            name: "vault_create".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
-        }
+        bench_result("vault_create", duration, success, 0)
     }
 
     /// Benchmark: entry 保存。
@@ -133,6 +147,7 @@ impl BenchmarkRunner {
 
         let start = Instant::now();
         let mut success = 0u32;
+        let mut output_bytes = 0u64;
 
         for i in 0..iterations {
             let payload = serde_json::json!({
@@ -140,27 +155,58 @@ impl BenchmarkRunner {
                 "password": format!("pass-{}", i),
                 "url": format!("https://site-{}.example.com", i),
             });
-            if EntryRepo::create(
+            if let Ok(entry) = EntryRepo::create(
                 &conn,
                 &ctx,
                 &project.project_id,
                 EntryType::Login,
                 Some(&format!("Entry-{}", i)),
                 &payload,
-            )
-            .is_ok()
-            {
+            ) {
                 success += 1;
+                output_bytes += entry.payload_ct.len() as u64;
             }
         }
 
         let duration = start.elapsed();
-        BenchResult {
-            name: "entry_save".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
+        bench_result("entry_create", duration, success, output_bytes)
+    }
+
+    /// Benchmark: repeatedly make a small edit to one entry.
+    pub fn bench_edit_entry(iterations: u32) -> BenchResult {
+        let conn = initialized_memory_vault();
+        let ctx = CommitContext::new("bench-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Edit Bench", None, None).unwrap();
+        let mut entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Editable"),
+            &serde_json::json!({"username":"bench","counter":0}),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        for i in 0..iterations {
+            entry.payload_ct = serde_json::to_vec(&serde_json::json!({
+                "username": "bench",
+                "counter": i,
+            }))
+            .unwrap();
+            match EntryRepo::update(&conn, &ctx, &entry) {
+                Ok(updated) => {
+                    output_bytes += updated.payload_ct.len() as u64;
+                    entry = updated;
+                    success += 1;
+                }
+                Err(_) => break,
+            }
         }
+
+        bench_result("entry_edit_small", start.elapsed(), success, output_bytes)
     }
 
     /// Benchmark: project 标题搜索。
@@ -195,21 +241,21 @@ impl BenchmarkRunner {
 
         let start = Instant::now();
         let mut success = 0u32;
+        let mut output_bytes = 0u64;
 
         for i in 0..iterations {
             let query = format!("Project {}", i % 100);
-            if crate::search::SearchService::search_by_title(&conn, &query).is_ok() {
+            if let Ok(matches) = crate::search::SearchService::search_by_title(&conn, &query) {
+                output_bytes += matches
+                    .iter()
+                    .map(|item| item.project_id.len() + item.title.len() + item.summary.len())
+                    .sum::<usize>() as u64;
                 success += 1;
             }
         }
 
         let duration = start.elapsed();
-        BenchResult {
-            name: "search_by_title".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
-        }
+        bench_result("search_by_title", duration, success, output_bytes)
     }
 
     /// Benchmark: 小附件写入。
@@ -222,6 +268,7 @@ impl BenchmarkRunner {
 
         let start = Instant::now();
         let mut success = 0u32;
+        let mut output_bytes = 0u64;
 
         for i in 0..iterations {
             let data = format!("benchmark attachment data {}", i);
@@ -244,17 +291,124 @@ impl BenchmarkRunner {
                 .is_ok()
                 {
                     success += 1;
+                    output_bytes += data.len() as u64;
                 }
             }
         }
 
         let duration = start.elapsed();
-        BenchResult {
-            name: "attachment_write_small".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
+        bench_result("attachment_create_small", duration, success, output_bytes)
+    }
+
+    /// Benchmark: rename one attachment without touching its content.
+    pub fn bench_attachment_rename(iterations: u32) -> BenchResult {
+        let conn = initialized_memory_vault();
+        let ctx = CommitContext::new("bench-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Rename Bench", None, None).unwrap();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "rename-0.txt",
+            Some("text/plain"),
+            "",
+            0,
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        for i in 0..iterations {
+            let file_name = format!("rename-{i}.txt");
+            if AttachmentRepo::rename(
+                &conn,
+                &ctx,
+                &attachment.attachment_id,
+                &file_name,
+                Some("text/plain"),
+            )
+            .is_ok()
+            {
+                success += 1;
+                output_bytes += file_name.len() as u64;
+            }
         }
+
+        bench_result("attachment_rename", start.elapsed(), success, output_bytes)
+    }
+
+    /// Benchmark: replace the inline content of one existing attachment.
+    pub fn bench_attachment_replace(iterations: u32) -> BenchResult {
+        let conn = initialized_memory_vault();
+        let ctx = CommitContext::new("bench-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Replace Bench", None, None).unwrap();
+        let attachment = AttachmentRepo::add(
+            &conn,
+            &ctx,
+            &project.project_id,
+            None,
+            "replace.bin",
+            Some("application/octet-stream"),
+            "",
+            0,
+        )
+        .unwrap();
+        AttachmentRepo::write_inline_content(&conn, &ctx, &attachment.attachment_id, b"seed")
+            .unwrap();
+
+        let start = Instant::now();
+        let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        for i in 0..iterations {
+            let data = vec![(i % 251) as u8; 1024];
+            if AttachmentRepo::write_inline_content(&conn, &ctx, &attachment.attachment_id, &data)
+                .is_ok()
+            {
+                success += 1;
+                output_bytes += data.len() as u64;
+            }
+        }
+
+        bench_result(
+            "attachment_replace_1k",
+            start.elapsed(),
+            success,
+            output_bytes,
+        )
+    }
+
+    /// Benchmark: snapshot a representative small vault.
+    pub fn bench_snapshot(iterations: u32) -> BenchResult {
+        let conn = initialized_memory_vault();
+        let ctx = CommitContext::new("bench-device".to_string());
+        for i in 0..20u32 {
+            let project =
+                ProjectRepo::create(&conn, &ctx, &format!("Snapshot Project {i}"), None, None)
+                    .unwrap();
+            EntryRepo::create(
+                &conn,
+                &ctx,
+                &project.project_id,
+                EntryType::Login,
+                Some("Snapshot Entry"),
+                &serde_json::json!({"username": format!("user-{i}")}),
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        for _ in 0..iterations {
+            if let Ok(snapshot) = SnapshotRepo::create_snapshot(&conn, &ctx) {
+                success += 1;
+                output_bytes += snapshot.snapshot_ct.len() as u64;
+            }
+        }
+
+        bench_result("snapshot_create", start.elapsed(), success, output_bytes)
     }
 
     /// Benchmark: vault 文件打开。
@@ -289,12 +443,7 @@ impl BenchmarkRunner {
         }
 
         let duration = start.elapsed();
-        let result = BenchResult {
-            name: "vault_open".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
-        };
+        let result = bench_result("vault_open", duration, success, 0);
 
         // 清理
         let _ = std::fs::remove_file(&db_path);
@@ -304,60 +453,90 @@ impl BenchmarkRunner {
         result
     }
 
-    /// Benchmark: 同步 delta 计算（模拟生成变更摘要）。
-    pub fn bench_sync_delta(iterations: u32) -> BenchResult {
-        let conn = VaultConnection::open_in_memory().unwrap();
+    /// Benchmark: compact a persistent SQLite vault with VACUUM.
+    pub fn bench_compaction(iterations: u32) -> BenchResult {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("compaction.mdbx");
+        let conn = VaultConnection::create(&db_path).unwrap();
         crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
-        let ctx = CommitContext::new("bench-device".to_string());
-
-        // 创建 50 个 project，各带 1 个 entry
-        for i in 0..50u32 {
-            let p = ProjectRepo::create(&conn, &ctx, &format!("Delta Project {}", i), None, None)
-                .unwrap();
-            EntryRepo::create(
-                &conn,
-                &ctx,
-                &p.project_id,
-                EntryType::Login,
-                Some("Login"),
-                &serde_json::json!({"username": format!("user-{}", i)}),
+        conn.inner()
+            .execute_batch(
+                "CREATE TABLE benchmark_compaction_data (
+                    id INTEGER PRIMARY KEY,
+                    payload BLOB NOT NULL
+                 );",
             )
             .unwrap();
+        let payload = vec![0x5au8; 16 * 1024];
+        for id in 0..64u32 {
+            conn.inner()
+                .execute(
+                    "INSERT INTO benchmark_compaction_data (id, payload) VALUES (?1, ?2)",
+                    rusqlite::params![id, payload],
+                )
+                .unwrap();
         }
+        conn.inner()
+            .execute("DELETE FROM benchmark_compaction_data WHERE id % 2 = 0", [])
+            .unwrap();
 
         let start = Instant::now();
         let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        for _ in 0..iterations {
+            if conn
+                .inner()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+                .is_ok()
+            {
+                success += 1;
+                output_bytes += std::fs::metadata(&db_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+            }
+        }
+
+        bench_result("vault_compaction", start.elapsed(), success, output_bytes)
+    }
+
+    /// Benchmark: materialize and encode a real sync delta envelope.
+    pub fn bench_sync_delta(iterations: u32) -> BenchResult {
+        let conn = initialized_memory_vault();
+        let ctx = CommitContext::new("bench-device".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Delta Project", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Login"),
+            &serde_json::json!({"username":"delta-user"}),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let mut success = 0u32;
+        let mut output_bytes = 0u64;
+        let limits = SyncDeltaLimits::default();
 
         for _ in 0..iterations {
-            // 模拟 sync delta：列出所有 project + entry 的 (id, updated_at) 对
-            let projects = match ProjectRepo::list_all(&conn) {
-                Ok(ps) => ps,
-                Err(_) => continue,
-            };
-
-            let mut delta_size: u64 = 0;
-            for p in &projects {
-                delta_size += p.project_id.len() as u64;
-                delta_size += p.updated_at.len() as u64;
-
-                if let Ok(entries) = EntryRepo::list_by_project(&conn, &p.project_id) {
-                    for e in &entries {
-                        delta_size += e.entry_id.len() as u64;
-                        delta_size += e.updated_at.len() as u64;
-                    }
+            conn.inner()
+                .execute(
+                    "INSERT INTO sync_delta_mutations (entity_kind, entity_id, action)
+                     VALUES ('commit', ?1, 'upsert'), ('entry', ?2, 'upsert')",
+                    rusqlite::params![entry.head_commit_id, entry.entry_id],
+                )
+                .unwrap();
+            if let Ok(Some(envelope)) = materialize_pending_sync_delta(&conn, limits) {
+                if let Ok(encoded) = envelope.encode(limits) {
+                    output_bytes += encoded.len() as u64;
+                    success += 1;
                 }
             }
-            let _ = delta_size;
-            success += 1;
         }
 
         let duration = start.elapsed();
-        BenchResult {
-            name: "sync_delta_compute".to_string(),
-            duration,
-            ops: success,
-            ops_per_sec: success as f64 / duration.as_secs_f64(),
-        }
+        bench_result("sync_delta_materialize", duration, success, output_bytes)
     }
 
     /// KDBX 对照组的数据结构（参考值，用于对比输出）。
@@ -372,40 +551,66 @@ impl BenchmarkRunner {
                     duration: Duration::from_millis(100),
                     ops: 100,
                     ops_per_sec: 1000.0,
+                    output_bytes: 0,
                 },
                 BenchResult {
-                    name: "entry_save".to_string(),
+                    name: "entry_create".to_string(),
                     duration: Duration::from_millis(200),
                     ops: 100,
                     ops_per_sec: 500.0,
+                    output_bytes: 0,
                 },
                 BenchResult {
                     name: "search_by_title".to_string(),
                     duration: Duration::from_millis(50),
                     ops: 100,
                     ops_per_sec: 2000.0,
+                    output_bytes: 0,
                 },
                 BenchResult {
-                    name: "attachment_write_small".to_string(),
+                    name: "attachment_create_small".to_string(),
                     duration: Duration::from_millis(150),
                     ops: 100,
                     ops_per_sec: 666.0,
+                    output_bytes: 0,
                 },
                 BenchResult {
                     name: "vault_open".to_string(),
                     duration: Duration::from_millis(300),
                     ops: 100,
                     ops_per_sec: 333.0,
+                    output_bytes: 0,
                 },
                 BenchResult {
-                    name: "sync_delta_compute".to_string(),
+                    name: "sync_delta_materialize".to_string(),
                     duration: Duration::from_millis(80),
                     ops: 100,
                     ops_per_sec: 1250.0,
+                    output_bytes: 0,
                 },
             ],
             total_duration: Duration::from_millis(880),
         }
+    }
+}
+
+fn initialized_memory_vault() -> VaultConnection {
+    let conn = VaultConnection::open_in_memory().unwrap();
+    crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+    conn
+}
+
+fn bench_result(name: &str, duration: Duration, ops: u32, output_bytes: u64) -> BenchResult {
+    BenchResult {
+        name: name.to_string(),
+        duration,
+        ops,
+        ops_per_sec: if duration.is_zero() {
+            0.0
+        } else {
+            ops as f64 / duration.as_secs_f64()
+        },
+        output_bytes,
     }
 }
 
@@ -430,6 +635,14 @@ mod tests {
         let result = BenchmarkRunner::bench_save_entry(10);
         assert_eq!(result.ops, 10);
         assert!(result.ops_per_sec > 0.0);
+        assert!(result.output_bytes > 0);
+    }
+
+    #[test]
+    fn test_bench_edit_entry() {
+        let result = BenchmarkRunner::bench_edit_entry(5);
+        assert_eq!(result.ops, 5);
+        assert!(result.output_bytes > 0);
     }
 
     #[test]
@@ -444,6 +657,24 @@ mod tests {
         let result = BenchmarkRunner::bench_attachment_write(5);
         assert!(result.ops > 0);
         assert!(result.ops_per_sec > 0.0);
+        assert!(result.output_bytes > 0);
+    }
+
+    #[test]
+    fn test_bench_attachment_changes() {
+        let rename = BenchmarkRunner::bench_attachment_rename(3);
+        let replace = BenchmarkRunner::bench_attachment_replace(3);
+        assert_eq!(rename.ops, 3);
+        assert_eq!(replace.ops, 3);
+        assert!(rename.output_bytes > 0);
+        assert_eq!(replace.output_bytes, 3 * 1024);
+    }
+
+    #[test]
+    fn test_bench_snapshot() {
+        let result = BenchmarkRunner::bench_snapshot(2);
+        assert_eq!(result.ops, 2);
+        assert!(result.output_bytes > 0);
     }
 
     #[test]
@@ -458,12 +689,20 @@ mod tests {
         let result = BenchmarkRunner::bench_sync_delta(5);
         assert_eq!(result.ops, 5);
         assert!(result.ops_per_sec > 0.0);
+        assert!(result.output_bytes > 0);
+    }
+
+    #[test]
+    fn test_bench_compaction() {
+        let result = BenchmarkRunner::bench_compaction(1);
+        assert_eq!(result.ops, 1);
+        assert!(result.output_bytes > 0);
     }
 
     #[test]
     fn test_run_full_suite() {
         let suite = BenchmarkRunner::run_full_suite(5);
-        assert_eq!(suite.results.len(), 6);
+        assert_eq!(suite.results.len(), 11);
         assert!(suite.total_duration.as_micros() > 0);
 
         // 验证可以打印
