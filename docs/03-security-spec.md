@@ -188,6 +188,15 @@ explicit O(vault-size) operation, not a routine commit hook. External Blob
 Provider bytes, OS state, and availability remain outside its boundary; an
 automatically refreshed incremental Merkle root is a separate future design.
 
+New issuance uses manifest profile v2. V2 reads `table_xinfo`, so ordinary,
+generated, and hidden columns are all represented, and orders typed values
+canonically even when nullable primary keys or declared collations do not form
+a total order. Header verification, vault identity, and content hashing share
+one SQLite snapshot. Readers MUST continue to verify authenticated v1 tokens
+with the v1 hashing profile; a token version selects its algorithm and MUST NOT
+be silently reinterpreted as the current profile. CLI and UniFFI tokens remain
+opaque, so this profile change does not alter their public method signatures.
+
 ## 8. Attachment Security Rules
 
 Attachments are first-class sensitive data.

@@ -156,6 +156,14 @@ bounded opaque token covers non-internal schema objects, column definitions,
 and typed values from every main table, including unknown extension tables and
 additive columns.
 
+New tokens use manifest profile v2. V2 includes generated and hidden columns
+through SQLite `table_xinfo`, adds canonical typed ordering for nullable or
+collation-tied rows, and reads authenticated header metadata, vault identity,
+and content from one snapshot. Verification remains profile-aware and accepts
+previously issued v1 tokens with the original v1 algorithm. The token stays
+opaque at the CLI and UniFFI boundaries, so clients do not need a signature or
+storage-format migration.
+
 This is an explicit O(vault-size) checkpoint for backup publication, migration
 completion, device handoff, or suspected direct rewriting; it is not part of
 the routine small-mutation commit path. Any legitimate write invalidates the

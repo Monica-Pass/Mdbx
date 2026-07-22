@@ -213,6 +213,13 @@ vault content manifest。它在同一个 SQLite read snapshot 中哈希非内部
 commit hook 上。外部 Blob Provider 内容、操作系统状态和可用性不在清单边界内；自动刷新
 的增量 Merkle root 属于后续独立设计。
 
+新签发清单使用 profile v2。V2 通过 `table_xinfo` 同时纳入普通列、generated column 与
+hidden column；即使 nullable primary key 或声明 collation 不能形成全序，也会按 SQLite
+类型与规范值稳定排序。header 验证、vault identity 和内容哈希共享同一个 read snapshot。
+reader 必须继续按 v1 算法验证已认证的 v1 token；token version 选择对应 profile，禁止把
+旧 token 静默按当前算法重新解释。CLI 与 UniFFI 仍把 token 视为不透明字节，因此公开方法
+签名不变。
+
 ## 8. 附件安全规则
 
 附件属于一等敏感数据。

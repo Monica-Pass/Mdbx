@@ -6,8 +6,10 @@ use crate::error::{StorageError, StorageResult};
 use crate::vault_header_integrity::{self, VaultHeaderIntegrityStatus};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"MDBXVM1\0";
-const MANIFEST_DOMAIN: &[u8] = b"mdbx-vault-content-manifest-v1";
-const MANIFEST_VERSION: u8 = 1;
+const MANIFEST_DOMAIN_V1: &[u8] = b"mdbx-vault-content-manifest-v1";
+const MANIFEST_DOMAIN_V2: &[u8] = b"mdbx-vault-content-manifest-v2";
+const MANIFEST_VERSION_V1: u8 = 1;
+const MANIFEST_VERSION_V2: u8 = 2;
 const HMAC_TAG_LEN: usize = 32;
 const ROOT_LEN: usize = 32;
 const MAX_ID_BYTES: usize = 128;
@@ -26,6 +28,42 @@ pub struct VaultContentManifestVerification {
     pub table_count: u64,
     pub row_count: u64,
     pub hashed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestProfile {
+    V1,
+    V2,
+}
+
+impl ManifestProfile {
+    fn current() -> Self {
+        Self::V2
+    }
+
+    fn version(self) -> u8 {
+        match self {
+            Self::V1 => MANIFEST_VERSION_V1,
+            Self::V2 => MANIFEST_VERSION_V2,
+        }
+    }
+
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::V1 => MANIFEST_DOMAIN_V1,
+            Self::V2 => MANIFEST_DOMAIN_V2,
+        }
+    }
+
+    fn from_version(version: u8) -> StorageResult<Self> {
+        match version {
+            MANIFEST_VERSION_V1 => Ok(Self::V1),
+            MANIFEST_VERSION_V2 => Ok(Self::V2),
+            _ => Err(StorageError::Validation(format!(
+                "unsupported vault content manifest version {version}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +92,10 @@ struct TableColumn {
     not_null: i64,
     default_value: Option<String>,
     primary_key_order: i64,
+    hidden_kind: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestSnapshot {
     table_count: u64,
     row_count: u64,
@@ -72,18 +111,7 @@ impl VaultContentManifestService {
     /// This is deliberately an explicit O(vault-size) operation. Routine
     /// mutations remain incremental and do not recompute the whole vault.
     pub fn issue(conn: &VaultConnection) -> StorageResult<Vec<u8>> {
-        ensure_verified_unlocked(conn)?;
-        let (vault_id, schema_version) = vault_identity(conn)?;
-        let snapshot = conn.with_read_transaction(|| compute_snapshot(conn))?;
-        let payload = ManifestPayload {
-            vault_id,
-            schema_version,
-            table_count: snapshot.table_count,
-            row_count: snapshot.row_count,
-            hashed_bytes: snapshot.hashed_bytes,
-            root: snapshot.root,
-        };
-        encode_token(conn, &payload)
+        issue_with_profile(conn, ManifestProfile::current())
     }
 
     /// Verifies an exact-state checkpoint against the currently opened vault.
@@ -91,7 +119,6 @@ impl VaultContentManifestService {
         conn: &VaultConnection,
         token: &[u8],
     ) -> StorageResult<VaultContentManifestVerification> {
-        ensure_verified_unlocked(conn)?;
         if token.len() > MAX_VAULT_CONTENT_MANIFEST_BYTES {
             return Err(StorageError::Validation(format!(
                 "vault content manifest exceeds {MAX_VAULT_CONTENT_MANIFEST_BYTES} bytes"
@@ -104,46 +131,73 @@ impl VaultContentManifestService {
         }
         let payload_end = token.len() - HMAC_TAG_LEN;
         let (encoded_payload, expected_tag) = token.split_at(payload_end);
-        let keyring = conn.keyring().expect("verified unlock requires keyring");
-        mdbx_crypto::integrity::verify_hmac_sha256(
-            &keyring.integrity_subkey,
-            &[MANIFEST_DOMAIN, encoded_payload],
-            expected_tag,
-        )
-        .map_err(|_| {
-            StorageError::Validation("vault content manifest authentication failed".to_string())
-        })?;
+        let profile = peek_profile(encoded_payload)?;
 
-        let payload = decode_payload(encoded_payload)?;
+        conn.with_read_transaction(|| {
+            ensure_verified_unlocked(conn)?;
+            let keyring = conn.keyring().expect("verified unlock requires keyring");
+            mdbx_crypto::integrity::verify_hmac_sha256(
+                &keyring.integrity_subkey,
+                &[profile.domain(), encoded_payload],
+                expected_tag,
+            )
+            .map_err(|_| {
+                StorageError::Validation("vault content manifest authentication failed".to_string())
+            })?;
+
+            let (decoded_profile, payload) = decode_payload(encoded_payload)?;
+            if decoded_profile != profile {
+                return Err(StorageError::Validation(
+                    "vault content manifest profile mismatch".to_string(),
+                ));
+            }
+            let (vault_id, schema_version) = vault_identity(conn)?;
+            if payload.vault_id != vault_id {
+                return Err(StorageError::Validation(
+                    "vault content manifest belongs to another vault".to_string(),
+                ));
+            }
+            if payload.schema_version != schema_version {
+                return Err(StorageError::Validation(format!(
+                    "vault schema {schema_version} does not match manifest schema {}",
+                    payload.schema_version
+                )));
+            }
+
+            let snapshot = compute_snapshot(conn, profile)?;
+            if snapshot.table_count != payload.table_count
+                || snapshot.row_count != payload.row_count
+                || snapshot.hashed_bytes != payload.hashed_bytes
+                || snapshot.root != payload.root
+            {
+                return Err(StorageError::Validation(
+                    "vault content manifest does not match the current vault".to_string(),
+                ));
+            }
+            Ok(VaultContentManifestVerification {
+                table_count: snapshot.table_count,
+                row_count: snapshot.row_count,
+                hashed_bytes: snapshot.hashed_bytes,
+            })
+        })
+    }
+}
+
+fn issue_with_profile(conn: &VaultConnection, profile: ManifestProfile) -> StorageResult<Vec<u8>> {
+    conn.with_read_transaction(|| {
+        ensure_verified_unlocked(conn)?;
         let (vault_id, schema_version) = vault_identity(conn)?;
-        if payload.vault_id != vault_id {
-            return Err(StorageError::Validation(
-                "vault content manifest belongs to another vault".to_string(),
-            ));
-        }
-        if payload.schema_version != schema_version {
-            return Err(StorageError::Validation(format!(
-                "vault schema {schema_version} does not match manifest schema {}",
-                payload.schema_version
-            )));
-        }
-
-        let snapshot = conn.with_read_transaction(|| compute_snapshot(conn))?;
-        if snapshot.table_count != payload.table_count
-            || snapshot.row_count != payload.row_count
-            || snapshot.hashed_bytes != payload.hashed_bytes
-            || snapshot.root != payload.root
-        {
-            return Err(StorageError::Validation(
-                "vault content manifest does not match the current vault".to_string(),
-            ));
-        }
-        Ok(VaultContentManifestVerification {
+        let snapshot = compute_snapshot(conn, profile)?;
+        let payload = ManifestPayload {
+            vault_id,
+            schema_version,
             table_count: snapshot.table_count,
             row_count: snapshot.row_count,
             hashed_bytes: snapshot.hashed_bytes,
-        })
-    }
+            root: snapshot.root,
+        };
+        encode_token(conn, profile, &payload)
+    })
 }
 
 fn ensure_verified_unlocked(conn: &VaultConnection) -> StorageResult<()> {
@@ -171,10 +225,14 @@ fn vault_identity(conn: &VaultConnection) -> StorageResult<(String, u32)> {
     Ok((vault_id, schema_version))
 }
 
-fn encode_token(conn: &VaultConnection, payload: &ManifestPayload) -> StorageResult<Vec<u8>> {
+fn encode_token(
+    conn: &VaultConnection,
+    profile: ManifestProfile,
+    payload: &ManifestPayload,
+) -> StorageResult<Vec<u8>> {
     let mut encoded = Vec::with_capacity(128);
     encoded.extend_from_slice(MANIFEST_MAGIC);
-    encoded.push(MANIFEST_VERSION);
+    encoded.push(profile.version());
     encoded.extend_from_slice(&payload.schema_version.to_le_bytes());
     write_text(&mut encoded, &payload.vault_id, MAX_ID_BYTES, "vault ID")?;
     encoded.extend_from_slice(&payload.table_count.to_le_bytes());
@@ -185,7 +243,7 @@ fn encode_token(conn: &VaultConnection, payload: &ManifestPayload) -> StorageRes
     let keyring = conn.keyring().expect("verified unlock requires keyring");
     let tag = mdbx_crypto::integrity::hmac_sha256(
         &keyring.integrity_subkey,
-        &[MANIFEST_DOMAIN, &encoded],
+        &[profile.domain(), &encoded],
     )
     .map_err(StorageError::Crypto)?;
     encoded.extend_from_slice(&tag);
@@ -197,18 +255,24 @@ fn encode_token(conn: &VaultConnection, payload: &ManifestPayload) -> StorageRes
     Ok(encoded)
 }
 
-fn decode_payload(bytes: &[u8]) -> StorageResult<ManifestPayload> {
+fn peek_profile(bytes: &[u8]) -> StorageResult<ManifestProfile> {
     let mut reader = ManifestReader::new(bytes);
     if reader.read_array::<8>("magic")? != *MANIFEST_MAGIC {
         return Err(StorageError::Validation(
             "vault content manifest magic is invalid".to_string(),
         ));
     }
-    if reader.read_u8("version")? != MANIFEST_VERSION {
+    ManifestProfile::from_version(reader.read_u8("version")?)
+}
+
+fn decode_payload(bytes: &[u8]) -> StorageResult<(ManifestProfile, ManifestPayload)> {
+    let mut reader = ManifestReader::new(bytes);
+    if reader.read_array::<8>("magic")? != *MANIFEST_MAGIC {
         return Err(StorageError::Validation(
-            "unsupported vault content manifest version".to_string(),
+            "vault content manifest magic is invalid".to_string(),
         ));
     }
+    let profile = ManifestProfile::from_version(reader.read_u8("version")?)?;
     let schema_version = u32::from_le_bytes(reader.read_array("schema version")?);
     let vault_id = reader.read_text(MAX_ID_BYTES, "vault ID")?;
     let table_count = u64::from_le_bytes(reader.read_array("table count")?);
@@ -220,17 +284,23 @@ fn decode_payload(bytes: &[u8]) -> StorageResult<ManifestPayload> {
             "vault content manifest has trailing data".to_string(),
         ));
     }
-    Ok(ManifestPayload {
-        vault_id,
-        schema_version,
-        table_count,
-        row_count,
-        hashed_bytes,
-        root,
-    })
+    Ok((
+        profile,
+        ManifestPayload {
+            vault_id,
+            schema_version,
+            table_count,
+            row_count,
+            hashed_bytes,
+            root,
+        },
+    ))
 }
 
-fn compute_snapshot(conn: &VaultConnection) -> StorageResult<ManifestSnapshot> {
+fn compute_snapshot(
+    conn: &VaultConnection,
+    profile: ManifestProfile,
+) -> StorageResult<ManifestSnapshot> {
     let objects = load_schema_objects(conn)?;
     let tables = objects
         .iter()
@@ -248,7 +318,7 @@ fn compute_snapshot(conn: &VaultConnection) -> StorageResult<ManifestSnapshot> {
         &mut hasher,
         &mut hashed_bytes,
         0x01,
-        MANIFEST_DOMAIN,
+        profile.domain(),
         MAX_SCHEMA_SQL_BYTES,
         "manifest domain",
     )?;
@@ -279,7 +349,7 @@ fn compute_snapshot(conn: &VaultConnection) -> StorageResult<ManifestSnapshot> {
     let mut row_count = 0_u64;
     for table in &tables {
         hash_text(&mut hasher, &mut hashed_bytes, 0x10, &table.name)?;
-        let columns = load_columns(conn, &table.name)?;
+        let columns = load_columns(conn, &table.name, profile)?;
         if columns.is_empty() || columns.len() > MAX_COLUMNS_PER_TABLE {
             return Err(StorageError::Validation(format!(
                 "table {} has an unsupported column count",
@@ -316,6 +386,9 @@ fn compute_snapshot(conn: &VaultConnection) -> StorageResult<ManifestSnapshot> {
                 0x18,
                 column.primary_key_order,
             );
+            if profile == ManifestProfile::V2 {
+                hash_i64(&mut hasher, &mut hashed_bytes, 0x19, column.hidden_kind);
+            }
         }
 
         let quoted_table = quote_identifier(&table.name);
@@ -324,22 +397,7 @@ fn compute_snapshot(conn: &VaultConnection) -> StorageResult<ManifestSnapshot> {
             .map(|column| quote_identifier(&column.name))
             .collect::<Vec<_>>()
             .join(", ");
-        let order_columns = columns
-            .iter()
-            .filter(|column| column.primary_key_order > 0)
-            .collect::<Vec<_>>();
-        let order_columns = if order_columns.is_empty() {
-            columns.iter().collect::<Vec<_>>()
-        } else {
-            let mut ordered = order_columns;
-            ordered.sort_by_key(|column| column.primary_key_order);
-            ordered
-        };
-        let order_clause = order_columns
-            .iter()
-            .map(|column| quote_identifier(&column.name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let order_clause = build_order_clause(conn, &table.name, &columns, profile);
         let query =
             format!("SELECT {selected_columns} FROM {quoted_table} ORDER BY {order_clause}");
         let mut statement = conn.inner().prepare(&query)?;
@@ -394,8 +452,16 @@ fn load_schema_objects(conn: &VaultConnection) -> StorageResult<Vec<SchemaObject
     Ok(objects)
 }
 
-fn load_columns(conn: &VaultConnection, table: &str) -> StorageResult<Vec<TableColumn>> {
-    let query = format!("PRAGMA table_info({})", quote_identifier(table));
+fn load_columns(
+    conn: &VaultConnection,
+    table: &str,
+    profile: ManifestProfile,
+) -> StorageResult<Vec<TableColumn>> {
+    let pragma = match profile {
+        ManifestProfile::V1 => "table_info",
+        ManifestProfile::V2 => "table_xinfo",
+    };
+    let query = format!("PRAGMA {pragma}({})", quote_identifier(table));
     let mut statement = conn.inner().prepare(&query)?;
     let mut columns = statement
         .query_map([], |row| {
@@ -406,11 +472,82 @@ fn load_columns(conn: &VaultConnection, table: &str) -> StorageResult<Vec<TableC
                 not_null: row.get(3)?,
                 default_value: row.get(4)?,
                 primary_key_order: row.get(5)?,
+                hidden_kind: if profile == ManifestProfile::V2 {
+                    row.get(6)?
+                } else {
+                    0
+                },
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     columns.sort_by_key(|column| column.cid);
     Ok(columns)
+}
+
+fn build_order_clause(
+    conn: &VaultConnection,
+    table: &str,
+    columns: &[TableColumn],
+    profile: ManifestProfile,
+) -> String {
+    if profile == ManifestProfile::V1 {
+        let primary_key = columns
+            .iter()
+            .filter(|column| column.primary_key_order > 0)
+            .collect::<Vec<_>>();
+        let ordered = if primary_key.is_empty() {
+            columns.iter().collect::<Vec<_>>()
+        } else {
+            let mut ordered = primary_key;
+            ordered.sort_by_key(|column| column.primary_key_order);
+            ordered
+        };
+        return ordered
+            .iter()
+            .map(|column| quote_identifier(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+
+    let mut primary_key = columns
+        .iter()
+        .filter(|column| column.primary_key_order > 0)
+        .collect::<Vec<_>>();
+    primary_key.sort_by_key(|column| column.primary_key_order);
+
+    let mut terms = primary_key
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>();
+    for column in columns {
+        let identifier = quote_identifier(&column.name);
+        terms.push(format!("typeof({identifier}) COLLATE BINARY"));
+        terms.push(format!("{identifier} COLLATE BINARY"));
+    }
+    if let Some(alias) = accessible_rowid_alias(conn, table, columns) {
+        terms.push(alias.to_string());
+    }
+    terms.join(", ")
+}
+
+fn accessible_rowid_alias(
+    conn: &VaultConnection,
+    table: &str,
+    columns: &[TableColumn],
+) -> Option<&'static str> {
+    for alias in ["rowid", "_rowid_", "oid"] {
+        if columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(alias))
+        {
+            continue;
+        }
+        let query = format!("SELECT {alias} FROM {} LIMIT 0", quote_identifier(table));
+        if conn.inner().prepare(&query).is_ok() {
+            return Some(alias);
+        }
+    }
+    None
 }
 
 fn hash_value(
@@ -598,6 +735,7 @@ mod tests {
     fn exact_manifest_roundtrips_and_legitimate_changes_require_reissue() {
         let conn = setup();
         let token = VaultContentManifestService::issue(&conn).unwrap();
+        assert_eq!(token[MANIFEST_MAGIC.len()], MANIFEST_VERSION_V2);
         let equal = VaultContentManifestService::verify(&conn, &token).unwrap();
         assert!(equal.table_count > 0);
         assert!(equal.row_count > 0);
@@ -613,6 +751,75 @@ mod tests {
         assert!(VaultContentManifestService::verify(&conn, &token).is_err());
         let replacement = VaultContentManifestService::issue(&conn).unwrap();
         assert!(VaultContentManifestService::verify(&conn, &replacement).is_ok());
+    }
+
+    #[test]
+    fn legacy_v1_tokens_remain_verifiable_after_v2_issue_becomes_current() {
+        let conn = setup();
+        let token = issue_with_profile(&conn, ManifestProfile::V1).unwrap();
+        assert_eq!(token[MANIFEST_MAGIC.len()], MANIFEST_VERSION_V1);
+
+        let verification = VaultContentManifestService::verify(&conn, &token).unwrap();
+        assert!(verification.table_count > 0);
+        assert!(verification.row_count > 0);
+
+        let current = VaultContentManifestService::issue(&conn).unwrap();
+        assert_eq!(current[MANIFEST_MAGIC.len()], MANIFEST_VERSION_V2);
+    }
+
+    #[test]
+    fn v2_covers_generated_columns_and_canonicalizes_nullable_primary_keys() {
+        let conn = setup();
+        conn.inner()
+            .execute_batch(
+                "CREATE TABLE extension_generated_probe (
+                     raw TEXT,
+                     folded TEXT GENERATED ALWAYS AS (lower(raw)) STORED,
+                     sized INTEGER GENERATED ALWAYS AS (length(raw)) VIRTUAL
+                 );
+                 INSERT INTO extension_generated_probe (raw) VALUES ('Alpha');
+                 CREATE TABLE extension_nullable_pk (
+                     key TEXT PRIMARY KEY,
+                     payload TEXT COLLATE NOCASE
+                 );
+                 INSERT INTO extension_nullable_pk (key, payload)
+                 VALUES (NULL, 'second'), (NULL, 'first');",
+            )
+            .unwrap();
+
+        let legacy_columns =
+            load_columns(&conn, "extension_generated_probe", ManifestProfile::V1).unwrap();
+        assert_eq!(
+            legacy_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["raw"]
+        );
+        let columns =
+            load_columns(&conn, "extension_generated_probe", ManifestProfile::V2).unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.hidden_kind))
+                .collect::<Vec<_>>(),
+            [("raw", 0), ("folded", 3), ("sized", 2)]
+        );
+
+        let before = conn
+            .with_read_transaction(|| compute_snapshot(&conn, ManifestProfile::V2))
+            .unwrap();
+        conn.inner()
+            .execute_batch(
+                "DELETE FROM extension_nullable_pk;
+                 INSERT INTO extension_nullable_pk (key, payload)
+                 VALUES (NULL, 'first'), (NULL, 'second');",
+            )
+            .unwrap();
+        let after = conn
+            .with_read_transaction(|| compute_snapshot(&conn, ManifestProfile::V2))
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

@@ -253,6 +253,12 @@ inventory，必须先版本化 anchor 语义，不能静默删除锚定行。
 `MdbxVault.create_content_manifest` / `verify_content_manifest`。清单 token 是有界不透明
 字节，覆盖非内部 schema 对象、列定义和所有表行值，未知扩展表与附加列不会被静默遗漏。
 
+新 token 使用 manifest profile v2。V2 通过 SQLite `table_xinfo` 纳入 generated/hidden
+columns，并为 nullable primary key 或 collation 相等的行增加带类型的规范排序；header
+认证、vault identity 和内容哈希位于同一个 read snapshot。验证端仍按原 v1 算法接受已经
+签发的 v1 token，不能把旧 token 静默重解释成 v2。CLI 与 UniFFI 边界继续传递不透明字节，
+客户端无需修改方法签名或迁移 token 存储格式。
+
 这是显式的 O(vault-size) 精确检查点：客户端应在备份发布、迁移后、跨设备交接或怀疑文件
 被直接改写时使用，而不应把它放进每次小 mutation 的提交路径。验证成功后，任何合法写入
 都会使旧清单失效，客户端必须重新签发并替换外部 token。它不包含外部 Blob Provider
