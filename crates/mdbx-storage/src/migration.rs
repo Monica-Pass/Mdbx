@@ -1615,6 +1615,228 @@ mod tests {
     }
 
     #[test]
+    fn real_mdbx1_release_fixture_upgrades_and_preserves_all_record_families() {
+        use crate::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
+        use crate::unlock::UnlockService;
+        use rusqlite::OpenFlags;
+        use sha2::{Digest, Sha256};
+
+        const FIXTURE: &[u8] = include_bytes!("../test-data/mdbx1-release-1.0.mdbx");
+        const MANIFEST: &str = include_str!("../test-data/mdbx1-release-1.0.manifest.json");
+
+        let manifest: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
+        let mut digest = Sha256::new();
+        digest.update(FIXTURE);
+        assert_eq!(
+            format!("{:X}", digest.finalize()),
+            manifest["fixture_sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            FIXTURE.len(),
+            manifest["fixture_bytes"].as_u64().unwrap() as usize
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "mdbx1-release-golden-{}.mdbx",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, FIXTURE).unwrap();
+
+        let before = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let format: String = before
+            .query_row("SELECT format_version FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, FORMAT_V1);
+        let before_counts: (i64, i64, i64, i64, i64) = before
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM projects),
+                    (SELECT COUNT(*) FROM entries),
+                    (SELECT COUNT(*) FROM attachments),
+                    (SELECT COUNT(*) FROM snapshots),
+                    (SELECT COUNT(*) FROM commits)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(before_counts, (1, 1, 1, 1, 6));
+        let before_commit_ids: Vec<String> = {
+            let mut statement = before
+                .prepare("SELECT commit_id FROM commits ORDER BY commit_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before_object_version_ids: Vec<(String, String, String)> = {
+            let mut statement = before
+                .prepare(
+                    "SELECT object_type, object_id, commit_id
+                     FROM object_versions
+                     ORDER BY object_type, object_id, commit_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        drop(before);
+
+        let plan = inspect_migration_path(&path).unwrap();
+        assert!(plan.requires_upgrade);
+        assert_eq!(plan.format_version.as_deref(), Some(FORMAT_V1));
+        assert_eq!(plan.schema_version, Some(1));
+        let inspected_bytes = std::fs::read(&path).unwrap();
+        let mut inspected_digest = Sha256::new();
+        inspected_digest.update(&inspected_bytes);
+        assert_eq!(
+            format!("{:X}", inspected_digest.finalize()),
+            manifest["fixture_sha256"].as_str().unwrap()
+        );
+
+        let info = upgrade_path(&path).unwrap().unwrap();
+        assert_eq!(info.format_version, FORMAT_V2);
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+
+        let mut conn = VaultConnection::open(&path).unwrap();
+        UnlockService::unlock_with_password(
+            &mut conn,
+            manifest["test_unlock_password"].as_str().unwrap(),
+        )
+        .unwrap();
+        let project_id = manifest["project_id"].as_str().unwrap();
+        let project = ProjectRepo::get_by_id(&conn, project_id).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(project.title_ct).unwrap(),
+            manifest["project_title"].as_str().unwrap()
+        );
+        assert_eq!(project.group_id.as_deref(), Some("golden"));
+
+        let entry_id = manifest["entry_id"].as_str().unwrap();
+        let entry = EntryRepo::get_by_id(&conn, entry_id).unwrap().unwrap();
+        assert_eq!(entry.project_id, project_id);
+        assert_eq!(
+            String::from_utf8(entry.title_ct.unwrap()).unwrap(),
+            manifest["entry_title"].as_str().unwrap()
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&entry.payload_ct).unwrap();
+        assert_eq!(payload["username"], "golden-user");
+        assert_eq!(payload["password"], "golden-secret");
+        assert_eq!(payload["url"], "https://mdbx1.example");
+
+        let tag_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM project_tags
+                 WHERE project_id = ?1 AND tag = 'golden'",
+                [project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 1);
+
+        let attachment_id = manifest["attachment_id"].as_str().unwrap();
+        let attachment = AttachmentRepo::get_by_id(&conn, attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(attachment.file_name_ct).unwrap(),
+            manifest["attachment_file_name"].as_str().unwrap()
+        );
+        assert_eq!(
+            AttachmentRepo::read_content(&conn, attachment_id).unwrap(),
+            manifest["attachment_bytes"].as_str().unwrap().as_bytes()
+        );
+        assert!(SnapshotRepo::list_all(&conn)
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot.snapshot_id == manifest["snapshot_id"]));
+
+        let after_counts: (i64, i64, i64, i64, i64) = conn
+            .inner()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM projects),
+                    (SELECT COUNT(*) FROM entries),
+                    (SELECT COUNT(*) FROM attachments),
+                    (SELECT COUNT(*) FROM snapshots),
+                    (SELECT COUNT(*) FROM commits)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after_counts, before_counts);
+        let after_commit_ids: Vec<String> = {
+            let mut statement = conn
+                .inner()
+                .prepare("SELECT commit_id FROM commits ORDER BY commit_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(after_commit_ids, before_commit_ids);
+        let after_object_version_ids: Vec<(String, String, String)> = {
+            let mut statement = conn
+                .inner()
+                .prepare(
+                    "SELECT object_type, object_id, commit_id
+                     FROM object_versions
+                     ORDER BY object_type, object_id, commit_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(after_object_version_ids, before_object_version_ids);
+
+        let first_info = read_format_info(conn.inner()).unwrap();
+        upgrade_to_latest(conn.inner()).unwrap();
+        assert_eq!(read_format_info(conn.inner()).unwrap(), first_info);
+        let migration_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SYNC_STATE_EXTENSIONS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("mdbx-wal"));
+        let _ = std::fs::remove_file(path.with_extension("mdbx-shm"));
+    }
+
+    #[test]
     fn mdbx1_upgrade_creates_sync_state_extension_store() {
         let conn = v1_database();
 
