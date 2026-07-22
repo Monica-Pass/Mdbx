@@ -150,6 +150,25 @@ MDBX MUST authenticate:
 
 Moving ciphertext into the wrong context MUST fail authentication.
 
+MDBX2 schema 16 authenticates the vault header with
+`mdbx-vault-header-hmac-sha256-v1` under the vault integrity subkey. The
+length-delimited HMAC covers the vault identity, format and schema versions,
+minimum reader/writer versions, creation/update timestamps, default Tiga mode,
+active key epoch, compatibility and critical-extension flags, Tiga policy
+version, and compliance status. A database trigger invalidates an established
+tag whenever any covered column changes; a legal storage-core mutation MUST
+refresh the tag in the same transaction. An established header MUST NOT be
+downgraded to the migration-only `pending` state.
+
+MDBX1 and earlier MDBX2 vaults enter `pending` during the additive migration
+because no verified vault key is available at open time. The first successful
+unlock establishes the tag. Subsequent unlocks MUST verify it before attaching
+the keyring, and health checks MUST report invalidated or mismatched tags as an
+error. A locked health check can validate tag shape but can only report keyed
+verification as pending. This mechanism does not provide an external rollback
+anchor: detecting replacement by an older, internally consistent vault still
+requires client-maintained generation or backup state.
+
 ## 8. Attachment Security Rules
 
 Attachments are first-class sensitive data.

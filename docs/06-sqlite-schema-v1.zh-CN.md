@@ -68,6 +68,18 @@
 - `active_key_epoch_id TEXT NOT NULL`
 - `compat_flags TEXT NOT NULL`
 - `critical_extensions TEXT NOT NULL`
+- `schema_version INTEGER NOT NULL`
+- `min_reader_version TEXT NOT NULL`
+- `min_writer_version TEXT NOT NULL`
+- `tiga_policy_version INTEGER NOT NULL`
+- `tiga_compliance_status TEXT NOT NULL`
+- `header_integrity_profile TEXT NOT NULL`
+- `header_integrity_tag BLOB NULL`
+
+schema 16 的 `header_integrity_profile/header_integrity_tag` 是 additive 字段。
+旧库升级后先使用 `pending/NULL`，首次成功解锁后写入
+`mdbx-vault-header-hmac-sha256-v1` 与 32-byte HMAC。受保护 header 字段变化会由
+trigger 自动进入 `invalidated/NULL`，合法 mutation 必须在同一事务内重新封签。
 
 ## 3.2 projects
 
@@ -339,7 +351,7 @@
 - 管理密钥轮换
 - 初始化时允许使用 `mdbx-init-marker-v1` 随机 marker 作为兼容边界
 - 配置或变更 unlock method 后，active epoch 应绑定 `mdbx-active-key-epoch-v1` wrapping
-- 完整 key rotation、retirement、跨 epoch 读取迁移仍需单独实现；不得把初始化 marker 宣称为完整轮换
+- 随机 key rotation、retirement、跨 epoch 历史读取、同步合并与 Tiga 授权已实现；初始化 marker 仍不得宣称为真实数据密钥
 
 推荐字段：
 

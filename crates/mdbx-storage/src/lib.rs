@@ -28,3 +28,4 @@ pub mod sync_state;
 pub mod tiga;
 pub mod tiga_policy;
 pub mod unlock;
+pub(crate) mod vault_header_integrity;

@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v11, v12, v13, v14, v15, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v12, v13, v14, v15, v16, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_SCHEMA_VERSION: u32 = 16;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -26,6 +26,7 @@ pub const MIGRATION_COMMIT_INVENTORY: &str = "mdbx-2-commit-inventory-v1";
 pub const MIGRATION_SYNC_DELTA_BATCHES: &str = "mdbx-2-sync-delta-batches-v1";
 pub const MIGRATION_SYNC_DELTA_CAPTURE: &str = "mdbx-2-sync-delta-capture-v1";
 pub const MIGRATION_SYNC_STATE_EXTENSIONS: &str = "mdbx-2-sync-state-extensions-v1";
+pub const MIGRATION_VAULT_HEADER_AUTH: &str = "mdbx-2-vault-header-auth-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -292,6 +293,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v13::create_extensions(conn)?;
         v14::create_extensions(conn)?;
         v15::create_extensions(conn)?;
+        v16::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
@@ -328,6 +330,12 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
              (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![MIGRATION_SYNC_STATE_EXTENSIONS, from_format, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![MIGRATION_VAULT_HEADER_AUTH, from_format, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
 
@@ -391,6 +399,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v13::create_extensions(conn)?;
         v14::create_extensions(conn)?;
         v15::create_extensions(conn)?;
+        v16::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -471,6 +480,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_SYNC_STATE_EXTENSIONS, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_VAULT_HEADER_AUTH, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
         conn.execute(
@@ -692,6 +707,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
     v13::validate_sync_delta_schema(conn)?;
     v14::validate_sync_delta_capture(conn)?;
     v15::validate_sync_state_extensions(conn)?;
+    v16::validate_header_auth_schema(conn)?;
     for column in [
         "operation_id",
         "commit_id",
@@ -973,7 +989,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
         let inventory_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -982,6 +998,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inventory_migration_count, 1);
+        let header_auth_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_VAULT_HEADER_AUTH],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(header_auth_migration_count, 1);
         let delta_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -1146,7 +1170,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 
     #[test]
@@ -1717,6 +1741,19 @@ mod tests {
             manifest["test_unlock_password"].as_str().unwrap(),
         )
         .unwrap();
+        let (header_profile, header_tag): (String, Option<Vec<u8>>) = conn
+            .inner()
+            .query_row(
+                "SELECT header_integrity_profile, header_integrity_tag FROM vault_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            header_profile,
+            crate::schema::v16::HEADER_AUTH_HMAC_SHA256_V1_PROFILE
+        );
+        assert_eq!(header_tag.unwrap().len(), 32);
         let project_id = manifest["project_id"].as_str().unwrap();
         let project = ProjectRepo::get_by_id(&conn, project_id).unwrap().unwrap();
         assert_eq!(

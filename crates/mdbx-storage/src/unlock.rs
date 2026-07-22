@@ -726,7 +726,7 @@ impl UnlockService {
             "UPDATE vault_meta SET tiga_compliance_status = ?1, updated_at = ?2",
             rusqlite::params![status, chrono::Utc::now().to_rfc3339()],
         )?;
-        Ok(())
+        crate::vault_header_integrity::refresh_after_mutation(conn)
     }
 
     /// 删除指定类型的解锁方式。
@@ -943,6 +943,7 @@ impl UnlockService {
 
     fn attach_verified_keyring(conn: &mut VaultConnection, vault_key: &[u8]) -> StorageResult<()> {
         let (keyring, active_key_epoch_id, epoch_keyrings) = Self::build_keyring(conn, vault_key)?;
+        crate::vault_header_integrity::verify_or_initialize(conn, &keyring)?;
         conn.attach_verified_keyring(keyring, active_key_epoch_id, epoch_keyrings);
         Ok(())
     }
@@ -2184,6 +2185,52 @@ mod tests {
 
         UnlockService::setup_password(&mut conn, "my-password").unwrap();
         assert!(conn.is_encrypted());
+    }
+
+    #[test]
+    fn test_setup_seals_vault_header() {
+        let mut conn = setup();
+        UnlockService::setup_password(&mut conn, "my-password").unwrap();
+
+        let (profile, tag): (String, Option<Vec<u8>>) = conn
+            .inner()
+            .query_row(
+                "SELECT header_integrity_profile, header_integrity_tag FROM vault_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            profile,
+            crate::schema::v16::HEADER_AUTH_HMAC_SHA256_V1_PROFILE
+        );
+        assert_eq!(tag.unwrap().len(), 32);
+        assert_eq!(
+            crate::vault_header_integrity::check(&conn).unwrap(),
+            crate::vault_header_integrity::VaultHeaderIntegrityStatus::Verified
+        );
+    }
+
+    #[test]
+    fn test_unlock_rejects_tampered_vault_header() {
+        let path =
+            std::env::temp_dir().join(format!("mdbx-header-tamper-{}.mdbx", uuid::Uuid::new_v4()));
+        {
+            let mut conn = VaultConnection::create(&path).unwrap();
+            initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+            UnlockService::setup_password(&mut conn, "my-password").unwrap();
+        }
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute("UPDATE vault_meta SET default_tiga_mode = 'power'", [])
+                .unwrap();
+        }
+
+        let mut conn = VaultConnection::open(&path).unwrap();
+        let error = UnlockService::unlock_with_password(&mut conn, "my-password").unwrap_err();
+        assert!(error.to_string().contains("header authentication"));
+        assert!(!conn.is_encrypted());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

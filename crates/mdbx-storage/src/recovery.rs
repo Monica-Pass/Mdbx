@@ -54,6 +54,33 @@ impl RecoveryVerifier {
             });
         }
 
+        match crate::vault_header_integrity::check(conn) {
+            Ok(crate::vault_header_integrity::VaultHeaderIntegrityStatus::Pending) => {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Warning,
+                    category: "vault-header-integrity".to_string(),
+                    description:
+                        "vault header authentication is pending the first successful unlock"
+                            .to_string(),
+                });
+            }
+            Ok(crate::vault_header_integrity::VaultHeaderIntegrityStatus::UnverifiedLocked) => {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Warning,
+                    category: "vault-header-integrity".to_string(),
+                    description:
+                        "vault header authentication requires an unlocked keyring for verification"
+                            .to_string(),
+                });
+            }
+            Ok(crate::vault_header_integrity::VaultHeaderIntegrityStatus::Verified) => {}
+            Err(error) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "vault-header-integrity".to_string(),
+                description: format!("vault header authentication failed: {error}"),
+            }),
+        }
+
         // 2. 检查 commit 链
         match Self::check_commit_chain(conn) {
             Ok(commit_issues) => issues.extend(commit_issues),
@@ -1154,6 +1181,24 @@ mod tests {
             .iter()
             .any(|i| i.severity >= IssueSeverity::Error);
         assert!(!has_errors, "unexpected errors: {:?}", result.issues);
+    }
+
+    #[test]
+    fn full_health_check_reports_authenticated_vault_header_tampering() {
+        let (mut conn, _ctx, _project_id) = setup();
+        crate::unlock::UnlockService::setup_password(&mut conn, "health-password").unwrap();
+        assert!(RecoveryVerifier::full_health_check(&conn).unwrap().healthy);
+
+        conn.inner()
+            .execute("UPDATE vault_meta SET compat_flags = 'tampered'", [])
+            .unwrap();
+        let result = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(!result.healthy);
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Error
+                && issue.category == "vault-header-integrity"
+                && issue.description.contains("invalidated")
+        }));
     }
 
     #[test]

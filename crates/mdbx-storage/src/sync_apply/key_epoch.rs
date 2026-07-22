@@ -80,6 +80,7 @@ pub(super) fn apply(
     {
         conn.ensure_critical_extension(FIELD_KEY_EPOCHS_EXTENSION)?;
     }
+    crate::vault_header_integrity::refresh_after_mutation(conn)?;
     UnlockService::verify_key_epoch_state(conn)
 }
 

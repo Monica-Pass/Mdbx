@@ -10,6 +10,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// Length-prefixing keeps adjacent fields unambiguous, so callers can build
 /// stable tags without inventing ad hoc separators.
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> CryptoResult<Vec<u8>> {
+    let mac = hmac_sha256_state(key, parts)?;
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+/// Verifies an HMAC-SHA-256 tag in constant time.
+pub fn verify_hmac_sha256(key: &[u8], parts: &[&[u8]], expected: &[u8]) -> CryptoResult<()> {
+    let mac = hmac_sha256_state(key, parts)?;
+    mac.verify_slice(expected)
+        .map_err(|_| CryptoError::AuthenticationFailed)
+}
+
+fn hmac_sha256_state(key: &[u8], parts: &[&[u8]]) -> CryptoResult<HmacSha256> {
     if key.len() != 32 {
         return Err(CryptoError::InvalidParameter(
             "HMAC key must be 32 bytes".to_string(),
@@ -22,7 +34,7 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> CryptoResult<Vec<u8>> {
         mac.update(&(part.len() as u64).to_le_bytes());
         mac.update(part);
     }
-    Ok(mac.finalize().into_bytes().to_vec())
+    Ok(mac)
 }
 
 #[cfg(test)]
@@ -50,5 +62,15 @@ mod tests {
     fn test_invalid_key_rejected() {
         let err = hmac_sha256(b"short", &[b"x"]).unwrap_err();
         assert!(matches!(err, CryptoError::InvalidParameter(_)));
+    }
+
+    #[test]
+    fn test_verify_hmac_sha256_rejects_tampering() {
+        let key = [11_u8; 32];
+        let tag = hmac_sha256(&key, &[b"vault", b"header"]).unwrap();
+        verify_hmac_sha256(&key, &[b"vault", b"header"], &tag).unwrap();
+
+        let error = verify_hmac_sha256(&key, &[b"vault", b"changed"], &tag).unwrap_err();
+        assert!(matches!(error, CryptoError::AuthenticationFailed));
     }
 }

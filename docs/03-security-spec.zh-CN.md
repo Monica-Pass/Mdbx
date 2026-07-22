@@ -186,6 +186,21 @@ MDBX 必须认证以下内容：
 
 密文被移动到错误上下文后必须认证失败。
 
+MDBX2 schema 16 使用 vault 完整性子密钥和
+`mdbx-vault-header-hmac-sha256-v1` 认证 vault header。长度分隔的 HMAC
+覆盖 vault 身份、格式/schema 版本、最低 reader/writer 版本、创建/更新时间、
+默认 Tiga 模式、active key epoch、兼容与关键扩展标志、Tiga 策略版本和合规状态。
+数据库触发器会在任一受保护列变化时使既有标签进入 `invalidated`；合法 storage
+core mutation 必须在同一事务内刷新标签。已经建立认证的 header 不得降级回仅供
+迁移使用的 `pending`。
+
+MDBX1 和较早 MDBX2 在 additive migration 时还没有已验证 vault key，因此先进入
+`pending`；首次成功解锁时建立标签。后续解锁必须在附加 Keyring 前验证标签，health
+check 必须把 invalidated 或 tag mismatch 报告为错误。锁定状态的 health check 可以
+检查标签形状，但只能提示需要解锁后做 keyed verification。该机制不提供外部 rollback
+anchor；若要发现整个文件被替换成更旧但内部自洽的版本，客户端仍需维护 generation
+或备份状态。
+
 ## 8. 附件安全规则
 
 附件属于一等敏感数据。

@@ -138,6 +138,7 @@ impl KeyEpochService {
              SET active_key_epoch_id = ?1, updated_at = ?2",
             rusqlite::params![new_epoch_id, rotated_at],
         )?;
+        crate::vault_header_integrity::refresh_after_mutation(conn)?;
         UnlockService::validate_active_key_epoch(conn)?;
 
         let changed_ids = vec![previous_epoch_id.clone(), new_epoch_id.to_string()];

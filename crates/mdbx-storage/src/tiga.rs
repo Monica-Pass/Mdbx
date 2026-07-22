@@ -57,6 +57,7 @@ impl TigaService {
                 "UPDATE vault_meta SET default_tiga_mode = ?1, updated_at = ?2",
                 params![mode.to_string(), now],
             )?;
+            crate::vault_header_integrity::refresh_after_mutation(conn)?;
             Ok(commit_id)
         })
     }

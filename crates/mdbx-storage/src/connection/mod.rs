@@ -366,6 +366,7 @@ impl VaultConnection {
                     rusqlite::params![merged, chrono::Utc::now().to_rfc3339()],
                 )
                 .map_err(StorageError::Database)?;
+            crate::vault_header_integrity::refresh_after_mutation(self)?;
         }
         Ok(())
     }

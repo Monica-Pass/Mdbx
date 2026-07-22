@@ -773,6 +773,7 @@ impl TigaService {
                     compliance_storage_value(resolved.compliance)
                 ],
             )?;
+            crate::vault_header_integrity::refresh_after_mutation(conn)?;
             record_authorization_event(
                 conn,
                 &scope,
@@ -927,6 +928,9 @@ impl TigaService {
                 Some(&override_tag),
             )?;
             let commit_id = track_scope_policy_change(conn, ctx, &scope)?;
+            if matches!(scope, TigaScope::Vault) {
+                crate::vault_header_integrity::refresh_after_mutation(conn)?;
+            }
             record_authorization_event(
                 conn,
                 &scope,
@@ -952,6 +956,9 @@ impl TigaService {
         conn.with_immediate_transaction(|| {
             TigaPolicyStore::delete_override(conn, &scope)?;
             let commit_id = track_scope_policy_change(conn, ctx, &scope)?;
+            if matches!(scope, TigaScope::Vault) {
+                crate::vault_header_integrity::refresh_after_mutation(conn)?;
+            }
             record_authorization_event(
                 conn,
                 &scope,

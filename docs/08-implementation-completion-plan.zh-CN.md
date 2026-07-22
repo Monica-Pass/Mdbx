@@ -71,12 +71,13 @@ MDBX 必须坚持：
 - `project_tags` 已分类为用户可见元数据：tracked tag API 会产生 project 级 commit；sync state 携带每个 project 的完整 tag 集合；临时 FTS/search index 保持解锁会话内临时状态，不进入历史。
 - 未知非关键字段兼容矩阵已覆盖 MDBX1 `vault_meta`/`projects`/`entries` 附加列自动升级、schema 10 Tiga 策略表重建，以及 complete sync-state 顶层扩展的有界 decode、事务 apply、持久化、collect 和重新编码。旧 peer 缺少扩展键不会删除本地值；严格 delta/bundle 记录仍拒绝未知字段。
 - UniFFI 通用原子 operation 已覆盖 project、ObjectRecord、Relation、Label 和 Assignment；Attachment 另有受命令数、单项字节数、总字节数和 chunk 大小限制的原子批量 operation。
+- schema 16 已为影响格式、解密、key epoch 与 Tiga 的 `vault_meta` header 建立统一 HMAC；受保护 mutation 由 trigger 先失效旧标签并在同一事务重新封签，解锁与 health check 都会拒绝篡改。MDBX1/早期 MDBX2 升级保持原数据，首次成功解锁后从 `pending` 建立标签。
 
 ## 3. 主要差距
 
 ### 3.1 格式与恢复
 
-- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，但完整 key rotation、retirement、跨 epoch 读取迁移仍未闭环。
+- `key_epochs.wrapped_epoch_key_ct` 已不再使用固定全零占位；初始化 marker 与真实 active epoch wrapping 已分离并有验证，随机 key rotation、retirement、跨 epoch 历史读取、同步合并、Tiga 授权与 UniFFI 已闭环。
 - MDBX2 已加入 `MDBX-1` / `MDBX-1-DRAFT` 自动事务迁移、schema migration 记录、最低 reader/writer 版本和未知 critical extension 写入拒绝。
 - snapshot 已覆盖 project、entry、attachment metadata、project tags 和 active `attachment_chunks`；旧 snapshot 缺少新增字段时保持现有兼容数据。
 - 已冻结由真实 `MDBX1.0` tag 生成的 release golden vault，以及由同一历史 reader 固化 marker 的 `MDBX-1-DRAFT` golden vault；两者共享只读 inspection、schema 1 升级、原凭据解锁、project/entry/tag/attachment/snapshot、commit/object-version 身份保留和幂等回归。旧 `MDBX1.0` CLI 可读取兼容投影，但不得作为 MDBX2 writer；后续真实发布版本仍需按相同规则继续追加 fixture。未知字段保留已覆盖当前可验证的物理迁移，以及 complete sync-state 的 apply/collect 回环。
@@ -108,7 +109,7 @@ MDBX 必须坚持：
 ### 3.5 安全
 
 - Keyring、Argon2id/HKDF 输出、vault/epoch 解包结果的自动内存清零基线已完成；明文驻留最小化、密钥文件、真实硬件密钥协议、生物识别封装仍需扩展。
-- header/content 全局认证模型还不完整。
+- vault header 元数据 HMAC 基线已完成；跨所有内容族的单一 whole-vault authentication root 与外部 rollback anchor 仍未完成。
 - 加密上下文 AAD 已覆盖字段级，但 commit/bundle/snapshot 的认证边界还需统一记录到规范。
 
 ### 3.6 Android 接入
@@ -128,8 +129,9 @@ MDBX 必须坚持：
 
 - recovery 验证 commit integrity tag。（已完成）
 - health check 输出 commit tag mismatch、missing parent、dangling head、chunk mismatch。（已完成）
-- snapshot 明确 payload 加密策略，拒绝已解锁状态下的篡改，并覆盖 attachment chunk 恢复。
-- 整理“生产初始化不得保留固定占位密文”的测试边界。（固定 `X'00'` 已移除；初始化 marker 与 active epoch wrapping 已分离；完整 rotation 仍后续）
+- snapshot 已使用认证密文，已解锁状态拒绝篡改，并覆盖 attachment chunk 恢复。（已完成）
+- 整理“生产初始化不得保留固定占位密文”的测试边界。（已完成；固定 `X'00'` 已移除，初始化 marker、active epoch wrapping 与完整随机 rotation 已分离）
+- vault header 元数据认证、mutation 原子重签与 health/unlock 验证。（已完成）
 
 验收：
 

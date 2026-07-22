@@ -60,7 +60,7 @@ pub(super) fn apply_tiga_vault_state(
             std::cmp::max(&local.updated_at, &incoming.updated_at),
         ],
     )?;
-    Ok(())
+    crate::vault_header_integrity::refresh_after_mutation(conn)
 }
 
 pub(super) fn apply_tiga_policy_exceptions(
