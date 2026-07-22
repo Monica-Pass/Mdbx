@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "benchmark")]
+use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 #[cfg(any(not(feature = "external-blob-store"), test))]
 use mdbx_core::model::attachment::StorageMode;
@@ -9,7 +11,7 @@ use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
-use mdbx_storage::benchmark::BenchmarkRunner;
+use mdbx_storage::benchmark::{BenchmarkMode, BenchmarkRunner};
 #[cfg(feature = "external-blob-store")]
 use mdbx_storage::blob_lifecycle::{BlobAuditOptions, BlobLifecycleLimits, BlobLifecycleService};
 #[cfg(feature = "external-blob-store")]
@@ -167,6 +169,9 @@ enum Commands {
         /// 每个 benchmark 的迭代次数
         #[arg(short, long, default_value_t = 20)]
         iterations: u32,
+        /// 存储模式；encrypted 使用默认 Multi password 和正式字段加密
+        #[arg(long, value_enum, default_value = "encrypted")]
+        mode: BenchmarkCliMode,
         /// 以机器可读 JSON 输出
         #[arg(long)]
         json: bool,
@@ -186,6 +191,23 @@ enum Commands {
         /// 输出 JSON 文件
         output: PathBuf,
     },
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BenchmarkCliMode {
+    Encrypted,
+    Compatibility,
+}
+
+#[cfg(feature = "benchmark")]
+impl From<BenchmarkCliMode> for BenchmarkMode {
+    fn from(value: BenchmarkCliMode) -> Self {
+        match value {
+            BenchmarkCliMode::Encrypted => Self::Encrypted,
+            BenchmarkCliMode::Compatibility => Self::Compatibility,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -533,9 +555,10 @@ fn run(cli: Cli) -> Result<(), String> {
         #[cfg(feature = "benchmark")]
         Commands::Benchmark {
             iterations,
+            mode,
             json,
             output,
-        } => cmd_benchmark(iterations, json, output),
+        } => cmd_benchmark(iterations, mode, json, output),
         #[cfg(feature = "kdbx-import")]
         Commands::ImportKdbxJson { file } => {
             let mut conn = open_or_create_vault(&cli.vault, unlock)?;
@@ -2078,13 +2101,19 @@ fn severity_label(severity: IssueSeverity) -> &'static str {
 }
 
 #[cfg(feature = "benchmark")]
-fn cmd_benchmark(iterations: u32, json: bool, output: Option<PathBuf>) -> Result<(), String> {
+fn cmd_benchmark(
+    iterations: u32,
+    mode: BenchmarkCliMode,
+    json: bool,
+    output: Option<PathBuf>,
+) -> Result<(), String> {
     if iterations == 0 {
         return Err("iterations must be greater than zero".to_string());
     }
-    let suite = BenchmarkRunner::run_full_suite(iterations);
+    let mode = BenchmarkMode::from(mode);
+    let suite = BenchmarkRunner::run_full_suite_with_mode(iterations, mode);
     if json || output.is_some() {
-        let report = suite.json_report(iterations);
+        let report = suite.json_report_with_mode(iterations, mode);
         let encoded = serde_json::to_string_pretty(&report)
             .map_err(|error| format!("failed to encode benchmark report: {error}"))?;
         if let Some(path) = output {
@@ -4758,6 +4787,30 @@ mod tests {
 
     #[cfg(feature = "benchmark")]
     #[test]
+    fn benchmark_cli_defaults_to_encrypted_and_accepts_compatibility() {
+        let default = Cli::try_parse_from(["mdbx", "benchmark", "--iterations", "1"]).unwrap();
+        let Commands::Benchmark { mode, .. } = default.command else {
+            panic!("benchmark command was not parsed");
+        };
+        assert_eq!(mode, BenchmarkCliMode::Encrypted);
+
+        let compatibility = Cli::try_parse_from([
+            "mdbx",
+            "benchmark",
+            "--iterations",
+            "1",
+            "--mode",
+            "compatibility",
+        ])
+        .unwrap();
+        let Commands::Benchmark { mode, .. } = compatibility.command else {
+            panic!("benchmark command was not parsed");
+        };
+        assert_eq!(mode, BenchmarkCliMode::Compatibility);
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[test]
     fn cli_exposes_health_and_benchmark() {
         let vault = TempVault::new();
         let path = vault.path();
@@ -4769,6 +4822,7 @@ mod tests {
             &path,
             Commands::Benchmark {
                 iterations: 1,
+                mode: BenchmarkCliMode::Encrypted,
                 json: false,
                 output: Some(report_path.clone()),
             },
@@ -4778,6 +4832,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
         assert_eq!(report["format"], "mdbx-benchmark-report-v1");
         assert_eq!(report["metadata"]["iterations"], 1);
+        assert_eq!(report["metadata"]["storage_mode"], "encrypted");
+        assert_eq!(report["metadata"]["field_encryption"], true);
         assert_eq!(report["results"].as_array().unwrap().len(), 11);
         std::fs::remove_file(report_path).unwrap();
     }
