@@ -32,6 +32,47 @@ fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
 }
 
 #[test]
+fn build_capability_manifest_is_available_without_a_vault() {
+    let manifest = mdbx_build_capability_manifest();
+    assert_eq!(manifest.profile, "mdbx-build-capabilities-v1");
+    assert_eq!(manifest.engine_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(manifest.storage_profile, "mdbx-storage-capabilities-v1");
+    assert_eq!(manifest.sync_profile, "mdbx-sync-capabilities-v1");
+    assert_eq!(manifest.sync_protocol_version, mdbx_sync::PROTOCOL_VERSION);
+    assert!(manifest
+        .enabled_storage_capability_ids
+        .contains(&"mdbx.storage.mdbx1-compatibility".to_string()));
+    assert!(manifest
+        .enabled_sync_capability_ids
+        .contains(&mdbx_sync::CAPABILITY_AUTHENTICATED_STATE_ROOT_V1.to_string()));
+
+    // Cargo may unify dependency features in workspace builds. The manifest
+    // must report the resulting binary and partition each optional ID once.
+    for capability in [
+        "mdbx.storage.benchmarks",
+        "mdbx.storage.derived-search-index",
+        "mdbx.storage.filesystem-blob-store",
+        "mdbx.storage.kdbx-json-export",
+        "mdbx.storage.kdbx-json-import",
+    ] {
+        let enabled = manifest
+            .enabled_storage_capability_ids
+            .contains(&capability.to_string());
+        let disabled = manifest
+            .disabled_optional_storage_capability_ids
+            .contains(&capability.to_string());
+        assert_ne!(enabled, disabled, "optional capability {capability}");
+    }
+    let zstd = mdbx_sync::CAPABILITY_ZSTD_BUNDLE_V1.to_string();
+    assert_ne!(
+        manifest.enabled_sync_capability_ids.contains(&zstd),
+        manifest
+            .disabled_optional_sync_capability_ids
+            .contains(&zstd)
+    );
+}
+
+#[test]
 fn integrity_root_ffi_exposes_metadata_only_status_and_locked_inspection() {
     let path =
         std::env::temp_dir().join(format!("mdbx-ffi-integrity-root-{}.mdbx", Uuid::new_v4()));

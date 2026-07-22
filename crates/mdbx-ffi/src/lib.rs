@@ -4,6 +4,7 @@
 //! operations. Product-specific payload meaning belongs in each client.
 
 mod attachment_facade;
+mod capability_facade;
 mod conflict_facade;
 mod extension_facade;
 mod history_facade;
@@ -16,6 +17,7 @@ mod vault_facade;
 mod write_facade;
 
 pub use attachment_facade::*;
+pub use capability_facade::*;
 pub use conflict_facade::*;
 pub use history_facade::*;
 pub use integrity_root_facade::*;

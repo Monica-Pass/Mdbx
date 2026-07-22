@@ -10,6 +10,7 @@
 
 当前导出的边界覆盖：
 
+- 无需打开 vault，检查当前库实际编译的 storage 与 sync 能力
 - 使用密码创建 vault，默认 Tiga 模式为 `Multi`
 - 使用显式 `Sky`、`Multi` 或 `Power` Tiga 模式创建 vault
 - 使用密码打开 vault
@@ -49,6 +50,11 @@
 ## 数据模型
 
 ### Records
+
+顶层函数 `mdbx_build_capability_manifest` 在选择 vault 前返回
+`MdbxBuildCapabilityManifest`。它以版本化、规范排序的列表分别给出 storage 与 sync
+已启用能力和被裁剪的已知可选能力。它只描述编译内容，不会注册 Collection Adapter、接受
+vault critical extension、授予密钥访问或协商 peer 会话。
 
 `VaultInfo` 包含：
 

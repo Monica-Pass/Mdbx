@@ -111,10 +111,16 @@ The current `mdbx-cli` is a development and validation entry point for this Rust
 - `snapshot create/list/restore`
 - `sync bundle/apply`
 - `health`
+- `capabilities` / `capabilities --json`
 - `benchmark`
 - `import-kdbx-json` / `export-kdbx-json`
 
 Note: `import-kdbx-json` / `export-kdbx-json` use a KDBX interoperability JSON intermediate representation. They are not full binary `.kdbx` parsing or writing. Once a vault has unlock methods configured, normal CLI operations must pass `--unlock-password` or `--unlock-pin`; otherwise the command is rejected so production writes do not silently fall back to the legacy plaintext compatibility path.
+
+`mdbx capabilities` does not open a vault. It reports the storage and sync
+modules compiled into the current binary; `--json` is suitable for installation
+checks. The report does not replace Collection Adapter registration, vault
+critical-extension validation, or sync-session capability negotiation.
 
 The current CLI does not yet implement real FIDO/WebAuthn/security-key interaction, production session tokens, or audit policy. Security-key support in storage core is a key-material abstraction with policy tests, not an end-to-end hardware-key client.
 

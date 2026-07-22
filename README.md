@@ -111,10 +111,13 @@ cargo run -p mdbx-cli -- --help
 - `snapshot create/list/restore`
 - `sync bundle/apply`
 - `health`
+- `capabilities` / `capabilities --json`
 - `benchmark`
 - `import-kdbx-json` / `export-kdbx-json`
 
 注意：`import-kdbx-json` / `export-kdbx-json` 使用的是 KDBX 互操作 JSON 中间表示，不是完整二进制 `.kdbx` 文件解析/写入。配过解锁方式的 vault 在 CLI 普通操作中必须传入 `--unlock-password` 或 `--unlock-pin`；否则命令会拒绝继续，避免把生产写入静默降级到明文兼容路径。
+
+`mdbx capabilities` 不打开 vault，报告当前二进制实际编译的 storage 与 sync 模块；`--json` 适合客户端安装检查。它只描述构建内容，不替代 Collection Adapter 注册、vault critical extension 检查或同步会话能力协商。
 
 当前 CLI 还没有接入真实 FIDO/WebAuthn/security-key 交互，也没有生产级 session token / audit policy；硬件密钥在 storage core 中是 key material 抽象与策略测试，不应宣称为端到端硬件密钥客户端。
 

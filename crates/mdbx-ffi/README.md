@@ -10,6 +10,7 @@ This crate is intentionally not a low-level SQLite API. If a client needs tags, 
 
 The exported boundary covers:
 
+- inspect the current library's compiled storage and sync capabilities without opening a vault
 - create a vault with password unlock, defaulting to `Multi` Tiga mode
 - create a vault with explicit `Sky`, `Multi`, or `Power` Tiga mode
 - open a vault with password unlock
@@ -49,6 +50,13 @@ Treat unsupported features as missing facade methods, not permission to bypass t
 ## Data Model
 
 ### Records
+
+`MdbxBuildCapabilityManifest` is returned by the top-level
+`mdbx_build_capability_manifest` function before any vault is selected. It
+contains versioned, canonical enabled and omitted-optional lists for storage and
+sync. It describes compiled code only: it does not register a Collection
+Adapter, accept a vault critical extension, grant key access, or negotiate a
+peer session.
 
 `VaultInfo` contains:
 

@@ -25,6 +25,7 @@ use mdbx_storage::blob_store::ManageableEncryptedBlobStore;
 use mdbx_storage::blob_transfer::{
     BlobTransferCheckpoint, BlobTransferLimits, BlobTransferService,
 };
+use mdbx_storage::capability::{BuildCapabilityManifest, CapabilitySet};
 use mdbx_storage::connection::{PendingVaultCreation, VaultConnection};
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 use mdbx_storage::import::KdbxEntry;
@@ -107,6 +108,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 显示当前二进制实际编译的模块能力
+    Capabilities {
+        /// 以机器可读 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
     /// 创建新 vault 并设置解锁凭据
     Init {
         /// Tiga 安全模式: power, multi (默认), sky
@@ -579,6 +586,7 @@ fn run(cli: Cli) -> Result<(), String> {
     };
 
     match cli.command {
+        Commands::Capabilities { json } => cmd_capabilities(json),
         Commands::Init {
             tiga,
             password,
@@ -661,6 +669,64 @@ fn run(cli: Cli) -> Result<(), String> {
             cmd_export_kdbx_json(&conn, output)
         }
     }
+}
+
+fn cmd_capabilities(json: bool) -> Result<(), String> {
+    let manifest = CapabilitySet::current().build_manifest();
+    println!("{}", render_capability_manifest(&manifest, json)?);
+    Ok(())
+}
+
+fn render_capability_manifest(
+    manifest: &BuildCapabilityManifest,
+    json: bool,
+) -> Result<String, String> {
+    if json {
+        return serde_json::to_string_pretty(manifest)
+            .map_err(|error| format!("failed to encode build capability manifest: {error}"));
+    }
+
+    let mut lines = vec![
+        format!("MDBX {} ({})", manifest.engine_version, manifest.profile),
+        format!("Storage profile: {}", manifest.storage.profile),
+        "Enabled storage capabilities:".to_string(),
+    ];
+    lines.extend(
+        manifest
+            .storage
+            .enabled_capability_ids
+            .iter()
+            .map(|capability| format!("  {capability}")),
+    );
+    lines.push("Disabled optional storage capabilities:".to_string());
+    lines.extend(
+        manifest
+            .storage
+            .disabled_optional_capability_ids
+            .iter()
+            .map(|capability| format!("  {capability}")),
+    );
+    lines.push(format!(
+        "Sync profile: {} (protocol {})",
+        manifest.synchronization.profile, manifest.synchronization.protocol_version
+    ));
+    lines.push("Enabled sync capabilities:".to_string());
+    lines.extend(
+        manifest
+            .synchronization
+            .enabled_capability_ids
+            .iter()
+            .map(|capability| format!("  {capability}")),
+    );
+    lines.push("Disabled optional sync capabilities:".to_string());
+    lines.extend(
+        manifest
+            .synchronization
+            .disabled_optional_capability_ids
+            .iter()
+            .map(|capability| format!("  {capability}")),
+    );
+    Ok(lines.join("\n"))
 }
 
 #[derive(Clone, Copy)]
@@ -3233,6 +3299,39 @@ mod tests {
     }
 
     #[test]
+    fn build_capability_manifest_is_vault_independent_and_matches_features() {
+        let parsed = Cli::try_parse_from(["mdbx", "capabilities", "--json"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Capabilities { json: true }
+        ));
+
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(locked_cli(&path, Commands::Capabilities { json: false })).unwrap();
+        assert!(!path.exists());
+
+        let manifest = CapabilitySet::current().build_manifest();
+        let encoded = render_capability_manifest(&manifest, true).unwrap();
+        let decoded: BuildCapabilityManifest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(
+            manifest
+                .storage
+                .enabled_capability_ids
+                .contains(&"mdbx.storage.filesystem-blob-store".to_string()),
+            cfg!(feature = "external-blob-store")
+        );
+        assert_eq!(
+            manifest
+                .synchronization
+                .enabled_capability_ids
+                .contains(&mdbx_sync::CAPABILITY_ZSTD_BUNDLE_V1.to_string()),
+            cfg!(feature = "sync-compression")
+        );
+    }
+
+    #[test]
     fn rollback_anchor_cli_creates_verifies_and_preserves_files() {
         let vault = TempVault::new();
         let path = vault.path();
@@ -5320,6 +5419,11 @@ mod tests {
         backup_vault(&source_path, &target_path);
         write_cli_sync_checkpoint(&sender_base, &vault_id, &base, None).unwrap();
         write_cli_sync_checkpoint(&receiver_checkpoint, &vault_id, &base, None).unwrap();
+        let first_compression = if cfg!(feature = "sync-compression") {
+            BundleCompressionCli::Zstd
+        } else {
+            BundleCompressionCli::None
+        };
 
         for title in ["Checkpoint One", "Checkpoint Two", "Checkpoint Three"] {
             run(cli(
@@ -5340,7 +5444,7 @@ mod tests {
                     output: first_bundle.clone(),
                     base_checkpoint: Some(sender_base.clone()),
                     result_checkpoint: Some(sender_first.clone()),
-                    compression: BundleCompressionCli::Zstd,
+                    compression: first_compression,
                     authenticated: true,
                 },
             },
@@ -5349,7 +5453,11 @@ mod tests {
         let first_bundle_bytes = std::fs::read(&first_bundle).unwrap();
         assert_eq!(
             u32::from_le_bytes(first_bundle_bytes[8..12].try_into().unwrap()),
-            mdbx_sync::AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+            if cfg!(feature = "sync-compression") {
+                mdbx_sync::AUTHENTICATED_COMPRESSED_INCREMENTAL_BUNDLE_VERSION
+            } else {
+                mdbx_sync::AUTHENTICATED_INCREMENTAL_BUNDLE_VERSION
+            }
         );
         let first_result = read_cli_sync_checkpoint(&sender_first, &vault_id).unwrap();
         assert!(first_result.resume.is_some());

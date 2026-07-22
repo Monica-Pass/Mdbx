@@ -106,6 +106,7 @@ MDBX 必须坚持：
 - bundle v7-v10 已增加基于 vault integrity subkey 的 opt-in transport HMAC；`authenticated-bundle-v1` 与 zstd、原四项增量能力分别协商，CLI 默认与旧 peer 回退仍保持 v1-v6。
 - external-hash-ref 已具备有界、可恢复、密文校验的 Provider 间 Blob 传输；默认文件系统 Provider 使用带 owner/expiry 的持久 lease，另一实例的清理会观察活动 lease。
 - CollectionProfile 已提供实例级领域契约；邮件、收藏夹和 Steam 的实际 Adapter、派生索引及 payload migration 仍需分别实现。
+- `mdbx-build-capabilities-v1` 已把强制 storage 不变量、可裁剪 storage 模块和已编译 sync 能力变成稳定运行时清单；UniFFI 与 `mdbx capabilities --json` 可在打开 vault 前查询。该清单不替代 Adapter 注册、critical extension 校验或 sync 协商。
 
 ### 3.5 安全
 
@@ -273,4 +274,5 @@ MDBX 必须坚持：
 下一刀建议：
 
 - 每次发布新代际时继续固化对应 golden vault，并使用上一代 reader 二进制验证只读兼容投影；旧 writer 始终受 `min_writer_version` 边界约束。
-- 形成可发布 benchmark 报告，覆盖小 entry 修改、附件改名、附件替换、snapshot 和 compaction 的时延与 delta 大小。
+- 为真实二进制 `.kdbx` 导入/导出选择经过审计的独立 Adapter；在此之前继续把现有能力明确标为 KDBX JSON 互操作，不得扩大宣称。
+- 生产客户端继续补齐真实硬件密钥、受保护会话与默认脱敏输出；这些平台能力不能由 storage build manifest 伪造。

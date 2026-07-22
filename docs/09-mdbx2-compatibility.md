@@ -199,3 +199,18 @@ the routine small-mutation commit path. Any legitimate write invalidates the
 old token and requires client-side reissuance. External Blob Provider bodies,
 OS state, and availability remain outside the manifest, and the operation does
 not change MDBX1/MDBX1-DRAFT reading or migration semantics.
+
+### Build Capability Discovery
+
+Feature-trimmed binaries expose `mdbx-build-capabilities-v1` through Rust
+`CapabilitySet::build_manifest`, UniFFI `mdbx_build_capability_manifest`, and
+the vault-independent `mdbx capabilities --json` command. The canonical report
+separates storage modules from synchronization protocol support and lists both
+enabled IDs and known optional IDs omitted at compile time.
+
+This report is process metadata, not vault metadata. It is never written into
+MDBX1 or MDBX2, changes no migration or wire format, and is available without
+opening the selected path. It does not replace process-local Collection Adapter
+registration, critical-extension validation for writable open, or Hello/HelloAck
+negotiation with a peer. Existing clients that never request the report retain
+their exact behavior.
