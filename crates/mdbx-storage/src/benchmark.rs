@@ -4,12 +4,38 @@ use std::{env, process::Command};
 use mdbx_core::model::EntryType;
 
 use crate::connection::VaultConnection;
+use crate::error::StorageResult;
 use crate::repo::attachment::AttachmentRepo;
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::project::ProjectRepo;
 use crate::repo::snapshot::SnapshotRepo;
 use crate::sync_delta::{materialize_pending_sync_delta, SyncDeltaLimits};
+use crate::unlock::UnlockService;
+
+const BENCHMARK_PASSWORD: &str = "mdbx-benchmark-password";
+
+/// Storage mode used by a benchmark suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkMode {
+    /// Legacy/test path without an attached keyring.
+    Compatibility,
+    /// Formally configured and unlocked vault with epoch-tagged field encryption.
+    Encrypted,
+}
+
+impl BenchmarkMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatibility => "compatibility",
+            Self::Encrypted => "encrypted",
+        }
+    }
+
+    pub const fn is_encrypted(self) -> bool {
+        matches!(self, Self::Encrypted)
+    }
+}
 
 /// 单个 benchmark 结果。
 #[derive(Debug, Clone)]
@@ -81,6 +107,11 @@ impl BenchSuite {
 
     /// Return a stable, machine-readable report for publication and CI.
     pub fn json_report(&self, iterations: u32) -> serde_json::Value {
+        self.json_report_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    /// Return a report that identifies the storage and unlock mode under test.
+    pub fn json_report_with_mode(&self, iterations: u32, mode: BenchmarkMode) -> serde_json::Value {
         let rustc = Command::new("rustc")
             .arg("--version")
             .output()
@@ -106,6 +137,13 @@ impl BenchSuite {
                 "arch": env::consts::ARCH,
                 "rustc": rustc,
                 "git_commit": git_commit,
+                "storage_mode": mode.as_str(),
+                "field_encryption": mode.is_encrypted(),
+                "unlock_policy": if mode.is_encrypted() {
+                    serde_json::Value::String("multi-password".to_string())
+                } else {
+                    serde_json::Value::Null
+                },
                 "dataset": {
                     "search_projects": 100,
                     "snapshot_projects": 20,
@@ -131,6 +169,7 @@ impl BenchSuite {
                 "KDBX reference numbers in the source are estimates and are not measured in this report.",
                 "vault_compaction uses SQLite WAL checkpoint plus VACUUM on a synthetic fragmentation table.",
                 "output_bytes is operation-specific: it is encoded payload bytes for sync and stored content bytes for attachment writes.",
+                "encrypted mode configures a Multi password before workload setup; only vault_create and vault_open include password KDF cost.",
             ],
         })
     }
@@ -152,24 +191,33 @@ pub struct BenchmarkRunner;
 impl BenchmarkRunner {
     /// 运行完整 benchmark 套件。
     pub fn run_full_suite(iterations: u32) -> BenchSuite {
+        Self::run_full_suite_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    /// Run all workloads with the requested storage mode.
+    pub fn run_full_suite_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchSuite {
         let mut results = Vec::new();
         let start = Instant::now();
 
-        results.push(Self::bench_create_vault(iterations));
-        results.push(Self::bench_save_entry(iterations));
-        results.push(Self::bench_edit_entry(iterations));
-        results.push(Self::bench_search(iterations));
-        results.push(Self::bench_attachment_write(iterations));
-        results.push(Self::bench_attachment_rename(iterations));
-        results.push(Self::bench_attachment_replace(iterations));
-        results.push(Self::bench_snapshot(iterations));
-        results.push(Self::bench_open_vault(iterations));
-        results.push(Self::bench_compaction(iterations));
-        results.push(Self::bench_sync_delta(iterations));
+        results.push(Self::bench_create_vault_with_mode(iterations, mode));
+        results.push(Self::bench_save_entry_with_mode(iterations, mode));
+        results.push(Self::bench_edit_entry_with_mode(iterations, mode));
+        results.push(Self::bench_search_with_mode(iterations, mode));
+        results.push(Self::bench_attachment_write_with_mode(iterations, mode));
+        results.push(Self::bench_attachment_rename_with_mode(iterations, mode));
+        results.push(Self::bench_attachment_replace_with_mode(iterations, mode));
+        results.push(Self::bench_snapshot_with_mode(iterations, mode));
+        results.push(Self::bench_open_vault_with_mode(iterations, mode));
+        results.push(Self::bench_compaction_with_mode(iterations, mode));
+        results.push(Self::bench_sync_delta_with_mode(iterations, mode));
 
         let total = start.elapsed();
         BenchSuite {
-            suite_name: format!("MDBX Benchmark ({} iterations)", iterations),
+            suite_name: format!(
+                "MDBX Benchmark ({} mode, {} iterations)",
+                mode.as_str(),
+                iterations
+            ),
             results,
             total_duration: total,
         }
@@ -177,13 +225,19 @@ impl BenchmarkRunner {
 
     /// Benchmark: vault 创建。
     pub fn bench_create_vault(iterations: u32) -> BenchResult {
+        Self::bench_create_vault_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_create_vault_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
         let start = Instant::now();
         let mut success = 0u32;
 
         for _ in 0..iterations {
-            let conn = VaultConnection::open_in_memory().unwrap();
+            let mut conn = VaultConnection::open_in_memory().unwrap();
             let params = crate::init::VaultInitParams::default();
-            if crate::init::initialize_vault(&conn, &params).is_ok() {
+            if crate::init::initialize_vault(&conn, &params).is_ok()
+                && configure_benchmark_mode(&mut conn, mode).is_ok()
+            {
                 success += 1;
             }
             // conn 在作用域结束时关闭
@@ -195,8 +249,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: entry 保存。
     pub fn bench_save_entry(iterations: u32) -> BenchResult {
-        let conn = VaultConnection::open_in_memory().unwrap();
-        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        Self::bench_save_entry_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_save_entry_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
 
         // 预先创建 project
@@ -231,7 +288,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: repeatedly make a small edit to one entry.
     pub fn bench_edit_entry(iterations: u32) -> BenchResult {
-        let conn = initialized_memory_vault();
+        Self::bench_edit_entry_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_edit_entry_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Edit Bench", None, None).unwrap();
         let mut entry = EntryRepo::create(
@@ -268,8 +329,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: project 标题搜索。
     pub fn bench_search(iterations: u32) -> BenchResult {
-        let conn = VaultConnection::open_in_memory().unwrap();
-        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        Self::bench_search_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_search_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
 
         // 预先创建数据
@@ -317,8 +381,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: 小附件写入。
     pub fn bench_attachment_write(iterations: u32) -> BenchResult {
-        let conn = VaultConnection::open_in_memory().unwrap();
-        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        Self::bench_attachment_write_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_attachment_write_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
 
         let project = ProjectRepo::create(&conn, &ctx, "Attach Bench", None, None).unwrap();
@@ -359,7 +426,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: rename one attachment without touching its content.
     pub fn bench_attachment_rename(iterations: u32) -> BenchResult {
-        let conn = initialized_memory_vault();
+        Self::bench_attachment_rename_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_attachment_rename_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Rename Bench", None, None).unwrap();
         let attachment = AttachmentRepo::add(
@@ -398,7 +469,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: replace the inline content of one existing attachment.
     pub fn bench_attachment_replace(iterations: u32) -> BenchResult {
-        let conn = initialized_memory_vault();
+        Self::bench_attachment_replace_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_attachment_replace_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Replace Bench", None, None).unwrap();
         let attachment = AttachmentRepo::add(
@@ -438,7 +513,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: snapshot a representative small vault.
     pub fn bench_snapshot(iterations: u32) -> BenchResult {
-        let conn = initialized_memory_vault();
+        Self::bench_snapshot_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_snapshot_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
         for i in 0..20u32 {
             let project =
@@ -470,13 +549,18 @@ impl BenchmarkRunner {
 
     /// Benchmark: vault 文件打开。
     pub fn bench_open_vault(iterations: u32) -> BenchResult {
+        Self::bench_open_vault_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_open_vault_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
         // 先创建一个持久化的 vault 文件
         let dir = std::env::temp_dir();
         let db_path = dir.join(format!("mdbx-bench-open-{}.mdbx", uuid::Uuid::new_v4()));
 
         {
-            let conn = VaultConnection::create(&db_path).unwrap();
+            let mut conn = VaultConnection::create(&db_path).unwrap();
             crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+            configure_benchmark_mode(&mut conn, mode).unwrap();
             let ctx = CommitContext::new("bench-device".to_string());
             let p = ProjectRepo::create(&conn, &ctx, "Bench Open", None, None).unwrap();
             EntryRepo::create(
@@ -494,7 +578,13 @@ impl BenchmarkRunner {
         let mut success = 0u32;
 
         for _ in 0..iterations {
-            if VaultConnection::open(&db_path).is_ok() {
+            let opened = VaultConnection::open(&db_path).and_then(|mut conn| {
+                if mode.is_encrypted() {
+                    UnlockService::unlock_with_password(&mut conn, BENCHMARK_PASSWORD)?;
+                }
+                Ok(())
+            });
+            if opened.is_ok() {
                 success += 1;
             }
         }
@@ -512,10 +602,15 @@ impl BenchmarkRunner {
 
     /// Benchmark: compact a persistent SQLite vault with VACUUM.
     pub fn bench_compaction(iterations: u32) -> BenchResult {
+        Self::bench_compaction_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_compaction_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("compaction.mdbx");
-        let conn = VaultConnection::create(&db_path).unwrap();
+        let mut conn = VaultConnection::create(&db_path).unwrap();
         crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        configure_benchmark_mode(&mut conn, mode).unwrap();
         conn.inner()
             .execute_batch(
                 "CREATE TABLE benchmark_compaction_data (
@@ -558,7 +653,11 @@ impl BenchmarkRunner {
 
     /// Benchmark: materialize and encode a real sync delta envelope.
     pub fn bench_sync_delta(iterations: u32) -> BenchResult {
-        let conn = initialized_memory_vault();
+        Self::bench_sync_delta_with_mode(iterations, BenchmarkMode::Compatibility)
+    }
+
+    fn bench_sync_delta_with_mode(iterations: u32, mode: BenchmarkMode) -> BenchResult {
+        let conn = initialized_memory_vault(mode);
         let ctx = CommitContext::new("bench-device".to_string());
         let project = ProjectRepo::create(&conn, &ctx, "Delta Project", None, None).unwrap();
         let entry = EntryRepo::create(
@@ -651,10 +750,18 @@ impl BenchmarkRunner {
     }
 }
 
-fn initialized_memory_vault() -> VaultConnection {
-    let conn = VaultConnection::open_in_memory().unwrap();
+fn initialized_memory_vault(mode: BenchmarkMode) -> VaultConnection {
+    let mut conn = VaultConnection::open_in_memory().unwrap();
     crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+    configure_benchmark_mode(&mut conn, mode).unwrap();
     conn
+}
+
+fn configure_benchmark_mode(conn: &mut VaultConnection, mode: BenchmarkMode) -> StorageResult<()> {
+    if mode.is_encrypted() {
+        UnlockService::setup_password(conn, BENCHMARK_PASSWORD)?;
+    }
+    Ok(())
 }
 
 fn bench_result(name: &str, duration: Duration, ops: u32, output_bytes: u64) -> BenchResult {
@@ -777,11 +884,64 @@ mod tests {
         let report = suite.json_report(2);
         assert_eq!(report["format"], "mdbx-benchmark-report-v1");
         assert_eq!(report["metadata"]["iterations"], 2);
+        assert_eq!(report["metadata"]["storage_mode"], "compatibility");
+        assert_eq!(report["metadata"]["field_encryption"], false);
+        assert!(report["metadata"]["unlock_policy"].is_null());
         assert!(report["metadata"]["os"].is_string());
         assert!(report["metadata"]["rustc"].is_string());
         assert_eq!(report["results"][0]["output_bytes"], 128);
         assert_eq!(report["results"][0]["output_bytes_per_op"], 64.0);
-        assert_eq!(report["limitations"].as_array().unwrap().len(), 4);
+        assert_eq!(report["limitations"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn encrypted_mode_uses_verified_epoch_ciphertext() {
+        let conn = initialized_memory_vault(BenchmarkMode::Encrypted);
+        assert!(conn.is_encrypted());
+        assert!(conn.active_session().is_some());
+        assert!(conn.active_key_epoch_id().is_some());
+
+        let ctx = CommitContext::new("encrypted-benchmark-test".to_string());
+        let project = ProjectRepo::create(&conn, &ctx, "Encrypted title", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Encrypted entry"),
+            &serde_json::json!({"secret":"value"}),
+        )
+        .unwrap();
+        let raw_project: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT title_ct FROM projects WHERE project_id = ?1",
+                [&project.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_entry: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT payload_ct FROM entries WHERE entry_id = ?1",
+                [&entry.entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw_project.starts_with(b"MDBXFE2\0"));
+        assert!(raw_entry.starts_with(b"MDBXFE2\0"));
+    }
+
+    #[test]
+    fn encrypted_full_suite_completes_and_reports_mode() {
+        let suite = BenchmarkRunner::run_full_suite_with_mode(1, BenchmarkMode::Encrypted);
+        assert_eq!(suite.results.len(), 11);
+        assert!(suite.results.iter().all(|result| result.ops == 1));
+
+        let report = suite.json_report_with_mode(1, BenchmarkMode::Encrypted);
+        assert_eq!(report["metadata"]["storage_mode"], "encrypted");
+        assert_eq!(report["metadata"]["field_encryption"], true);
+        assert_eq!(report["metadata"]["unlock_policy"], "multi-password");
     }
 
     #[test]
