@@ -1,7 +1,6 @@
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
@@ -15,8 +14,10 @@ use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
+use crate::migration::SNAPSHOT_RECORD_AUTH_EXTENSION;
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
+use crate::repo::snapshot_integrity::{self, SnapshotIntegrityInput};
 use crate::repo::{CollectionProfileRepo, TombstoneRepo};
 use crate::sync_state::ProjectTagSetRow;
 use crate::tiga::TigaService;
@@ -98,10 +99,19 @@ impl SnapshotRepo {
             let snapshot_json = serde_json::to_vec(&payload)
                 .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
             let snapshot_ct = Self::encrypt_payload(conn, &snapshot_id, &snapshot_json)?;
-            let snapshot_hash = compute_sha256_hex(&snapshot_ct);
 
             let commit_id =
                 ctx.create_commit(conn, "snapshot", "multi", &[snapshot_id.clone()], &[])?;
+            let snapshot_hash = snapshot_integrity::issue_descriptor(
+                conn,
+                &SnapshotIntegrityInput {
+                    snapshot_id: &snapshot_id,
+                    base_commit_id: &commit_id,
+                    snapshot_ct: &snapshot_ct,
+                    created_at: &now,
+                    created_by_device_id: &ctx.device_id,
+                },
+            )?;
 
             conn.inner().execute(
                 "INSERT INTO snapshots (snapshot_id, base_commit_id, snapshot_ct,
@@ -160,13 +170,20 @@ impl SnapshotRepo {
         let snap = SnapshotRepo::get_by_id(conn, snapshot_id)?
             .ok_or_else(|| StorageError::NotFound(snapshot_id.to_string()))?;
 
-        // 校验 hash
-        let computed = compute_sha256_hex(&snap.snapshot_ct);
-        if computed != snap.snapshot_hash {
-            return Err(StorageError::ConstraintViolation(format!(
-                "snapshot hash mismatch: expected {}, got {}",
-                snap.snapshot_hash, computed
-            )));
+        if !snapshot_integrity::verify_descriptor(
+            conn,
+            &SnapshotIntegrityInput {
+                snapshot_id: &snap.snapshot_id,
+                base_commit_id: &snap.base_commit_id,
+                snapshot_ct: &snap.snapshot_ct,
+                created_at: &snap.created_at,
+                created_by_device_id: &snap.created_by_device_id,
+            },
+            &snap.snapshot_hash,
+        )? {
+            return Err(StorageError::ConstraintViolation(
+                "snapshot integrity descriptor mismatch".to_string(),
+            ));
         }
 
         let snapshot_json = Self::decrypt_payload(conn, snapshot_id, &snap.snapshot_ct)?;
@@ -503,13 +520,23 @@ impl SnapshotRepo {
         Ok(snapshots)
     }
 
-    /// 校验 snapshot 内部 hash 一致性。
+    /// 校验 snapshot 密文摘要、记录描述和解锁后的 payload 完整性。
     pub fn verify_integrity(conn: &VaultConnection, snapshot_id: &str) -> StorageResult<bool> {
         let snap = match SnapshotRepo::get_by_id(conn, snapshot_id)? {
             Some(s) => s,
             None => return Ok(false),
         };
-        if compute_sha256_hex(&snap.snapshot_ct) != snap.snapshot_hash {
+        if !snapshot_integrity::verify_descriptor(
+            conn,
+            &SnapshotIntegrityInput {
+                snapshot_id: &snap.snapshot_id,
+                base_commit_id: &snap.base_commit_id,
+                snapshot_ct: &snap.snapshot_ct,
+                created_at: &snap.created_at,
+                created_by_device_id: &snap.created_by_device_id,
+            },
+            &snap.snapshot_hash,
+        )? {
             return Ok(false);
         }
 
@@ -531,14 +558,18 @@ impl SnapshotRepo {
         max_references: usize,
     ) -> StorageResult<Vec<SnapshotExternalBlobReference>> {
         let mut stmt = conn.inner().prepare(
-            "SELECT snapshot_id, snapshot_ct, snapshot_hash
+            "SELECT snapshot_id, base_commit_id, snapshot_ct, snapshot_hash,
+                    created_at, created_by_device_id
              FROM snapshots ORDER BY snapshot_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut references = Vec::new();
@@ -552,13 +583,30 @@ impl SnapshotRepo {
                     "snapshot count exceeds the maintenance limit of {max_snapshots}"
                 )));
             }
-            let (snapshot_id, snapshot_ct, snapshot_hash) = row?;
+            let (
+                snapshot_id,
+                base_commit_id,
+                snapshot_ct,
+                snapshot_hash,
+                created_at,
+                created_by_device_id,
+            ) = row?;
             if snapshot_ct.len() > max_snapshot_ciphertext_bytes {
                 return Err(StorageError::Validation(format!(
                     "snapshot {snapshot_id} exceeds the {max_snapshot_ciphertext_bytes}-byte maintenance limit"
                 )));
             }
-            if compute_sha256_hex(&snapshot_ct) != snapshot_hash {
+            if !snapshot_integrity::verify_descriptor(
+                conn,
+                &SnapshotIntegrityInput {
+                    snapshot_id: &snapshot_id,
+                    base_commit_id: &base_commit_id,
+                    snapshot_ct: &snapshot_ct,
+                    created_at: &created_at,
+                    created_by_device_id: &created_by_device_id,
+                },
+                &snapshot_hash,
+            )? {
                 return Err(StorageError::ConstraintViolation(format!(
                     "snapshot {snapshot_id} failed integrity verification"
                 )));
@@ -622,14 +670,31 @@ impl SnapshotRepo {
         id: &str,
         plaintext: &[u8],
     ) -> StorageResult<Vec<u8>> {
-        encrypt_field(
+        let unlocked = conn.keyring().is_some();
+        if !unlocked && snapshot_auth_extension_enabled(conn)? {
+            return Err(StorageError::Validation(
+                "snapshot-record-auth-v1 requires an unlocked keyring for snapshot creation"
+                    .to_string(),
+            ));
+        }
+        if unlocked {
+            conn.ensure_critical_extension(SNAPSHOT_RECORD_AUTH_EXTENSION)?;
+        }
+        let ciphertext = encrypt_field(
             conn,
             FieldKeyPurpose::Metadata,
             plaintext,
             "snapshot",
             id,
-            "payload",
-        )
+            if unlocked { "payload-v2" } else { "payload" },
+        )?;
+        if unlocked {
+            Ok(snapshot_integrity::wrap_authenticated_ciphertext(
+                ciphertext,
+            ))
+        } else {
+            Ok(ciphertext)
+        }
     }
 
     fn decrypt_payload(
@@ -637,15 +702,48 @@ impl SnapshotRepo {
         id: &str,
         ciphertext: &[u8],
     ) -> StorageResult<Vec<u8>> {
+        let (ciphertext, field_name) =
+            match snapshot_integrity::authenticated_ciphertext_inner(ciphertext) {
+                Some(inner) => {
+                    if conn.keyring().is_none() {
+                        return Err(StorageError::Validation(
+                            "authenticated snapshot payload requires an unlocked keyring"
+                                .to_string(),
+                        ));
+                    }
+                    (inner, "payload-v2")
+                }
+                None => (ciphertext, "payload"),
+            };
         decrypt_field(
             conn,
             FieldKeyPurpose::Metadata,
             ciphertext,
             "snapshot",
             id,
-            "payload",
+            field_name,
         )
     }
+}
+
+fn snapshot_auth_extension_enabled(conn: &VaultConnection) -> StorageResult<bool> {
+    let value: String = conn
+        .inner()
+        .query_row(
+            "SELECT critical_extensions FROM vault_meta LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Database)?;
+    if value.trim().is_empty() || value.trim() == "[]" {
+        return Ok(false);
+    }
+    let extensions = serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+        StorageError::Validation(format!("critical extensions are invalid: {error}"))
+    })?;
+    Ok(extensions
+        .iter()
+        .any(|extension| extension == SNAPSHOT_RECORD_AUTH_EXTENSION))
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,12 +1485,6 @@ fn bump_clock(clock: &str) -> String {
     format!(r#"{{"counter":{}}}"#, counter + 1)
 }
 
-fn compute_sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -1413,6 +1505,7 @@ mod tests {
     #[cfg(feature = "derived-search-index")]
     use crate::search::SearchService;
     use crate::tiga::TigaService;
+    use crate::unlock::UnlockService;
     use mdbx_core::model::{
         CollectionTypeId, EntryType, ExtensionCapabilityId, ObjectTypeId, RelationKindId,
         UnlockMethodType, VaultSession,
@@ -1424,6 +1517,12 @@ mod tests {
         let params = VaultInitParams::default();
         initialize_vault(&conn, &params).unwrap();
         let ctx = CommitContext::new("test-device".to_string());
+        (conn, ctx)
+    }
+
+    fn setup_unlocked() -> (VaultConnection, CommitContext) {
+        let (mut conn, ctx) = setup();
+        UnlockService::setup_password(&mut conn, "snapshot-auth-password").unwrap();
         (conn, ctx)
     }
 
@@ -1474,6 +1573,109 @@ mod tests {
         assert!(payload.entries.is_empty());
         assert!(payload.attachments.is_empty());
         assert!(payload.attachment_chunks.unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_snapshot_binds_metadata_and_rejects_downgrade() {
+        let (conn, ctx) = setup_unlocked();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        assert!(snapshot
+            .snapshot_ct
+            .starts_with(snapshot_integrity::AUTHENTICATED_CIPHERTEXT_MAGIC));
+        assert!(snapshot.snapshot_hash.starts_with("hmac-sha256-v1:"));
+        let critical_extensions: String = conn
+            .inner()
+            .query_row("SELECT critical_extensions FROM vault_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(serde_json::from_str::<Vec<String>>(&critical_extensions)
+            .unwrap()
+            .iter()
+            .any(|extension| extension == SNAPSHOT_RECORD_AUTH_EXTENSION));
+        assert!(SnapshotRepo::verify_integrity(&conn, &snapshot.snapshot_id).unwrap());
+
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET created_at = 'tampered-at' WHERE snapshot_id = ?1",
+                params![snapshot.snapshot_id],
+            )
+            .unwrap();
+        assert!(!SnapshotRepo::verify_integrity(&conn, &snapshot.snapshot_id).unwrap());
+
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET created_at = ?1, snapshot_hash = ?2
+                 WHERE snapshot_id = ?3",
+                params![
+                    snapshot.created_at,
+                    snapshot_integrity::ciphertext_sha256_hex(&snapshot.snapshot_ct),
+                    snapshot.snapshot_id
+                ],
+            )
+            .unwrap();
+        assert!(!SnapshotRepo::verify_integrity(&conn, &snapshot.snapshot_id).unwrap());
+
+        let stripped = snapshot.snapshot_ct
+            [snapshot_integrity::AUTHENTICATED_CIPHERTEXT_MAGIC.len()..]
+            .to_vec();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = ?1, snapshot_hash = ?2
+                 WHERE snapshot_id = ?3",
+                params![
+                    stripped.clone(),
+                    snapshot_integrity::ciphertext_sha256_hex(&stripped),
+                    snapshot.snapshot_id
+                ],
+            )
+            .unwrap();
+        assert!(!SnapshotRepo::verify_integrity(&conn, &snapshot.snapshot_id).unwrap());
+    }
+
+    #[test]
+    fn legacy_encrypted_snapshot_profile_remains_readable() {
+        let (conn, ctx) = setup_unlocked();
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        let plaintext =
+            SnapshotRepo::decrypt_payload(&conn, &snapshot.snapshot_id, &snapshot.snapshot_ct)
+                .unwrap();
+        let legacy_ciphertext = conn
+            .with_immediate_transaction(|| {
+                encrypt_field(
+                    &conn,
+                    FieldKeyPurpose::Metadata,
+                    &plaintext,
+                    "snapshot",
+                    &snapshot.snapshot_id,
+                    "payload",
+                )
+            })
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = ?1, snapshot_hash = ?2
+                 WHERE snapshot_id = ?3",
+                params![
+                    legacy_ciphertext.clone(),
+                    snapshot_integrity::ciphertext_sha256_hex(&legacy_ciphertext),
+                    snapshot.snapshot_id
+                ],
+            )
+            .unwrap();
+
+        assert!(SnapshotRepo::verify_integrity(&conn, &snapshot.snapshot_id).unwrap());
+        assert!(SnapshotRepo::restore_snapshot(&conn, &ctx, &snapshot.snapshot_id).is_ok());
+    }
+
+    #[test]
+    fn authenticated_snapshot_extension_blocks_locked_legacy_creation() {
+        let (mut conn, ctx) = setup_unlocked();
+        SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        conn.clear_session();
+
+        let error = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap_err();
+        assert!(error.to_string().contains("requires an unlocked keyring"));
     }
 
     #[test]
@@ -2347,7 +2549,7 @@ mod tests {
                  WHERE snapshot_id = ?3",
                 params![
                     invalid_payload,
-                    compute_sha256_hex(&invalid_payload),
+                    snapshot_integrity::ciphertext_sha256_hex(&invalid_payload),
                     snapshot.snapshot_id
                 ],
             )

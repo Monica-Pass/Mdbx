@@ -208,6 +208,14 @@ MDBX 必须支持从逻辑损坏或同步中断中恢复。
 
 snapshot 是保存在 vault 内部的逻辑恢复点。可移植备份生成可独立打开的完整 vault 文件；sync bundle 在副本之间传输增量 commit 状态。三者用途不同，WAL 活跃时仅复制 SQLite 主文件也不能替代其中任何一种机制。
 
+verified-unlocked writer 创建的新 snapshot 使用 `MDBXSN2` payload profile 和版本化
+`hmac-sha256-v1` integrity descriptor。HMAC 在现有 snapshot commit 的同一事务内绑定
+vault ID、snapshot ID、base commit、落盘密文摘要、创建时间和创建设备。首次写入该格式时
+注册 critical extension `snapshot-record-auth-v1`；不理解该 profile 的 reader 必须拒绝
+vault，不能套用旧 snapshot AAD 继续写。既有 64 位十六进制 SHA-256 snapshot 与原始
+`payload` AAD 继续读取和恢复。锁定状态只能检查公开密文摘要与 descriptor 形状；解锁后
+再执行 keyed metadata verification 和 payload authentication。
+
 离线同步包读取器必须在分配内存和反序列化之前执行 payload 上限。bundle v3/v4 在头部记录未压缩 payload 长度，并拒绝非零保留字节和 payload hash 后的尾随数据。bundle v5/v6 分别对压缩输入和解压输出应用同一配置上限。bundle v1 与 v2 兼容读取器必须限制底层 reader 的读取量，禁止无界读取。资源配置可以选择更低的上限，协议硬上限始终生效。
 
 ## 12. 附件存储模式

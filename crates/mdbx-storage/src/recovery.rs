@@ -819,7 +819,7 @@ impl RecoveryVerifier {
         Ok(issues)
     }
 
-    /// 检查所有 snapshot 的公开 hash，并在解锁后验证认证密文与 payload 结构。
+    /// 检查所有 snapshot 的公开摘要，并在解锁后验证认证描述、密文与 payload 结构。
     pub fn check_snapshots(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
         use crate::repo::snapshot::SnapshotRepo;
 
@@ -849,7 +849,7 @@ impl RecoveryVerifier {
         Ok(issues)
     }
 
-    /// 验证快照完整性（hash 校验）。
+    /// 验证快照完整性（摘要、记录描述和解锁后的 payload）。
     pub fn verify_snapshot_integrity(
         conn: &VaultConnection,
         snapshot_id: &str,
@@ -1325,6 +1325,30 @@ mod tests {
                 "UPDATE snapshots SET snapshot_ct = ?1, snapshot_hash = ?2
                  WHERE snapshot_id = ?3",
                 rusqlite::params![tampered, recomputed_hash, snapshot.snapshot_id],
+            )
+            .unwrap();
+
+        let result = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(!result.healthy);
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Error
+                && issue.category == "snapshots"
+                && issue.description.contains(&snapshot.snapshot_id)
+        }));
+    }
+
+    #[test]
+    fn full_health_check_reports_authenticated_snapshot_metadata_tampering() {
+        use crate::repo::snapshot::SnapshotRepo;
+
+        let (mut conn, ctx, _project_id) = setup();
+        attach_test_keyring(&mut conn);
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET created_by_device_id = 'tampered-device'
+                 WHERE snapshot_id = ?1",
+                rusqlite::params![snapshot.snapshot_id],
             )
             .unwrap();
 

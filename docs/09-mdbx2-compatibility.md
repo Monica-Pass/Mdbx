@@ -66,6 +66,12 @@ As an additional release-binary observation, the `MDBX1.0` CLI successfully list
 - Restore recreates the exact active set while retaining post-snapshot rows as tombstoned history.
 - Restored objects receive one causal restore head and object-version records.
 - New snapshots include project tags and attachment chunks without clearing fields absent from legacy snapshots.
+- Verified-unlocked snapshots use the `MDBXSN2` payload profile and a versioned
+  HMAC descriptor that binds their base commit and row metadata. Existing
+  64-hex SHA snapshots retain their original AAD and restore semantics. The
+  first new-profile snapshot registers `snapshot-record-auth-v1`, so an older
+  MDBX2 reader rejects the unknown critical extension rather than silently
+  applying legacy decryption rules.
 - Tiga mutations atomically update commits, rows, heads, and object versions.
 - Tiga2 policy state, scoped overrides, exact exceptions, and typed audit events are synchronized. Concurrent policy conflicts merge toward the stricter value.
 - Authorized Tiga mutations record the exact Commit2 `operation_id` and `commit_id` in the same transaction. Rejected decisions and non-mutating disclosures have no commit association.

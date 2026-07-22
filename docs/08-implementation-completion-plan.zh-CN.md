@@ -133,7 +133,9 @@ MDBX 必须坚持：
 
 - recovery 验证 commit integrity tag。（已完成）
 - health check 输出 commit tag mismatch、missing parent、dangling head、chunk mismatch。（已完成）
-- snapshot 已使用认证密文，已解锁状态拒绝篡改，并覆盖 attachment chunk 恢复。（已完成）
+- snapshot 已使用认证密文并覆盖 attachment chunk 恢复；新解锁快照通过
+  `snapshot-record-auth-v1` / `MDBXSN2` 额外绑定 base commit、创建时间和设备，旧 SHA
+  snapshot 继续按原 AAD 恢复。（已完成）
 - 整理“生产初始化不得保留固定占位密文”的测试边界。（已完成；固定 `X'00'` 已移除，初始化 marker、active epoch wrapping 与完整随机 rotation 已分离）
 - vault header 元数据认证、mutation 原子重签与 health/unlock 验证。（已完成）
 

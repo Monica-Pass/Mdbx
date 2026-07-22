@@ -208,6 +208,18 @@ Minimum requirements:
 
 A snapshot is a logical recovery point stored inside a vault. It is distinct from a portable backup, which creates an independently openable complete vault file, and from a sync bundle, which carries incremental commit state between replicas. None of these artifacts can be replaced by copying only the SQLite main file while WAL is active.
 
+New snapshots created by a verified-unlocked writer use the `MDBXSN2` payload
+profile and a versioned `hmac-sha256-v1` integrity descriptor. The HMAC binds
+the vault ID, snapshot ID, base commit, stored ciphertext digest, creation
+timestamp, and creating device in the same transaction as the existing
+snapshot commit. The first such write registers the critical extension
+`snapshot-record-auth-v1`; readers that do not understand the profile must
+reject the vault instead of applying legacy snapshot AAD rules. Existing
+64-hex SHA-256 snapshots and their original `payload` AAD remain readable and
+restorable. Locked checks can validate the public ciphertext digest and
+descriptor shape; keyed metadata verification and payload authentication occur
+after unlock.
+
 Offline sync bundle readers MUST enforce a payload limit before allocation and deserialization. Bundle v3 and v4 store the uncompressed payload length in the header and reject non-zero reserved bytes or data after the payload hash. Bundle v5 and v6 apply the same configured limit independently to compressed input and decompressed output. Bundle v1 and v2 compatibility readers MUST cap the underlying reader rather than call an unbounded read. Resource profiles may choose a lower limit; the protocol hard ceiling remains mandatory.
 
 ## 12. Attachment Storage Modes

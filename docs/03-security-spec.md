@@ -177,6 +177,18 @@ retention, backup, and replacement policy. A lost token cannot be detected by
 the database, and the anchor is not a trusted clock, an availability guarantee,
 or a whole-vault authentication root.
 
+Verified-unlocked snapshot creation uses the critical extension
+`snapshot-record-auth-v1`. Its `MDBXSN2` ciphertext profile changes the field
+AAD from legacy `payload` to `payload-v2`, preventing an authenticated record
+from being downgraded merely by replacing the descriptor with a recomputed
+plain hash. The versioned descriptor retains a public SHA-256 ciphertext digest
+and HMAC-authenticates the vault, snapshot identity, base commit, digest,
+timestamp, and creating device with the integrity subkey. Restore, health, and
+snapshot Blob-reference scans MUST use the same verifier. Legacy 64-hex
+snapshots keep their historical SHA plus AEAD boundary; clients that require
+metadata authentication should create a replacement snapshot rather than
+rewrite the old row.
+
 For an explicit exact-state checkpoint, MDBX2 also provides a bounded opaque
 vault content manifest through storage, the CLI, and UniFFI. It hashes the
 non-internal main schema, columns, and typed row values in one read snapshot,

@@ -13,6 +13,7 @@ pub mod object_version;
 pub mod payload_migration;
 pub mod project;
 pub mod snapshot;
+mod snapshot_integrity;
 pub mod sync_delta_inventory;
 pub mod tombstone;
 

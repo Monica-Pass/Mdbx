@@ -28,8 +28,10 @@ pub const MIGRATION_SYNC_DELTA_CAPTURE: &str = "mdbx-2-sync-delta-capture-v1";
 pub const MIGRATION_SYNC_STATE_EXTENSIONS: &str = "mdbx-2-sync-state-extensions-v1";
 pub const MIGRATION_VAULT_HEADER_AUTH: &str = "mdbx-2-vault-header-auth-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
+pub const SNAPSHOT_RECORD_AUTH_EXTENSION: &str = "snapshot-record-auth-v1";
 
-const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
+const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] =
+    &[FIELD_KEY_EPOCHS_EXTENSION, SNAPSHOT_RECORD_AUTH_EXTENSION];
 const MAX_PRE_MIGRATION_INTEGRITY_ISSUES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1243,12 +1245,16 @@ mod tests {
     #[test]
     fn merge_critical_extension_is_canonical_and_idempotent() {
         let merged = merge_critical_extension("", FIELD_KEY_EPOCHS_EXTENSION).unwrap();
+        let merged = merge_critical_extension(&merged, SNAPSHOT_RECORD_AUTH_EXTENSION).unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&merged).unwrap(),
-            vec![FIELD_KEY_EPOCHS_EXTENSION.to_string()]
+            vec![
+                FIELD_KEY_EPOCHS_EXTENSION.to_string(),
+                SNAPSHOT_RECORD_AUTH_EXTENSION.to_string()
+            ]
         );
         assert_eq!(
-            merge_critical_extension(&merged, FIELD_KEY_EPOCHS_EXTENSION).unwrap(),
+            merge_critical_extension(&merged, SNAPSHOT_RECORD_AUTH_EXTENSION).unwrap(),
             merged
         );
     }

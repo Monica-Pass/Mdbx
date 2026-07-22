@@ -121,6 +121,10 @@ MDBX2 同时收紧以下实现边界：
 - snapshot 创建和恢复进入原子事务。
 - snapshot 恢复重建精确 active set；快照后新增对象保留历史行，但通过 tombstone 离开 active set。
 - snapshot 恢复为所有受影响对象写入统一 causal head 和 object version。
+- verified-unlocked snapshot 使用 `MDBXSN2` payload profile 和版本化 HMAC descriptor，
+  绑定 base commit、创建时间与设备元数据。既有 64 位 SHA snapshot 保持原 AAD 和恢复语义；
+  首次写入新 profile 时注册 `snapshot-record-auth-v1`，旧 MDBX2 reader 会因未知 critical
+  extension 安全拒绝，而不是静默套用旧解密规则。
 - Commit2 增加幂等 operation ID、结构化变更摘要、稳定分支身份、合并后的 vector clock 和
   原子设备序列分配，不重写任何历史 commit。
 - 离线 bundle v3 增加显式 payload 长度和有界解码；MDBX2 继续转换读取没有 operation
