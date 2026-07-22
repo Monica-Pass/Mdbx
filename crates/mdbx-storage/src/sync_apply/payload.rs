@@ -14,7 +14,7 @@ use crate::sync_delta::{
 };
 use crate::sync_state::{decode_sync_state_payload_with_limits, SyncStateLimits};
 
-use super::{key_epoch_apply, lifecycle_apply, PayloadApplyResult, SyncApplyRepo};
+use super::{key_epoch_apply, lifecycle_apply, state_apply, PayloadApplyResult, SyncApplyRepo};
 
 pub(super) fn apply_fast_forward_payloads(
     conn: &VaultConnection,
@@ -49,7 +49,7 @@ pub(super) fn apply_fast_forward_payloads(
                     "a commit cannot mix complete sync state and a state delta".to_string(),
                 ));
             }
-            result.conflicts += SyncApplyRepo::apply_sync_state(
+            result.conflicts += state_apply::apply_sync_state(
                 conn,
                 ctx,
                 &serialized.commit.commit_id,
@@ -98,7 +98,7 @@ pub(super) fn apply_divergent_payloads(
                     "a commit cannot mix complete sync state and a state delta".to_string(),
                 ));
             }
-            result.conflicts += SyncApplyRepo::apply_sync_state(
+            result.conflicts += state_apply::apply_sync_state(
                 conn,
                 ctx,
                 &serialized.commit.commit_id,
@@ -153,7 +153,7 @@ fn apply_commit_sync_delta(
         )));
     }
     let body = decode_sync_delta_body(envelope, SyncDeltaLimits::default())?;
-    let conflicts = SyncApplyRepo::apply_sync_state(
+    let conflicts = state_apply::apply_sync_state(
         conn,
         ctx,
         &serialized.commit.commit_id,
