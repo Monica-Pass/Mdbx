@@ -1,6 +1,6 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::kdf;
@@ -18,31 +18,19 @@ use crate::kdf;
 /// ```
 pub struct Keyring {
     /// 主解锁密钥（从用户凭据派生）
-    pub unlock_key: Vec<u8>,
+    pub unlock_key: Zeroizing<Vec<u8>>,
     /// vault 加密密钥
-    pub vault_key: Vec<u8>,
+    pub vault_key: Zeroizing<Vec<u8>>,
     /// 记录加密子密钥
-    pub record_subkey: Vec<u8>,
+    pub record_subkey: Zeroizing<Vec<u8>>,
     /// 附件加密子密钥
-    pub attachment_subkey: Vec<u8>,
+    pub attachment_subkey: Zeroizing<Vec<u8>>,
     /// 元数据加密子密钥
-    pub metadata_subkey: Vec<u8>,
+    pub metadata_subkey: Zeroizing<Vec<u8>>,
     /// commit/history 加密子密钥
-    pub history_subkey: Vec<u8>,
+    pub history_subkey: Zeroizing<Vec<u8>>,
     /// 完整性认证子密钥
-    pub integrity_subkey: Vec<u8>,
-}
-
-impl Drop for Keyring {
-    fn drop(&mut self) {
-        self.unlock_key.zeroize();
-        self.vault_key.zeroize();
-        self.record_subkey.zeroize();
-        self.attachment_subkey.zeroize();
-        self.metadata_subkey.zeroize();
-        self.history_subkey.zeroize();
-        self.integrity_subkey.zeroize();
-    }
+    pub integrity_subkey: Zeroizing<Vec<u8>>,
 }
 
 impl Keyring {
@@ -92,8 +80,8 @@ impl Keyring {
         let integrity_subkey = Self::hkdf_expand(vault_key, vault_context, b"integrity")?;
 
         Ok(Self {
-            unlock_key: Vec::new(), // 未保存
-            vault_key: vault_key.to_vec(),
+            unlock_key: Zeroizing::new(Vec::new()), // 未保存
+            vault_key: Zeroizing::new(vault_key.to_vec()),
             record_subkey,
             attachment_subkey,
             metadata_subkey,
@@ -103,9 +91,9 @@ impl Keyring {
     }
 
     /// HKDF-SHA-256 派生。
-    fn hkdf_expand(ikm: &[u8], salt: &[u8], info: &[u8]) -> CryptoResult<Vec<u8>> {
+    fn hkdf_expand(ikm: &[u8], salt: &[u8], info: &[u8]) -> CryptoResult<Zeroizing<Vec<u8>>> {
         let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-        let mut okm = vec![0u8; 32];
+        let mut okm = Zeroizing::new(vec![0u8; 32]);
         hk.expand(info, &mut okm)
             .map_err(|e| CryptoError::KeyDerivation(format!("HKDF expand failed: {}", e)))?;
         Ok(okm)
@@ -180,10 +168,25 @@ mod tests {
         let vault_key = crate::aead::generate_key().unwrap();
         let kr = Keyring::from_vault_key(&vault_key, b"vault").unwrap();
 
-        assert_eq!(kr.vault_key, vault_key);
+        assert_eq!(kr.vault_key.as_slice(), vault_key.as_slice());
         assert_eq!(kr.record_subkey.len(), 32);
         assert_eq!(kr.history_subkey.len(), 32);
         assert_eq!(kr.integrity_subkey.len(), 32);
         assert!(kr.unlock_key.is_empty()); // from_vault_key 不解锁
+    }
+
+    #[test]
+    fn test_keyring_clones_keep_zeroizing_ownership() {
+        fn assert_zeroizing_vec(_: &Zeroizing<Vec<u8>>) {}
+
+        let vault_key = crate::aead::generate_key().unwrap();
+        let kr = Keyring::from_vault_key(&vault_key, b"vault").unwrap();
+        let cloned_vault_key = kr.vault_key.clone();
+        let cloned_record_subkey = kr.record_subkey.clone();
+
+        assert_zeroizing_vec(&cloned_vault_key);
+        assert_zeroizing_vec(&cloned_record_subkey);
+        assert_eq!(cloned_vault_key.as_slice(), vault_key.as_slice());
+        assert_eq!(cloned_record_subkey.as_slice(), kr.record_subkey.as_slice());
     }
 }

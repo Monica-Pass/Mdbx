@@ -201,6 +201,13 @@ MDBX 必须认证以下内容：
 
 ## 9. 内存安全规则
 
+MDBX2 必须让长期持有的 Keyring 字段使用离开作用域后自动清零的 buffer。
+Argon2id/HKDF 输出、解包得到的 vault key，以及解包得到的数据 epoch key，
+必须在产生时立即进入该 buffer。复制 Keyring 密钥字段时，复制结果也必须
+保留自动清零所有权。这保证 MDBX storage core 自己拥有的正常 Rust 生命周期；
+不宣称能够擦除客户端主动复制、操作系统 crash dump、硬件或密码库内部，或
+storage core 不拥有的 allocator 副本。
+
 实现最好做到：
 
 - 尽量缩短明文在内存中的停留时间

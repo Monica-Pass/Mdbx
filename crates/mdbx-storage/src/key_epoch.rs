@@ -33,15 +33,14 @@ impl KeyEpochService {
         ctx: &CommitContext,
         context: TigaAuthorizationContext<'_>,
     ) -> StorageResult<KeyEpochRotationResult> {
-        let vault_key = Zeroizing::new(
-            conn.keyring()
-                .map(|keyring| keyring.vault_key.clone())
-                .ok_or_else(|| {
-                    StorageError::Validation(
-                        "vault must be unlocked before rotating the key epoch".to_string(),
-                    )
-                })?,
-        );
+        let vault_key = conn
+            .keyring()
+            .map(|keyring| keyring.vault_key.clone())
+            .ok_or_else(|| {
+                StorageError::Validation(
+                    "vault must be unlocked before rotating the key epoch".to_string(),
+                )
+            })?;
         let vault_id: String = conn
             .inner()
             .query_row("SELECT vault_id FROM vault_meta LIMIT 1", [], |row| {
@@ -262,7 +261,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(epoch_key.len(), 32);
-            assert_ne!(epoch_key, root_key);
+            assert_ne!(epoch_key.as_slice(), root_key.as_slice());
 
             let old_state: (String, Option<String>) = conn
                 .inner()

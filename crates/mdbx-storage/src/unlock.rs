@@ -73,9 +73,9 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
+        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let vault_key = Self::get_or_generate_vault_key(conn)?;
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -129,9 +129,9 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
+        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let vault_key = Self::get_or_generate_vault_key(conn)?;
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -172,9 +172,9 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Zeroizing::new(Self::derive_key(key_data, &kdf_params)?);
+        let unlock_key = Self::derive_key(key_data, &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let vault_key = Self::get_or_generate_vault_key(conn)?;
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -225,9 +225,9 @@ impl UnlockService {
         kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let unlock_key = Zeroizing::new(Self::derive_key(combined.as_slice(), &kdf_params)?);
+        let unlock_key = Self::derive_key(combined.as_slice(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::get_or_generate_vault_key(conn)?);
+        let vault_key = Self::get_or_generate_vault_key(conn)?;
         let wrapped = Self::wrap_vault_key(unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -321,12 +321,10 @@ impl UnlockService {
         let normalized = pin.trim();
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
+        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let vault_key =
+            Self::unwrap_vault_key(unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         Self::attach_verified_keyring(conn, vault_key.as_slice())?;
 
@@ -346,12 +344,10 @@ impl UnlockService {
         let normalized = Self::normalize_unicode(password);
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Zeroizing::new(Self::derive_key(normalized.as_bytes(), &kdf_params)?);
+        let unlock_key = Self::derive_key(normalized.as_bytes(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let vault_key =
+            Self::unwrap_vault_key(unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         Self::attach_verified_keyring(conn, vault_key.as_slice())?;
 
@@ -370,12 +366,10 @@ impl UnlockService {
 
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Zeroizing::new(Self::derive_key(key_data, &kdf_params)?);
+        let unlock_key = Self::derive_key(key_data, &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let vault_key =
+            Self::unwrap_vault_key(unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         Self::attach_verified_keyring(conn, vault_key.as_slice())?;
 
@@ -403,12 +397,10 @@ impl UnlockService {
         ));
         let kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let unlock_key = Zeroizing::new(Self::derive_key(combined.as_slice(), &kdf_params)?);
+        let unlock_key = Self::derive_key(combined.as_slice(), &kdf_params)?;
 
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let vault_key =
+            Self::unwrap_vault_key(unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         Self::attach_verified_keyring(conn, vault_key.as_slice())?;
 
@@ -434,14 +426,9 @@ impl UnlockService {
         let old_normalized = old_pin.trim();
         let old_kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let old_unlock_key = Zeroizing::new(Self::derive_key(
-            old_normalized.as_bytes(),
-            &old_kdf_params,
-        )?);
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            old_unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let old_unlock_key = Self::derive_key(old_normalized.as_bytes(), &old_kdf_params)?;
+        let vault_key =
+            Self::unwrap_vault_key(old_unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         // 用新凭据重新包裹
         Self::validate_pin(new_pin)?;
@@ -450,10 +437,7 @@ impl UnlockService {
         new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let new_unlock_key = Zeroizing::new(Self::derive_key(
-            new_normalized.as_bytes(),
-            &new_kdf_params,
-        )?);
+        let new_unlock_key = Self::derive_key(new_normalized.as_bytes(), &new_kdf_params)?;
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -500,14 +484,9 @@ impl UnlockService {
         let old_normalized = Self::normalize_unicode(old_password);
         let old_kdf_params = KdfParams::from_json_bytes(&method.kdf_params_ct)
             .map_err(|e| StorageError::SchemaCreation(format!("invalid KDF params: {}", e)))?;
-        let old_unlock_key = Zeroizing::new(Self::derive_key(
-            old_normalized.as_bytes(),
-            &old_kdf_params,
-        )?);
-        let vault_key = Zeroizing::new(Self::unwrap_vault_key(
-            old_unlock_key.as_slice(),
-            &method.wrapped_vault_key_ct,
-        )?);
+        let old_unlock_key = Self::derive_key(old_normalized.as_bytes(), &old_kdf_params)?;
+        let vault_key =
+            Self::unwrap_vault_key(old_unlock_key.as_slice(), &method.wrapped_vault_key_ct)?;
 
         let mode = old_kdf_params.infer_tiga_mode();
         Self::validate_password(new_password)?;
@@ -516,10 +495,7 @@ impl UnlockService {
         new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let new_unlock_key = Zeroizing::new(Self::derive_key(
-            new_normalized.as_bytes(),
-            &new_kdf_params,
-        )?);
+        let new_unlock_key = Self::derive_key(new_normalized.as_bytes(), &new_kdf_params)?;
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), vault_key.as_slice())?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(vault_key.as_slice())?;
 
@@ -578,8 +554,7 @@ impl UnlockService {
         new_kdf_params.salt = kdf::generate_salt(16).map_err(|e| {
             StorageError::Crypto(mdbx_crypto::error::CryptoError::RngError(e.to_string()))
         })?;
-        let new_unlock_key =
-            Zeroizing::new(Self::derive_key(normalized.as_bytes(), &new_kdf_params)?);
+        let new_unlock_key = Self::derive_key(normalized.as_bytes(), &new_kdf_params)?;
         let new_wrapped = Self::wrap_vault_key(new_unlock_key.as_slice(), &vault_key)?;
         let active_epoch_wrapped = Self::wrap_active_key_epoch(&vault_key)?;
 
@@ -873,14 +848,15 @@ impl UnlockService {
                     ));
                 }
                 if let Some(vault_key) = vault_key {
-                    let unwrapped =
+                    let unwrapped = Zeroizing::new(
                         aead::decrypt(vault_key, &wrapped_epoch_key_ct, ACTIVE_KEY_EPOCH_AAD)
                             .map_err(|_| {
                                 StorageError::Validation(
                                     "active key epoch wrapper authentication failed".to_string(),
                                 )
-                            })?;
-                    if unwrapped != vault_key {
+                            })?,
+                    );
+                    if unwrapped.as_slice() != vault_key {
                         return Err(StorageError::Validation(
                             "active key epoch wrapper does not match the unlocked vault key"
                                 .to_string(),
@@ -896,16 +872,18 @@ impl UnlockService {
                 }
                 if let Some(vault_key) = vault_key {
                     let vault_ctx = Self::read_vault_context(conn)?;
-                    let epoch_key = aead::decrypt(
-                        vault_key,
-                        &wrapped_epoch_key_ct,
-                        &random_epoch_wrap_aad(&vault_ctx, &active_key_epoch_id),
-                    )
-                    .map_err(|_| {
-                        StorageError::Validation(
-                            "random key epoch wrapper authentication failed".to_string(),
+                    let epoch_key = Zeroizing::new(
+                        aead::decrypt(
+                            vault_key,
+                            &wrapped_epoch_key_ct,
+                            &random_epoch_wrap_aad(&vault_ctx, &active_key_epoch_id),
                         )
-                    })?;
+                        .map_err(|_| {
+                            StorageError::Validation(
+                                "random key epoch wrapper authentication failed".to_string(),
+                            )
+                        })?,
+                    );
                     if epoch_key.len() != 32 {
                         return Err(StorageError::Validation(
                             "random key epoch material must be 32 bytes".to_string(),
@@ -933,10 +911,12 @@ impl UnlockService {
     /// 首次设置解锁方式时生成新的随机 vault_key。
     /// 后续设置的解锁方式复用同一个 vault_key，
     /// 确保无论用哪种方式解锁都能解密同一批数据。
-    fn get_or_generate_vault_key(conn: &VaultConnection) -> StorageResult<Vec<u8>> {
+    fn get_or_generate_vault_key(conn: &VaultConnection) -> StorageResult<Zeroizing<Vec<u8>>> {
         match conn.keyring() {
             Some(kr) => Ok(kr.vault_key.clone()),
-            None => aead::generate_key().map_err(StorageError::Crypto),
+            None => aead::generate_key()
+                .map(Zeroizing::new)
+                .map_err(StorageError::Crypto),
         }
     }
 
@@ -968,28 +948,26 @@ impl UnlockService {
     }
 
     pub(crate) fn refresh_verified_keyring(conn: &mut VaultConnection) -> StorageResult<()> {
-        let vault_key = Zeroizing::new(
-            conn.keyring()
-                .map(|keyring| keyring.vault_key.clone())
-                .ok_or_else(|| {
-                    StorageError::Validation(
-                        "vault must be unlocked before refreshing key epochs".to_string(),
-                    )
-                })?,
-        );
+        let vault_key = conn
+            .keyring()
+            .map(|keyring| keyring.vault_key.clone())
+            .ok_or_else(|| {
+                StorageError::Validation(
+                    "vault must be unlocked before refreshing key epochs".to_string(),
+                )
+            })?;
         Self::attach_verified_keyring(conn, vault_key.as_slice())
     }
 
     pub(crate) fn verify_key_epoch_state(conn: &VaultConnection) -> StorageResult<()> {
-        let vault_key = Zeroizing::new(
-            conn.keyring()
-                .map(|keyring| keyring.vault_key.clone())
-                .ok_or_else(|| {
-                    StorageError::Validation(
-                        "vault must be unlocked before verifying key epochs".to_string(),
-                    )
-                })?,
-        );
+        let vault_key = conn
+            .keyring()
+            .map(|keyring| keyring.vault_key.clone())
+            .ok_or_else(|| {
+                StorageError::Validation(
+                    "vault must be unlocked before verifying key epochs".to_string(),
+                )
+            })?;
         Self::build_keyring(conn, vault_key.as_slice()).map(|_| ())
     }
 
@@ -1021,17 +999,20 @@ impl UnlockService {
         let mut epoch_keyrings = HashMap::new();
         for (key_epoch_id, status, wrapped_epoch_key_ct, profile) in rows {
             let epoch_key = match profile.as_str() {
-                INIT_KEY_EPOCH_PROFILE_ID if status == "active" => vault_key.to_vec(),
+                INIT_KEY_EPOCH_PROFILE_ID if status == "active" => {
+                    Zeroizing::new(vault_key.to_vec())
+                }
                 ACTIVE_KEY_EPOCH_PROFILE_ID => {
-                    let unwrapped =
+                    let unwrapped = Zeroizing::new(
                         aead::decrypt(vault_key, &wrapped_epoch_key_ct, ACTIVE_KEY_EPOCH_AAD)
                             .map_err(|_| {
                                 StorageError::Validation(format!(
                                     "key epoch {} wrapper authentication failed",
                                     key_epoch_id
                                 ))
-                            })?;
-                    if unwrapped != vault_key {
+                            })?,
+                    );
+                    if unwrapped.as_slice() != vault_key {
                         return Err(StorageError::Validation(format!(
                             "key epoch {} does not match the unlocked vault key",
                             key_epoch_id
@@ -1040,17 +1021,19 @@ impl UnlockService {
                     unwrapped
                 }
                 RANDOM_KEY_EPOCH_PROFILE_ID => {
-                    let epoch_key = aead::decrypt(
-                        vault_key,
-                        &wrapped_epoch_key_ct,
-                        &random_epoch_wrap_aad(vault_ctx, &key_epoch_id),
-                    )
-                    .map_err(|_| {
-                        StorageError::Validation(format!(
-                            "random key epoch {} wrapper authentication failed",
-                            key_epoch_id
-                        ))
-                    })?;
+                    let epoch_key = Zeroizing::new(
+                        aead::decrypt(
+                            vault_key,
+                            &wrapped_epoch_key_ct,
+                            &random_epoch_wrap_aad(vault_ctx, &key_epoch_id),
+                        )
+                        .map_err(|_| {
+                            StorageError::Validation(format!(
+                                "random key epoch {} wrapper authentication failed",
+                                key_epoch_id
+                            ))
+                        })?,
+                    );
                     if epoch_key.len() != 32 {
                         return Err(StorageError::Validation(format!(
                             "random key epoch {} material must be 32 bytes",
@@ -1081,13 +1064,15 @@ impl UnlockService {
     }
 
     /// 用 unlock_key 解包得到 vault_key。
-    fn unwrap_vault_key(unlock_key: &[u8], wrapped: &[u8]) -> StorageResult<Vec<u8>> {
-        aead::decrypt(unlock_key, wrapped, VAULT_KEY_WRAP_AAD).map_err(|e| match e {
-            mdbx_crypto::error::CryptoError::AuthenticationFailed => {
-                StorageError::Validation("incorrect credential".to_string())
-            }
-            other => StorageError::Crypto(other),
-        })
+    fn unwrap_vault_key(unlock_key: &[u8], wrapped: &[u8]) -> StorageResult<Zeroizing<Vec<u8>>> {
+        aead::decrypt(unlock_key, wrapped, VAULT_KEY_WRAP_AAD)
+            .map(Zeroizing::new)
+            .map_err(|e| match e {
+                mdbx_crypto::error::CryptoError::AuthenticationFailed => {
+                    StorageError::Validation("incorrect credential".to_string())
+                }
+                other => StorageError::Crypto(other),
+            })
     }
 
     /// 从 vault_meta 读取 vault_id 作为 Keyring 的派生上下文。
@@ -1102,7 +1087,7 @@ impl UnlockService {
     }
 
     /// 从凭据和 KDF 参数派生密钥（使用 Argon2id）。
-    fn derive_key(credential: &[u8], kdf_params: &KdfParams) -> StorageResult<Vec<u8>> {
+    fn derive_key(credential: &[u8], kdf_params: &KdfParams) -> StorageResult<Zeroizing<Vec<u8>>> {
         let argon2_params = Argon2Params {
             memory_kib: kdf_params.mem_limit_kib,
             iterations: kdf_params.ops_limit,
@@ -2187,7 +2172,7 @@ mod tests {
         let derived = UnlockService::derive_key(b"test-password", &kdf_params).unwrap();
 
         // wrapped_vault_key_ct 不能等于派生密钥（它是 AEAD 密文，不是原始密钥字节）
-        assert_ne!(method.wrapped_vault_key_ct, derived);
+        assert_ne!(method.wrapped_vault_key_ct.as_slice(), derived.as_slice());
         // 密文至少 nonce(24) + tag(16) + 加密的 vault_key(32) = 72 字节
         assert!(method.wrapped_vault_key_ct.len() >= 72);
     }

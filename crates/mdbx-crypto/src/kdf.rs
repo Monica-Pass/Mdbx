@@ -1,4 +1,5 @@
 use argon2::{Argon2, Params, Version};
+use zeroize::Zeroizing;
 
 use crate::error::{CryptoError, CryptoResult};
 
@@ -55,7 +56,11 @@ impl Argon2Params {
 /// # Unicode 规范化
 ///
 /// 调用者在传入密码前应完成 NFC 规范化，确保跨平台一致性。
-pub fn derive_key(credential: &[u8], salt: &[u8], params: &Argon2Params) -> CryptoResult<Vec<u8>> {
+pub fn derive_key(
+    credential: &[u8],
+    salt: &[u8],
+    params: &Argon2Params,
+) -> CryptoResult<Zeroizing<Vec<u8>>> {
     let argon2_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -66,7 +71,7 @@ pub fn derive_key(credential: &[u8], salt: &[u8], params: &Argon2Params) -> Cryp
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, argon2_params);
 
-    let mut output = vec![0u8; params.output_len];
+    let mut output = Zeroizing::new(vec![0u8; params.output_len]);
     argon2
         .hash_password_into(credential, salt, &mut output)
         .map_err(|e| CryptoError::KeyDerivation(format!("Argon2id hashing failed: {}", e)))?;

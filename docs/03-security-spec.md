@@ -165,6 +165,14 @@ If external referenced attachments are supported, the external content MUST stil
 
 ## 9. Memory Safety Rules
 
+MDBX2 MUST keep long-lived keyring fields in automatically zeroizing buffers.
+Argon2id and HKDF outputs, unwrapped vault keys, and unwrapped data-epoch keys
+MUST enter such a buffer at the point they are produced. Cloning a keyring key
+MUST preserve zeroizing ownership. This protects the normal Rust-owned lifetime;
+it does not claim to erase copies made by callers, operating-system crash dumps,
+hardware or cryptographic library internals, or allocator copies that are outside
+the storage core's ownership.
+
 Implementations SHOULD:
 
 - minimize plaintext lifetime in memory
