@@ -11,9 +11,11 @@ default = [
     "kdbx-import",
     "kdbx-export",
     "external-blob-store",
+    "sync-compression",
 ]
 core = ["mdbx-storage/core"]
 external-blob-store = ["mdbx-storage/filesystem-blob-store"]
+sync-compression = ["mdbx-sync/zstd-compression"]
 search = ["mdbx-storage/derived-search-index"]
 benchmark = ["mdbx-storage/benchmarks"]
 kdbx-import = ["mdbx-storage/kdbx-import"]

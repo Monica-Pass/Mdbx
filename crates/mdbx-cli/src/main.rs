@@ -2,9 +2,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "benchmark")]
-use clap::ValueEnum;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(not(feature = "external-blob-store"), test))]
 use mdbx_core::model::attachment::StorageMode;
 use mdbx_core::model::{ChangeScope, Commit, CommitKind, EntryType};
@@ -57,12 +55,12 @@ use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_st
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_sync::{
-    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits, write_bundle,
-    write_incremental_bundle, BundleReadLimits, CommitBatch, CommitOperationMetadata,
-    IncrementalBundleCheckpoint, IncrementalBundleManifest, IncrementalBundleResume,
-    IncrementalCommitInventoryEntry, IncrementalDeltaInventoryEntry, IncrementalDeltaKind,
-    IncrementalSyncBundle, SerializedCommit, SyncBundleFile, TombstoneRecord,
-    INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
+    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits,
+    write_bundle_with_compression, write_incremental_bundle_with_compression, BundleCompression,
+    BundleReadLimits, CommitBatch, CommitOperationMetadata, IncrementalBundleCheckpoint,
+    IncrementalBundleManifest, IncrementalBundleResume, IncrementalCommitInventoryEntry,
+    IncrementalDeltaInventoryEntry, IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit,
+    SyncBundleFile, TombstoneRecord, INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
 };
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -461,6 +459,21 @@ enum SnapshotAction {
     Restore { snapshot_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BundleCompressionCli {
+    None,
+    Zstd,
+}
+
+impl From<BundleCompressionCli> for BundleCompression {
+    fn from(value: BundleCompressionCli) -> Self {
+        match value {
+            BundleCompressionCli::None => Self::None,
+            BundleCompressionCli::Zstd => Self::Zstd,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum SyncAction {
     /// 导出同步包
@@ -468,18 +481,21 @@ enum SyncAction {
         /// 输出文件路径
         #[arg(short, long, default_value = "sync-bundle.mdbx-sync")]
         output: PathBuf,
-        /// 由接收端返回的上一次成功 checkpoint；存在时导出 bundle v4
+        /// 由接收端返回的上一次成功 checkpoint；存在时导出增量 bundle
         #[arg(long)]
         base_checkpoint: Option<PathBuf>,
         /// 保存本次导出的结果 checkpoint，供接收端确认后返回
         #[arg(long)]
         result_checkpoint: Option<PathBuf>,
+        /// Bundle 压缩格式；默认保持兼容的未压缩 v3/v4
+        #[arg(long, value_enum, default_value = "none")]
+        compression: BundleCompressionCli,
     },
     /// 导入同步包
     Apply {
         /// 输入文件路径
         file: PathBuf,
-        /// v4 peer checkpoint 文件；成功应用后原子更新
+        /// 增量 peer checkpoint 文件；成功应用后原子更新
         #[arg(long)]
         checkpoint: Option<PathBuf>,
     },
@@ -1958,14 +1974,16 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
             output,
             base_checkpoint,
             result_checkpoint,
+            compression,
         } => {
+            let compression = resolve_bundle_compression(compression)?;
             let mut file = std::fs::File::create(&output)
                 .map_err(|e| format!("failed to create bundle '{}': {}", output.display(), e))?;
             if let Some(base_path) = base_checkpoint {
                 let base = read_cli_sync_checkpoint(&base_path, &vault_id(conn)?)?;
                 let bundle =
                     export_incremental_sync_segment(conn, &base.checkpoint, base.resume.as_ref())?;
-                write_incremental_bundle(&bundle, &mut file)
+                write_incremental_bundle_with_compression(&bundle, &mut file, compression)
                     .map_err(|e| format!("incremental bundle write failed: {e}"))?;
                 file.sync_all()
                     .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
@@ -1988,7 +2006,7 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
                 );
             } else {
                 let bundle = export_sync_bundle(conn)?;
-                write_bundle(&bundle, &mut file)
+                write_bundle_with_compression(&bundle, &mut file, compression)
                     .map_err(|e| format!("bundle write failed: {e}"))?;
                 file.sync_all()
                     .map_err(|e| format!("failed to synchronize bundle: {e}"))?;
@@ -2044,6 +2062,19 @@ fn cmd_sync(conn: &mut VaultConnection, action: SyncAction) -> Result<(), String
             Ok(())
         }
     }
+}
+
+fn resolve_bundle_compression(
+    compression: BundleCompressionCli,
+) -> Result<BundleCompression, String> {
+    let compression = BundleCompression::from(compression);
+    if compression == BundleCompression::Zstd && !cfg!(feature = "sync-compression") {
+        return Err(
+            "zstd bundle compression is unavailable in this build; enable sync-compression"
+                .to_string(),
+        );
+    }
+    Ok(compression)
 }
 
 fn cmd_health(conn: &VaultConnection) -> Result<(), String> {
@@ -4347,6 +4378,7 @@ mod tests {
                     output: bundle_path.clone(),
                     base_checkpoint: None,
                     result_checkpoint: None,
+                    compression: BundleCompressionCli::None,
                 },
             },
         ))
@@ -4679,10 +4711,16 @@ mod tests {
                     output: first_bundle.clone(),
                     base_checkpoint: Some(sender_base.clone()),
                     result_checkpoint: Some(sender_first.clone()),
+                    compression: BundleCompressionCli::Zstd,
                 },
             },
         ))
         .unwrap();
+        let first_bundle_bytes = std::fs::read(&first_bundle).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(first_bundle_bytes[8..12].try_into().unwrap()),
+            6
+        );
         let first_result = read_cli_sync_checkpoint(&sender_first, &vault_id).unwrap();
         assert!(first_result.resume.is_some());
 
@@ -4729,6 +4767,7 @@ mod tests {
                     output: second_bundle.clone(),
                     base_checkpoint: Some(sender_first.clone()),
                     result_checkpoint: Some(sender_second.clone()),
+                    compression: BundleCompressionCli::None,
                 },
             },
         ))
@@ -4783,6 +4822,35 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("pass --unlock-password or --unlock-pin"));
+    }
+
+    #[test]
+    fn sync_bundle_cli_defaults_to_none_and_accepts_zstd() {
+        let default = Cli::try_parse_from(["mdbx", "sync", "bundle"]).unwrap();
+        let Commands::Sync {
+            action: SyncAction::Bundle { compression, .. },
+        } = default.command
+        else {
+            panic!("sync bundle command was not parsed");
+        };
+        assert_eq!(compression, BundleCompressionCli::None);
+
+        let compressed =
+            Cli::try_parse_from(["mdbx", "sync", "bundle", "--compression", "zstd"]).unwrap();
+        let Commands::Sync {
+            action: SyncAction::Bundle { compression, .. },
+        } = compressed.command
+        else {
+            panic!("compressed sync bundle command was not parsed");
+        };
+        assert_eq!(compression, BundleCompressionCli::Zstd);
+    }
+
+    #[cfg(not(feature = "sync-compression"))]
+    #[test]
+    fn trimmed_cli_reports_zstd_as_unavailable() {
+        let error = resolve_bundle_compression(BundleCompressionCli::Zstd).unwrap_err();
+        assert!(error.contains("unavailable in this build"));
     }
 
     #[cfg(feature = "benchmark")]
