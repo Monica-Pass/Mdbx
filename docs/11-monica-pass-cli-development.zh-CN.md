@@ -48,9 +48,10 @@ mdbx/
 - `sync bundle/apply`
 - `health`
 - `benchmark`
+- `import-kdbx` / `export-kdbx`
 - `import-kdbx-json` / `export-kdbx-json`
 
-其中 `import-kdbx-json` / `export-kdbx-json` 是 KDBX 互操作 JSON 中间表示，不是完整二进制 `.kdbx` 文件读写。配置过 unlock method 的 vault 在普通 `mdbx-cli` 操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则命令会拒绝继续，避免生产入口静默走 storage legacy/test 明文兼容路径。
+其中 `import-kdbx` / `export-kdbx` 负责加密 KDBX3/KDBX4 读取与 KDBX4 写出，`import-kdbx-json` / `export-kdbx-json` 保留 KDBX 互操作 JSON 中间表示。两种导入命令都在完整解析后执行原子 operation，一次命令只产生一个 Commit2 commit；storage 原有 best-effort `import_entries` 仅作为兼容 API 保留。配置过 unlock method 的 vault 在普通 `mdbx-cli` 操作中必须传入 `--unlock-password` 或 `--unlock-pin`，否则命令会拒绝继续，避免生产入口静默走 storage legacy/test 明文兼容路径。
 
 现有 Rust 存储层具备：
 

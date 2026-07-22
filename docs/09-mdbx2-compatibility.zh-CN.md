@@ -311,6 +311,18 @@ KDBX4 AES/Argon2 的内存、迭代次数与并行度。解密后检查条目数
 单项字节和投影总字节；完整投影通过后才允许 `KdbxImporter` 修改 vault。错误凭据、畸形头、
 不支持的 KDF 和资源超限均保持 MDBX 原状态。
 
+Repository 落库层明确保留两种兼容契约。原有 `KdbxImporter::import_entries` 在源码和行为上
+继续兼容：各源条目独立尝试，有效兄弟条目可以保留，后续 entry 或 attachment 失败会记录为
+warning。该接口属于 best-effort 旧桥接，不承诺单条原子性或整批原子性。
+
+新接入使用 `KdbxImporter::import_entries_atomic`。该方法在打开事务前构造完整导入计划，并对
+每个源字段和附件字节按固定字段顺序、长度分帧与独立 domain 计算 SHA-256 intent 摘要。随后
+所有 project、Login/Note entry、附件元数据与内容、历史、对象版本、head 和同步 delta 都在
+同一个 `CommitContext::run_operation` 中完成；任一失败都会回滚整个批次。相同 operation ID
+与相同输入的重试直接返回既有 commit，不会重复创建对象；相同 ID 对应不同输入时拒绝执行。
+JSON 与二进制 CLI 都只在解析或解密成功后生成新的 operation UUID；无论导入多少对象，一次
+成功命令只产生一个 Commit2 commit。
+
 导出固定写入 KDBX4，使用 Argon2id、64 MiB 内存、三次迭代和两个 lane。CLI 密码来自隐藏
 交互输入或标准输入中的一行有界 UTF-8，不提供密码参数。输出先写入同目录临时文件并完成同步，
 再执行无覆盖发布；已有目标文件保持原内容。

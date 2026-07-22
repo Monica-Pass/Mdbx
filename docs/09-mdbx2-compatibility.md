@@ -232,6 +232,24 @@ depth, per-item byte, and aggregate projected-byte limits are checked before
 `KdbxImporter` can mutate a vault. Wrong credentials, malformed headers,
 unsupported KDFs, and limit violations therefore leave MDBX unchanged.
 
+Repository application has two explicit compatibility contracts. The existing
+`KdbxImporter::import_entries` method remains source- and behavior-compatible:
+it attempts source entries independently, can retain valid siblings, and
+reports later entry or attachment failures as warnings. It is a best-effort
+legacy bridge and does not promise per-entry or whole-batch atomicity.
+
+New integrations use `KdbxImporter::import_entries_atomic`. The method prepares
+the complete import plan before opening a transaction and derives a
+domain-separated, length-framed SHA-256 intent digest from every source field
+and attachment byte. All projects, Login and Note entries, attachment metadata,
+content, history, object versions, heads, and synchronization deltas then run
+under one `CommitContext::run_operation`. Any failure rolls back the complete
+batch. A retry with the same operation ID and input returns the existing commit
+without duplicating objects; changed input with the same ID is rejected. Both
+JSON and binary CLI imports allocate a fresh operation UUID only after parsing
+or decryption succeeds, and one successful command creates exactly one Commit2
+commit regardless of the number of imported objects.
+
 Export writes KDBX4 with Argon2id, 64 MiB memory, three iterations, and two
 lanes. CLI passwords come from a hidden prompt or one bounded UTF-8 line on
 standard input; there is no password argument. Publication uses a synchronized

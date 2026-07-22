@@ -37,7 +37,7 @@ use mdbx_storage::import::KdbxEntry;
 #[cfg(feature = "kdbx-export")]
 use mdbx_storage::import::KdbxExporter;
 #[cfg(feature = "kdbx-import")]
-use mdbx_storage::import::KdbxImporter;
+use mdbx_storage::import::{ImportResult, KdbxImporter};
 #[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
 use mdbx_storage::import::{KdbxBinaryAdapter, KdbxBinaryLimits};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
@@ -2651,19 +2651,8 @@ fn import_kdbx_with_password(
         KdbxBinaryLimits::default(),
     )
     .map_err(|error| format!("failed to decode KDBX '{}': {error}", file.display()))?;
-    let result = KdbxImporter::import_entries(conn, &ctx(), &document.entries);
-
-    println!(
-        "Imported {}: projects={} entries={} attachments={} skipped={}",
-        document.format_version,
-        result.projects_created,
-        result.entries_created,
-        result.attachments_created,
-        result.entries_skipped
-    );
-    for warning in result.warnings {
-        println!("  warning: {warning}");
-    }
+    let execution = import_kdbx_entries_atomic(conn, &document.entries)?;
+    report_kdbx_import(&document.format_version, execution);
     Ok(())
 }
 
@@ -2777,19 +2766,39 @@ fn cmd_import_kdbx_json(conn: &mut VaultConnection, file: PathBuf) -> Result<(),
         std::fs::read(&file).map_err(|e| format!("failed to read '{}': {}", file.display(), e))?;
     let entries: Vec<KdbxEntry> = serde_json::from_slice(&bytes)
         .map_err(|e| format!("failed to parse KDBX JSON '{}': {}", file.display(), e))?;
-    let result = KdbxImporter::import_entries(conn, &ctx(), &entries);
-
-    println!(
-        "Imported KDBX JSON: projects={} entries={} attachments={} skipped={}",
-        result.projects_created,
-        result.entries_created,
-        result.attachments_created,
-        result.entries_skipped
-    );
-    for warning in result.warnings {
-        println!("  warning: {}", warning);
-    }
+    let execution = import_kdbx_entries_atomic(conn, &entries)?;
+    report_kdbx_import("KDBX JSON", execution);
     Ok(())
+}
+
+#[cfg(feature = "kdbx-import")]
+fn import_kdbx_entries_atomic(
+    conn: &VaultConnection,
+    entries: &[KdbxEntry],
+) -> Result<OperationExecution<ImportResult>, String> {
+    KdbxImporter::import_entries_atomic(conn, &ctx(), uuid::Uuid::new_v4().to_string(), entries)
+        .map_err(|error| format!("failed to import KDBX atomically: {error}"))
+}
+
+#[cfg(feature = "kdbx-import")]
+fn report_kdbx_import(label: &str, execution: OperationExecution<ImportResult>) {
+    match execution {
+        OperationExecution::Applied { value, commit_id } => {
+            println!(
+                "Imported {label}: projects={} entries={} attachments={} skipped={} commit={commit_id}",
+                value.projects_created,
+                value.entries_created,
+                value.attachments_created,
+                value.entries_skipped
+            );
+            for warning in value.warnings {
+                println!("  warning: {warning}");
+            }
+        }
+        OperationExecution::AlreadyCommitted { commit_id } => {
+            println!("KDBX import already committed: source={label} commit={commit_id}");
+        }
+    }
 }
 
 #[cfg(feature = "kdbx-export")]
@@ -5967,19 +5976,38 @@ mod tests {
         let destination_path = destination.path();
         run(init_cli(&destination_path)).unwrap();
         let mut destination_conn = open_unlocked(&destination_path);
+        let before_import_commits: i64 = destination_conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
         let wrong_password =
             import_kdbx_with_password(&mut destination_conn, kdbx.clone(), "wrong-password")
                 .unwrap_err();
         assert!(wrong_password.contains("failed to decode KDBX"));
         assert!(ProjectRepo::list_all(&destination_conn).unwrap().is_empty());
+        let after_wrong_password: i64 = destination_conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_wrong_password, before_import_commits);
 
         let malformed_error =
             import_kdbx_with_password(&mut destination_conn, malformed, "binary-password")
                 .unwrap_err();
         assert!(malformed_error.contains("failed to decode KDBX"));
         assert!(ProjectRepo::list_all(&destination_conn).unwrap().is_empty());
+        let after_malformed: i64 = destination_conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_malformed, before_import_commits);
 
         import_kdbx_with_password(&mut destination_conn, kdbx, "binary-password").unwrap();
+        let after_import_commits: i64 = destination_conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_import_commits, before_import_commits + 1);
         let projects = ProjectRepo::list_all(&destination_conn).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(project_title(&projects[0]), "Binary Mail");
@@ -6036,6 +6064,15 @@ mod tests {
         }];
         std::fs::write(&import_path, serde_json::to_vec(&entries).unwrap()).unwrap();
 
+        let before_import_commits = {
+            let conn = open_unlocked(&path);
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM commits", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+
         run(cli(
             &path,
             Commands::ImportKdbxJson {
@@ -6045,6 +6082,11 @@ mod tests {
         .unwrap();
 
         let conn = open_unlocked(&path);
+        let after_import_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_import_commits, before_import_commits + 1);
         let projects = ProjectRepo::list_all(&conn).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(project_title(&projects[0]), "Imported Login");
