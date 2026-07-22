@@ -1,7 +1,7 @@
 use crate::connection::VaultConnection;
 use crate::error::StorageResult;
 use crate::repo::CommitContext;
-use crate::sync_state::SyncStatePayload;
+use crate::sync_state::{persist_sync_state_extensions, SyncStatePayload};
 
 use super::{
     attachment_apply, commit_graph_apply, entry_apply, generic_metadata_apply, key_epoch_apply,
@@ -81,5 +81,6 @@ pub(super) fn apply_sync_state(
     if let Some(acknowledgements) = &state.tombstone_acknowledgements {
         lifecycle_apply::apply_tombstone_acknowledgements(conn, acknowledgements)?;
     }
+    persist_sync_state_extensions(conn, &state.extensions, incoming_commit_id)?;
     Ok(conflicts)
 }

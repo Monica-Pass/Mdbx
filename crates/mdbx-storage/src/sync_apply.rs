@@ -2727,6 +2727,141 @@ mod tests {
     }
 
     #[test]
+    fn sync_state_extensions_survive_apply_collect_and_omission() {
+        let source_path = temp_vault_path("extension-roundtrip-source");
+        let target_path = temp_vault_path("extension-roundtrip-target");
+        {
+            let source = VaultConnection::create(&source_path).unwrap();
+            initialize_vault(
+                &source,
+                &VaultInitParams {
+                    vault_id: Some("extension-roundtrip-vault".to_string()),
+                    device_id: "device-a".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            checkpoint(&source);
+        }
+        std::fs::copy(&source_path, &target_path).unwrap();
+
+        let source = VaultConnection::open(&source_path).unwrap();
+        let target = VaultConnection::open(&target_path).unwrap();
+        let source_ctx = CommitContext::new("device-a".to_string());
+        let target_ctx = CommitContext::new("device-b".to_string());
+        let first_project =
+            ProjectRepo::create(&source, &source_ctx, "Extension source", None, None).unwrap();
+
+        let mut extension_payload = collect_sync_state_payload(&source).unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&extension_payload.ciphertext).unwrap();
+        encoded.as_object_mut().unwrap().insert(
+            "com.example.future-metadata".to_string(),
+            serde_json::json!({"revision": 3, "flags": ["a", "b"]}),
+        );
+        extension_payload.ciphertext = serde_json::to_vec(&encoded).unwrap();
+
+        let mut first_commits = serialized_commits_from(&source);
+        first_commits
+            .iter_mut()
+            .find(|commit| commit.commit.commit_id == first_project.head_commit_id)
+            .unwrap()
+            .object_payloads
+            .push(extension_payload);
+        SyncApplyRepo::apply_batch(
+            &target,
+            &target_ctx,
+            &CommitBatch::new(first_commits, 0, true),
+        )
+        .unwrap();
+
+        let collected = collect_sync_state(&target).unwrap();
+        assert_eq!(
+            collected.extensions.get("com.example.future-metadata"),
+            Some(&serde_json::json!({"revision": 3, "flags": ["a", "b"]}))
+        );
+        let stored_source_commit: String = target
+            .inner()
+            .query_row(
+                "SELECT source_commit_id FROM sync_state_extensions
+                 WHERE extension_key = 'com.example.future-metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_source_commit, first_project.head_commit_id);
+
+        let second_project =
+            ProjectRepo::create(&source, &source_ctx, "Extension update", None, None).unwrap();
+        let mut updated_extension_payload = collect_sync_state_payload(&source).unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&updated_extension_payload.ciphertext).unwrap();
+        encoded.as_object_mut().unwrap().insert(
+            "com.example.future-metadata".to_string(),
+            serde_json::json!({"revision": 4, "flags": ["c"]}),
+        );
+        updated_extension_payload.ciphertext = serde_json::to_vec(&encoded).unwrap();
+        let mut second_commits = serialized_commits_from(&source);
+        second_commits
+            .iter_mut()
+            .find(|commit| commit.commit.commit_id == second_project.head_commit_id)
+            .unwrap()
+            .object_payloads
+            .push(updated_extension_payload);
+        SyncApplyRepo::apply_batch(
+            &target,
+            &target_ctx,
+            &CommitBatch::new(second_commits, 0, true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            collect_sync_state(&target)
+                .unwrap()
+                .extensions
+                .get("com.example.future-metadata"),
+            Some(&serde_json::json!({"revision": 4, "flags": ["c"]}))
+        );
+
+        let third_project =
+            ProjectRepo::create(&source, &source_ctx, "Extension omission", None, None).unwrap();
+        let mut third_commits = serialized_commits_from(&source);
+        third_commits
+            .iter_mut()
+            .find(|commit| commit.commit.commit_id == third_project.head_commit_id)
+            .unwrap()
+            .object_payloads
+            .push(collect_sync_state_payload(&source).unwrap());
+        SyncApplyRepo::apply_batch(
+            &target,
+            &target_ctx,
+            &CommitBatch::new(third_commits, 0, true),
+        )
+        .unwrap();
+
+        let preserved = collect_sync_state(&target).unwrap();
+        assert_eq!(
+            preserved.extensions.get("com.example.future-metadata"),
+            Some(&serde_json::json!({"revision": 4, "flags": ["c"]}))
+        );
+        let preserved_source_commit: String = target
+            .inner()
+            .query_row(
+                "SELECT source_commit_id FROM sync_state_extensions
+                 WHERE extension_key = 'com.example.future-metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_source_commit, second_project.head_commit_id);
+
+        drop(source);
+        drop(target);
+        remove_vault_files(&source_path);
+        remove_vault_files(&target_path);
+    }
+
+    #[test]
     fn relation_sync_roundtrips_generic_metadata_and_versions() {
         let source_path = temp_vault_path("relation-sync-source");
         let target_path = temp_vault_path("relation-sync-target");

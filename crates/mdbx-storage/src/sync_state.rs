@@ -1,4 +1,5 @@
 use mdbx_sync::ObjectPayload;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -408,7 +409,7 @@ pub fn collect_sync_state_with_limits(
     validate_row_limit(count_source_rows(conn)?, limits)?;
     let state = SyncStatePayload {
         format: SYNC_STATE_FORMAT.to_string(),
-        extensions: BTreeMap::new(),
+        extensions: load_sync_state_extensions(conn)?,
         key_epoch_state: Some(load_key_epoch_state(conn)?),
         tiga_vault_state: Some(load_tiga_vault_state(conn)?),
         tiga_policy_overrides: Some(load_tiga_policy_override_rows(conn)?),
@@ -429,6 +430,60 @@ pub fn collect_sync_state_with_limits(
     };
     state.validate_resource_limits(limits)?;
     Ok(state)
+}
+
+pub(crate) fn persist_sync_state_extensions(
+    conn: &VaultConnection,
+    extensions: &BTreeMap<String, serde_json::Value>,
+    source_commit_id: &str,
+) -> StorageResult<()> {
+    validate_sync_state_extension_map(extensions)?;
+    if extensions.is_empty() {
+        return Ok(());
+    }
+
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    let mut statement = conn.inner().prepare_cached(
+        "INSERT INTO sync_state_extensions
+            (extension_key, value_json, source_commit_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(extension_key) DO UPDATE SET
+            value_json = excluded.value_json,
+            source_commit_id = excluded.source_commit_id,
+            updated_at = excluded.updated_at",
+    )?;
+    for (key, value) in extensions {
+        let value_json = serde_json::to_vec(value)
+            .map_err(|error| StorageError::SchemaCreation(error.to_string()))?;
+        statement.execute(params![key, value_json, source_commit_id, updated_at])?;
+    }
+    Ok(())
+}
+
+fn load_sync_state_extensions(
+    conn: &VaultConnection,
+) -> StorageResult<BTreeMap<String, serde_json::Value>> {
+    let mut statement = conn.inner().prepare(
+        "SELECT extension_key, value_json
+         FROM sync_state_extensions ORDER BY extension_key ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut extensions = BTreeMap::new();
+    for row in rows {
+        let (key, value_json) = row?;
+        let value = serde_json::from_slice(&value_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?;
+        extensions.insert(key, value);
+    }
+    validate_sync_state_extension_map(&extensions)?;
+    Ok(extensions)
 }
 
 pub(crate) fn load_key_epoch_state(conn: &VaultConnection) -> StorageResult<KeyEpochState> {
@@ -656,47 +711,55 @@ impl SyncStatePayload {
     }
 
     fn validate_extensions(&self) -> StorageResult<()> {
-        if self.extensions.len() > MAX_SYNC_STATE_EXTENSION_FIELDS {
+        validate_sync_state_extension_map(&self.extensions)
+    }
+}
+
+fn validate_sync_state_extension_map(
+    extensions: &BTreeMap<String, serde_json::Value>,
+) -> StorageResult<()> {
+    if extensions.len() > MAX_SYNC_STATE_EXTENSION_FIELDS {
+        return Err(StorageError::ResourceLimit {
+            resource: "sync state extension fields".to_string(),
+            actual: extensions.len() as u64,
+            limit: MAX_SYNC_STATE_EXTENSION_FIELDS as u64,
+        });
+    }
+    let mut total_bytes = 0usize;
+    for (key, value) in extensions {
+        if key.is_empty() || key.len() > MAX_SYNC_STATE_EXTENSION_KEY_BYTES {
+            return Err(StorageError::Validation(format!(
+                "sync state extension key must contain 1 to {MAX_SYNC_STATE_EXTENSION_KEY_BYTES} bytes"
+            )));
+        }
+        if is_sync_state_known_field(key) {
+            return Err(StorageError::Validation(format!(
+                "sync state extension cannot shadow known field {key}"
+            )));
+        }
+        validate_extension_value(value, 0)?;
+        let encoded = serde_json::to_vec(value)
+            .map_err(|error| StorageError::SchemaCreation(error.to_string()))?;
+        total_bytes = total_bytes
+            .checked_add(key.len())
+            .and_then(|size| size.checked_add(encoded.len()))
+            .ok_or_else(|| StorageError::ResourceLimit {
+                resource: "sync state extension bytes".to_string(),
+                actual: u64::MAX,
+                limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
+            })?;
+        if total_bytes > MAX_SYNC_STATE_EXTENSION_BYTES {
             return Err(StorageError::ResourceLimit {
-                resource: "sync state extension fields".to_string(),
-                actual: self.extensions.len() as u64,
-                limit: MAX_SYNC_STATE_EXTENSION_FIELDS as u64,
+                resource: "sync state extension bytes".to_string(),
+                actual: total_bytes as u64,
+                limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
             });
         }
-        let mut total_bytes = 0usize;
-        for (key, value) in &self.extensions {
-            if key.is_empty() || key.len() > MAX_SYNC_STATE_EXTENSION_KEY_BYTES {
-                return Err(StorageError::Validation(format!(
-                    "sync state extension key must contain 1 to {MAX_SYNC_STATE_EXTENSION_KEY_BYTES} bytes"
-                )));
-            }
-            if is_sync_state_known_field(key) {
-                return Err(StorageError::Validation(format!(
-                    "sync state extension cannot shadow known field {key}"
-                )));
-            }
-            validate_extension_value(value, 0)?;
-            let encoded = serde_json::to_vec(value)
-                .map_err(|error| StorageError::SchemaCreation(error.to_string()))?;
-            total_bytes = total_bytes
-                .checked_add(key.len())
-                .and_then(|size| size.checked_add(encoded.len()))
-                .ok_or_else(|| StorageError::ResourceLimit {
-                    resource: "sync state extension bytes".to_string(),
-                    actual: u64::MAX,
-                    limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
-                })?;
-            if total_bytes > MAX_SYNC_STATE_EXTENSION_BYTES {
-                return Err(StorageError::ResourceLimit {
-                    resource: "sync state extension bytes".to_string(),
-                    actual: total_bytes as u64,
-                    limit: MAX_SYNC_STATE_EXTENSION_BYTES as u64,
-                });
-            }
-        }
-        Ok(())
     }
+    Ok(())
+}
 
+impl SyncStatePayload {
     pub(crate) fn total_rows(&self) -> StorageResult<usize> {
         let mut total = 0usize;
         let mut add = |count: usize| -> StorageResult<()> {
