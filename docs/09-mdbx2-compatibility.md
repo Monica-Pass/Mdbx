@@ -20,7 +20,7 @@ An upgraded vault records:
 
 ```text
 format_version     = MDBX-2
-schema_version     = 14
+schema_version     = 15
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -41,6 +41,10 @@ Schemas 6 through 11 continue as ordered additive migrations. Schema 7 adds gene
 Schema 10's policy-table rebuild also carries forward bounded, additive columns that are not known to the current reader when their definitions are nullable or have safe literal defaults. Unsupported definitions fail the transaction before the old tables are replaced, so a non-critical field is never silently discarded.
 
 Schema 12 adds a local stable commit inventory whose migration preserves commit identity and backfills parent-before-child order. Schema 13 adds the state-delta batch inventory, its normalized commit associations, bounded versioned envelope rules, and a bootstrap floor fixed at the migration commit watermark. Schema 14 adds transaction-local logical mutation capture for every synchronized core state family. Before each outer write transaction commits, MDBX deduplicates those keys, materializes a bounded state body, and stores either a commit-associated or auxiliary batch atomically with the domain rows. Bootstrap mutations generated while creating or upgrading a vault are discarded in the same transaction because their state is covered by the floor. Historical deltas are not invented during migration; checkpoints before the floor continue to require bounded complete-state bootstrap.
+
+Schema 15 adds `sync_state_extensions` for bounded unknown top-level complete-state fields. Apply upserts only keys present in the incoming state, in the same transaction as the commit and domain rows. A missing key never means deletion, so an older peer cannot erase a future extension merely by omitting it. Collection restores stored values in key order, and migration plus current-schema validation enforce 256 fields, 128-byte keys, a 64 KiB aggregate budget, and the existing nesting-depth limit.
+
+The storage core treats each extension value as opaque JSON: it validates, stores, and forwards the value but does not interpret or decrypt it. Opaque does not mean automatically encrypted. Non-secret capability or version metadata may use ordinary JSON; any value containing passwords, mail content, tokens, or other sensitive material MUST be an authenticated ciphertext envelope produced before it enters the unknown extension. This contract lets a locked older reader preserve future sensitive state without creating plaintext itself.
 
 The storage apply path recognizes authenticated `mdbx-storage/state-delta-v1` object payloads. A commit-associated envelope must be carried by its final associated commit, every referenced commit must be available, and the commit, sparse state rows, device heads, authorized deletions, received batch, and capture cleanup succeed or roll back together. Fast-forward, divergent, and late-payload repair paths share this boundary. Bundle v4 applies commit-associated and auxiliary batches in one outer transaction, so a failed tail batch rolls back the complete segment without creating user-visible commits. These additions do not change the `projects`, `entries`, commit DAG, sync-state v1-v2, or bundle v1-v3 formats.
 
@@ -64,6 +68,7 @@ Future generations MUST migrate sequentially. For example, MDBX3 opening MDBX-1 
 - Offline sync bundle version 4 adds paired incremental inventories, authenticated base validation, bounded resumable segments, and atomic commit-plus-auxiliary application while preserving the version 1-3 readers.
 - CLI bundle application delegates to `mdbx-storage::SyncApplyRepo`; the duplicate CLI SQL apply engine was removed.
 - Storage accepts bounded authenticated state-delta payloads atomically, persists received batches for forwarding, preserves sparse local tombstones, and merges device revocation monotonically. Complete-state payloads remain supported and cannot be mixed with a delta on one commit.
+- Unknown complete-state extensions survive decode, transactional apply, storage, collection, and re-encoding. Present keys update atomically; absent keys preserve the local value.
 - Portable backup uses SQLite online backup so committed WAL pages are included, verifies SQLite and MDBX metadata plus `vault_id`, converts the result to a sidecar-independent file, and refuses to replace any destination artifact.
 
 ## Client/Core Boundary

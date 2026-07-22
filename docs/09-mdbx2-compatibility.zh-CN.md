@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；事务级状态 delta 使用 `14`。
+  - 当前内部 schema 序号；未知同步扩展持久化使用 `15`。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 14
+schema_version    = 15
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -68,6 +68,10 @@ schema 6 到 schema 11 继续采用顺序附加迁移：schema 7 增加通用关
 schema 10 重建 Tiga 策略表时，也会保留当前 reader 不认识但属于附加性质的有界字段；字段必须可空或带安全字面量默认值。无法安全重建的字段会在替换旧表前让事务失败，绝不会静默丢弃非关键字段。
 
 schema 12 增加本地稳定 commit 库存，迁移过程保持 commit 身份不变，并按照 parent-before-child 顺序回填。schema 13 增加状态 delta 批次库存、规范化 commit 关联、有界版本化信封规则，以及固定在迁移 commit 水位的 bootstrap floor。schema 14 为所有参与同步的核心状态族增加事务级逻辑变更采集；每个外层写事务提交前，MDBX 会对逻辑键去重，物化有界状态体，并将 commit 关联批次或 auxiliary 批次与业务行原子保存。创建或升级 vault 时产生的 bootstrap 变更会在同一事务中清除，因为这些状态已经由 floor 覆盖。迁移过程不会虚构历史 delta；早于 floor 的 checkpoint 继续使用有界完整状态完成首次同步。
+
+schema 15 增加 `sync_state_extensions`，用于保存 complete-state 顶层的有界未知字段。apply 只 upsert incoming state 实际携带的键，并与 commit 和业务行处于同一个事务；缺少某个键不表示删除，因此旧 peer 仅仅省略未来字段时不能擦除本地扩展。collect 按键顺序恢复值。迁移和 current-schema 验证共同执行 256 个字段、128-byte 键、64 KiB 聚合预算及既有嵌套深度限制。
+
+storage core 将扩展值视为 opaque JSON：只验证、保存和转发，不解释也不解密。opaque 不等于自动加密。非敏感的能力或版本元数据可以使用普通 JSON；密码、邮件正文、token 或其他敏感材料在进入未知扩展前，MUST 由扩展生产者封装为认证密文。这样旧 reader 才能在锁定状态保存未来敏感状态，同时不会自行产生明文。
 
 storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。
 
@@ -116,6 +120,7 @@ MDBX2 同时收紧以下实现边界：
 - 迁移不得修改现有 KDF 参数或 wrapped vault key；凭据相关升级只能在用户成功认证后执行。
 - CLI bundle apply 统一使用 `mdbx-storage::SyncApplyRepo`，不再维护独立 SQL 同步实现。
 - storage 可以原子接收有界、认证的状态 delta，保存收到的批次以便继续转发，保留稀疏 delta 未涉及的本地 tombstone，并单调合并 device revocation。同一个 commit 不得混用完整状态与 delta，既有完整状态仍保持兼容。
+- complete-state 未知扩展可经过 decode、事务 apply、数据库保存、collect 和重新编码而不丢失；incoming 中存在的键原子更新，缺失键保留本地值。
 - 可移植备份使用 SQLite online backup，完整包含已提交的 WAL 页面；发布前校验 SQLite 完整性、MDBX metadata 与 `vault_id`，转换为无需旁路文件的单文件，并拒绝替换任何已有目标文件。
 
 ## 6. 验收要求
