@@ -108,6 +108,18 @@ A `BoundedSyncBundle` is an offline commit transport with a hash-checked payload
 
 A `BoundedSyncState` is the complete state object carried inside a sync commit. Its JSON bytes and decoded row count are checked independently from the surrounding bundle. The default contract allows 96 MiB and 250,000 logical rows; explicit desktop callers may use the hard ceiling of 512 MiB and 2,000,000 rows. Reserved state object types require the exact `state` object ID and matching associated data. Exceeding a limit fails the enclosing apply transaction before any commit, tombstone, branch head, or object row remains visible.
 
+### IncrementalIntegrityRoot
+
+An `IncrementalIntegrityRoot` is the versioned sparse-Merkle digest of the
+authenticated logical state used for synchronization. Its leaves contain
+domain-separated stable keys and digests of canonical encrypted/state
+representations, never plaintext payloads. The root is updated in the same
+outer transaction as the mutation or sync apply through the sync-delta seam.
+It covers synchronized logical state, commit/delta anchors, and referenced
+ciphertext digests; external Provider bytes, OS state, and unregistered
+physical extension tables remain outside its proof and continue to use the
+explicit content manifest or Provider audits.
+
 ### HealthReport
 
 A `HealthReport` is a read-only structured diagnosis of vault integrity. Each issue has a stable severity, category, and description suitable for CLI output and native client presentation. Tombstone diagnostics compare exact typed markers with the current deletion state of every synchronized object family while recognizing unresolved delete-versus-modify conflicts as a temporary valid state.
@@ -151,6 +163,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 35. Reserved sync state types require object ID `state` and associated data equal to the exact object type. Unknown object types remain available to ordinary opaque payload handling.
 36. Generic UniFFI write operations are bounded before the vault write lock: defaults are 256 commands, 1 MiB per JSON payload, 8 MiB total JSON payload, and 16 MiB serialized intent. Explicit limits remain under hard ceilings.
 37. A bounded write operation streams its complete command serialization into the intent digest, accepts namespaced ObjectTypeIds, creates one commit, and rolls back every object and head when any command fails.
+38. An established IncrementalIntegrityRoot is updated atomically with every covered local or incoming state mutation; a root collection, encoding, authentication, or resource failure rolls back the enclosing transaction and never downgrades to an unverified warning.
 
 ## Module Architecture
 
@@ -181,6 +194,15 @@ Permanent purge receipts are applied before ordinary objects during complete syn
 ### Recovery and Health Module
 
 The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, typed tombstones, and permanent purge receipts. It reports missing markers for deleted rows, unexplained markers for active rows, duplicate markers, invalid receipt authentication tags, and active rows that contradict a permanent receipt. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
+
+### Integrity Root Module
+
+The Integrity Root Module owns the IncrementalIntegrityRoot tree, its bounded
+rebuild path, HMAC metadata, and verification status. It sits behind the
+transactional sync-delta seam rather than requiring each repository or Adapter
+to know about tree nodes. The existing content manifest remains the exact
+full-schema checkpoint, and the rollback anchor remains the external
+append-only inventory proof; neither is silently replaced by this Module.
 
 ### Capability Features
 

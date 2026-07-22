@@ -114,7 +114,7 @@ MDBX 必须坚持：
   UniFFI 提供，用于检测 append-only inventory 回退；显式 O(vault-size) vault content
   manifest v2 已覆盖主 schema、未知扩展表、generated/hidden columns 和 typed rows 的
   精确检查点，同时继续验证 v1 token；自动刷新的增量 whole-vault Merkle authentication
-  root 仍未完成。
+  root 仍未完成；覆盖契约已先记录在 ADR-0022，等待事务级 sparse-root 实现。
 - 加密上下文 AAD 已覆盖字段级；commit、bundle 与 snapshot 的认证边界已经进入兼容性规范，自动刷新的 whole-vault Merkle root 仍是下一层完整性工作。
 
 ### 3.6 Android 接入

@@ -86,6 +86,11 @@ CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpo
 
 认证 complete/incremental 信封分别使用 v7/v8；对应的 zstd 表示使用 v9/v10。既有逻辑 payload SHA-256 trailer 之后追加 HMAC-SHA-256，密钥取自 vault integrity subkey；tag 绑定版本化 domain、magic、version、20-byte 有界 header 区和逻辑 payload 摘要。密钥绝不会写入或随 bundle 传输。该机制只能证明信封由某个持有共享 vault key 的一方生成并绑定其元数据，不能识别具体设备；它也不提供传输保密性，不替代内部字段、commit 或 delta 的加密认证，因此 bundle 仍不得视为可公开文件。CLI 默认继续输出 legacy v3/v4，显式 `--compression zstd` 才输出 v5/v6，只有显式 `--authenticated` 才选择 v7-v10；apply 会自动使用已打开 vault 的 key，同时继续读取 v1-v6。
 
+拟议的 `IncrementalIntegrityRoot` 契约是 additive 的，并与 bundle capability
+分开。ADR-0022 定义通过 sync-delta capture 在同一个外层事务中更新的 sparse Merkle
+root，覆盖同步逻辑状态。在该 profile 建立前，O(vault-size) content manifest 仍是
+精确 schema 检查点；外部 Provider 原始字节和未注册物理扩展表不会被增量 root 默默声称覆盖。
+
 ### 3.1 真实发布 Golden Vault 与旧 Reader 边界
 
 仓库同时冻结 `crates/mdbx-storage/test-data/mdbx1-release-1.0.mdbx` 与 `mdbx1-draft-golden.mdbx`。release fixture 由历史 `MDBX1.0` tag（commit `1a43fa9e8e87eebf6d0e1b84543c3291d0b25142`）真实生成；DRAFT fixture 由同一个历史 reader 只修改 `vault_meta.format_version` 后 checkpoint 得到。两份 manifest 都记录不可变 SHA-256、测试专用解锁凭据，以及 project、entry、attachment 和 snapshot 的稳定 ID。

@@ -200,6 +200,14 @@ explicit O(vault-size) operation, not a routine commit hook. External Blob
 Provider bytes, OS state, and availability remain outside its boundary; an
 automatically refreshed incremental Merkle root is a separate future design.
 
+The contract for that future design is recorded in ADR-0022. It is an opt-in
+`IncrementalIntegrityRoot` over synchronized logical state, maintained through
+the transaction-level sync-delta seam with a sparse Merkle tree. It must not be
+implemented by recomputing the full manifest on every edit, and it must not be
+described as proof of external Provider bytes or arbitrary unregistered SQLite
+tables. Until the root profile is established, the explicit manifest and
+rollback-anchor mechanisms remain authoritative for their documented scopes.
+
 New issuance uses manifest profile v2. V2 reads `table_xinfo`, so ordinary,
 generated, and hidden columns are all represented, and orders typed values
 canonically even when nullable primary keys or declared collations do not form
