@@ -14,7 +14,15 @@ use crate::sync_delta::{
 };
 use crate::sync_state::{decode_sync_state_payload_with_limits, SyncStateLimits};
 
-use super::{key_epoch_apply, lifecycle_apply, state_apply, PayloadApplyResult, SyncApplyRepo};
+use super::{key_epoch_apply, lifecycle_apply, state_apply, SyncApplyRepo};
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct PayloadApplyResult {
+    pub(super) conflicts: u32,
+    pub(super) received_delta: bool,
+    pub(super) received_complete_state: bool,
+    pub(super) delta_commit_ids: Vec<String>,
+}
 
 pub(super) fn apply_fast_forward_payloads(
     conn: &VaultConnection,

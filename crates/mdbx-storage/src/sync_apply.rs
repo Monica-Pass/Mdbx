@@ -47,14 +47,6 @@ pub struct ApplyBatchResult {
 
 pub struct SyncApplyRepo;
 
-#[derive(Debug, Clone, Default)]
-struct PayloadApplyResult {
-    conflicts: u32,
-    received_delta: bool,
-    received_complete_state: bool,
-    delta_commit_ids: Vec<String>,
-}
-
 impl SyncApplyRepo {
     fn object_apply_decision(
         conn: &VaultConnection,
