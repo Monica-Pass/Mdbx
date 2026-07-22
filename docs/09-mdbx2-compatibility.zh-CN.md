@@ -77,6 +77,14 @@ storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object p
 
 CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpoint 后改用 bundle v4。未完成的 v4 传输会在 checkpoint 文件中保存 transfer ID、下一段序号和上一段 payload 摘要，后续导出与应用必须匹配同一条恢复链。没有 resume 字段的旧 checkpoint JSON 仍可读取。transport-neutral 同步客户端只有在双方同时声明 commit paging、delta paging、bundle v4 与 resume 四项能力时才选择 v4；支持 paging 的 Hello 不再携带旧的完整 commit ID 向量。旧 peer 或能力不完整的 peer 使用有界完整状态回退。
 
+### 3.1 真实发布 Golden Vault 与旧 Reader 边界
+
+仓库冻结 `crates/mdbx-storage/test-data/mdbx1-release-1.0.mdbx`。该文件由历史 `MDBX1.0` tag（commit `1a43fa9e8e87eebf6d0e1b84543c3291d0b25142`）真实生成；manifest 记录不可变 SHA-256、测试专用解锁凭据，以及 project、entry、attachment 和 snapshot 的稳定 ID。
+
+迁移回归会复制这组原始字节，确认 inspection 不修改文件，再执行 schema 1 到当前 schema 的升级；随后使用原 MDBX1 凭据解锁，逐项验证 project metadata、entry payload、project tag、内联附件内容、snapshot 身份，并比较升级前后的 commit 与 object-version 身份，最后验证重复升级幂等。
+
+另外，实测 `MDBX1.0` CLI 可以从已由当前 reader 升级的副本中列出该 project 和 entry。这只证明 MDBX1 物理兼容投影仍可读取，不表示旧 binary 是安全的 MDBX2 writer：旧代码不会执行 `min_writer_version` 门禁，也无法保存未来语义。vault 声明 `min_writer_version = MDBX-2` 后，旧 binary MUST NOT 再执行写入。
+
 ## 4. Schema 演进规则
 
 - 新字段 SHOULD 可空或带安全默认值。
