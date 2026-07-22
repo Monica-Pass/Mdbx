@@ -65,6 +65,8 @@ schema 5 随后以增量迁移升级到 schema 6，增加可空的 `commit_opera
 
 schema 6 到 schema 11 继续采用顺序附加迁移：schema 7 增加通用关系、标签和标签分配；schema 8 增加 tombstone 删除证明与设备确认；schema 9 增加永久清理凭证；schema 10 将 Attachment 纳入 Tiga scope；schema 11 增加一对一 `collection_profiles`。这些迁移均保留 `projects`、`entries` 和旧公开接口。
 
+schema 10 重建 Tiga 策略表时，也会保留当前 reader 不认识但属于附加性质的有界字段；字段必须可空或带安全字面量默认值。无法安全重建的字段会在替换旧表前让事务失败，绝不会静默丢弃非关键字段。
+
 schema 12 增加本地稳定 commit 库存，迁移过程保持 commit 身份不变，并按照 parent-before-child 顺序回填。schema 13 增加状态 delta 批次库存、规范化 commit 关联、有界版本化信封规则，以及固定在迁移 commit 水位的 bootstrap floor。schema 14 为所有参与同步的核心状态族增加事务级逻辑变更采集；每个外层写事务提交前，MDBX 会对逻辑键去重，物化有界状态体，并将 commit 关联批次或 auxiliary 批次与业务行原子保存。创建或升级 vault 时产生的 bootstrap 变更会在同一事务中清除，因为这些状态已经由 floor 覆盖。迁移过程不会虚构历史 delta；早于 floor 的 checkpoint 继续使用有界完整状态完成首次同步。
 
 storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v3 格式。
