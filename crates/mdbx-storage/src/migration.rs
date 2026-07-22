@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v11, v12, v13, v14, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v12, v13, v14, v15, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -25,6 +25,7 @@ pub const MIGRATION_COLLECTION_PROFILES: &str = "mdbx-2-collection-profiles-v1";
 pub const MIGRATION_COMMIT_INVENTORY: &str = "mdbx-2-commit-inventory-v1";
 pub const MIGRATION_SYNC_DELTA_BATCHES: &str = "mdbx-2-sync-delta-batches-v1";
 pub const MIGRATION_SYNC_DELTA_CAPTURE: &str = "mdbx-2-sync-delta-capture-v1";
+pub const MIGRATION_SYNC_STATE_EXTENSIONS: &str = "mdbx-2-sync-state-extensions-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[FIELD_KEY_EPOCHS_EXTENSION];
@@ -290,6 +291,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v12::create_extensions(conn)?;
         v13::create_extensions(conn)?;
         v14::create_extensions(conn)?;
+        v15::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
@@ -320,6 +322,12 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
              (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![MIGRATION_SYNC_DELTA_CAPTURE, from_format, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![MIGRATION_SYNC_STATE_EXTENSIONS, from_format, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
 
@@ -382,6 +390,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v12::create_extensions(conn)?;
         v13::create_extensions(conn)?;
         v14::create_extensions(conn)?;
+        v15::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -456,6 +465,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_SYNC_DELTA_CAPTURE, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_SYNC_STATE_EXTENSIONS, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
         conn.execute(
@@ -665,6 +680,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
         "sync_delta_batches",
         "sync_delta_batch_commits",
         "sync_delta_mutations",
+        "sync_state_extensions",
     ] {
         if !table_exists(conn, table)? {
             return Err(StorageError::Validation(format!(
@@ -675,6 +691,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
     v12::validate_commit_inventory(conn)?;
     v13::validate_sync_delta_schema(conn)?;
     v14::validate_sync_delta_capture(conn)?;
+    v15::validate_sync_state_extensions(conn)?;
     for column in [
         "operation_id",
         "commit_id",
@@ -956,7 +973,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
         let inventory_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -1129,7 +1146,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
@@ -1594,6 +1611,56 @@ mod tests {
         assert!(table_exists(&conn, "object_labels").unwrap());
         assert!(table_exists(&conn, "object_label_assignments").unwrap());
         assert!(table_exists(&conn, "commit_inventory").unwrap());
+        assert!(table_exists(&conn, "sync_state_extensions").unwrap());
+    }
+
+    #[test]
+    fn mdbx1_upgrade_creates_sync_state_extension_store() {
+        let conn = v1_database();
+
+        let info = upgrade_to_latest(&conn).unwrap().unwrap();
+
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&conn, "sync_state_extensions").unwrap());
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SYNC_STATE_EXTENSIONS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn schema14_upgrade_creates_sync_state_extension_store_idempotently() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        crate::init::initialize_vault(&conn, &crate::init::VaultInitParams::default()).unwrap();
+        conn.inner()
+            .execute_batch(
+                "DROP TABLE sync_state_extensions;
+                 DELETE FROM schema_migrations
+                 WHERE migration_id = 'mdbx-2-sync-state-extensions-v1';
+                 UPDATE vault_meta SET schema_version = 14;",
+            )
+            .unwrap();
+
+        let inspection = inspect_migration(conn.inner()).unwrap();
+        assert!(inspection.requires_upgrade);
+        let info = upgrade_to_latest(conn.inner()).unwrap().unwrap();
+        assert_eq!(info.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(conn.inner(), "sync_state_extensions").unwrap());
+
+        upgrade_to_latest(conn.inner()).unwrap();
+        let migration_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SYNC_STATE_EXTENSIONS],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 
     #[test]
