@@ -1008,6 +1008,103 @@ mod tests {
     }
 
     #[test]
+    fn stale_prune_plan_leaves_snapshots_and_commits_unchanged() {
+        let (conn, ctx) = setup();
+        let eligible_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        SnapshotRepo::create_automatic_snapshot(&conn, &ctx, &eligible_at).unwrap();
+        let evaluation_time = Utc::now().timestamp() + 3600;
+        let plan = SnapshotLifecycleRepo::plan_automatic_prune(&conn, 0, evaluation_time).unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+
+        SnapshotRepo::create_automatic_snapshot(&conn, &ctx, &eligible_at).unwrap();
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let device = DeviceContext {
+            device_id: Some("snapshot-lifecycle-device".to_string()),
+            assurance: DeviceAssurance::Standard,
+            ..Default::default()
+        };
+        let error = SnapshotLifecycleRepo::prune_automatic_authorized(
+            &conn,
+            &ctx,
+            &plan.plan_token,
+            0,
+            evaluation_time,
+            auth_context(&conn, &device, evaluation_time),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ConstraintViolation(message) if message.contains("stale")
+        ));
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            before_commits
+        );
+    }
+
+    #[test]
+    fn prune_denial_preserves_automatic_snapshot_rows_and_commit_history() {
+        let (conn, ctx) = setup();
+        let eligible_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let snapshot = SnapshotRepo::create_automatic_snapshot(&conn, &ctx, &eligible_at).unwrap();
+        let evaluation_time = Utc::now().timestamp() + 3600;
+        let plan = SnapshotLifecycleRepo::plan_automatic_prune(&conn, 0, evaluation_time).unwrap();
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let device = DeviceContext {
+            device_id: Some("snapshot-lifecycle-device".to_string()),
+            assurance: DeviceAssurance::Standard,
+            ..Default::default()
+        };
+        let error = SnapshotLifecycleRepo::prune_automatic_authorized(
+            &conn,
+            &ctx,
+            &plan.plan_token,
+            0,
+            evaluation_time,
+            TigaAuthorizationContext {
+                session: None,
+                device: &device,
+                now_unix_secs: evaluation_time,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+        assert!(SnapshotRepo::get_by_id(&conn, &snapshot.snapshot_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            before_commits
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM snapshot_lifecycle WHERE snapshot_id = ?1",
+                    params![snapshot.snapshot_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn automatic_creation_requires_tiga_and_records_create_snapshot_audit() {
         let (conn, ctx) = setup();
         let device = DeviceContext {

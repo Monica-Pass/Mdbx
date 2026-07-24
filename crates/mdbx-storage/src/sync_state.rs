@@ -1369,9 +1369,9 @@ pub(crate) fn load_branch_rows(conn: &VaultConnection) -> StorageResult<Vec<Bran
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
-    use crate::repo::CommitContext;
     #[cfg(feature = "derived-search-index")]
     use crate::repo::ProjectRepo;
+    use crate::repo::{CommitContext, SnapshotRepo};
     #[cfg(feature = "derived-search-index")]
     use crate::search::SearchService;
     use crate::unlock::UnlockService;
@@ -1576,6 +1576,30 @@ mod tests {
         assert_eq!(state.epochs[0].status, "active");
         assert!(state.integrity_tag.is_some());
         state.verify_integrity(&conn).unwrap();
+    }
+
+    #[test]
+    fn sync_state_excludes_local_snapshot_lifecycle_metadata() {
+        let (mut conn, ctx) = setup();
+        UnlockService::setup_password(&mut conn, "sync snapshot lifecycle password").unwrap();
+        let eligible_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let snapshot = SnapshotRepo::create_automatic_snapshot(&conn, &ctx, &eligible_at).unwrap();
+
+        let lifecycle_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_lifecycle WHERE snapshot_id = ?1",
+                [&snapshot.snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_count, 1);
+
+        let state = collect_sync_state(&conn).unwrap();
+        let encoded = serde_json::to_value(&state).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert!(!object.contains_key("snapshot_lifecycle"));
+        assert!(!object.contains_key("snapshots"));
     }
 
     #[test]

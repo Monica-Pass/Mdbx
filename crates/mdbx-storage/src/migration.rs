@@ -373,6 +373,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
             ],
         )
         .map_err(StorageError::Database)?;
+        validate_current_schema(conn)?;
         Ok(())
     })();
 
@@ -524,6 +525,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 now,
             ],
         )?;
+        validate_current_schema(conn)?;
         Ok(())
     })();
 
@@ -1701,7 +1703,9 @@ mod tests {
         fixture: &[u8],
         manifest_json: &str,
     ) {
-        use crate::repo::{AttachmentRepo, EntryRepo, ProjectRepo, SnapshotRepo};
+        use crate::repo::{
+            AttachmentRepo, EntryRepo, ProjectRepo, SnapshotLifecycleRepo, SnapshotRepo,
+        };
         use crate::unlock::UnlockService;
         use rusqlite::OpenFlags;
         use sha2::{Digest, Sha256};
@@ -1860,6 +1864,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|snapshot| snapshot.snapshot_id == manifest["snapshot_id"]));
+        let legacy_lifecycle =
+            SnapshotLifecycleRepo::get(&conn, manifest["snapshot_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            legacy_lifecycle.kind,
+            mdbx_core::model::SnapshotKind::Manual
+        );
+        assert!(legacy_lifecycle.retention_eligible_at.is_none());
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM snapshot_lifecycle", [], |row| row
+                    .get(0),)
+                .unwrap(),
+            0
+        );
 
         let after_counts: (i64, i64, i64, i64, i64) = conn
             .inner()
@@ -1924,6 +1944,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
+        let lifecycle_migration_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SNAPSHOT_LIFECYCLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_migration_count, 1);
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
@@ -1945,6 +1974,82 @@ mod tests {
             include_bytes!("../test-data/mdbx1-draft-golden.mdbx"),
             include_str!("../test-data/mdbx1-draft-golden.manifest.json"),
         );
+    }
+
+    #[test]
+    fn schema17_validation_failure_rolls_back_marker_and_migration_rows() {
+        use crate::init::{initialize_vault, VaultInitParams};
+        use crate::repo::SnapshotRepo;
+
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(
+            &conn,
+            &VaultInitParams {
+                device_id: "migration-rollback-device".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let snapshot = SnapshotRepo::create_snapshot(
+            &conn,
+            &crate::repo::CommitContext::new("migration-rollback-device".to_string()),
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "INSERT INTO snapshot_lifecycle
+                    (snapshot_id, snapshot_kind, retention_eligible_at,
+                     integrity_profile, integrity_tag)
+                 VALUES (?1, 'manual', NULL, 'hmac-sha256-v1', ?2)",
+                params![snapshot.snapshot_id, vec![0_u8; 32]],
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshot_lifecycle
+                 SET integrity_profile = 'tampered-profile'",
+                [],
+            )
+            .unwrap();
+        conn.inner()
+            .execute("UPDATE vault_meta SET schema_version = 16", [])
+            .unwrap();
+        let before_migrations: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        let error = upgrade_to_latest(conn.inner()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot_lifecycle contains invalid"));
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT schema_version FROM vault_meta", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            16
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            before_migrations
+        );
+        let profile: String = conn
+            .inner()
+            .query_row(
+                "SELECT integrity_profile FROM snapshot_lifecycle LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(profile, "tampered-profile");
     }
 
     #[test]
