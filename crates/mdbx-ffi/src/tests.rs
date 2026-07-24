@@ -2063,6 +2063,150 @@ fn conflict_facade_lists_and_resolves_generic_metadata() {
 }
 
 #[test]
+fn conflict_summary_facade_pages_filters_binds_cursors_and_exposes_limits() {
+    let conn = VaultConnection::open_in_memory().unwrap();
+    initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+    let ctx = CommitContext::new("ffi-conflict-summary-device".to_string());
+    let first = ConflictRepo::create(
+        &conn,
+        &ctx,
+        ConflictObjectType::Entry,
+        "entry-1",
+        "base-1",
+        "local-1",
+        "incoming-1",
+        &["payload.title".to_string()],
+    )
+    .unwrap();
+    let second = ConflictRepo::create(
+        &conn,
+        &ctx,
+        ConflictObjectType::Entry,
+        "entry-2",
+        "base-2",
+        "local-2",
+        "incoming-2",
+        &["payload.body".to_string()],
+    )
+    .unwrap();
+    let project = ConflictRepo::create(
+        &conn,
+        &ctx,
+        ConflictObjectType::Project,
+        "project-1",
+        "base-3",
+        "local-3",
+        "incoming-3",
+        &["title".to_string()],
+    )
+    .unwrap();
+    conn.inner()
+        .execute(
+            "UPDATE conflicts SET created_at = '2026-07-25T00:00:00Z' WHERE conflict_id IN (?1, ?2, ?3)",
+            rusqlite::params![&first.conflict_id, &second.conflict_id, &project.conflict_id],
+        )
+        .unwrap();
+
+    let vault = MdbxVault {
+        conn: Mutex::new(conn),
+        device_id: "ffi-conflict-summary-device".to_string(),
+        vault_id: "ffi-conflict-summary-vault".to_string(),
+    };
+
+    let limits = default_conflict_summary_limits();
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+    assert_eq!(limits.max_fields_json_bytes, 64 * 1024);
+    assert_eq!(limits.max_field_count, 256);
+    assert_eq!(limits.max_field_path_bytes, 4096);
+
+    let first_page = vault
+        .list_unresolved_conflict_summaries(Some("entry".to_string()), 1, None)
+        .unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    assert_eq!(first_page.items[0].object_type, "entry");
+    assert!(first_page.next_cursor.is_some());
+    let second_page = vault
+        .list_unresolved_conflict_summaries(
+            Some("entry".to_string()),
+            1,
+            first_page.next_cursor.clone(),
+        )
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert_eq!(second_page.items[0].object_type, "entry");
+    assert_ne!(
+        first_page.items[0].conflict_id,
+        second_page.items[0].conflict_id
+    );
+    assert!(second_page.next_cursor.is_none());
+    assert!(vault
+        .list_unresolved_conflict_summaries(Some("project".to_string()), 1, first_page.next_cursor,)
+        .is_err());
+    assert!(matches!(
+        vault.list_unresolved_conflict_summaries(Some("unknown".to_string()), 1, None),
+        Err(MdbxFfiError::InvalidConflictObjectType { object_type })
+            if object_type == "unknown"
+    ));
+
+    // The legacy complete read remains callable alongside the bounded plane.
+    assert_eq!(vault.list_unresolved_conflicts().unwrap().len(), 3);
+}
+
+#[test]
+fn conflict_summary_facade_fails_closed_for_oversized_and_malformed_fields() {
+    let conn = VaultConnection::open_in_memory().unwrap();
+    initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+    let ctx = CommitContext::new("ffi-conflict-summary-limits-device".to_string());
+    let conflict = ConflictRepo::create(
+        &conn,
+        &ctx,
+        ConflictObjectType::Entry,
+        "entry-1",
+        "base-1",
+        "local-1",
+        "incoming-1",
+        &["payload.title".to_string()],
+    )
+    .unwrap();
+    let vault = MdbxVault {
+        conn: Mutex::new(conn),
+        device_id: "ffi-conflict-summary-limits-device".to_string(),
+        vault_id: "ffi-conflict-summary-limits-vault".to_string(),
+    };
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE conflicts SET conflicting_fields = ?2 WHERE conflict_id = ?1",
+                rusqlite::params![&conflict.conflict_id, "x".repeat(64 * 1024 + 1)],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        vault.list_unresolved_conflict_summaries(None, 1, None),
+        Err(MdbxFfiError::Storage { message })
+            if message.contains("conflicting fields JSON bytes")
+    ));
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE conflicts SET conflicting_fields = 'not-json' WHERE conflict_id = ?1",
+                [&conflict.conflict_id],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        vault.list_unresolved_conflict_summaries(None, 1, None),
+        Err(MdbxFfiError::Storage { message })
+            if message.contains("invalid conflicting fields JSON")
+    ));
+}
+
+#[test]
 fn conflict_facade_applies_typed_project_and_attachment_custom_merges() {
     let conn = VaultConnection::open_in_memory().unwrap();
     initialize_vault(&conn, &VaultInitParams::default()).unwrap();

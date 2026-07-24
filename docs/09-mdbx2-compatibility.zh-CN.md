@@ -117,6 +117,14 @@ Collection、Object 和 Label 摘要 API 都是 additive 的 reader surface，�
 
 附件导航遵循同样的 additive 规则。`AttachmentSummaryRepo` 和 UniFFI 的 `MdbxAttachmentSummary` 方法按 Collection 或 Object 分页 active attachment，单独分页 deleted attachment，并按 ID 返回不读取 chunk/blob payload 的元数据。文件名明文最多 4096 个 UTF-8 bytes，media type 明文最多 512 bytes；密文投影预留共享 128 KiB 信封空间，并在认证解密后再次检查精确明文。超出这些限制的旧附件仍可通过 `AttachmentRepo::get_by_id`、`list_by_project`、`list_by_entry`、`list_deleted` 以及已有完整 FFI 方法读取。`attach list` 和 `attach deleted` 使用有界分页；内容导出、repair 和完整性校验继续使用完整路径。
 
+冲突导航遵循同样的 additive 规则。`ConflictSummaryRepo` 与 UniFFI 的
+`MdbxConflictSummary` 只分页 unresolved 冲突元数据，可以按核心冲突对象类型过滤，
+并把不透明游标绑定到该过滤条件以及 `created_at DESC, conflict_id DESC` keyset。
+有界投影把 `conflicting_fields` JSON 限制为 64 KiB，解码后的字段路径最多 256 项，
+单个路径最多 4096 个 UTF-8 bytes；SQL 不会物化超限 JSON。客户端通过
+`default_conflict_summary_limits` 发现契约。已有完整冲突读取和 typed resolution 方法
+继续作为显式解决、repair 和 export 路径；一个类型过滤器生成的游标不能复用于其他类型。
+
 仅增加或读取摘要不会修改 format marker、schema version、commit、object version、同步字段、snapshot 字段、密文或 key epoch。这同时保持 MDBX1 自动升级承诺和历史 reader 看到的物理兼容投影。
 
 ## 4. Schema 演进规则

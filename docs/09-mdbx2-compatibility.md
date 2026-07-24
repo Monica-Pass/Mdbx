@@ -90,6 +90,17 @@ New navigation applies fixed field and page limits. A legacy row outside those l
 
 Attachment navigation follows the same additive rule. `AttachmentSummaryRepo` and the UniFFI `MdbxAttachmentSummary` methods page active attachments by Collection or Object, page deleted attachments separately, and expose by-ID metadata without selecting chunk/blob payloads. File-name plaintext is limited to 4096 UTF-8 bytes and media type plaintext to 512 bytes; encrypted projections reserve the shared 128 KiB envelope allowance and recheck the exact plaintext after authenticated decryption. A legacy attachment outside those limits remains readable through `AttachmentRepo::get_by_id`, `list_by_project`, `list_by_entry`, `list_deleted`, and the existing complete FFI methods. `attach list` and `attach deleted` use the bounded pages, while content export, repair, and integrity verification keep the complete paths.
 
+Conflict navigation follows the same additive rule. `ConflictSummaryRepo` and
+the UniFFI `MdbxConflictSummary` methods page only unresolved conflict metadata,
+optionally filter by core conflict object type, and bind an opaque cursor to
+that filter and the `created_at DESC, conflict_id DESC` keyset. The bounded
+projection caps the stored `conflicting_fields` JSON at 64 KiB, the decoded
+path count at 256, and each path at 4096 UTF-8 bytes; SQL does not materialize
+an oversized JSON value. `default_conflict_summary_limits` publishes the
+contract. Existing complete conflict reads and typed resolution methods remain
+the explicit resolution, repair, and export path, and a cursor from one type
+filter cannot be reused for another.
+
 No format marker, schema version, commit, object version, synchronization field, snapshot field, ciphertext, or key epoch is changed merely by adding or reading a summary. This preserves both automatic MDBX1 upgrade guarantees and the physical projection observed by the historical reader.
 
 ## MDBX2 Consistency Changes

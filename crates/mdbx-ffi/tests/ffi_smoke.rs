@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
     default_attachment_batch_limits, default_attachment_presentation_limits,
-    default_composite_write_operation_limits, default_object_metadata_disclosure_limits,
-    default_write_operation_limits, inspect_vault_migration, open_vault,
-    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
-    MdbxAttachmentBatchCommand, MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest,
-    MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
-    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxObjectMetadataDisclosureLimits,
-    MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
-    MdbxUnlockMethodType, MdbxWriteCommand,
+    default_composite_write_operation_limits, default_conflict_summary_limits,
+    default_object_metadata_disclosure_limits, default_write_operation_limits,
+    inspect_vault_migration, open_vault, open_vault_with_password_security_key,
+    open_vault_with_security_key, upgrade_vault, MdbxAttachmentBatchCommand,
+    MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest, MdbxAuthorizationConstraintKind,
+    MdbxAuthorizationOutcome, MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext,
+    MdbxFfiError, MdbxObjectMetadataDisclosureLimits, MdbxPolicyCompliance, MdbxTigaMode,
+    MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use mdbx_storage::migration::CURRENT_SCHEMA_VERSION;
 use uuid::Uuid;
@@ -465,6 +465,35 @@ fn generic_metadata_summary_pages_are_available_to_external_clients() {
             .len(),
         1
     );
+}
+
+#[test]
+fn bounded_conflict_summary_api_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("conflict-summary");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "conflict summary password 12345!".to_string(),
+        "ffi-conflict-summary-device".to_string(),
+    )
+    .unwrap();
+
+    let limits = default_conflict_summary_limits();
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+    assert_eq!(limits.max_fields_json_bytes, 64 * 1024);
+    assert_eq!(limits.max_field_count, 256);
+    assert_eq!(limits.max_field_path_bytes, 4096);
+
+    let page = vault
+        .list_unresolved_conflict_summaries(None, 1, None)
+        .unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+    assert!(matches!(
+        vault.list_unresolved_conflict_summaries(Some("unknown".to_string()), 1, None),
+        Err(MdbxFfiError::InvalidConflictObjectType { object_type })
+            if object_type == "unknown"
+    ));
 }
 
 #[test]

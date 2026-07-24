@@ -79,6 +79,8 @@ pub enum MdbxFfiError {
     InvalidExtensionCapabilityId { capability_id: String },
     #[error("vault lock poisoned")]
     LockPoisoned,
+    #[error("invalid conflict object type: {object_type}")]
+    InvalidConflictObjectType { object_type: String },
 }
 
 impl From<StorageError> for MdbxFfiError {

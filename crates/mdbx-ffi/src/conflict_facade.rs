@@ -18,6 +18,38 @@ pub struct MdbxConflictRecord {
     pub resolved_at: Option<String>,
 }
 
+/// Bounded conflict metadata for queue navigation. This additive record does
+/// not replace the complete legacy conflict record used by resolution flows.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxConflictSummary {
+    pub conflict_id: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub base_commit_id: String,
+    pub local_commit_id: String,
+    pub incoming_commit_id: String,
+    pub conflicting_fields: Vec<String>,
+    pub resolution: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxConflictSummaryPage {
+    pub items: Vec<MdbxConflictSummary>,
+    pub next_cursor: Option<String>,
+}
+
+/// Fixed resource contract for bounded unresolved-conflict navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxConflictSummaryLimits {
+    pub max_page_size: u32,
+    pub max_cursor_bytes: u32,
+    pub max_fields_json_bytes: u64,
+    pub max_field_count: u32,
+    pub max_field_path_bytes: u64,
+}
+
 /// Client-editable project fields for an explicit custom conflict merge.
 ///
 /// The conflict ID supplies the project identity. Policy, clocks, collection
@@ -46,14 +78,30 @@ pub struct MdbxAttachmentConflictMerge {
     pub deleted: bool,
 }
 
-use mdbx_core::model::{Attachment, Conflict, ConflictObjectType, ConflictResolution};
+use mdbx_core::model::{
+    Attachment, Conflict, ConflictObjectType, ConflictResolution, ConflictSummary,
+    ConflictSummaryPage,
+};
 use mdbx_storage::error::StorageError;
 use mdbx_storage::repo::{
-    AttachmentRepo, CommitContext, ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo,
-    ObjectRelationRepo, ProjectRepo,
+    AttachmentRepo, CommitContext, ConflictRepo, ConflictSummaryRepo, ObjectLabelAssignmentRepo,
+    ObjectLabelRepo, ObjectRelationRepo, ProjectRepo, MAX_CONFLICT_SUMMARY_CURSOR_BYTES,
+    MAX_CONFLICT_SUMMARY_FIELDS_JSON_BYTES, MAX_CONFLICT_SUMMARY_FIELD_BYTES,
+    MAX_CONFLICT_SUMMARY_FIELD_COUNT, MAX_CONFLICT_SUMMARY_PAGE_SIZE,
 };
 
 use super::{parse_payload_json, parse_relation_kind, MdbxFfiError, MdbxVault};
+
+#[uniffi::export]
+pub fn default_conflict_summary_limits() -> MdbxConflictSummaryLimits {
+    MdbxConflictSummaryLimits {
+        max_page_size: MAX_CONFLICT_SUMMARY_PAGE_SIZE as u32,
+        max_cursor_bytes: MAX_CONFLICT_SUMMARY_CURSOR_BYTES as u32,
+        max_fields_json_bytes: MAX_CONFLICT_SUMMARY_FIELDS_JSON_BYTES as u64,
+        max_field_count: MAX_CONFLICT_SUMMARY_FIELD_COUNT as u32,
+        max_field_path_bytes: MAX_CONFLICT_SUMMARY_FIELD_BYTES as u64,
+    }
+}
 
 #[uniffi::export]
 impl MdbxVault {
@@ -63,6 +111,25 @@ impl MdbxVault {
             .iter()
             .map(conflict_record)
             .collect())
+    }
+
+    /// Page unresolved conflicts without selecting an unbounded conflict
+    /// payload. The optional object type is part of the opaque cursor query.
+    pub fn list_unresolved_conflict_summaries(
+        &self,
+        object_type: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxConflictSummaryPage, MdbxFfiError> {
+        let object_type = parse_optional_conflict_object_type(object_type)?;
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let page = ConflictSummaryRepo::list_unresolved_summaries(
+            &conn,
+            object_type.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(conflict_summary_page_from_core(page))
     }
 
     pub fn resolve_conflict(
@@ -255,6 +322,49 @@ impl MdbxVault {
             &merged,
         )?;
         Ok(conflict_record(&resolved))
+    }
+}
+
+fn parse_optional_conflict_object_type(
+    object_type: Option<String>,
+) -> Result<Option<ConflictObjectType>, MdbxFfiError> {
+    object_type
+        .as_deref()
+        .map(parse_conflict_object_type)
+        .transpose()
+}
+
+fn parse_conflict_object_type(value: &str) -> Result<ConflictObjectType, MdbxFfiError> {
+    value
+        .parse()
+        .map_err(|_| MdbxFfiError::InvalidConflictObjectType {
+            object_type: value.to_string(),
+        })
+}
+
+fn conflict_summary_page_from_core(page: ConflictSummaryPage) -> MdbxConflictSummaryPage {
+    MdbxConflictSummaryPage {
+        items: page
+            .items
+            .into_iter()
+            .map(conflict_summary_from_core)
+            .collect(),
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn conflict_summary_from_core(summary: ConflictSummary) -> MdbxConflictSummary {
+    MdbxConflictSummary {
+        conflict_id: summary.conflict_id,
+        object_type: summary.object_type.to_string(),
+        object_id: summary.object_id,
+        base_commit_id: summary.base_commit_id,
+        local_commit_id: summary.local_commit_id,
+        incoming_commit_id: summary.incoming_commit_id,
+        conflicting_fields: summary.conflicting_fields,
+        resolution: summary.resolution.to_string(),
+        created_at: summary.created_at,
+        resolved_at: summary.resolved_at,
     }
 }
 

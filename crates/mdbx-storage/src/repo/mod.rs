@@ -7,6 +7,7 @@ pub mod commit_ctx;
 pub mod commit_history;
 pub mod commit_inventory;
 pub mod conflict;
+pub mod conflict_summary;
 pub mod entry;
 pub mod object_label;
 pub mod object_metadata_summary;
@@ -38,6 +39,11 @@ pub use commit_inventory::{
     MAX_COMMIT_INVENTORY_TOKEN_BYTES,
 };
 pub use conflict::{ConflictCreateRequest, ConflictRepo};
+pub use conflict_summary::{
+    ConflictSummaryRepo, MAX_CONFLICT_SUMMARY_CURSOR_BYTES, MAX_CONFLICT_SUMMARY_FIELDS_JSON_BYTES,
+    MAX_CONFLICT_SUMMARY_FIELD_BYTES, MAX_CONFLICT_SUMMARY_FIELD_COUNT,
+    MAX_CONFLICT_SUMMARY_PAGE_SIZE,
+};
 pub use entry::{EntryCreateRequest, EntryRepo};
 pub use object_label::{
     ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,

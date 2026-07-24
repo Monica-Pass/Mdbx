@@ -147,6 +147,20 @@ deleted 方法，也不能用 offset 自行重建。CLI `entry deleted` 也使�
 
 没有 Profile 的 MDBX1 Collection 仍然有效，类型/版本字段为空。旧标题、label name 或引用超出固定展示限制时，只会在有界摘要路径返回 resource-limit error；完整兼容 API 仍可用于显式 repair/export，不能删除或重新解释其行为。
 
+### 3.2 有界冲突队列导航
+
+冲突管理页应调用 `list_unresolved_conflict_summaries`，可选传入核心对象类型
+（`project`、`entry`、`attachment`、`object-relation`、`object-label` 或
+`object-label-assignment`），页大小使用 1 到 200，并且只把同一查询返回的游标传回去。
+启动时调用 `default_conflict_summary_limits` 发现 200 条/页、游标 4096 bytes、
+字段 JSON 64 KiB、256 条路径和单路径 4096 bytes 的固定契约。
+
+`MdbxConflictSummary` 只用于队列导航与选择，包含稳定对象/commit 身份、有界冲突字段、
+解决状态和创建时间；它不授予明文披露权限，也不能替代 typed resolution 方法。游标是按
+`created_at DESC, conflict_id DESC` 排序的 live keyset position；同步、冲突解决或其他 metadata
+变更后必须丢弃，不能拿到另一个类型过滤器复用。旧行字段 JSON 损坏或超限时，有界页面可以
+失败关闭；完整 `list_unresolved_conflicts` 仍可用于显式 repair/export。
+
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
 Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN.md`。它记录 Android 端如何在 `MdbxRepository` / `MdbxVaultStore` 边界内处理 Room 索引、working copy、WebDAV、OneDrive、旧测试版 vault 和后续 FFI 迁移。
@@ -385,6 +399,11 @@ MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLi
 - 合并后写入新 commit
 
 冲突展示 SHOULD 使用字段化 diff，而不是把 JSON 或 SQL 当代码块丢给用户。
+
+队列较大时，先用 `list_unresolved_conflict_summaries` 填充分页列表，用户选中一条后再读取
+完整 typed state。解决必须调用现有 entry/project/attachment/relation/label/assignment 专用
+方法；不能只改 `conflicts.resolution`，也不能把摘要页当成 mutation 或授权结果。遇到
+resource-limit 或 malformed-row error 时，应显示需要 repair 的状态，而不是默认退回无界完整列表。
 
 ### 5.6 提交历史页
 

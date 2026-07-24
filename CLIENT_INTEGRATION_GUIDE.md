@@ -148,6 +148,26 @@ For attachment navigation, call `list_attachment_summaries(collection_id, object
 
 MDBX1 Collections without a Profile are valid and return empty type/version fields. A legacy title, label name, or reference outside the fixed presentation limit returns a resource-limit error only through the bounded summary path. The complete compatibility APIs remain available for explicit repair/export workflows and must not be removed or reinterpreted.
 
+### 3.2 Bounded Conflict Queue Navigation
+
+Conflict-management screens should call `list_unresolved_conflict_summaries`
+with an optional core object type (`project`, `entry`, `attachment`,
+`object-relation`, `object-label`, or `object-label-assignment`), a page size
+from 1 through 200, and the cursor returned by the same query. Call
+`default_conflict_summary_limits` at startup to discover the 200-row,
+4096-byte-cursor, 64 KiB-field-JSON, 256-path, and 4096-byte-per-path
+contract.
+
+`MdbxConflictSummary` is for queue navigation and selection. It includes
+stable object and commit identities, bounded field paths, resolution state, and
+creation time, but it does not authorize plaintext disclosure or replace the
+typed resolution methods. Cursors are live keyset positions ordered by
+`created_at DESC, conflict_id DESC`; discard them after a sync, conflict
+resolution, or other metadata mutation, and never reuse one with another type
+filter. A malformed or oversized legacy field list may fail on this bounded
+surface; the complete `list_unresolved_conflicts` method remains available for
+an explicit repair/export path.
+
 See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
 
 For the current Monica for Android MDBX 1.0 integration reference, see `docs/android/README.md`. It documents the Android-side `MdbxRepository` / `MdbxVaultStore` boundary, Room indexes, working-copy model, WebDAV, OneDrive, legacy test-version vaults, and future FFI migration path.
@@ -389,6 +409,13 @@ It must support:
 - write a new commit after resolution
 
 Conflict display should use parsed field diffs, not raw JSON or SQL code blocks.
+
+For a large queue, populate the page with `list_unresolved_conflict_summaries`
+and load complete typed state only after the user selects one row. Resolve via
+the existing entry/project/attachment/relation/label/assignment methods; never
+mark only `conflicts.resolution` and never treat a summary page as a mutation
+or authorization result. Show resource-limit or malformed-row errors as a
+repair-needed state rather than retrying with an unbounded list by default.
 
 ### 5.6 Commit History
 

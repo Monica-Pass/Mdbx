@@ -35,6 +35,7 @@
 - 创建、列出、更新、软删除、恢复、移动 generic entry
 - 创建、查询、更新和删除通用关系、标签及标签分配
 - 列出未解决冲突，并对 project、entry、attachment、关系、标签和标签分配执行本地优先或传入优先解决
+- 按可选对象类型过滤分页有界 unresolved 冲突摘要，并发现固定 limits 契约
 - 应用经过验证的自定义 payload 或通用元数据冲突解决状态
 
 当前还没有暴露：
@@ -82,6 +83,13 @@ vault critical extension、授予密钥访问或协商 peer 会话。
 调用 `default_presentation_metadata_limits` 获取固定契约：标题明文 64 KiB、label name 明文 512 bytes、UTF-8 引用 4096 bytes、每页最多 200 条摘要、游标最多 4096 bytes。旧行超出展示限制时，有界摘要路径失败关闭；完整兼容读取仍可用于显式 repair/export。
 
 `MdbxAttachmentSummary` 是附件导航的有界记录。Collection 使用 `object_id = None` 调用 `list_attachment_summaries`，Object 传入 Object ID；tombstone 使用 `list_deleted_attachment_summaries`，按 ID 的元数据使用 `get_attachment_summary`。记录包含经过认证的文件名/media type、归属、存储模式、content hash、大小、chunk 数、head commit、删除状态和更新时间，但绝不包含 chunk 内容或 external blob 引用。`default_attachment_presentation_limits` 返回文件名 4096 bytes、media type 512 bytes、共享 128 KiB 密文信封预留、每页 200 条和游标 4096 bytes 的契约。已有完整 attachment 方法继续作为兼容以及显式内容/repair 路径。
+
+`MdbxConflictSummary` 是有界 unresolved 冲突队列记录。调用
+`list_unresolved_conflict_summaries(object_type, page_size, cursor)` 时可以传入核心对象类型，
+返回的游标只能用于完全相同的查询。`default_conflict_summary_limits` 返回每页 200 条、游标
+4096 bytes、字段 JSON 64 KiB、最多 256 条路径以及单路径 4096 bytes 的契约。摘要包含稳定
+对象/commit 身份和有界字段路径，但不代表明文披露或解决操作；已有完整冲突读取和 typed
+resolution 方法继续作为兼容、repair 和 mutation 路径。
 
 客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
 
@@ -202,6 +210,7 @@ entry 返回时，`payload_json` 会从已存 JSON 值重新序列化。不要�
 - `Storage { message }`：storage、unlock、constraint 或 repository 失败
 - `Serialization { message }`：输入 JSON 非法，或已存 JSON 无法解析
 - `InvalidEntryType { entry_type }`：未知 entry type 字符串
+- `InvalidConflictObjectType { object_type }`：未知冲突对象类型过滤器
 - `InvalidCollectionTypeId { collection_type_id }`：Collection 类型缺少有效命名空间
 - `InvalidExtensionCapabilityId { capability_id }`：扩展能力标识无效
 - `LockPoisoned`：内部 vault mutex 被 poison

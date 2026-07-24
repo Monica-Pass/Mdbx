@@ -35,6 +35,7 @@ The exported boundary covers:
 - create, list, update, soft-delete, restore, and move generic entries
 - create, query, update, and delete generic relations, labels, and label assignments
 - list unresolved conflicts and resolve project, entry, attachment, relation, label, and assignment conflicts with local-wins or incoming-wins
+- page bounded unresolved conflict summaries with optional object-type filtering and discover the fixed limits contract
 - apply validated custom payload or generic metadata conflict resolutions
 
 The boundary does not currently expose:
@@ -84,6 +85,16 @@ peer session.
 Call `default_presentation_metadata_limits` to discover the fixed contract: 64 KiB title plaintext, 512-byte label-name plaintext, 4096 UTF-8-byte references, 200 summary rows per page, and 4096-byte cursors. A legacy row outside a presentation limit fails closed on the bounded summary path; complete compatibility reads remain available for explicit repair/export.
 
 `MdbxAttachmentSummary` is the bounded attachment navigation record. Use `list_attachment_summaries` with `object_id = None` for a Collection or an Object ID for an Object, `list_deleted_attachment_summaries` for tombstones, and `get_attachment_summary` for by-ID metadata. The record contains authenticated file name/media type, ownership, storage mode, content hash, sizes, chunk count, head commit, deletion state, and update time, but never chunk bodies or external blob references. `default_attachment_presentation_limits` reports a 4096-byte file-name limit, 512-byte media-type limit, shared 128 KiB ciphertext-envelope allowance, a 200-row page ceiling, and a 4096-byte cursor ceiling. Existing complete attachment methods remain the compatibility and explicit content/repair path.
+
+`MdbxConflictSummary` is the bounded unresolved-conflict queue record. Call
+`list_unresolved_conflict_summaries(object_type, page_size, cursor)` with an
+optional core object type and reuse the returned cursor only for that exact
+query. `default_conflict_summary_limits` reports the 200-row page ceiling,
+4096-byte cursor ceiling, 64 KiB stored field-JSON ceiling, 256-path ceiling,
+and 4096-byte per-path ceiling. The summary contains stable object/commit
+identities and bounded field paths, but is not a plaintext disclosure or
+resolution operation. Existing complete conflict reads and typed resolution
+methods remain the explicit compatibility, repair, and mutation paths.
 
 Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
 
@@ -206,6 +217,7 @@ All exported functions return `Result<_, MdbxFfiError>`.
 - `Storage { message }`: storage, unlock, constraint, or repository failure
 - `Serialization { message }`: invalid JSON input or invalid stored JSON
 - `InvalidEntryType { entry_type }`: unknown entry type string
+- `InvalidConflictObjectType { object_type }`: unknown conflict object type filter
 - `InvalidCollectionTypeId { collection_type_id }`: invalid or non-namespaced Collection type
 - `InvalidExtensionCapabilityId { capability_id }`: invalid extension capability identifier
 - `LockPoisoned`: the internal vault mutex was poisoned

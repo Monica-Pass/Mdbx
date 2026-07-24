@@ -97,6 +97,18 @@ A `CommitOperation` is one finite user intent executed atomically and represente
 
 A `ConflictResolutionOperation` selects local state, incoming state, or a validated custom state for one conflicted object. It atomically writes the selected state, creates a two-parent merge commit, advances the object clock and heads, records a new ObjectVersion, reconciles tombstones, and marks the conflict resolved.
 
+### ConflictSummary
+
+A `ConflictSummary` is the bounded, payload-free navigation projection of one
+unresolved conflict. It carries stable object and commit identities, the
+bounded conflicting-field paths, resolution state, and creation position, but
+it is not a resolution payload. Summary pages use a 1–200 row keyset contract
+ordered by `created_at DESC, conflict_id DESC`; their cursors bind the
+unresolved query and optional conflict object-type filter. The projection
+limits the stored field JSON to 64 KiB, the path count to 256, and each path to
+4096 UTF-8 bytes. Complete conflict reads remain the explicit compatibility
+and resolution path.
+
 ### TombstoneState
 
 `TombstoneState` is the complete current deletion-marker collection projected into synchronization state. Per-commit tombstones remain compatible delete-event records. A present complete collection, including an empty collection, is authoritative only during conflict-free fast-forward application and therefore communicates both deletion and revival without discarding divergent local deletion state.
@@ -180,6 +192,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 37. A bounded write operation streams its complete command serialization into the intent digest, accepts namespaced ObjectTypeIds, creates one commit, and rolls back every object and head when any command fails.
 38. An established IncrementalIntegrityRoot is updated atomically with every covered local or incoming state mutation; a root collection, encoding, authentication, or resource failure rolls back the enclosing transaction and never downgrades to an unverified warning.
 39. Attachment navigation is metadata-only and bounded: summary SQL never selects chunk/blob payloads, checks encrypted display-field length before materialization, and rechecks authenticated plaintext limits after decryption. Complete attachment APIs remain available without reinterpretation.
+40. Conflict navigation is metadata-only and bounded: unresolved summary SQL projects conflicting-field length before materialization, enforces 64 KiB/256-path/4096-byte limits, and binds cursors to the query filter. Complete conflict reads and typed resolution APIs remain available without reinterpretation.
 
 ## Module Architecture
 
@@ -200,6 +213,10 @@ Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payloa
 ### Conflict Resolution Module
 
 The Conflict Resolution Module loads authenticated local and incoming ObjectVersions, validates identity and ownership constraints, and applies LocalWins, IncomingWins, or Custom state through one transaction. ObjectRelations, ObjectLabels, and ObjectLabelAssignments use the same merge-commit and tombstone rules as legacy projects, entries, and attachments. Duplicate assignment UUIDs for the same logical object-label membership are mapped to the local logical identity before resolution.
+
+Its navigation plane is intentionally separate: generic clients page
+`ConflictSummary` records through the bounded repository/FFI surface, then
+load complete typed state only for an explicit resolution or repair action.
 
 The synchronization state carries an optional complete TombstoneState. New producers always emit it. Legacy payloads omit it and retain their existing per-commit delete-event behavior. Receivers replace the complete collection only for conflict-free fast-forward commits; divergent commits continue to preserve local markers until a merge resolution becomes authoritative.
 

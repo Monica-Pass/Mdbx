@@ -268,6 +268,31 @@ pub struct Conflict {
     pub resolved_at: Option<String>,
 }
 
+/// 有界冲突导航摘要。
+///
+/// 与完整 [`Conflict`] 相比，摘要只允许 storage 层合同范围内的冲突字段
+/// 路径，供列表/选择界面使用；它不改变冲突解决所需的完整读取 API。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictSummary {
+    pub conflict_id: String,
+    pub object_type: ConflictObjectType,
+    pub object_id: String,
+    pub base_commit_id: CommitId,
+    pub local_commit_id: CommitId,
+    pub incoming_commit_id: CommitId,
+    pub conflicting_fields: Vec<String>,
+    pub resolution: ConflictResolution,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+/// 有界 unresolved conflict 摘要页。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictSummaryPage {
+    pub items: Vec<ConflictSummary>,
+    pub next_cursor: Option<String>,
+}
+
 /// 冲突涉及的对象类型。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -357,6 +382,25 @@ impl std::str::FromStr for ConflictResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_summary_roundtrips_without_changing_complete_conflict_shape() {
+        let summary = ConflictSummary {
+            conflict_id: "conflict-1".to_string(),
+            object_type: ConflictObjectType::Entry,
+            object_id: "entry-1".to_string(),
+            base_commit_id: "base-1".to_string(),
+            local_commit_id: "local-1".to_string(),
+            incoming_commit_id: "incoming-1".to_string(),
+            conflicting_fields: vec!["payload.password".to_string()],
+            resolution: ConflictResolution::Unresolved,
+            created_at: "2026-07-25T00:00:00Z".to_string(),
+            resolved_at: None,
+        };
+        let encoded = serde_json::to_vec(&summary).unwrap();
+        let decoded: ConflictSummary = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, summary);
+    }
 
     #[test]
     fn legacy_vault_meta_defaults_to_mdbx1_compatibility() {
