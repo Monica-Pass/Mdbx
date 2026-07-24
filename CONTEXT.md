@@ -26,6 +26,12 @@ Profile existence is monotonic and CollectionTypeId is immutable. Payload schema
 
 A `CollectionTypeId` is the exact namespaced identity of a Collection contract, such as `com.monica.mail`, `com.monica.bookmark`, or `com.monica.steam`. It is separate from ObjectTypeId because one Collection can accept several related object contracts.
 
+### CollectionSummary
+
+A `CollectionSummary` is the bounded, payload-free discovery projection of a Collection. It contains stable identity, decrypted title, optional CollectionProfile type/version, group and icon references, favorite/archive state, attachment count, head commit, deletion state, and update time. It never selects the legacy Project summary or the CollectionProfile payload.
+
+Active and deleted Collections use separate keyset-paginated queries. This lets a reopened generic client discover password, bookmark, mail, Steam, and future adapter Collections without remembering IDs or loading complete Projects.
+
 ### ExtensionCapabilityId
 
 An `ExtensionCapabilityId` identifies adapter code available in the current client process, such as `com.monica.mail.store`. Capability declarations are not persisted as authority and do not grant key access. A connection registers the capabilities its adapters actually provide; the Generic Object Module rejects user-visible writes when a CollectionProfile requires capabilities absent from that connection. Locked synchronization, backup, snapshot, health inspection, and opaque preservation remain available without the adapter.

@@ -891,6 +891,90 @@ fn attachment_facade_honors_collection_capability_trimming() {
 }
 
 #[test]
+fn collection_summary_ffi_discovers_profiles_pages_tombstones_and_limits() {
+    let vault = ffi_test_vault();
+    let first = vault.create_project("Mail".to_string()).unwrap();
+    let second = vault.create_project("Bookmarks".to_string()).unwrap();
+    vault
+        .set_collection_profile(
+            first.project_id.clone(),
+            "com.monica.mail".to_string(),
+            b"secret profile payload".to_vec(),
+            7,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    let limits = default_presentation_metadata_limits();
+    assert_eq!(limits.max_title_bytes, 64 * 1024);
+    assert_eq!(limits.max_label_name_bytes, 512);
+    assert_eq!(limits.max_reference_bytes, 4096);
+    assert_eq!(limits.max_collection_summary_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+
+    let first_page = vault.list_collection_summaries(1, None).unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    let active_cursor = first_page.next_cursor.clone().unwrap();
+    let second_page = vault
+        .list_collection_summaries(1, Some(active_cursor.clone()))
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    let mut discovered = vec![
+        first_page.items[0].collection_id.clone(),
+        second_page.items[0].collection_id.clone(),
+    ];
+    discovered.sort();
+    let mut expected = vec![first.project_id.clone(), second.project_id.clone()];
+    expected.sort();
+    assert_eq!(discovered, expected);
+
+    let summary = vault
+        .get_collection_summary(first.project_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.title, "Mail");
+    assert_eq!(
+        summary.collection_type_id.as_deref(),
+        Some("com.monica.mail")
+    );
+    assert_eq!(summary.profile_schema_version, Some(7));
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE collection_profiles SET payload_ct = X'00' WHERE project_id = ?1",
+                [&first.project_id],
+            )
+            .unwrap();
+        ProjectRepo::soft_delete(
+            &conn,
+            &CommitContext::new("ffi-collection-summary-delete".to_string()),
+            &second.project_id,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        vault
+            .get_collection_summary(first.project_id)
+            .unwrap()
+            .unwrap()
+            .title,
+        "Mail"
+    );
+    let deleted = vault.list_deleted_collection_summaries(10, None).unwrap();
+    assert_eq!(deleted.items.len(), 1);
+    assert_eq!(deleted.items[0].collection_id, second.project_id);
+    assert!(deleted.items[0].deleted);
+    assert!(vault
+        .list_deleted_collection_summaries(1, Some(active_cursor))
+        .is_err());
+    assert!(vault.list_collection_summaries(0, None).is_err());
+}
+
+#[test]
 fn collection_profile_facade_registers_capabilities_and_guards_object_types() {
     let conn = VaultConnection::open_in_memory().unwrap();
     initialize_vault(&conn, &VaultInitParams::default()).unwrap();

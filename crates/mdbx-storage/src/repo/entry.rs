@@ -299,6 +299,33 @@ impl EntryRepo {
             .transpose()
     }
 
+    /// Return the optional stored title ciphertext length without materializing the BLOB.
+    pub(crate) fn title_ciphertext_len(
+        conn: &VaultConnection,
+        entry_id: &str,
+    ) -> StorageResult<Option<u64>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT length(title_ct) FROM entries WHERE entry_id = ?1",
+                params![entry_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(StorageError::Database)?
+            .flatten();
+
+        stored
+            .map(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Validation(format!(
+                        "entry {entry_id} has a negative title ciphertext length"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Return the stored payload ciphertext length without materializing the BLOB.
     ///
     /// This projection is intentionally separate from `get_by_id` so authorized

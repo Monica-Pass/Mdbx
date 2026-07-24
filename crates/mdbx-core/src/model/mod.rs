@@ -9,9 +9,9 @@ pub mod unlock;
 
 pub use attachment::Attachment;
 pub use collection::{
-    CollectionProfile, CollectionTypeId, ExtensionCapabilityId,
-    MAX_COLLECTION_PROFILE_CAPABILITIES, MAX_COLLECTION_PROFILE_OBJECT_TYPES,
-    MAX_COLLECTION_PROFILE_PAYLOAD_BYTES,
+    CollectionProfile, CollectionSummary, CollectionSummaryPage, CollectionTypeId,
+    ExtensionCapabilityId, MAX_COLLECTION_PROFILE_CAPABILITIES,
+    MAX_COLLECTION_PROFILE_OBJECT_TYPES, MAX_COLLECTION_PROFILE_PAYLOAD_BYTES,
 };
 pub use commit::{
     ChangeScope, Commit, CommitKind, CommitParent, Conflict, ConflictObjectType,

@@ -29,6 +29,7 @@
 - 通过已授权 storage API 列出和删除解锁方式
 - 通过 Tiga 授权轮换数据密钥 epoch，并返回旧 epoch、新 active epoch、rotation commit 与时间戳
 - 创建 project
+- 通过有界、无 payload 的摘要页发现 active 和 deleted Collection
 - 注册当前客户端实际提供的扩展能力，读取或设置 Collection Profile
 - 创建、列出、更新、软删除、恢复、移动 generic entry
 - 创建、查询、更新和删除通用关系、标签及标签分配
@@ -37,7 +38,7 @@
 
 当前还没有暴露：
 
-- project 列表、更新、删除流程
+- project 更新、删除流程
 - 除 project container 之外的嵌套文件夹专用操作
 - tag
 - attachment 与 attachment content
@@ -74,6 +75,10 @@ vault critical extension、授予密钥访问或协商 peer 会话。
 - `title`
 
 `MdbxCollectionProfile` 包含 Collection 的命名空间类型、版本化二进制加密配置、允许的 ObjectTypeId、所需 ExtensionCapabilityId，以及创建和更新时间设备信息。
+
+`MdbxCollectionSummary` 是顶层导航的默认记录。它包含 Collection ID、有界标题、可选 Profile 类型/版本、group/icon 引用、收藏/归档状态、附件计数、head commit、删除状态和更新时间，绝不包含 `summary_ct` 或 Profile payload。`list_collection_summaries` 与 `list_deleted_collection_summaries` 的页大小范围为 1 到 200；返回游标只能用于同一查询。`get_collection_summary` 可以按 ID 返回 tombstone。
+
+调用 `default_presentation_metadata_limits` 获取固定契约：标题明文 64 KiB、label name 明文 512 bytes、UTF-8 引用 4096 bytes、每页最多 200 条摘要、游标最多 4096 bytes。旧行超出展示限制时，有界摘要路径失败关闭；完整兼容读取仍可用于显式 repair/export。
 
 客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
 

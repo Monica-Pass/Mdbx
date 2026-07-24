@@ -6,6 +6,10 @@ use mdbx_core::model::{ObjectSummary, ObjectSummaryPage, ObjectTypeId};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::presentation_metadata::{
+    bounded_optional_ciphertext, enforce_plaintext_length, max_field_ciphertext_bytes,
+    MAX_PRESENTATION_TITLE_BYTES,
+};
 use crate::repo::entry::EntryRepo;
 
 pub const MAX_OBJECT_SUMMARY_PAGE_SIZE: usize = 200;
@@ -27,6 +31,7 @@ struct RawObjectSummary {
     object_id: String,
     collection_id: String,
     object_type_id: String,
+    title_ciphertext_bytes: Option<i64>,
     title_ct: Option<Vec<u8>>,
     payload_schema_version: u32,
     head_commit_id: String,
@@ -46,10 +51,15 @@ impl ObjectSummaryRepo {
         let raw = conn
             .inner()
             .query_row(
-                "SELECT entry_id, project_id, entry_type, title_ct,
+                "SELECT entry_id, project_id, entry_type, length(title_ct),
+                        CASE WHEN title_ct IS NULL OR length(title_ct) <= ?2
+                             THEN title_ct END,
                         payload_schema_version, head_commit_id, deleted, updated_at
                  FROM entries WHERE entry_id = ?1",
-                [object_id],
+                rusqlite::params![
+                    object_id,
+                    max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES) as i64,
+                ],
                 read_raw_summary,
             )
             .optional()
@@ -74,7 +84,9 @@ impl ObjectSummaryRepo {
             .map(|value| parse_cursor(value, collection_id, object_type_value))
             .transpose()?;
         let mut stmt = conn.inner().prepare(
-            "SELECT entry_id, project_id, entry_type, title_ct,
+            "SELECT entry_id, project_id, entry_type, length(title_ct),
+                    CASE WHEN title_ct IS NULL OR length(title_ct) <= ?5
+                         THEN title_ct END,
                     payload_schema_version, head_commit_id, deleted, updated_at
              FROM entries
              WHERE deleted = 0 AND project_id = ?1
@@ -82,7 +94,7 @@ impl ObjectSummaryRepo {
                AND (?3 IS NULL OR updated_at < ?3
                     OR (updated_at = ?3 AND entry_id < ?4))
              ORDER BY updated_at DESC, entry_id DESC
-             LIMIT ?5",
+             LIMIT ?6",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -90,6 +102,7 @@ impl ObjectSummaryRepo {
                 object_type_value,
                 cursor.as_ref().map(|cursor| cursor.updated_at.as_str()),
                 cursor.as_ref().map(|cursor| cursor.object_id.as_str()),
+                max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES) as i64,
                 (page_size + 1) as i64,
             ],
             read_raw_summary,
@@ -119,18 +132,19 @@ impl ObjectSummaryRepo {
 }
 
 fn read_raw_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawObjectSummary> {
-    let payload_schema_version = row.get::<_, i64>(4)?;
+    let payload_schema_version = row.get::<_, i64>(5)?;
     Ok(RawObjectSummary {
         object_id: row.get(0)?,
         collection_id: row.get(1)?,
         object_type_id: row.get(2)?,
-        title_ct: row.get(3)?,
+        title_ciphertext_bytes: row.get(3)?,
+        title_ct: row.get(4)?,
         payload_schema_version: u32::try_from(payload_schema_version).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
         })?,
-        head_commit_id: row.get(5)?,
-        deleted: row.get::<_, i32>(6)? != 0,
-        updated_at: row.get(7)?,
+        head_commit_id: row.get(6)?,
+        deleted: row.get::<_, i32>(7)? != 0,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -139,11 +153,23 @@ fn decode_summary(conn: &VaultConnection, row: RawObjectSummary) -> StorageResul
         .object_type_id
         .parse::<ObjectTypeId>()
         .map_err(StorageError::Validation)?;
-    let title = row
-        .title_ct
+    let title_ct = bounded_optional_ciphertext(
+        "object title ciphertext bytes",
+        row.title_ciphertext_bytes,
+        row.title_ct,
+        MAX_PRESENTATION_TITLE_BYTES,
+    )?;
+    let title = title_ct
         .as_deref()
         .map(|ciphertext| EntryRepo::decrypt_metadata(conn, &row.object_id, "title", ciphertext))
         .transpose()?;
+    if let Some(title) = title.as_deref() {
+        enforce_plaintext_length(
+            "object title plaintext bytes",
+            title.len() as u64,
+            MAX_PRESENTATION_TITLE_BYTES,
+        )?;
+    }
     Ok(ObjectSummary {
         object_id: row.object_id,
         collection_id: row.collection_id,
@@ -347,6 +373,66 @@ mod tests {
         assert_eq!(summary.title.as_deref(), Some(b"Deleted title".as_slice()));
         assert!(summary.deleted);
         assert!(EntryRepo::get_by_id(&conn, &summary.object_id).is_err());
+    }
+
+    #[test]
+    fn presentation_object_summary_bounds_title_ciphertext_and_plaintext() {
+        let (conn, ctx, collection_id, _) = setup();
+        let oversized_ciphertext = EntryRepo::create(
+            &conn,
+            &ctx,
+            &collection_id,
+            ObjectTypeId::Login,
+            Some("Oversized ciphertext"),
+            &serde_json::json!({"password":"secret"}),
+        )
+        .unwrap();
+        let ciphertext_bytes = max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES) + 1;
+        conn.inner()
+            .execute(
+                "UPDATE entries SET title_ct = zeroblob(?2) WHERE entry_id = ?1",
+                rusqlite::params![&oversized_ciphertext.entry_id, ciphertext_bytes as i64],
+            )
+            .unwrap();
+
+        let error = ObjectSummaryRepo::get(&conn, &oversized_ciphertext.entry_id).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object title ciphertext bytes"
+                && actual == ciphertext_bytes
+                && limit == max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES)
+        ));
+        assert!(matches!(
+            ObjectSummaryRepo::list(&conn, &collection_id, None, 10, None),
+            Err(StorageError::ResourceLimit { ref resource, .. })
+                if resource == "object title ciphertext bytes"
+        ));
+
+        let long_title = "x".repeat(MAX_PRESENTATION_TITLE_BYTES as usize + 1);
+        let oversized_plaintext = EntryRepo::create(
+            &conn,
+            &ctx,
+            &collection_id,
+            ObjectTypeId::Login,
+            Some(&long_title),
+            &serde_json::json!({"password":"secret"}),
+        )
+        .unwrap();
+        let error = ObjectSummaryRepo::get(&conn, &oversized_plaintext.entry_id).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object title plaintext bytes"
+                && actual == MAX_PRESENTATION_TITLE_BYTES + 1
+                && limit == MAX_PRESENTATION_TITLE_BYTES
+        ));
     }
 
     #[test]

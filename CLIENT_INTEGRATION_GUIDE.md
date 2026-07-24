@@ -127,6 +127,14 @@ Clients should prefer storage / repository APIs over hand-written SQL.
 
 When using `mdbx-ffi`, treat it as the client boundary for Vault, Collection Profile, and ObjectRecord operations. A domain Adapter registers the ExtensionCapabilityIds actually present in the current process before mutating a profiled Collection. Missing Adapters preserve unknown ciphertext and must not be bypassed by false capability declarations. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods and tests instead of writing the corresponding SQLite tables from the client.
 
+### 3.1 Bounded Collection Discovery
+
+After reopening a vault, use `get_collection_summary`, `list_collection_summaries`, and `list_deleted_collection_summaries` to build the top-level navigation tree. These methods discover password, bookmark, mail, Steam, and future adapter Collections without remembering IDs or reading complete Projects. Each page contains at most 200 payload-free summaries and returns an opaque cursor no larger than 4096 bytes; the cursor is tied to its active/deleted query and must be discarded after metadata mutations.
+
+`MdbxCollectionSummary` contains the Collection ID, title, optional CollectionProfile type/version, group/icon references, favorite/archive state, attachment count, head commit, deletion state, and update time. It never contains `summary_ct` or CollectionProfile payload. Call `default_presentation_metadata_limits` to discover the fixed display contract: 64 KiB title plaintext, 512-byte label name plaintext, and 4096 UTF-8-byte group/icon references. New screens should page summaries, then page Object and Label summaries; they should not use complete list methods as a default navigation path.
+
+MDBX1 Collections without a Profile are valid and return empty type/version fields. A legacy title, label name, or reference outside the fixed presentation limit returns a resource-limit error only through the bounded summary path. The complete compatibility APIs remain available for explicit repair/export workflows and must not be removed or reinterpreted.
+
 See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
 
 For the current Monica for Android MDBX 1.0 integration reference, see `docs/android/README.md`. It documents the Android-side `MdbxRepository` / `MdbxVaultStore` boundary, Room indexes, working-copy model, WebDAV, OneDrive, legacy test-version vaults, and future FFI migration path.

@@ -127,6 +127,14 @@ MDBX 不是“把密码表塞进一个 SQLite 文件”。
 
 使用 `mdbx-ffi` 时，应把它视为 Vault、Collection Profile 和 ObjectRecord 操作的客户端边界。领域 Adapter 在修改 profiled Collection 前注册当前进程实际提供的 ExtensionCapabilityId；缺少 Adapter 时继续保留未知密文，不得伪造能力绕过写入限制。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该新增明确的 facade 方法和测试，而不是让客户端直接写对应 SQLite 表。
 
+### 3.1 有界 Collection 发现
+
+vault 重开后，顶层导航应使用 `get_collection_summary`、`list_collection_summaries` 和 `list_deleted_collection_summaries`。这些方法无需记住 Collection ID，也不会读取完整 Project，就能发现密码、书签、邮箱、Steam 以及未来 Adapter 的 Collection。每页最多 200 个无 payload 摘要，不透明游标最多 4096 bytes；游标绑定 active/deleted 查询，发生本地或同步 metadata 变化后必须丢弃并从第一页刷新。
+
+`MdbxCollectionSummary` 包含 Collection ID、标题、可选 CollectionProfile 类型/版本、group/icon 引用、收藏/归档状态、附件计数、head commit、删除状态和更新时间，不包含 `summary_ct` 或 CollectionProfile payload。调用 `default_presentation_metadata_limits` 获取固定展示契约：标题明文 64 KiB、label name 明文 512 bytes、group/icon 引用 4096 UTF-8 bytes。新界面应继续分页 Object 和 Label 摘要，不应把完整 list 方法作为默认导航路径。
+
+没有 Profile 的 MDBX1 Collection 仍然有效，类型/版本字段为空。旧标题、label name 或引用超出固定展示限制时，只会在有界摘要路径返回 resource-limit error；完整兼容 API 仍可用于显式 repair/export，不能删除或重新解释其行为。
+
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
 Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN.md`。它记录 Android 端如何在 `MdbxRepository` / `MdbxVaultStore` 边界内处理 Room 索引、working copy、WebDAV、OneDrive、旧测试版 vault 和后续 FFI 迁移。

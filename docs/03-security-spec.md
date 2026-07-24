@@ -126,7 +126,9 @@ Sensitive operations MUST use the policy engine rather than branch directly on a
 
 ### 5.2 Authorization Before Plaintext
 
-MDBX2 treats metadata selection and encrypted payload disclosure as different operations. Object, relation, label, and label-assignment navigation uses bounded summaries; relation and label summaries never select payload ciphertext. Complete-record APIs remain compatibility interfaces and are not safe default disclosure boundaries.
+MDBX2 treats metadata selection and encrypted payload disclosure as different operations. Collection, object, relation, label, and label-assignment navigation uses bounded summaries. Collection summaries never select the legacy Project summary or CollectionProfile payload; relation and label summaries never select payload ciphertext. Complete-record APIs remain compatibility interfaces and are not safe default disclosure boundaries.
+
+Presentation metadata has fixed allocation limits: Collection/Object titles are at most 64 KiB of plaintext, ObjectLabel names are at most 512 bytes, and Collection group/icon references are at most 4096 UTF-8 bytes. Encrypted display-field SQL MUST select the stored length and return the BLOB through a conditional projection only when it fits the plaintext limit plus the shared 128 KiB compatible envelope allowance. Authenticated plaintext length is checked again after decryption. Plaintext references are measured in UTF-8 bytes and are also conditionally projected before conversion to a host-language string.
 
 An object payload reveal authorizes its Entry scope. A relation payload reveal authorizes both source and target Entry scopes and preserves both decisions. A label payload reveal authorizes its collection Project scope. Relation and Label are not new persisted Tiga scope types. If any required scope does not allow, no deleted-state check, payload length query, BLOB load, or decrypt may run, and the typed result contains no payload.
 

@@ -1,6 +1,7 @@
 pub mod attachment;
 pub mod branch;
 pub mod collection_profile;
+pub mod collection_summary;
 pub mod commit_ctx;
 pub mod commit_history;
 pub mod commit_inventory;
@@ -23,6 +24,9 @@ pub use attachment::{
 };
 pub use branch::BranchRepo;
 pub use collection_profile::{CollectionProfileRepo, CollectionProfileSpec};
+pub use collection_summary::{
+    CollectionSummaryRepo, MAX_COLLECTION_SUMMARY_CURSOR_BYTES, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+};
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use commit_inventory::{

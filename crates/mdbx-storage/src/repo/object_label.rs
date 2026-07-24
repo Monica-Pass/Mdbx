@@ -194,6 +194,31 @@ impl ObjectLabelRepo {
             .map_err(StorageError::Database)
     }
 
+    pub(crate) fn name_ciphertext_len(
+        conn: &VaultConnection,
+        label_id: &str,
+    ) -> StorageResult<Option<u64>> {
+        let stored = conn
+            .inner()
+            .query_row(
+                "SELECT length(name_ct) FROM object_labels WHERE label_id = ?1",
+                params![label_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StorageError::Database)?;
+
+        stored
+            .map(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Validation(format!(
+                        "object label {label_id} has a negative name ciphertext length"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Return stored payload ciphertext length without materializing the BLOB.
     pub(crate) fn payload_ciphertext_len(
         conn: &VaultConnection,
@@ -633,10 +658,12 @@ fn validate_name(value: &str) -> StorageResult<()> {
     validate_name_bytes(value.as_bytes())
 }
 
-fn validate_name_bytes(value: &[u8]) -> StorageResult<()> {
+pub(crate) fn validate_name_bytes(value: &[u8]) -> StorageResult<()> {
     let name =
         std::str::from_utf8(value).map_err(|error| StorageError::Validation(error.to_string()))?;
-    if name.trim().is_empty() || name.len() > 512 {
+    if name.trim().is_empty()
+        || name.len() > crate::presentation_metadata::MAX_PRESENTATION_LABEL_NAME_BYTES as usize
+    {
         return Err(StorageError::Validation(
             "object label name must contain 1 to 512 UTF-8 bytes".to_string(),
         ));

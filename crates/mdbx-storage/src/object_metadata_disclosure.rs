@@ -3,6 +3,10 @@ use mdbx_core::tiga::{DeviceContext, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::presentation_metadata::{
+    enforce_plaintext_length, enforce_stored_ciphertext_length, max_field_ciphertext_bytes,
+    MAX_PRESENTATION_LABEL_NAME_BYTES,
+};
 use crate::repo::{ObjectLabelRepo, ObjectRelationRepo};
 use crate::tiga::TigaService;
 use crate::tiga_policy::{
@@ -14,9 +18,6 @@ pub const DEFAULT_MAX_OBJECT_METADATA_DISCLOSURE_PAYLOAD_BYTES: u64 = 8 * 1024 *
 
 /// Hard ceiling for a caller-selected relation or label disclosure limit.
 pub const HARD_MAX_OBJECT_METADATA_DISCLOSURE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Reserved space for authenticated-encryption and field-key epoch envelopes.
-const OBJECT_METADATA_DISCLOSURE_CIPHERTEXT_OVERHEAD_BYTES: u64 = 128 * 1024;
 
 /// Validated resource contract shared by relation and label payload disclosure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,7 @@ impl ObjectMetadataDisclosureLimits {
     }
 
     fn max_ciphertext_bytes(self) -> u64 {
-        self.max_payload_bytes + OBJECT_METADATA_DISCLOSURE_CIPHERTEXT_OVERHEAD_BYTES
+        max_field_ciphertext_bytes(self.max_payload_bytes)
     }
 }
 
@@ -278,6 +279,13 @@ impl ObjectMetadataDisclosureService {
             }
             Some(false) => {}
         }
+        let name_ciphertext_bytes = ObjectLabelRepo::name_ciphertext_len(conn, label_id)?
+            .ok_or_else(|| StorageError::NotFound(label_id.to_string()))?;
+        enforce_stored_ciphertext_length(
+            "object label name ciphertext bytes",
+            name_ciphertext_bytes,
+            MAX_PRESENTATION_LABEL_NAME_BYTES,
+        )?;
         let ciphertext_bytes = ObjectLabelRepo::payload_ciphertext_len(conn, label_id)?
             .ok_or_else(|| StorageError::NotFound(label_id.to_string()))?;
         enforce_ciphertext_limit(
@@ -292,6 +300,12 @@ impl ObjectMetadataDisclosureService {
                 "cannot reveal a deleted object label".to_string(),
             ));
         }
+        enforce_plaintext_length(
+            "object label name plaintext bytes",
+            label.name_ct.len() as u64,
+            MAX_PRESENTATION_LABEL_NAME_BYTES,
+        )?;
+        crate::repo::object_label::validate_name_bytes(&label.name_ct)?;
         enforce_plaintext_limit(
             "object label plaintext payload bytes",
             label.payload_ct.len() as u64,
@@ -655,8 +669,12 @@ mod tests {
             .conn
             .inner()
             .execute(
-                "UPDATE object_labels SET payload_ct = X'00' WHERE label_id = ?1",
-                [&fixture.label_id],
+                "UPDATE object_labels SET name_ct = zeroblob(?2), payload_ct = X'00'
+                 WHERE label_id = ?1",
+                rusqlite::params![
+                    &fixture.label_id,
+                    (max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES) + 1) as i64,
+                ],
             )
             .unwrap();
 
@@ -689,6 +707,41 @@ mod tests {
             NOW
         );
         assert!(ObjectLabelRepo::get_by_id(&fixture.conn, &fixture.label_id).is_err());
+    }
+
+    #[test]
+    fn presentation_label_disclosure_rejects_oversized_name_before_record_loading() {
+        let fixture = setup();
+        let oversized = max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES) + 1;
+        fixture
+            .conn
+            .inner()
+            .execute(
+                "UPDATE object_labels SET name_ct = zeroblob(?2), payload_ct = X'00'
+                 WHERE label_id = ?1",
+                rusqlite::params![&fixture.label_id, oversized as i64],
+            )
+            .unwrap();
+        let session = fixture.conn.active_session().unwrap().clone();
+        let device = standard_device();
+
+        let error = ObjectMetadataDisclosureService::reveal_label_authorized(
+            &fixture.conn,
+            &fixture.label_id,
+            authorization_context(&session, &device),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object label name ciphertext bytes"
+                && actual == oversized
+                && limit == max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES)
+        ));
     }
 
     #[test]

@@ -10,6 +10,10 @@ use mdbx_core::model::{
 use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
+use crate::presentation_metadata::{
+    bounded_required_ciphertext, enforce_plaintext_length, max_field_ciphertext_bytes,
+    MAX_PRESENTATION_LABEL_NAME_BYTES,
+};
 
 pub const MAX_OBJECT_METADATA_SUMMARY_PAGE_SIZE: usize = 200;
 const OBJECT_METADATA_SUMMARY_CURSOR_VERSION: u8 = 1;
@@ -52,7 +56,8 @@ struct RawRelationSummary {
 struct RawLabelSummary {
     label_id: String,
     collection_id: String,
-    name_ct: Vec<u8>,
+    name_ciphertext_bytes: i64,
+    name_ct: Option<Vec<u8>>,
     payload_schema_version: u32,
     head_commit_id: String,
     deleted: bool,
@@ -198,10 +203,14 @@ impl ObjectMetadataSummaryRepo {
         let raw = conn
             .inner()
             .query_row(
-                "SELECT label_id, collection_id, name_ct, payload_schema_version,
-                        head_commit_id, deleted, updated_at
+                "SELECT label_id, collection_id, length(name_ct),
+                        CASE WHEN length(name_ct) <= ?2 THEN name_ct END,
+                        payload_schema_version, head_commit_id, deleted, updated_at
                  FROM object_labels WHERE label_id = ?1",
-                [label_id],
+                rusqlite::params![
+                    label_id,
+                    max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES) as i64,
+                ],
                 read_raw_label_summary,
             )
             .optional()
@@ -221,20 +230,22 @@ impl ObjectMetadataSummaryRepo {
             .map(|value| parse_cursor(value, query, collection_id, None))
             .transpose()?;
         let mut stmt = conn.inner().prepare(
-            "SELECT label_id, collection_id, name_ct, payload_schema_version,
-                    head_commit_id, deleted, updated_at
+            "SELECT label_id, collection_id, length(name_ct),
+                    CASE WHEN length(name_ct) <= ?4 THEN name_ct END,
+                    payload_schema_version, head_commit_id, deleted, updated_at
              FROM object_labels
              WHERE deleted = 0 AND collection_id = ?1
                AND (?2 IS NULL OR updated_at < ?2
                     OR (updated_at = ?2 AND label_id < ?3))
              ORDER BY updated_at DESC, label_id DESC
-             LIMIT ?4",
+             LIMIT ?5",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![
                 collection_id,
                 cursor.as_ref().map(|cursor| cursor.updated_at.as_str()),
                 cursor.as_ref().map(|cursor| cursor.item_id.as_str()),
+                max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES) as i64,
                 (page_size + 1) as i64,
             ],
             read_raw_label_summary,
@@ -405,11 +416,12 @@ fn read_raw_label_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawLabelS
     Ok(RawLabelSummary {
         label_id: row.get(0)?,
         collection_id: row.get(1)?,
-        name_ct: row.get(2)?,
-        payload_schema_version: read_schema_version(row, 3)?,
-        head_commit_id: row.get(4)?,
-        deleted: row.get::<_, i32>(5)? != 0,
-        updated_at: row.get(6)?,
+        name_ciphertext_bytes: row.get(2)?,
+        name_ct: row.get(3)?,
+        payload_schema_version: read_schema_version(row, 4)?,
+        head_commit_id: row.get(5)?,
+        deleted: row.get::<_, i32>(6)? != 0,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -417,14 +429,26 @@ fn decode_label_summary(
     conn: &VaultConnection,
     row: RawLabelSummary,
 ) -> StorageResult<ObjectLabelSummary> {
+    let name_ct = bounded_required_ciphertext(
+        "object label name ciphertext bytes",
+        row.name_ciphertext_bytes,
+        row.name_ct,
+        MAX_PRESENTATION_LABEL_NAME_BYTES,
+    )?;
     let name = decrypt_field(
         conn,
         FieldKeyPurpose::Metadata,
-        &row.name_ct,
+        &name_ct,
         "object-label",
         &row.label_id,
         "name",
     )?;
+    enforce_plaintext_length(
+        "object label name plaintext bytes",
+        name.len() as u64,
+        MAX_PRESENTATION_LABEL_NAME_BYTES,
+    )?;
+    crate::repo::object_label::validate_name_bytes(&name)?;
     Ok(ObjectLabelSummary {
         label_id: row.label_id,
         collection_id: row.collection_id,
@@ -711,6 +735,73 @@ mod tests {
         assert_eq!(deleted_summary.name, b"Deleted");
         assert!(ObjectLabelRepo::get_by_id(&conn, &deleted.label_id).is_err());
         assert!(ObjectLabelRepo::get_by_id(&conn, &active_ids[0]).is_err());
+    }
+
+    #[test]
+    fn presentation_label_summary_bounds_name_ciphertext_and_plaintext() {
+        let (conn, ctx, collection_id, _) = setup();
+        let label = ObjectLabelRepo::create(
+            &conn,
+            &ctx,
+            ObjectLabelCreateRequest::new(
+                &collection_id,
+                "Bounded",
+                serde_json::json!({"color":"red"}),
+            ),
+        )
+        .unwrap();
+        let ciphertext_bytes = max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES) + 1;
+        conn.inner()
+            .execute(
+                "UPDATE object_labels SET name_ct = zeroblob(?2) WHERE label_id = ?1",
+                rusqlite::params![&label.label_id, ciphertext_bytes as i64],
+            )
+            .unwrap();
+
+        let error = ObjectMetadataSummaryRepo::get_label(&conn, &label.label_id).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object label name ciphertext bytes"
+                && actual == ciphertext_bytes
+                && limit == max_field_ciphertext_bytes(MAX_PRESENTATION_LABEL_NAME_BYTES)
+        ));
+        assert!(matches!(
+            ObjectMetadataSummaryRepo::list_labels(&conn, &collection_id, 10, None),
+            Err(StorageError::ResourceLimit { ref resource, .. })
+                if resource == "object label name ciphertext bytes"
+        ));
+
+        let plaintext = vec![b'x'; MAX_PRESENTATION_LABEL_NAME_BYTES as usize + 1];
+        let ciphertext = crate::crypto_layer::encrypt_field(
+            &conn,
+            FieldKeyPurpose::Metadata,
+            &plaintext,
+            "object-label",
+            &label.label_id,
+            "name",
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE object_labels SET name_ct = ?2 WHERE label_id = ?1",
+                rusqlite::params![&label.label_id, ciphertext],
+            )
+            .unwrap();
+        let error = ObjectMetadataSummaryRepo::get_label(&conn, &label.label_id).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object label name plaintext bytes"
+                && actual == MAX_PRESENTATION_LABEL_NAME_BYTES + 1
+                && limit == MAX_PRESENTATION_LABEL_NAME_BYTES
+        ));
     }
 
     #[test]

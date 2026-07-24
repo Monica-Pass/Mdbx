@@ -49,8 +49,8 @@ use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 #[cfg(not(test))]
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
 use mdbx_storage::repo::{
-    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, EntryRepo,
-    ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
+    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, CollectionSummaryRepo,
+    EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotRepo, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
 };
 use mdbx_storage::repo::{
     CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
@@ -1195,24 +1195,52 @@ fn cmd_project(conn: &mut VaultConnection, action: ProjectAction) -> Result<(), 
     let ctx = ctx();
     match action {
         ProjectAction::List => {
-            let projects = ProjectRepo::list_all(conn).map_err(|e| format!("{}", e))?;
-            if projects.is_empty() {
-                println!("(no projects)");
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = CollectionSummaryRepo::list_active(
+                    conn,
+                    MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+                    cursor.as_deref(),
+                )
+                .map_err(|e| format!("{}", e))?;
+                for p in &page.items {
+                    found = true;
+                    let title = String::from_utf8_lossy(&p.title);
+                    let fav = if p.favorite { " ★" } else { "" };
+                    println!("{}  {}{}", p.collection_id, title, fav);
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for p in &projects {
-                let title = String::from_utf8_lossy(&p.title_ct);
-                let fav = if p.favorite { " ★" } else { "" };
-                println!("{}  {}{}", p.project_id, title, fav);
+            if !found {
+                println!("(no projects)");
             }
         }
         ProjectAction::Deleted => {
-            let projects = ProjectRepo::list_deleted(conn).map_err(|e| format!("{}", e))?;
-            if projects.is_empty() {
-                println!("(no deleted projects)");
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = CollectionSummaryRepo::list_deleted(
+                    conn,
+                    MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+                    cursor.as_deref(),
+                )
+                .map_err(|e| format!("{}", e))?;
+                for p in &page.items {
+                    found = true;
+                    let title = String::from_utf8_lossy(&p.title);
+                    println!("{}  {}", p.collection_id, title);
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for p in &projects {
-                let title = String::from_utf8_lossy(&p.title_ct);
-                println!("{}  {}", p.project_id, title);
+            if !found {
+                println!("(no deleted projects)");
             }
         }
         ProjectAction::Create { title, group } => {

@@ -3,6 +3,10 @@ use mdbx_core::tiga::{AuthorizationDecision, DeviceContext, TigaOperation, TigaS
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
+use crate::presentation_metadata::{
+    enforce_plaintext_length, enforce_stored_ciphertext_length, max_field_ciphertext_bytes,
+    MAX_PRESENTATION_TITLE_BYTES,
+};
 use crate::repo::EntryRepo;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
@@ -12,13 +16,6 @@ pub const DEFAULT_MAX_OBJECT_DISCLOSURE_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Hard ceiling for a caller-selected object disclosure limit.
 pub const HARD_MAX_OBJECT_DISCLOSURE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Reserved space for authenticated-encryption and field-key epoch envelopes.
-///
-/// Current committed AEAD adds 80 bytes, and the largest representable epoch envelope adds
-/// 65,545 bytes. Keeping a 128 KiB allowance avoids coupling this boundary to one envelope
-/// generation while still rejecting clearly oversized BLOBs before SQLite materializes them.
-const OBJECT_DISCLOSURE_CIPHERTEXT_OVERHEAD_BYTES: u64 = 128 * 1024;
 
 /// Validated resource contract for one object payload disclosure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +38,7 @@ impl ObjectDisclosureLimits {
     }
 
     fn max_ciphertext_bytes(self) -> u64 {
-        self.max_payload_bytes + OBJECT_DISCLOSURE_CIPHERTEXT_OVERHEAD_BYTES
+        max_field_ciphertext_bytes(self.max_payload_bytes)
     }
 }
 
@@ -154,6 +151,13 @@ impl ObjectDisclosureService {
                 "cannot reveal a deleted object".to_string(),
             ));
         }
+        if let Some(title_ciphertext_bytes) = EntryRepo::title_ciphertext_len(conn, object_id)? {
+            enforce_stored_ciphertext_length(
+                "object title ciphertext bytes",
+                title_ciphertext_bytes,
+                MAX_PRESENTATION_TITLE_BYTES,
+            )?;
+        }
         let ciphertext_bytes = EntryRepo::payload_ciphertext_len(conn, object_id)?
             .ok_or_else(|| StorageError::NotFound(object_id.to_string()))?;
         let max_ciphertext_bytes = limits.max_ciphertext_bytes();
@@ -170,6 +174,13 @@ impl ObjectDisclosureService {
             return Err(StorageError::ConstraintViolation(
                 "cannot reveal a deleted object".to_string(),
             ));
+        }
+        if let Some(title) = object.title_ct.as_deref() {
+            enforce_plaintext_length(
+                "object title plaintext bytes",
+                title.len() as u64,
+                MAX_PRESENTATION_TITLE_BYTES,
+            )?;
         }
         let plaintext_bytes = object.payload_ct.len() as u64;
         if plaintext_bytes > limits.max_payload_bytes() {
@@ -337,6 +348,39 @@ mod tests {
             } if resource == "object payload ciphertext bytes"
                 && actual == oversized
                 && limit == limits.max_ciphertext_bytes()
+        ));
+    }
+
+    #[test]
+    fn presentation_object_disclosure_rejects_oversized_title_before_record_loading() {
+        let (conn, _, object_id) = setup();
+        let oversized = max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES) + 1;
+        conn.inner()
+            .execute(
+                "UPDATE entries SET title_ct = zeroblob(?2), payload_ct = X'00'
+                 WHERE entry_id = ?1",
+                rusqlite::params![&object_id, oversized as i64],
+            )
+            .unwrap();
+        let session = conn.active_session().unwrap().clone();
+        let device = standard_device();
+
+        let error = ObjectDisclosureService::reveal_authorized(
+            &conn,
+            &object_id,
+            authorization_context(&session, &device),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::ResourceLimit {
+                ref resource,
+                actual,
+                limit,
+            } if resource == "object title ciphertext bytes"
+                && actual == oversized
+                && limit == max_field_ciphertext_bytes(MAX_PRESENTATION_TITLE_BYTES)
         ));
     }
 

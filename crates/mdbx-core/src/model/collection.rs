@@ -194,6 +194,30 @@ impl CollectionProfile {
     }
 }
 
+/// Bounded, payload-free Collection metadata for navigation and adapter discovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionSummary {
+    pub collection_id: ProjectId,
+    pub title: Vec<u8>,
+    pub collection_type_id: Option<CollectionTypeId>,
+    pub profile_schema_version: Option<u32>,
+    pub group_id: Option<String>,
+    pub icon_ref: Option<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    pub attachment_count: u32,
+    pub head_commit_id: String,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+/// Bounded page of Collection summaries with an opaque query-bound cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionSummaryPage {
+    pub items: Vec<CollectionSummary>,
+    pub next_cursor: Option<String>,
+}
+
 fn validate_namespaced_id(value: &str, kind: &str) -> Result<(), String> {
     validate_extension_id(value)?;
     if !value.contains('.') {

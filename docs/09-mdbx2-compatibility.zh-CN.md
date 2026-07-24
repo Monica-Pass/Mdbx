@@ -109,6 +109,14 @@ root hash 相等。
 
 另外，实测 `MDBX1.0` CLI 可以从已由当前 reader 升级的副本中列出该 project 和 entry。这只证明 MDBX1 物理兼容投影仍可读取，不表示旧 binary 是安全的 MDBX2 writer：旧代码不会执行 `min_writer_version` 门禁，也无法保存未来语义。vault 声明 `min_writer_version = MDBX-2` 后，旧 binary MUST NOT 再执行写入。
 
+### 3.2 有界导航兼容层
+
+Collection、Object 和 Label 摘要 API 都是 additive 的 reader surface，不改变 schema 字节。`CollectionSummaryRepo` 复用 MDBX1 的 `projects` 表，并可选地 left join `collection_profiles`；因此 MDBX1 Collection 仍然可以被发现，只是没有 Profile 类型和版本。摘要查询不会选择旧 Project summary 或 CollectionProfile payload。
+
+新的导航接口使用固定字段和分页限制。旧行如果超出这些限制，只会在有界摘要接口中返回 resource-limit error；完整 Project、Entry、Label repo 和 FFI 方法继续保持历史行为，显式 repair/export 工具仍可读取它们。CLI 和新客户端默认使用摘要接口，不会静默删除或重定义兼容方法。
+
+仅增加或读取摘要不会修改 format marker、schema version、commit、object version、同步字段、snapshot 字段、密文或 key epoch。这同时保持 MDBX1 自动升级承诺和历史 reader 看到的物理兼容投影。
+
 ## 4. Schema 演进规则
 
 - 新字段 SHOULD 可空或带安全默认值。

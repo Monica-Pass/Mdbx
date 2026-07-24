@@ -82,6 +82,14 @@ The shared migration regression runs against both exact byte sequences, verifies
 
 As an additional release-binary observation, the `MDBX1.0` CLI successfully listed the project and entry from a copy already upgraded by the current reader. This demonstrates that the MDBX1 physical projection remains readable. It does not make the old binary a safe MDBX2 writer: old code does not enforce `min_writer_version`, cannot preserve future semantics, and MUST NOT be used for writes once the vault declares `min_writer_version = MDBX-2`.
 
+### Bounded Navigation Compatibility
+
+Collection, Object, and Label summary APIs are additive reader surfaces and do not change schema bytes. `CollectionSummaryRepo` reuses the MDBX1 `projects` table plus an optional left join to `collection_profiles`; an MDBX1 Collection therefore remains discoverable with no profile type/version. Summary queries never select the legacy Project summary or CollectionProfile payload.
+
+New navigation applies fixed field and page limits. A legacy row outside those limits returns a resource-limit error only through the bounded summary surface. Existing complete Project, Entry, and Label repositories and FFI methods retain their historical behavior so an explicit repair/export tool can still inspect the row. The CLI and new clients use summaries by default; compatibility methods are not silently removed or redefined.
+
+No format marker, schema version, commit, object version, synchronization field, snapshot field, ciphertext, or key epoch is changed merely by adding or reading a summary. This preserves both automatic MDBX1 upgrade guarantees and the physical projection observed by the historical reader.
+
 ## MDBX2 Consistency Changes
 
 - Snapshot creation and restore are atomic.
