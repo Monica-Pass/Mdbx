@@ -168,6 +168,32 @@ filter. A malformed or oversized legacy field list may fail on this bounded
 surface; the complete `list_unresolved_conflicts` method remains available for
 an explicit repair/export path.
 
+### 3.3 Bounded Snapshot Navigation
+
+Snapshot-management screens should call `get_snapshot_summary(snapshot_id)`
+for a metadata-only detail and `list_snapshot_summaries(page_size, cursor)`
+for the queue. Call `default_snapshot_summary_limits` once to discover the
+fixed 1–200 row page ceiling, 4096-byte cursor ceiling, and 4096-byte UTF-8
+metadata-field ceiling. Pass the returned cursor only to the same list query;
+it is a live keyset position ordered by `created_at DESC, snapshot_id DESC`,
+not a snapshot token or authorization credential. Discard it after snapshot
+creation, pruning, synchronization, or another metadata mutation.
+
+`MdbxSnapshotSummary` contains the snapshot ID, base commit ID, descriptor hash,
+creation time/device, and `snapshot_ciphertext_bytes`. The byte count is a
+storage-size projection and does not prove that the encrypted payload is valid
+or decryptable. The summary path never selects, decrypts, deserializes, or
+verifies `snapshot_ct`, so a corrupt or very large payload does not block the
+navigation screen. If the selected snapshot needs structure inspection,
+integrity verification, export, or restore, call the existing complete
+snapshot API explicitly and handle its authentication result separately.
+
+The CLI `snapshot list` command already follows this bounded path. Existing
+`SnapshotRepo` complete reads, creation, verification, and restore methods stay
+available for MDBX1 clients and explicit recovery/repair workflows; a summary
+resource-limit error does not delete, migrate, or reinterpret the underlying
+snapshot row.
+
 See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
 
 For the current Monica for Android MDBX 1.0 integration reference, see `docs/android/README.md`. It documents the Android-side `MdbxRepository` / `MdbxVaultStore` boundary, Room indexes, working-copy model, WebDAV, OneDrive, legacy test-version vaults, and future FFI migration path.

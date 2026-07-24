@@ -125,6 +125,17 @@ Collection、Object 和 Label 摘要 API 都是 additive 的 reader surface，�
 `default_conflict_summary_limits` 发现契约。已有完整冲突读取和 typed resolution 方法
 继续作为显式解决、repair 和 export 路径；一个类型过滤器生成的游标不能复用于其他类型。
 
+Snapshot 导航遵循同样的 additive 规则。`SnapshotSummaryRepo::get` 与
+`SnapshotSummaryRepo::list` 只返回稳定的 snapshot/base commit 身份、摘要 hash、
+创建元数据和 `length(snapshot_ct)`，不会选择、解密、反序列化或验证 `snapshot_ct`。
+每页 1 到 200 条，按 `created_at DESC, snapshot_id DESC` 使用 keyset，并返回不超过
+4096 bytes、绑定查询的游标。每个必需的 snapshot 元数据文本字段最多 4096 个 UTF-8
+bytes。UniFFI 通过 `default_snapshot_summary_limits` 发布同一固定契约；`snapshot list`
+保持原有命令和输出格式，但改用有界页面迭代。密文长度只表示存储字节数，不表示 payload
+有效或完整性验证结果。既有完整 `SnapshotRepo` 读取、创建、校验和授权恢复方法继续保持
+MDBX1 客户端与显式 recovery/repair 的行为；损坏或超大的 payload 只会在调用完整路径时
+影响该行。
+
 仅增加或读取摘要不会修改 format marker、schema version、commit、object version、同步字段、snapshot 字段、密文或 key epoch。这同时保持 MDBX1 自动升级承诺和历史 reader 看到的物理兼容投影。
 
 ## 4. Schema 演进规则

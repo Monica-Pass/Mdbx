@@ -18,6 +18,7 @@ pub mod payload_migration;
 pub mod project;
 pub mod snapshot;
 mod snapshot_integrity;
+pub mod snapshot_summary;
 pub mod sync_delta_inventory;
 pub mod tombstone;
 
@@ -60,6 +61,10 @@ pub use object_version::ObjectVersionRepo;
 pub use payload_migration::{PayloadMigrationPlanRequest, PayloadMigrationRepo};
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
+pub use snapshot_summary::{
+    SnapshotSummaryRepo, MAX_SNAPSHOT_SUMMARY_CURSOR_BYTES, MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
+    MAX_SNAPSHOT_SUMMARY_TEXT_BYTES,
+};
 pub use sync_delta_inventory::{
     SyncDeltaInventoryItem, SyncDeltaInventoryPage, SyncDeltaInventoryRepo,
     MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE, MAX_SYNC_DELTA_INVENTORY_TOKEN_BYTES,

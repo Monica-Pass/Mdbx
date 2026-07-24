@@ -51,7 +51,8 @@ use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
 use mdbx_storage::repo::{
     AttachmentPlaintextPurpose, AttachmentRepo, AttachmentSummaryRepo, AttachmentWriteOptions,
     CollectionSummaryRepo, EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
-    MAX_ATTACHMENT_SUMMARY_PAGE_SIZE, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+    SnapshotSummaryRepo, MAX_ATTACHMENT_SUMMARY_PAGE_SIZE, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+    MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
 };
 use mdbx_storage::repo::{
     CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
@@ -2287,12 +2288,29 @@ fn cmd_snapshot(conn: &mut VaultConnection, action: SnapshotAction) -> Result<()
             println!("  time: {}", snap.created_at);
         }
         SnapshotAction::List => {
-            let snaps = SnapshotRepo::list_all(conn).map_err(|e| format!("{}", e))?;
-            if snaps.is_empty() {
-                println!("(no snapshots)");
+            let mut cursor = None;
+            let mut has_snapshots = false;
+            loop {
+                let page = SnapshotSummaryRepo::list(
+                    conn,
+                    MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
+                    cursor.as_deref(),
+                )
+                .map_err(|e| format!("{}", e))?;
+                for snapshot in &page.items {
+                    has_snapshots = true;
+                    println!(
+                        "{}  {}  {}",
+                        snapshot.snapshot_id, snapshot.created_at, snapshot.snapshot_hash
+                    );
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for s in &snaps {
-                println!("{}  {}  {}", s.snapshot_id, s.created_at, s.snapshot_hash);
+            if !has_snapshots {
+                println!("(no snapshots)");
             }
         }
         SnapshotAction::Restore { snapshot_id } => {
@@ -4814,6 +4832,37 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn cli_snapshot_list_is_payload_free_for_corrupt_large_ciphertext() {
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        let conn = open_unlocked(&path);
+        let snapshot = SnapshotRepo::create_snapshot(&conn, &ctx()).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE snapshots SET snapshot_ct = zeroblob(?2) WHERE snapshot_id = ?1",
+                params![&snapshot.snapshot_id, 2 * 1024 * 1024_i64],
+            )
+            .unwrap();
+        assert_eq!(
+            SnapshotSummaryRepo::get(&conn, &snapshot.snapshot_id)
+                .unwrap()
+                .unwrap()
+                .snapshot_ciphertext_bytes,
+            2 * 1024 * 1024
+        );
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::Snapshot {
+                action: SnapshotAction::List,
+            },
+        ))
+        .unwrap();
     }
 
     #[test]

@@ -37,6 +37,7 @@
 - 列出未解决冲突，并对 project、entry、attachment、关系、标签和标签分配执行本地优先或传入优先解决
 - 按可选对象类型过滤分页有界 unresolved 冲突摘要，并发现固定 limits 契约
 - 应用经过验证的自定义 payload 或通用元数据冲突解决状态
+- 分页有界 snapshot 摘要、按 ID 读取快照元数据，并发现固定导航 limits 契约
 
 当前还没有暴露：
 
@@ -45,7 +46,7 @@
 - tag
 - 除上述 attachment API 之外的 external Blob Provider 传输与维护操作
 - sync bundle/apply 操作
-- snapshot
+- 完整 snapshot 创建、校验、导出和恢复流程
 - diagnostics / maintenance 数据
 
 这些能力应该视为“缺少 facade 方法”，不能因此绕过 storage 层直接写表。
@@ -90,6 +91,15 @@ vault critical extension、授予密钥访问或协商 peer 会话。
 4096 bytes、字段 JSON 64 KiB、最多 256 条路径以及单路径 4096 bytes 的契约。摘要包含稳定
 对象/commit 身份和有界字段路径，但不代表明文披露或解决操作；已有完整冲突读取和 typed
 resolution 方法继续作为兼容、repair 和 mutation 路径。
+
+`MdbxSnapshotSummary` 是有界 snapshot 管理记录。列表使用
+`list_snapshot_summaries(page_size, cursor)`，按 ID 的元数据详情使用
+`get_snapshot_summary(snapshot_id)`；调用 `default_snapshot_summary_limits` 获取每页
+1 到 200 条、游标 4096 bytes、元数据文本 4096 bytes 的固定契约。记录包含稳定的
+snapshot/base commit 身份、摘要 hash、创建元数据和 `snapshot_ciphertext_bytes`，但绝不包含
+`snapshot_ct`。这个字节数只是存储大小投影，不是完整性结果。摘要 SQL 不会选择、解密、
+反序列化或验证加密 payload，因此损坏或很大的快照仍可导航。完整快照操作不在此 facade
+内；需要 payload 的工作必须走已有授权 storage/API 边界。
 
 客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
 

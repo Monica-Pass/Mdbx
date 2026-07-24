@@ -101,6 +101,21 @@ contract. Existing complete conflict reads and typed resolution methods remain
 the explicit resolution, repair, and export path, and a cursor from one type
 filter cannot be reused for another.
 
+Snapshot navigation follows the same additive rule. `SnapshotSummaryRepo::get`
+and `SnapshotSummaryRepo::list` expose stable snapshot/base-commit identities,
+the descriptor hash, creation metadata, and `length(snapshot_ct)` without
+selecting, decrypting, deserializing, or verifying `snapshot_ct`. Pages contain
+1–200 rows, use the `created_at DESC, snapshot_id DESC` keyset, and return a
+query-bound cursor no larger than 4096 bytes. Required snapshot metadata text is
+limited to 4096 UTF-8 bytes. `default_snapshot_summary_limits` publishes the
+same fixed limits through UniFFI; `snapshot list` uses the bounded pages while
+keeping its existing command and output shape. The ciphertext length is a
+storage size, not an integrity or payload-validity claim. Existing complete
+`SnapshotRepo` reads, creation, verification, and authorized restore methods
+remain unchanged for MDBX1 clients and explicit recovery/repair workflows, so
+a corrupt or oversized payload affects only the bounded row that is selected
+through that complete path.
+
 No format marker, schema version, commit, object version, synchronization field, snapshot field, ciphertext, or key epoch is changed merely by adding or reading a summary. This preserves both automatic MDBX1 upgrade guarantees and the physical projection observed by the historical reader.
 
 ## MDBX2 Consistency Changes

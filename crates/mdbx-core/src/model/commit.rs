@@ -244,6 +244,28 @@ pub struct Snapshot {
     pub created_by_device_id: DeviceId,
 }
 
+/// 有界快照导航摘要。
+///
+/// 摘要只包含快照记录元数据和密文长度，不包含 `snapshot_ct` 内容，也不
+/// 表示已经完成密文或 payload 完整性校验。完整 [`Snapshot`] 仍用于显式
+/// 恢复、校验和兼容读取。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    pub snapshot_id: SnapshotId,
+    pub base_commit_id: CommitId,
+    pub snapshot_hash: String,
+    pub snapshot_ciphertext_bytes: u64,
+    pub created_at: String,
+    pub created_by_device_id: DeviceId,
+}
+
+/// 有界快照摘要页。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSummaryPage {
+    pub items: Vec<SnapshotSummary>,
+    pub next_cursor: Option<String>,
+}
+
 /// 冲突记录 — 并发修改无法自动合并时产生。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {
@@ -382,6 +404,22 @@ impl std::str::FromStr for ConflictResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_summary_roundtrips_without_snapshot_ciphertext() {
+        let summary = SnapshotSummary {
+            snapshot_id: "snapshot-1".to_string(),
+            base_commit_id: "commit-1".to_string(),
+            snapshot_hash: "a".repeat(64),
+            snapshot_ciphertext_bytes: 4096,
+            created_at: "2026-07-25T00:00:00Z".to_string(),
+            created_by_device_id: "device-1".to_string(),
+        };
+        let encoded = serde_json::to_vec(&summary).unwrap();
+        let decoded: SnapshotSummary = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, summary);
+        assert!(!encoded.windows(11).any(|window| window == b"snapshot_ct"));
+    }
 
     #[test]
     fn conflict_summary_roundtrips_without_changing_complete_conflict_shape() {

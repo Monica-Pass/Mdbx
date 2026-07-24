@@ -5,7 +5,7 @@ use mdbx_core::model::ConflictObjectType;
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::repo::{
     AttachmentRepo, CommitContext, ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo,
-    ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo, TombstoneRepo,
+    ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo, SnapshotRepo, TombstoneRepo,
 };
 use mdbx_storage::unlock::UnlockService;
 use sha2::{Digest, Sha256};
@@ -2204,6 +2204,76 @@ fn conflict_summary_facade_fails_closed_for_oversized_and_malformed_fields() {
         Err(MdbxFfiError::Storage { message })
             if message.contains("invalid conflicting fields JSON")
     ));
+}
+
+#[test]
+fn snapshot_summary_facade_pages_without_loading_payload_and_preserves_legacy_reads() {
+    let conn = VaultConnection::open_in_memory().unwrap();
+    initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+    let ctx = CommitContext::new("ffi-snapshot-summary-device".to_string());
+    let first = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+    let second = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+    let third = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+    conn.inner()
+        .execute(
+            "UPDATE snapshots SET created_at = '2026-07-25T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    conn.inner()
+        .execute(
+            "UPDATE snapshots SET snapshot_ct = ?1 WHERE snapshot_id = ?2",
+            rusqlite::params![vec![0x7f_u8; 512 * 1024], &second.snapshot_id],
+        )
+        .unwrap();
+
+    let vault = MdbxVault {
+        conn: Mutex::new(conn),
+        device_id: "ffi-snapshot-summary-device".to_string(),
+        vault_id: "ffi-snapshot-summary-vault".to_string(),
+    };
+    let limits = default_snapshot_summary_limits();
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+    assert_eq!(limits.max_text_bytes, 4096);
+
+    let first_page = vault.list_snapshot_summaries(2, None).unwrap();
+    assert_eq!(first_page.items.len(), 2);
+    assert!(first_page.next_cursor.is_some());
+    let second_page = vault
+        .list_snapshot_summaries(2, first_page.next_cursor.clone())
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert!(second_page.next_cursor.is_none());
+    let all_items = first_page
+        .items
+        .iter()
+        .chain(second_page.items.iter())
+        .collect::<Vec<_>>();
+    assert!(all_items
+        .iter()
+        .any(|item| item.snapshot_id == first.snapshot_id));
+    assert!(all_items
+        .iter()
+        .any(|item| item.snapshot_id == third.snapshot_id));
+    assert!(all_items.iter().any(|item| {
+        item.snapshot_id == second.snapshot_id && item.snapshot_ciphertext_bytes == 512 * 1024
+    }));
+    let by_id = vault
+        .get_snapshot_summary(second.snapshot_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_id.snapshot_ciphertext_bytes, 512 * 1024);
+    assert!(vault.list_snapshot_summaries(0, None).is_err());
+
+    // Complete reads remain available for explicit compatibility/recovery use.
+    assert_eq!(
+        SnapshotRepo::list_all(&vault.conn.lock().unwrap())
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_ne!(first.snapshot_id, second.snapshot_id);
 }
 
 #[test]

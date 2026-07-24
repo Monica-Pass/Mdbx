@@ -161,6 +161,25 @@ deleted 方法，也不能用 offset 自行重建。CLI `entry deleted` 也使�
 变更后必须丢弃，不能拿到另一个类型过滤器复用。旧行字段 JSON 损坏或超限时，有界页面可以
 失败关闭；完整 `list_unresolved_conflicts` 仍可用于显式 repair/export。
 
+### 3.3 有界 Snapshot 导航
+
+快照管理页应使用 `get_snapshot_summary(snapshot_id)` 获取只含元数据的详情，使用
+`list_snapshot_summaries(page_size, cursor)` 获取列表。启动时调用
+`default_snapshot_summary_limits` 发现固定契约：每页 1 到 200 条、游标最多 4096
+bytes、每个 UTF-8 元数据文本字段最多 4096 bytes。返回的游标只能传回同一个 list 查询；
+它是按 `created_at DESC, snapshot_id DESC` 排序的 live keyset position，不是快照 token
+或授权凭据。创建、清理、同步或其他 metadata 变化后必须丢弃游标并从第一页重新开始。
+
+`MdbxSnapshotSummary` 包含 snapshot ID、base commit ID、摘要 hash、创建时间/设备以及
+`snapshot_ciphertext_bytes`。这个字节数只是存储大小投影，不证明加密 payload 有效、可解密
+或已通过完整性校验。摘要路径不会选择、解密、反序列化或验证 `snapshot_ct`，因此损坏或很大
+的 payload 不会阻塞导航页。用户选中快照后，如果需要结构预览、完整性校验、导出或恢复，
+再显式调用既有完整 snapshot API，并单独处理其认证结果。
+
+CLI 的 `snapshot list` 已使用这条有界路径。既有 `SnapshotRepo` 完整读取、创建、校验和恢复
+方法继续供 MDBX1 客户端及显式 recovery/repair 流程使用；摘要路径的 resource-limit error
+不会删除、迁移或重新解释底层 snapshot 行。
+
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
 
 Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN.md`。它记录 Android 端如何在 `MdbxRepository` / `MdbxVaultStore` 边界内处理 Room 索引、working copy、WebDAV、OneDrive、旧测试版 vault 和后续 FFI 迁移。

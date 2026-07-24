@@ -109,6 +109,17 @@ limits the stored field JSON to 64 KiB, the path count to 256, and each path to
 4096 UTF-8 bytes. Complete conflict reads remain the explicit compatibility
 and resolution path.
 
+### SnapshotSummary
+
+A `SnapshotSummary` is the bounded, payload-free navigation projection of one
+snapshot. It carries the snapshot ID, base commit ID, descriptor hash, creation
+time/device, and the projected ciphertext byte length; it never contains
+`snapshot_ct` and does not claim payload decryption or integrity verification.
+Summary pages contain 1–200 rows ordered by `created_at DESC, snapshot_id DESC`
+and use query-bound cursors no larger than 4096 bytes. Required metadata text is
+limited to 4096 UTF-8 bytes. Complete Snapshot reads, verification, creation,
+and restore remain the explicit MDBX1-compatible recovery path.
+
 ### TombstoneState
 
 `TombstoneState` is the complete current deletion-marker collection projected into synchronization state. Per-commit tombstones remain compatible delete-event records. A present complete collection, including an empty collection, is authoritative only during conflict-free fast-forward application and therefore communicates both deletion and revival without discarding divergent local deletion state.
@@ -193,6 +204,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 38. An established IncrementalIntegrityRoot is updated atomically with every covered local or incoming state mutation; a root collection, encoding, authentication, or resource failure rolls back the enclosing transaction and never downgrades to an unverified warning.
 39. Attachment navigation is metadata-only and bounded: summary SQL never selects chunk/blob payloads, checks encrypted display-field length before materialization, and rechecks authenticated plaintext limits after decryption. Complete attachment APIs remain available without reinterpretation.
 40. Conflict navigation is metadata-only and bounded: unresolved summary SQL projects conflicting-field length before materialization, enforces 64 KiB/256-path/4096-byte limits, and binds cursors to the query filter. Complete conflict reads and typed resolution APIs remain available without reinterpretation.
+41. Snapshot navigation is metadata-only and bounded: summary SQL projects `length(snapshot_ct)` without selecting the encrypted BLOB, enforces 1–200 pages/4096-byte cursors/4096-byte metadata text, and leaves complete snapshot reads and restore semantics unchanged.
 
 ## Module Architecture
 
@@ -217,6 +229,12 @@ The Conflict Resolution Module loads authenticated local and incoming ObjectVers
 Its navigation plane is intentionally separate: generic clients page
 `ConflictSummary` records through the bounded repository/FFI surface, then
 load complete typed state only for an explicit resolution or repair action.
+
+Snapshot management has the same separation: generic clients page
+`SnapshotSummary` records through the bounded repository/FFI surface, then use
+complete snapshot reads, integrity verification, export, or authorized restore
+only after an explicit recovery action. Summary navigation never interprets
+the encrypted snapshot payload.
 
 The synchronization state carries an optional complete TombstoneState. New producers always emit it. Legacy payloads omit it and retain their existing per-commit delete-event behavior. Receivers replace the complete collection only for conflict-free fast-forward commits; divergent commits continue to preserve local markers until a merge resolution becomes authoritative.
 

@@ -37,6 +37,7 @@ The exported boundary covers:
 - list unresolved conflicts and resolve project, entry, attachment, relation, label, and assignment conflicts with local-wins or incoming-wins
 - page bounded unresolved conflict summaries with optional object-type filtering and discover the fixed limits contract
 - apply validated custom payload or generic metadata conflict resolutions
+- page bounded snapshot summaries, read one snapshot's metadata, and discover the fixed navigation limits contract
 
 The boundary does not currently expose:
 
@@ -45,7 +46,7 @@ The boundary does not currently expose:
 - tags
 - external Blob Provider transfer and maintenance operations beyond the attachment APIs above
 - sync bundle/apply operations
-- snapshots
+- complete snapshot creation, verification, export, and restore flows
 - diagnostics and maintenance data
 
 Treat unsupported features as missing facade methods, not permission to bypass the storage layer.
@@ -95,6 +96,19 @@ and 4096-byte per-path ceiling. The summary contains stable object/commit
 identities and bounded field paths, but is not a plaintext disclosure or
 resolution operation. Existing complete conflict reads and typed resolution
 methods remain the explicit compatibility, repair, and mutation paths.
+
+`MdbxSnapshotSummary` is the bounded snapshot-management record. Use
+`list_snapshot_summaries(page_size, cursor)` for a queue and
+`get_snapshot_summary(snapshot_id)` for metadata-only detail; call
+`default_snapshot_summary_limits` to discover the 1–200 row, 4096-byte cursor,
+and 4096-byte metadata-text limits. The record includes stable snapshot/base
+commit identities, descriptor hash, creation metadata, and
+`snapshot_ciphertext_bytes`, but never `snapshot_ct`. The byte count is a
+storage-size projection rather than an integrity result. Summary SQL does not
+select, decrypt, deserialize, or verify the encrypted payload, so corrupt or
+large snapshots remain navigable. Existing complete snapshot operations are
+outside this facade and must be reached through their authorized storage/API
+boundary when payload-dependent work is required.
 
 Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
 

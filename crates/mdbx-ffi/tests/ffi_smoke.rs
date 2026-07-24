@@ -5,13 +5,14 @@ use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
     default_attachment_batch_limits, default_attachment_presentation_limits,
     default_composite_write_operation_limits, default_conflict_summary_limits,
-    default_object_metadata_disclosure_limits, default_write_operation_limits,
-    inspect_vault_migration, open_vault, open_vault_with_password_security_key,
-    open_vault_with_security_key, upgrade_vault, MdbxAttachmentBatchCommand,
-    MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest, MdbxAuthorizationConstraintKind,
-    MdbxAuthorizationOutcome, MdbxAuthorizationReason, MdbxDeviceAssurance, MdbxDeviceContext,
-    MdbxFfiError, MdbxObjectMetadataDisclosureLimits, MdbxPolicyCompliance, MdbxTigaMode,
-    MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
+    default_object_metadata_disclosure_limits, default_snapshot_summary_limits,
+    default_write_operation_limits, inspect_vault_migration, open_vault,
+    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    MdbxAttachmentBatchCommand, MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest,
+    MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
+    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxObjectMetadataDisclosureLimits,
+    MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
+    MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use mdbx_storage::migration::CURRENT_SCHEMA_VERSION;
 use uuid::Uuid;
@@ -494,6 +495,30 @@ fn bounded_conflict_summary_api_is_available_to_external_clients() {
         Err(MdbxFfiError::InvalidConflictObjectType { object_type })
             if object_type == "unknown"
     ));
+}
+
+#[test]
+fn bounded_snapshot_summary_api_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("snapshot-summary");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "snapshot summary password 12345!".to_string(),
+        "ffi-snapshot-summary-device".to_string(),
+    )
+    .unwrap();
+    let limits = default_snapshot_summary_limits();
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+    assert_eq!(limits.max_text_bytes, 4096);
+
+    let page = vault.list_snapshot_summaries(1, None).unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+    assert!(vault
+        .get_snapshot_summary("missing-snapshot".to_string())
+        .unwrap()
+        .is_none());
+    assert!(vault.list_snapshot_summaries(0, None).is_err());
 }
 
 #[test]
