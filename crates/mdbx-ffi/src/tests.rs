@@ -2672,6 +2672,9 @@ fn bounded_write_operation_limits_and_streaming_intent_hash_are_stable() {
         title: "Mail".to_string(),
     }];
     let encoded = serde_json::to_vec(&commands).unwrap();
+    let storage_commands: Vec<mdbx_storage::repo::WriteCommand> =
+        commands.clone().into_iter().map(Into::into).collect();
+    assert_eq!(serde_json::to_vec(&storage_commands).unwrap(), encoded);
     assert_eq!(
         hash_write_operation_intent(&commands, encoded.len()).unwrap(),
         Sha256::digest(&encoded).to_vec()

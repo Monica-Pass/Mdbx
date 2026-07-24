@@ -263,6 +263,8 @@ MDBX2 同时收紧以下实现边界：
 
 原有单项 FFI 方法继续保留，作为 MDBX1 兼容投影和简单调用入口；需要把一个用户动作合并为单一历史节点时，应使用 operation API。
 
+Native Rust Adapter 使用 `mdbx_storage::repo::OperationCoordinator` 以及同一套有界 `WriteCommand` 契约。UniFFI facade 只负责 record 转换、vault 句柄管理和错误映射，不再维护第二套写入协议。`OperationCoordinator::prepare` 可以在客户端取得写锁之前完成；`execute` 与 `execute_prepared` 继续保证通用命令和组合操作共享一个事务。
+
 原有 operation 方法现在施加默认资源契约：256 条命令、单条 JSON payload 1 MiB、全部 JSON payload 8 MiB、序列化 intent 16 MiB。新增 `default_write_operation_limits` 和 `*_with_limits` 接口允许新客户端选择更小或受控的更大限制，但不能超过 4,096 条命令、单条 16 MiB、总 payload 64 MiB 与 intent 128 MiB 的硬上限。限制检查和流式 intent 哈希发生在 vault 写锁及事务之前；超限不会创建对象、commit 或推进 branch head。旧客户端方法签名和默认 main 分支行为不变。
 
 ### 7.5 对象摘要与披露读取 API

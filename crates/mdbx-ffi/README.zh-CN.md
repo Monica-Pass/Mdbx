@@ -171,7 +171,7 @@ Rust storage core 的完整同步状态使用 `SyncStateLimits` 独立限制编�
 
 一次用户动作需要修改多个 Collection 或 Object 时，应调用 `execute_write_operation` 或 `execute_write_operation_on_branch`。一次调用保持原子性、只产生一条 commit，并用完整命令列表认证幂等 intent。operation 命令额外接受 `com.monica.mail.message` 等 namespaced ObjectTypeId；旧单条 entry 方法继续保持已发布的 MDBX1 类型边界。
 
-兼容方法默认限制为 256 条命令、单条 JSON payload 1 MiB、全部 JSON payload 8 MiB、序列化 intent 16 MiB。`default_write_operation_limits` 返回该配置。新客户端可以调用 `*_with_limits` 并传入显式配置，但仍受 4,096 条命令、单条 16 MiB、总 payload 64 MiB、intent 128 MiB 的硬上限约束。资源校验和流式 intent 哈希在 vault 写锁与事务之前完成。更大导入应使用新的 operation ID 分批；某一批重试时必须复用原 operation ID 和完全相同的命令。
+兼容方法默认限制为 256 条命令、单条 JSON payload 1 MiB、全部 JSON payload 8 MiB、序列化 intent 16 MiB。`default_write_operation_limits` 返回该配置。新客户端可以调用 `*_with_limits` 并传入显式配置，但仍受 4,096 条命令、单条 16 MiB、总 payload 64 MiB、intent 128 MiB 的硬上限约束。FFI facade 将 DTO 转换为 `mdbx-storage::repo::WriteCommand`，由 `OperationCoordinator` 统一完成准备、资源校验、intent 哈希、变更摘要和仓储执行；这些检查在 vault 写锁与事务之前完成。更大导入应使用新的 operation ID 分批；某一批重试时必须复用原 operation ID 和完全相同的命令。
 
 ### 分页对象摘要
 

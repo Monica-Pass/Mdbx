@@ -1,6 +1,6 @@
 #[uniffi::export]
 pub fn default_write_operation_limits() -> MdbxWriteOperationLimits {
-    InternalWriteOperationLimits::default().public()
+    MdbxWriteOperationLimits::from_internal(InternalWriteOperationLimits::default())
 }
 
 #[uniffi::export]
@@ -123,14 +123,13 @@ pub struct MdbxWriteOperationLimits {
     pub max_intent_bytes: u64,
 }
 
-pub(crate) const DEFAULT_MAX_WRITE_COMMANDS: usize = 256;
-pub(crate) const HARD_MAX_WRITE_COMMANDS: usize = 4_096;
-pub(crate) const DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 1024 * 1024;
-const HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_WRITE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-const HARD_MAX_WRITE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_MAX_WRITE_INTENT_BYTES: usize = 16 * 1024 * 1024;
-const HARD_MAX_WRITE_INTENT_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_WRITE_COMMANDS: usize = mdbx_storage::repo::DEFAULT_MAX_WRITE_COMMANDS;
+#[cfg(test)]
+pub(crate) const HARD_MAX_WRITE_COMMANDS: usize = mdbx_storage::repo::HARD_MAX_WRITE_COMMANDS;
+pub(crate) const DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND: usize =
+    mdbx_storage::repo::DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND;
+const DEFAULT_MAX_WRITE_PAYLOAD_BYTES: usize = mdbx_storage::repo::DEFAULT_MAX_WRITE_PAYLOAD_BYTES;
+const DEFAULT_MAX_WRITE_INTENT_BYTES: usize = mdbx_storage::repo::DEFAULT_MAX_WRITE_INTENT_BYTES;
 
 impl Default for MdbxWriteOperationLimits {
     fn default() -> Self {
@@ -164,67 +163,13 @@ impl MdbxWriteOperationLimits {
         limits.validate()?;
         Ok(limits)
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct InternalWriteOperationLimits {
-    max_commands: usize,
-    max_payload_bytes_per_command: usize,
-    max_payload_bytes: usize,
-    max_intent_bytes: usize,
-}
-
-impl Default for InternalWriteOperationLimits {
-    fn default() -> Self {
-        MdbxWriteOperationLimits::default()
-            .into_internal()
-            .expect("built-in write operation limits must be valid")
-    }
-}
-
-impl InternalWriteOperationLimits {
-    fn validate(self) -> Result<(), MdbxFfiError> {
-        let checks = [
-            ("max_commands", self.max_commands, HARD_MAX_WRITE_COMMANDS),
-            (
-                "max_payload_bytes_per_command",
-                self.max_payload_bytes_per_command,
-                HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND,
-            ),
-            (
-                "max_payload_bytes",
-                self.max_payload_bytes,
-                HARD_MAX_WRITE_PAYLOAD_BYTES,
-            ),
-            (
-                "max_intent_bytes",
-                self.max_intent_bytes,
-                HARD_MAX_WRITE_INTENT_BYTES,
-            ),
-        ];
-        for (name, value, hard_max) in checks {
-            if value == 0 || value > hard_max {
-                return Err(StorageError::Validation(format!(
-                    "{name} must be between 1 and {hard_max}"
-                ))
-                .into());
-            }
-        }
-        if self.max_payload_bytes_per_command > self.max_payload_bytes {
-            return Err(StorageError::Validation(
-                "per-command payload limit cannot exceed total payload limit".to_string(),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn public(self) -> MdbxWriteOperationLimits {
+    fn from_internal(limits: InternalWriteOperationLimits) -> Self {
         MdbxWriteOperationLimits {
-            max_commands: self.max_commands as u64,
-            max_payload_bytes_per_command: self.max_payload_bytes_per_command as u64,
-            max_payload_bytes: self.max_payload_bytes as u64,
-            max_intent_bytes: self.max_intent_bytes as u64,
+            max_commands: limits.max_commands as u64,
+            max_payload_bytes_per_command: limits.max_payload_bytes_per_command as u64,
+            max_payload_bytes: limits.max_payload_bytes as u64,
+            max_intent_bytes: limits.max_intent_bytes as u64,
         }
     }
 }
@@ -235,24 +180,17 @@ pub(crate) fn validate_uuid(value: &str, field: &str) -> Result<(), MdbxFfiError
         .map_err(|_| StorageError::Validation(format!("{field} {value} must be a UUID")).into())
 }
 
-fn parse_write_object_type(entry_type: &str) -> Result<EntryType, MdbxFfiError> {
-    entry_type
-        .parse()
-        .map_err(|_| MdbxFfiError::InvalidEntryType {
-            entry_type: entry_type.to_string(),
-        })
-}
-
-use std::io::{self, Write};
-
-use mdbx_core::model::EntryType;
-use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
+#[cfg(test)]
 use mdbx_storage::repo::{
-    AttachmentRepo, CommitChange, CommitContext, CommitOperation, EntryRepo,
-    ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
-    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
-    ProjectRepo,
+    hash_write_operation_intent as hash_storage_write_operation_intent,
+    write_operation_changes as storage_write_operation_changes,
+};
+use mdbx_storage::repo::{
+    write_operation_scope as storage_write_operation_scope, AttachmentRepo, CommitChange,
+    CommitContext, CommitOperation, OperationCoordinator, OperationCoordinatorError,
+    OperationExecution, WriteCommand as StorageWriteCommand,
+    WriteOperationLimits as InternalWriteOperationLimits, WriteOperationRequest,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -263,402 +201,15 @@ use super::attachment_facade::{
     validate_attachment_batch_operation_inputs,
 };
 use super::{
-    default_attachment_batch_limits, entry_for_project, parse_payload_json, parse_relation_kind,
-    MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits, MdbxAttachmentRecord, MdbxFfiError,
-    MdbxVault,
+    default_attachment_batch_limits, MdbxAttachmentBatchCommand, MdbxAttachmentBatchLimits,
+    MdbxAttachmentRecord, MdbxFfiError, MdbxVault,
 };
 
-fn validate_write_operation(
-    operation_id: &str,
-    operation_kind: &str,
-    commands: &[MdbxWriteCommand],
-    limits: InternalWriteOperationLimits,
-) -> Result<(), MdbxFfiError> {
-    if operation_id.trim().is_empty() {
-        return Err(StorageError::Validation("operation_id must not be empty".to_string()).into());
-    }
-    if operation_kind.trim().is_empty() {
-        return Err(
-            StorageError::Validation("operation_kind must not be empty".to_string()).into(),
-        );
-    }
-    if commands.is_empty() {
-        return Err(
-            StorageError::Validation("write operation requires commands".to_string()).into(),
-        );
-    }
-    if commands.len() > limits.max_commands {
-        return Err(StorageError::ResourceLimit {
-            resource: "write operation commands".to_string(),
-            actual: commands.len() as u64,
-            limit: limits.max_commands as u64,
-        }
-        .into());
-    }
-    let mut total_payload_bytes = 0usize;
-    for command in commands {
-        let Some(payload_json) = validate_write_command(command)? else {
-            continue;
-        };
-        let payload_bytes = payload_json.len();
-        if payload_bytes > limits.max_payload_bytes_per_command {
-            return Err(StorageError::ResourceLimit {
-                resource: "write operation command payload bytes".to_string(),
-                actual: payload_bytes as u64,
-                limit: limits.max_payload_bytes_per_command as u64,
-            }
-            .into());
-        }
-        total_payload_bytes = total_payload_bytes
-            .checked_add(payload_bytes)
-            .ok_or_else(|| StorageError::ResourceLimit {
-                resource: "write operation payload bytes".to_string(),
-                actual: u64::MAX,
-                limit: limits.max_payload_bytes as u64,
-            })?;
-        if total_payload_bytes > limits.max_payload_bytes {
-            return Err(StorageError::ResourceLimit {
-                resource: "write operation payload bytes".to_string(),
-                actual: total_payload_bytes as u64,
-                limit: limits.max_payload_bytes as u64,
-            }
-            .into());
-        }
-        parse_payload_json(payload_json)?;
-    }
-    Ok(())
-}
-
-fn validate_write_command(command: &MdbxWriteCommand) -> Result<Option<&str>, MdbxFfiError> {
-    let payload_json = match command {
-        MdbxWriteCommand::CreateProject { project_id, .. } => {
-            validate_uuid(project_id, "project_id")?;
-            None
-        }
-        MdbxWriteCommand::CreateEntry {
-            entry_id,
-            project_id,
-            entry_type,
-            payload_json,
-            ..
-        }
-        | MdbxWriteCommand::UpdateEntry {
-            entry_id,
-            project_id,
-            entry_type,
-            payload_json,
-            ..
-        } => {
-            validate_uuid(entry_id, "entry_id")?;
-            validate_uuid(project_id, "project_id")?;
-            parse_write_object_type(entry_type)?;
-            Some(payload_json.as_str())
-        }
-        MdbxWriteCommand::DeleteEntry {
-            entry_id,
-            project_id,
-        }
-        | MdbxWriteCommand::RestoreEntry {
-            entry_id,
-            project_id,
-        } => {
-            validate_uuid(entry_id, "entry_id")?;
-            validate_uuid(project_id, "project_id")?;
-            None
-        }
-        MdbxWriteCommand::MoveEntry {
-            entry_id,
-            project_id,
-            target_project_id,
-        } => {
-            validate_uuid(entry_id, "entry_id")?;
-            validate_uuid(project_id, "project_id")?;
-            validate_uuid(target_project_id, "target_project_id")?;
-            None
-        }
-        MdbxWriteCommand::CreateObjectRelation {
-            relation_id,
-            source_object_id,
-            target_object_id,
-            relation_kind,
-            payload_json,
-            payload_schema_version,
-        } => {
-            validate_uuid(relation_id, "relation_id")?;
-            validate_uuid(source_object_id, "source_object_id")?;
-            validate_uuid(target_object_id, "target_object_id")?;
-            if source_object_id == target_object_id {
-                return Err(StorageError::Validation(
-                    "self relations require an explicit adapter object instead of an identity edge"
-                        .to_string(),
-                )
-                .into());
-            }
-            parse_relation_kind(relation_kind)?;
-            validate_write_payload_schema_version(*payload_schema_version)?;
-            Some(payload_json.as_str())
-        }
-        MdbxWriteCommand::UpdateObjectRelation {
-            relation_id,
-            relation_kind,
-            payload_json,
-            payload_schema_version,
-        } => {
-            validate_uuid(relation_id, "relation_id")?;
-            parse_relation_kind(relation_kind)?;
-            validate_write_payload_schema_version(*payload_schema_version)?;
-            Some(payload_json.as_str())
-        }
-        MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
-            validate_uuid(relation_id, "relation_id")?;
-            None
-        }
-        MdbxWriteCommand::CreateObjectLabel {
-            label_id,
-            collection_id,
-            name,
-            payload_json,
-            payload_schema_version,
-        } => {
-            validate_uuid(label_id, "label_id")?;
-            validate_uuid(collection_id, "collection_id")?;
-            validate_write_label_name(name)?;
-            validate_write_payload_schema_version(*payload_schema_version)?;
-            Some(payload_json.as_str())
-        }
-        MdbxWriteCommand::UpdateObjectLabel {
-            label_id,
-            name,
-            payload_json,
-            payload_schema_version,
-        } => {
-            validate_uuid(label_id, "label_id")?;
-            validate_write_label_name(name)?;
-            validate_write_payload_schema_version(*payload_schema_version)?;
-            Some(payload_json.as_str())
-        }
-        MdbxWriteCommand::DeleteObjectLabel { label_id } => {
-            validate_uuid(label_id, "label_id")?;
-            None
-        }
-        MdbxWriteCommand::AssignObjectLabel {
-            assignment_id,
-            object_id,
-            label_id,
-        } => {
-            validate_uuid(assignment_id, "assignment_id")?;
-            validate_uuid(object_id, "object_id")?;
-            validate_uuid(label_id, "label_id")?;
-            None
-        }
-        MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => {
-            validate_uuid(assignment_id, "assignment_id")?;
-            None
-        }
-    };
-    Ok(payload_json)
-}
-
-fn validate_write_payload_schema_version(value: u32) -> Result<(), MdbxFfiError> {
-    if value == 0 {
-        return Err(StorageError::Validation(
-            "payload_schema_version must be greater than zero".to_string(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn validate_write_label_name(value: &str) -> Result<(), MdbxFfiError> {
-    if value.trim().is_empty() || value.len() > 512 {
-        return Err(StorageError::Validation(
-            "object label name must contain 1 to 512 UTF-8 bytes".to_string(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
-pub(crate) fn hash_write_operation_intent(
-    commands: &[MdbxWriteCommand],
-    limit: usize,
-) -> Result<Vec<u8>, MdbxFfiError> {
-    let mut writer = LimitedIntentHashWriter::new(limit);
-    if let Err(error) = serde_json::to_writer(&mut writer, commands) {
-        if let Some(actual) = writer.exceeded_at {
-            return Err(StorageError::ResourceLimit {
-                resource: "write operation serialized intent bytes".to_string(),
-                actual: actual as u64,
-                limit: limit as u64,
-            }
-            .into());
-        }
-        return Err(error.into());
-    }
-    Ok(writer.finalize())
-}
-
-struct LimitedIntentHashWriter {
-    hasher: Sha256,
-    bytes_written: usize,
-    limit: usize,
-    exceeded_at: Option<usize>,
-}
-
-impl LimitedIntentHashWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            hasher: Sha256::new(),
-            bytes_written: 0,
-            limit,
-            exceeded_at: None,
-        }
-    }
-
-    fn finalize(self) -> Vec<u8> {
-        self.hasher.finalize().to_vec()
-    }
-}
-
-impl Write for LimitedIntentHashWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let actual = self
-            .bytes_written
-            .checked_add(buffer.len())
-            .unwrap_or(usize::MAX);
-        if actual > self.limit {
-            self.exceeded_at = Some(actual);
-            return Err(io::Error::other(
-                "write operation serialized intent limit exceeded",
-            ));
-        }
-        self.hasher.update(buffer);
-        self.bytes_written = actual;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-pub(crate) fn write_operation_changes(commands: &[MdbxWriteCommand]) -> Vec<CommitChange> {
-    let mut changes = Vec::new();
-    for command in commands {
-        let (object_type, object_id, action, fields): (&str, &String, &str, &[&str]) = match command
-        {
-            MdbxWriteCommand::CreateProject { project_id, .. } => {
-                ("project", project_id, "create", &["title"])
-            }
-            MdbxWriteCommand::CreateEntry { entry_id, .. } => (
-                "entry",
-                entry_id,
-                "create",
-                &["project_id", "entry_type", "title", "payload"],
-            ),
-            MdbxWriteCommand::UpdateEntry { entry_id, .. } => {
-                ("entry", entry_id, "update", &["title", "payload"])
-            }
-            MdbxWriteCommand::DeleteEntry { entry_id, .. } => {
-                ("entry", entry_id, "delete", &["deleted"])
-            }
-            MdbxWriteCommand::RestoreEntry { entry_id, .. } => {
-                ("entry", entry_id, "restore", &["deleted"])
-            }
-            MdbxWriteCommand::MoveEntry { entry_id, .. } => {
-                ("entry", entry_id, "move", &["project_id"])
-            }
-            MdbxWriteCommand::CreateObjectRelation { relation_id, .. } => (
-                "object-relation",
-                relation_id,
-                "create",
-                &[
-                    "source_object_id",
-                    "target_object_id",
-                    "relation_kind",
-                    "payload",
-                    "payload_schema_version",
-                ],
-            ),
-            MdbxWriteCommand::UpdateObjectRelation { relation_id, .. } => (
-                "object-relation",
-                relation_id,
-                "update",
-                &["relation_kind", "payload", "payload_schema_version"],
-            ),
-            MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
-                ("object-relation", relation_id, "delete", &["deleted"])
-            }
-            MdbxWriteCommand::CreateObjectLabel { label_id, .. } => (
-                "object-label",
-                label_id,
-                "create",
-                &["collection_id", "name", "payload", "payload_schema_version"],
-            ),
-            MdbxWriteCommand::UpdateObjectLabel { label_id, .. } => (
-                "object-label",
-                label_id,
-                "update",
-                &["name", "payload", "payload_schema_version"],
-            ),
-            MdbxWriteCommand::DeleteObjectLabel { label_id } => {
-                ("object-label", label_id, "delete", &["deleted"])
-            }
-            MdbxWriteCommand::AssignObjectLabel { assignment_id, .. } => (
-                "object-label-assignment",
-                assignment_id,
-                "create",
-                &["object_id", "label_id"],
-            ),
-            MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => (
-                "object-label-assignment",
-                assignment_id,
-                "delete",
-                &["deleted"],
-            ),
-        };
-        let incoming = CommitChange {
-            object_type: object_type.to_string(),
-            object_id: object_id.clone(),
-            action: action.to_string(),
-            fields: fields.iter().map(|field| (*field).to_string()).collect(),
-        };
-        if let Some(existing) = changes.iter_mut().find(|change: &&mut CommitChange| {
-            change.object_type == object_type && change.object_id == *object_id
-        }) {
-            if existing.action != incoming.action {
-                existing.action = "change".to_string();
-            }
-            for field in incoming.fields {
-                if !existing.fields.contains(&field) {
-                    existing.fields.push(field);
-                }
-            }
-        } else {
-            changes.push(incoming);
-        }
-    }
-    changes
-}
-
-fn write_operation_scope(changes: &[CommitChange]) -> String {
-    let first = &changes[0].object_type;
-    if changes.iter().all(|change| change.object_type == *first) {
-        first.clone()
-    } else {
-        "multi".to_string()
-    }
-}
-
-fn execute_write_commands(
-    conn: &VaultConnection,
-    ctx: &CommitContext,
-    commands: &[MdbxWriteCommand],
-) -> StorageResult<()> {
-    for command in commands {
+impl From<MdbxWriteCommand> for StorageWriteCommand {
+    fn from(command: MdbxWriteCommand) -> Self {
         match command {
             MdbxWriteCommand::CreateProject { project_id, title } => {
-                ProjectRepo::create_with_id(conn, ctx, project_id, title, None, None)?;
+                Self::CreateProject { project_id, title }
             }
             MdbxWriteCommand::CreateEntry {
                 entry_id,
@@ -666,66 +217,49 @@ fn execute_write_commands(
                 entry_type,
                 title,
                 payload_json,
-            } => {
-                let payload = serde_json::from_str(payload_json)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                let entry_type = parse_write_object_type(entry_type)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                EntryRepo::create_with_id(
-                    conn,
-                    ctx,
-                    entry_id,
-                    project_id,
-                    entry_type,
-                    Some(title),
-                    &payload,
-                )?;
-            }
+            } => Self::CreateEntry {
+                entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload_json,
+            },
             MdbxWriteCommand::UpdateEntry {
                 entry_id,
                 project_id,
                 entry_type,
                 title,
                 payload_json,
-            } => {
-                let expected_type = parse_write_object_type(entry_type)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                let mut entry = entry_for_project(conn, project_id, entry_id)?;
-                if entry.deleted || entry.entry_type != expected_type {
-                    return Err(StorageError::ConstraintViolation(format!(
-                        "entry {entry_id} cannot be updated"
-                    )));
-                }
-                entry.title_ct = Some(title.as_bytes().to_vec());
-                entry.payload_ct = serde_json::to_vec(
-                    &serde_json::from_str::<serde_json::Value>(payload_json)
-                        .map_err(|error| StorageError::Validation(error.to_string()))?,
-                )
-                .map_err(|error| StorageError::Validation(error.to_string()))?;
-                EntryRepo::update(conn, ctx, &entry)?;
-            }
+            } => Self::UpdateEntry {
+                entry_id,
+                project_id,
+                entry_type,
+                title,
+                payload_json,
+            },
             MdbxWriteCommand::DeleteEntry {
                 entry_id,
                 project_id,
-            } => {
-                entry_for_project(conn, project_id, entry_id)?;
-                EntryRepo::soft_delete(conn, ctx, entry_id)?;
-            }
+            } => Self::DeleteEntry {
+                entry_id,
+                project_id,
+            },
             MdbxWriteCommand::RestoreEntry {
                 entry_id,
                 project_id,
-            } => {
-                entry_for_project(conn, project_id, entry_id)?;
-                EntryRepo::restore(conn, ctx, entry_id)?;
-            }
+            } => Self::RestoreEntry {
+                entry_id,
+                project_id,
+            },
             MdbxWriteCommand::MoveEntry {
                 entry_id,
                 project_id,
                 target_project_id,
-            } => {
-                entry_for_project(conn, project_id, entry_id)?;
-                EntryRepo::move_to_project(conn, ctx, entry_id, target_project_id)?;
-            }
+            } => Self::MoveEntry {
+                entry_id,
+                project_id,
+                target_project_id,
+            },
             MdbxWriteCommand::CreateObjectRelation {
                 relation_id,
                 source_object_id,
@@ -733,38 +267,27 @@ fn execute_write_commands(
                 relation_kind,
                 payload_json,
                 payload_schema_version,
-            } => {
-                ObjectRelationRepo::create(
-                    conn,
-                    ctx,
-                    ObjectRelationCreateRequest::new(
-                        source_object_id,
-                        target_object_id,
-                        parse_relation_kind(relation_kind)
-                            .map_err(|error| StorageError::Validation(error.to_string()))?,
-                        parse_write_payload(payload_json)?,
-                    )
-                    .with_relation_id(relation_id)
-                    .with_payload_schema_version(*payload_schema_version),
-                )?;
-            }
+            } => Self::CreateObjectRelation {
+                relation_id,
+                source_object_id,
+                target_object_id,
+                relation_kind,
+                payload_json,
+                payload_schema_version,
+            },
             MdbxWriteCommand::UpdateObjectRelation {
                 relation_id,
                 relation_kind,
                 payload_json,
                 payload_schema_version,
-            } => {
-                let mut relation = ObjectRelationRepo::get_by_id(conn, relation_id)?
-                    .ok_or_else(|| StorageError::NotFound(relation_id.clone()))?;
-                relation.relation_kind = parse_relation_kind(relation_kind)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                relation.payload_ct = serde_json::to_vec(&parse_write_payload(payload_json)?)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                relation.payload_schema_version = *payload_schema_version;
-                ObjectRelationRepo::update(conn, ctx, &relation)?;
-            }
+            } => Self::UpdateObjectRelation {
+                relation_id,
+                relation_kind,
+                payload_json,
+                payload_schema_version,
+            },
             MdbxWriteCommand::DeleteObjectRelation { relation_id } => {
-                ObjectRelationRepo::soft_delete(conn, ctx, relation_id)?;
+                Self::DeleteObjectRelation { relation_id }
             }
             MdbxWriteCommand::CreateObjectLabel {
                 label_id,
@@ -772,58 +295,77 @@ fn execute_write_commands(
                 name,
                 payload_json,
                 payload_schema_version,
-            } => {
-                ObjectLabelRepo::create(
-                    conn,
-                    ctx,
-                    ObjectLabelCreateRequest::new(
-                        collection_id,
-                        name,
-                        parse_write_payload(payload_json)?,
-                    )
-                    .with_label_id(label_id)
-                    .with_payload_schema_version(*payload_schema_version),
-                )?;
-            }
+            } => Self::CreateObjectLabel {
+                label_id,
+                collection_id,
+                name,
+                payload_json,
+                payload_schema_version,
+            },
             MdbxWriteCommand::UpdateObjectLabel {
                 label_id,
                 name,
                 payload_json,
                 payload_schema_version,
-            } => {
-                let mut label = ObjectLabelRepo::get_by_id(conn, label_id)?
-                    .ok_or_else(|| StorageError::NotFound(label_id.clone()))?;
-                label.name_ct = name.as_bytes().to_vec();
-                label.payload_ct = serde_json::to_vec(&parse_write_payload(payload_json)?)
-                    .map_err(|error| StorageError::Validation(error.to_string()))?;
-                label.payload_schema_version = *payload_schema_version;
-                ObjectLabelRepo::update(conn, ctx, &label)?;
-            }
+            } => Self::UpdateObjectLabel {
+                label_id,
+                name,
+                payload_json,
+                payload_schema_version,
+            },
             MdbxWriteCommand::DeleteObjectLabel { label_id } => {
-                ObjectLabelRepo::soft_delete(conn, ctx, label_id)?;
+                Self::DeleteObjectLabel { label_id }
             }
             MdbxWriteCommand::AssignObjectLabel {
                 assignment_id,
                 object_id,
                 label_id,
-            } => {
-                ObjectLabelAssignmentRepo::create(
-                    conn,
-                    ctx,
-                    ObjectLabelAssignmentCreateRequest::new(object_id, label_id)
-                        .with_assignment_id(assignment_id),
-                )?;
-            }
+            } => Self::AssignObjectLabel {
+                assignment_id,
+                object_id,
+                label_id,
+            },
             MdbxWriteCommand::RemoveObjectLabelAssignment { assignment_id } => {
-                ObjectLabelAssignmentRepo::soft_delete(conn, ctx, assignment_id)?;
+                Self::RemoveObjectLabelAssignment { assignment_id }
             }
         }
     }
-    Ok(())
 }
 
-fn parse_write_payload(payload_json: &str) -> StorageResult<serde_json::Value> {
-    serde_json::from_str(payload_json).map_err(|error| StorageError::Validation(error.to_string()))
+impl From<OperationCoordinatorError> for MdbxFfiError {
+    fn from(error: OperationCoordinatorError) -> Self {
+        match error {
+            OperationCoordinatorError::Storage(error) => error.into(),
+            OperationCoordinatorError::Serialization(error) => error.into(),
+            OperationCoordinatorError::InvalidObjectTypeId { object_type_id } => {
+                Self::InvalidEntryType {
+                    entry_type: object_type_id,
+                }
+            }
+            OperationCoordinatorError::InvalidRelationKind { relation_kind } => {
+                Self::InvalidRelationKind { relation_kind }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn storage_write_commands(commands: &[MdbxWriteCommand]) -> Vec<StorageWriteCommand> {
+    commands.iter().cloned().map(Into::into).collect()
+}
+
+#[cfg(test)]
+pub(crate) fn hash_write_operation_intent(
+    commands: &[MdbxWriteCommand],
+    limit: usize,
+) -> Result<Vec<u8>, MdbxFfiError> {
+    hash_storage_write_operation_intent(&storage_write_commands(commands), limit)
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+pub(crate) fn write_operation_changes(commands: &[MdbxWriteCommand]) -> Vec<CommitChange> {
+    storage_write_operation_changes(&storage_write_commands(commands))
 }
 
 pub(crate) fn execute_write_operation_for_branch(
@@ -834,35 +376,21 @@ pub(crate) fn execute_write_operation_for_branch(
     commands: Vec<MdbxWriteCommand>,
     limits: InternalWriteOperationLimits,
 ) -> Result<MdbxWriteOperationResult, MdbxFfiError> {
-    validate_write_operation(&operation_id, &operation_kind, &commands, limits)?;
-    let intent_hash = hash_write_operation_intent(&commands, limits.max_intent_bytes)?;
-    let changed_objects = write_operation_changes(&commands);
-    let mut operation = CommitOperation::new(
-        operation_id,
-        operation_kind,
-        branch_id.as_deref().map(|_| "").unwrap_or("main"),
-        "change",
-        write_operation_scope(&changed_objects),
-        changed_objects,
-    )
-    .with_intent_hash(intent_hash);
+    let storage_commands = commands.into_iter().map(Into::into).collect();
+    let mut request = WriteOperationRequest::new(operation_id, operation_kind, storage_commands)
+        .with_limits(limits);
     if let Some(branch_id) = branch_id {
-        operation = operation.with_branch_id(branch_id);
+        request = request.with_branch_id(branch_id);
     }
+    let prepared = OperationCoordinator::prepare(request)?;
 
     let conn = vault.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
     let ctx = CommitContext::new(vault.device_id.clone());
-    let execution = ctx.run_operation(&conn, operation, |scoped| {
-        execute_write_commands(&conn, scoped, &commands)
-    })?;
-    let (commit_id, already_committed) = match execution {
-        OperationExecution::Applied { commit_id, .. } => (commit_id, false),
-        OperationExecution::AlreadyCommitted { commit_id } => (commit_id, true),
-    };
+    let outcome = OperationCoordinator::execute_prepared(&conn, &ctx, &prepared)?;
     Ok(write_operation_result(
-        &commands,
-        commit_id,
-        already_committed,
+        &outcome.changed_objects,
+        outcome.commit_id,
+        outcome.already_committed,
     ))
 }
 
@@ -880,59 +408,66 @@ pub(crate) fn execute_composite_write_operation(
     vault: &MdbxVault,
     request: CompositeWriteOperation,
 ) -> Result<MdbxCompositeWriteOperationResult, MdbxFfiError> {
-    if request.commands.is_empty() || request.attachment_commands.is_empty() {
+    let CompositeWriteOperation {
+        branch_id,
+        operation_id,
+        operation_kind,
+        commands,
+        attachment_commands,
+        write_limits,
+        attachment_limits,
+    } = request;
+    if commands.is_empty() || attachment_commands.is_empty() {
         return Err(StorageError::Validation(
             "composite write operation requires generic and attachment commands".to_string(),
         )
         .into());
     }
-    validate_write_operation(
-        &request.operation_id,
-        &request.operation_kind,
-        &request.commands,
-        request.write_limits,
-    )?;
+    let storage_commands = commands.into_iter().map(Into::into).collect();
+    let mut generic_request = WriteOperationRequest::new(
+        operation_id.clone(),
+        operation_kind.clone(),
+        storage_commands,
+    )
+    .with_limits(write_limits);
+    if let Some(branch_id) = &branch_id {
+        generic_request = generic_request.with_branch_id(branch_id.clone());
+    }
+    let prepared = OperationCoordinator::prepare(generic_request)?;
     let chunk_size = validate_attachment_batch_operation_inputs(
-        &request.operation_id,
-        &request.attachment_commands,
-        request.attachment_limits,
+        &operation_id,
+        &attachment_commands,
+        attachment_limits,
     )?;
-    let generic_intent_hash =
-        hash_write_operation_intent(&request.commands, request.write_limits.max_intent_bytes)?;
-    let attachment_intent_hash = hash_attachment_batch_intent(
-        &request.operation_id,
-        &request.attachment_commands,
-        request.attachment_limits,
-    );
+    let attachment_intent_hash =
+        hash_attachment_batch_intent(&operation_id, &attachment_commands, attachment_limits);
     let intent_hash = hash_composite_write_intent(
-        &request.operation_id,
-        &request.operation_kind,
-        &generic_intent_hash,
+        &operation_id,
+        &operation_kind,
+        prepared.intent_hash(),
         &attachment_intent_hash,
     );
-    let attachment_ids = attachment_batch_ids(&request.attachment_commands);
-    let mut changed_objects = write_operation_changes(&request.commands);
-    changed_objects.extend(attachment_batch_changes(&request.attachment_commands));
+    let attachment_ids = attachment_batch_ids(&attachment_commands);
+    let mut changed_objects = prepared.changed_objects().to_vec();
+    changed_objects.extend(attachment_batch_changes(&attachment_commands));
     let mut operation = CommitOperation::new(
-        request.operation_id,
-        request.operation_kind,
-        request.branch_id.as_deref().map(|_| "").unwrap_or("main"),
+        prepared.operation_id(),
+        prepared.operation_kind(),
+        prepared.branch_id().map(|_| "").unwrap_or("main"),
         "change",
-        write_operation_scope(&changed_objects),
+        storage_write_operation_scope(&changed_objects),
         changed_objects,
     )
     .with_intent_hash(intent_hash);
-    if let Some(branch_id) = request.branch_id {
+    if let Some(branch_id) = prepared.branch_id() {
         operation = operation.with_branch_id(branch_id);
     }
 
-    let generic_commands = request.commands;
-    let attachment_commands = request.attachment_commands;
     let conn = vault.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
     let ctx = CommitContext::new(vault.device_id.clone());
     let ids_for_action = attachment_ids.clone();
     let execution = ctx.run_operation(&conn, operation, |scoped| {
-        execute_write_commands(&conn, scoped, &generic_commands)?;
+        prepared.apply(&conn, scoped)?;
         execute_attachment_batch_commands(
             &conn,
             scoped,
@@ -956,7 +491,7 @@ pub(crate) fn execute_composite_write_operation(
         .map(attachment_record_from_core)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(MdbxCompositeWriteOperationResult {
-        operation: write_operation_result(&generic_commands, commit_id, already_committed),
+        operation: write_operation_result(prepared.changed_objects(), commit_id, already_committed),
         attachments,
     })
 }
@@ -977,11 +512,10 @@ fn hash_composite_write_intent(
 }
 
 fn write_operation_result(
-    commands: &[MdbxWriteCommand],
+    changes: &[CommitChange],
     commit_id: String,
     already_committed: bool,
 ) -> MdbxWriteOperationResult {
-    let changes = write_operation_changes(commands);
     let mut project_ids = Vec::new();
     let mut entry_ids = Vec::new();
     let mut relation_ids = Vec::new();
@@ -989,11 +523,11 @@ fn write_operation_result(
     let mut label_assignment_ids = Vec::new();
     for change in changes {
         match change.object_type.as_str() {
-            "project" => project_ids.push(change.object_id),
-            "entry" => entry_ids.push(change.object_id),
-            "object-relation" => relation_ids.push(change.object_id),
-            "object-label" => label_ids.push(change.object_id),
-            "object-label-assignment" => label_assignment_ids.push(change.object_id),
+            "project" => project_ids.push(change.object_id.clone()),
+            "entry" => entry_ids.push(change.object_id.clone()),
+            "object-relation" => relation_ids.push(change.object_id.clone()),
+            "object-label" => label_ids.push(change.object_id.clone()),
+            "object-label-assignment" => label_assignment_ids.push(change.object_id.clone()),
             _ => {}
         }
     }

@@ -211,6 +211,13 @@ Every create command carries a client-generated stable UUID. The client reuses t
 
 The existing single-mutation FFI methods remain available as the MDBX1-compatible projection and simple-call entry points. A client action that must appear as one history node should use the operation API.
 
+Native Rust adapters use `mdbx_storage::repo::OperationCoordinator` with the
+same bounded `WriteCommand` contract. The UniFFI facade only converts its
+records, manages the vault handle, and maps errors; it does not maintain a
+second write protocol. `OperationCoordinator::prepare` may complete before a
+client write lock, while `execute` and `execute_prepared` preserve one
+transaction for generic and composed operations.
+
 ### Object Summary and Disclosure Read API
 
 Existing UniFFI `get_object`, `list_objects`, and `list_entries` signatures and complete-payload behavior remain unchanged for MDBX1 and already generated clients. MDBX2 clients use additive `get_object_summary(object_id)` for metadata-only details and `list_object_summaries` for bounded collection screens.

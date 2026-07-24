@@ -29,9 +29,7 @@ pub use history_facade::*;
 pub use integrity_root_facade::*;
 pub use lifecycle_facade::*;
 pub use object_facade::*;
-pub(crate) use object_facade::{
-    entry_for_project, parse_object_type_id, parse_payload_json, parse_relation_kind,
-};
+pub(crate) use object_facade::{parse_object_type_id, parse_payload_json, parse_relation_kind};
 #[cfg(test)]
 pub(crate) use security_facade::scope_from_core;
 pub use security_facade::*;
