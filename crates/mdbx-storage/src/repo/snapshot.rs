@@ -7,7 +7,7 @@ use uuid::Uuid;
 use mdbx_core::model::attachment::{AttachmentChunk, StorageMode};
 use mdbx_core::model::{
     Attachment, CollectionProfile, Entry, ObjectLabel, ObjectLabelAssignment, ObjectRelation,
-    Project, Snapshot,
+    Project, Snapshot, SnapshotKind,
 };
 use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
@@ -18,7 +18,7 @@ use crate::migration::SNAPSHOT_RECORD_AUTH_EXTENSION;
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
 use crate::repo::snapshot_integrity::{self, SnapshotIntegrityInput};
-use crate::repo::{CollectionProfileRepo, TombstoneRepo};
+use crate::repo::{CollectionProfileRepo, SnapshotLifecycleRepo, TombstoneRepo};
 use crate::sync_state::ProjectTagSetRow;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
@@ -68,73 +68,130 @@ impl SnapshotRepo {
 
     /// 创建 snapshot：捕获当前所有未删除对象的元数据。
     pub fn create_snapshot(conn: &VaultConnection, ctx: &CommitContext) -> StorageResult<Snapshot> {
+        conn.with_immediate_transaction(|| Self::create_snapshot_inner(conn, ctx))
+    }
+
+    /// Create a snapshot and attach authenticated lifecycle metadata in the
+    /// same SQLite transaction. The legacy create_snapshot API remains
+    /// unchanged and creates a protected manual snapshot without a companion
+    /// row.
+    pub fn create_snapshot_with_lifecycle(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        kind: SnapshotKind,
+        retention_eligible_at: Option<&str>,
+    ) -> StorageResult<Snapshot> {
         conn.with_immediate_transaction(|| {
-            let now = chrono::Utc::now().to_rfc3339();
-            let snapshot_id = Uuid::new_v4().to_string();
-
-            let (vault_id, format_version): (String, String) = conn
-                .inner()
-                .query_row(
-                    "SELECT vault_id, format_version FROM vault_meta",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(StorageError::Database)?;
-
-            let payload = SnapshotPayload {
-                vault_id,
-                format_version,
-                snapshot_created_at: now.clone(),
-                projects: read_all_active_projects(conn)?,
-                collection_profiles: Some(CollectionProfileRepo::list_active(conn)?),
-                entries: read_all_active_entries(conn)?,
-                object_relations: Some(read_all_active_object_relations(conn)?),
-                object_labels: Some(read_all_active_object_labels(conn)?),
-                object_label_assignments: Some(read_all_active_object_label_assignments(conn)?),
-                attachments: read_all_active_attachments(conn)?,
-                attachment_chunks: Some(read_all_active_attachment_chunks(conn)?),
-                project_tags: Some(read_all_active_project_tags(conn)?),
-            };
-
-            let snapshot_json = serde_json::to_vec(&payload)
-                .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
-            let snapshot_ct = Self::encrypt_payload(conn, &snapshot_id, &snapshot_json)?;
-
-            let commit_id =
-                ctx.create_commit(conn, "snapshot", "multi", &[snapshot_id.clone()], &[])?;
-            let snapshot_hash = snapshot_integrity::issue_descriptor(
+            let snapshot = Self::create_snapshot_inner(conn, ctx)?;
+            SnapshotLifecycleRepo::register_from_snapshot_in_transaction(
                 conn,
-                &SnapshotIntegrityInput {
-                    snapshot_id: &snapshot_id,
-                    base_commit_id: &commit_id,
-                    snapshot_ct: &snapshot_ct,
-                    created_at: &now,
-                    created_by_device_id: &ctx.device_id,
-                },
+                &snapshot,
+                kind,
+                retention_eligible_at,
             )?;
+            Ok(snapshot)
+        })
+    }
 
-            conn.inner().execute(
-                "INSERT INTO snapshots (snapshot_id, base_commit_id, snapshot_ct,
-                 snapshot_hash, created_at, created_by_device_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    snapshot_id,
-                    commit_id,
-                    snapshot_ct,
-                    snapshot_hash,
-                    now,
-                    ctx.device_id,
-                ],
-            )?;
+    pub fn create_automatic_snapshot(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        retention_eligible_at: &str,
+    ) -> StorageResult<Snapshot> {
+        Self::create_snapshot_with_lifecycle(
+            conn,
+            ctx,
+            SnapshotKind::Automatic,
+            Some(retention_eligible_at),
+        )
+    }
 
-            Ok(Snapshot {
+    pub fn create_automatic_snapshot_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        retention_eligible_at: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(Snapshot, AuthorizationDecision)> {
+        let (snapshot, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::CreateSnapshot,
+            context,
+            || {
+                let snapshot = Self::create_automatic_snapshot(conn, ctx, retention_eligible_at)?;
+                let commit_id = snapshot.base_commit_id.clone();
+                Ok((snapshot, commit_id))
+            },
+        )?;
+        Ok((snapshot, decision))
+    }
+
+    fn create_snapshot_inner(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+    ) -> StorageResult<Snapshot> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let snapshot_id = Uuid::new_v4().to_string();
+
+        let (vault_id, format_version): (String, String) = conn
+            .inner()
+            .query_row(
+                "SELECT vault_id, format_version FROM vault_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(StorageError::Database)?;
+
+        let payload = SnapshotPayload {
+            vault_id,
+            format_version,
+            snapshot_created_at: now.clone(),
+            projects: read_all_active_projects(conn)?,
+            collection_profiles: Some(CollectionProfileRepo::list_active(conn)?),
+            entries: read_all_active_entries(conn)?,
+            object_relations: Some(read_all_active_object_relations(conn)?),
+            object_labels: Some(read_all_active_object_labels(conn)?),
+            object_label_assignments: Some(read_all_active_object_label_assignments(conn)?),
+            attachments: read_all_active_attachments(conn)?,
+            attachment_chunks: Some(read_all_active_attachment_chunks(conn)?),
+            project_tags: Some(read_all_active_project_tags(conn)?),
+        };
+
+        let snapshot_json = serde_json::to_vec(&payload)
+            .map_err(|e| StorageError::SchemaCreation(e.to_string()))?;
+        let snapshot_ct = Self::encrypt_payload(conn, &snapshot_id, &snapshot_json)?;
+        let commit_id =
+            ctx.create_commit(conn, "snapshot", "multi", &[snapshot_id.clone()], &[])?;
+        let snapshot_hash = snapshot_integrity::issue_descriptor(
+            conn,
+            &SnapshotIntegrityInput {
+                snapshot_id: &snapshot_id,
+                base_commit_id: &commit_id,
+                snapshot_ct: &snapshot_ct,
+                created_at: &now,
+                created_by_device_id: &ctx.device_id,
+            },
+        )?;
+        conn.inner().execute(
+            "INSERT INTO snapshots (snapshot_id, base_commit_id, snapshot_ct,
+             snapshot_hash, created_at, created_by_device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
                 snapshot_id,
-                base_commit_id: commit_id,
+                commit_id,
                 snapshot_ct,
                 snapshot_hash,
-                created_at: now,
-                created_by_device_id: ctx.device_id.clone(),
-            })
+                now,
+                ctx.device_id,
+            ],
+        )?;
+        Ok(Snapshot {
+            snapshot_id,
+            base_commit_id: commit_id,
+            snapshot_ct,
+            snapshot_hash,
+            created_at: now,
+            created_by_device_id: ctx.device_id.clone(),
         })
     }
 

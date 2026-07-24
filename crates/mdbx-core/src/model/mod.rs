@@ -15,8 +15,9 @@ pub use collection::{
 };
 pub use commit::{
     ChangeScope, Commit, CommitKind, CommitParent, Conflict, ConflictObjectType,
-    ConflictResolution, ConflictSummary, ConflictSummaryPage, Snapshot, SnapshotSummary,
-    SnapshotSummaryPage, Tombstone, TombstoneTargetType,
+    ConflictResolution, ConflictSummary, ConflictSummaryPage, Snapshot, SnapshotKind,
+    SnapshotLifecycleSummary, SnapshotPruneCandidate, SnapshotPrunePlan, SnapshotPruneResult,
+    SnapshotSummary, SnapshotSummaryPage, Tombstone, TombstoneTargetType,
 };
 pub use entry::{Entry, EntryType, ObjectSummary, ObjectSummaryPage, ObjectTypeId};
 pub use object_metadata::{

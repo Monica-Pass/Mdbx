@@ -266,6 +266,70 @@ pub struct SnapshotSummaryPage {
     pub next_cursor: Option<String>,
 }
 
+/// Snapshot recovery-point classification. Legacy rows without lifecycle
+/// metadata are treated as protected `Manual` points by storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotKind {
+    Manual,
+    Automatic,
+}
+
+impl std::fmt::Display for SnapshotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotKind::Manual => write!(f, "manual"),
+            SnapshotKind::Automatic => write!(f, "automatic"),
+        }
+    }
+}
+
+impl std::str::FromStr for SnapshotKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "automatic" => Ok(Self::Automatic),
+            _ => Err(format!("unknown snapshot kind: {value}")),
+        }
+    }
+}
+
+/// Authenticated lifecycle metadata exposed independently from the legacy
+/// snapshot payload and summary record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotLifecycleSummary {
+    pub snapshot_id: SnapshotId,
+    pub kind: SnapshotKind,
+    pub retention_eligible_at: Option<String>,
+}
+
+/// One bounded candidate in an automatic snapshot prune plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPruneCandidate {
+    pub summary: SnapshotSummary,
+    pub retention_eligible_at: String,
+}
+
+/// Read-only, bounded snapshot prune plan. The token is opaque to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPrunePlan {
+    pub plan_token: String,
+    pub keep_latest: usize,
+    pub candidates: Vec<SnapshotPruneCandidate>,
+    pub has_more: bool,
+    pub total_ciphertext_bytes: u64,
+}
+
+/// Result of one authorized, atomic automatic-snapshot prune operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPruneResult {
+    pub plan_token: String,
+    pub commit_id: String,
+    pub deleted_snapshot_ids: Vec<SnapshotId>,
+}
+
 /// 冲突记录 — 并发修改无法自动合并时产生。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {

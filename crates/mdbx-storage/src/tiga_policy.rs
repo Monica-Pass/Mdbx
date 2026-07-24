@@ -810,7 +810,9 @@ impl TigaService {
         }
         conn.with_immediate_transaction(|| {
             let (value, commit_id) = action()?;
-            if evaluated.decision.audit_required {
+            if evaluated.decision.audit_required
+                && !commit_has_security_audit_event(conn, &commit_id)?
+            {
                 record_authorization_event(
                     conn,
                     scope,
@@ -1287,6 +1289,18 @@ fn operation_id_for_commit(conn: &VaultConnection, commit_id: &str) -> StorageRe
                 "commit {commit_id} has no Commit2 operation metadata"
             ))
         })
+}
+
+fn commit_has_security_audit_event(conn: &VaultConnection, commit_id: &str) -> StorageResult<bool> {
+    conn.inner()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM security_audit_events WHERE commit_id = ?1
+             )",
+            params![commit_id],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Database)
 }
 
 pub(crate) fn validate_audit_evidence(event: &SecurityAuditEvent) -> StorageResult<()> {

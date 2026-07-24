@@ -6,12 +6,12 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::{v10, v11, v12, v13, v14, v15, v16, v2, v7, v8, v9};
+use crate::schema::{v10, v11, v12, v13, v14, v15, v16, v17, v2, v7, v8, v9};
 
 pub const FORMAT_V1: &str = "MDBX-1";
 pub const FORMAT_V1_DRAFT: &str = "MDBX-1-DRAFT";
 pub const FORMAT_V2: &str = "MDBX-2";
-pub const CURRENT_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_SCHEMA_VERSION: u32 = 17;
 pub const MIGRATION_V1_TO_V2: &str = "mdbx-1-to-mdbx-2";
 pub const MIGRATION_TIGA2_POLICY: &str = "mdbx-2-tiga-policy-v2";
 pub const MIGRATION_COMMIT2: &str = "mdbx-2-operation-commits-v1";
@@ -30,6 +30,7 @@ pub const MIGRATION_VAULT_HEADER_AUTH: &str = "mdbx-2-vault-header-auth-v1";
 pub const FIELD_KEY_EPOCHS_EXTENSION: &str = "field-key-epochs-v1";
 pub const SNAPSHOT_RECORD_AUTH_EXTENSION: &str = "snapshot-record-auth-v1";
 pub const AUTHENTICATED_STATE_ROOT_EXTENSION: &str = "authenticated-state-root-v1";
+pub const MIGRATION_SNAPSHOT_LIFECYCLE: &str = "mdbx-2-snapshot-lifecycle-v1";
 
 const SUPPORTED_CRITICAL_EXTENSIONS: &[&str] = &[
     FIELD_KEY_EPOCHS_EXTENSION,
@@ -300,6 +301,7 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
         v14::create_extensions(conn)?;
         v15::create_extensions(conn)?;
         v16::create_extensions(conn)?;
+        v17::create_extensions(conn)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
@@ -342,6 +344,12 @@ fn migrate_v1_to_v2(conn: &Connection, from_format: &str) -> StorageResult<()> {
              (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![MIGRATION_VAULT_HEADER_AUTH, from_format, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![MIGRATION_SNAPSHOT_LIFECYCLE, from_format, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
 
@@ -406,6 +414,7 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
         v14::create_extensions(conn)?;
         v15::create_extensions(conn)?;
         v16::create_extensions(conn)?;
+        v17::create_extensions(conn)?;
         let now = chrono::Utc::now().to_rfc3339();
         v13::initialize_bootstrap_floor(conn, &now)?;
         let remediation_required = migrate_tiga1_policy(conn, &now)?;
@@ -492,6 +501,12 @@ fn upgrade_mdbx2_schema(conn: &Connection) -> StorageResult<()> {
                 (migration_id, from_format, to_format, applied_at)
              VALUES (?1, ?2, ?2, ?3)",
             params![MIGRATION_VAULT_HEADER_AUTH, FORMAT_V2, now],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+                (migration_id, from_format, to_format, applied_at)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![MIGRATION_SNAPSHOT_LIFECYCLE, FORMAT_V2, now],
         )?;
         v14::discard_bootstrap_mutations(conn)?;
         conn.execute(
@@ -714,6 +729,7 @@ fn validate_current_schema(conn: &Connection) -> StorageResult<()> {
     v14::validate_sync_delta_capture(conn)?;
     v15::validate_sync_state_extensions(conn)?;
     v16::validate_header_auth_schema(conn)?;
+    v17::validate_snapshot_lifecycle_schema(conn)?;
     let critical_extensions: String = conn.query_row(
         "SELECT critical_extensions FROM vault_meta LIMIT 1",
         [],
@@ -1009,7 +1025,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
         let inventory_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -1026,6 +1042,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(header_auth_migration_count, 1);
+        let lifecycle_migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                params![MIGRATION_SNAPSHOT_LIFECYCLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_migration_count, 1);
+        let lifecycle_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'snapshot_lifecycle'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lifecycle_table_exists);
         let delta_migration_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -1190,7 +1225,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
     }
 
     #[test]

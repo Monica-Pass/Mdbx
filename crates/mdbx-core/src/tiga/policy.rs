@@ -980,6 +980,7 @@ pub enum TigaOperation {
     ExportData,
     PrintData,
     DecryptAttachment,
+    CreateSnapshot,
     RestoreSnapshot,
     ChangeUnlockMethods,
     ChangeSecurityPolicy,
@@ -987,6 +988,7 @@ pub enum TigaOperation {
     RotateKeyEpoch,
     DeleteAuditRecords,
     ManageDeletedObjectRetention,
+    ManageSnapshotRetention,
     PurgeDeletedObject,
     BackgroundAccess,
     SyncCiphertext,
@@ -1159,13 +1161,15 @@ impl TigaPolicy {
                     constraints.push(AuthorizationConstraint::NoPlaintextPersistence);
                 }
             }
-            TigaOperation::RestoreSnapshot
+            TigaOperation::CreateSnapshot
+            | TigaOperation::RestoreSnapshot
             | TigaOperation::ChangeUnlockMethods
             | TigaOperation::ChangeSecurityPolicy
             | TigaOperation::ChangeRecoveryMethods
             | TigaOperation::RotateKeyEpoch
             | TigaOperation::DeleteAuditRecords
             | TigaOperation::ManageDeletedObjectRetention
+            | TigaOperation::ManageSnapshotRetention
             | TigaOperation::PurgeDeletedObject => {
                 if operation == TigaOperation::DeleteAuditRecords
                     && !self.administration.audit_deletion_allowed
@@ -1250,13 +1254,15 @@ impl TigaPolicy {
             ),
             AuditLevel::SecurityChanges => matches!(
                 operation,
-                TigaOperation::RestoreSnapshot
+                TigaOperation::CreateSnapshot
+                    | TigaOperation::RestoreSnapshot
                     | TigaOperation::ChangeUnlockMethods
                     | TigaOperation::ChangeSecurityPolicy
                     | TigaOperation::ChangeRecoveryMethods
                     | TigaOperation::RotateKeyEpoch
                     | TigaOperation::DeleteAuditRecords
                     | TigaOperation::ManageDeletedObjectRetention
+                    | TigaOperation::ManageSnapshotRetention
                     | TigaOperation::PurgeDeletedObject
             ),
         }
@@ -1544,6 +1550,40 @@ mod tests {
         );
         assert_eq!(decision.outcome, AuthorizationOutcome::Allow);
         assert!(decision.audit_required);
+    }
+
+    #[test]
+    fn snapshot_operations_use_administration_auth_and_security_audit() {
+        let policy = TigaMode::Multi.policy();
+        let missing = policy.authorize(
+            TigaOperation::ManageSnapshotRetention,
+            AuthorizationContext {
+                session: None,
+                device: &DeviceContext::default(),
+                now_unix_secs: 100,
+            },
+        );
+        assert_eq!(
+            missing.outcome,
+            AuthorizationOutcome::RequireFreshAuthentication
+        );
+        let session = session(UnlockMethodType::Password, 100);
+        let created = policy.authorize(
+            TigaOperation::CreateSnapshot,
+            AuthorizationContext {
+                session: Some(&session),
+                device: &DeviceContext {
+                    assurance: DeviceAssurance::Standard,
+                    ..Default::default()
+                },
+                now_unix_secs: 101,
+            },
+        );
+        assert!(matches!(
+            created.outcome,
+            AuthorizationOutcome::Allow | AuthorizationOutcome::AllowWithConstraints
+        ));
+        assert!(created.audit_required);
     }
 
     #[test]
