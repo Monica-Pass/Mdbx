@@ -759,6 +759,60 @@ impl MdbxVault {
         })
     }
 
+    /// List deleted object presentation metadata for one Collection without
+    /// selecting or decrypting object payloads.
+    pub fn list_deleted_object_summaries(
+        &self,
+        collection_id: String,
+        object_type_id: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let object_type_id = parse_optional_object_type_id(object_type_id)?;
+        let page = ObjectSummaryRepo::list_deleted_by_collection(
+            &conn,
+            &collection_id,
+            object_type_id.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// List all deleted object presentation metadata without selecting or
+    /// decrypting object payloads.
+    pub fn list_all_deleted_object_summaries(
+        &self,
+        object_type_id: Option<String>,
+        page_size: u32,
+        cursor: Option<String>,
+    ) -> Result<MdbxObjectSummaryPage, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let object_type_id = parse_optional_object_type_id(object_type_id)?;
+        let page = ObjectSummaryRepo::list_deleted_all(
+            &conn,
+            object_type_id.as_ref(),
+            page_size as usize,
+            cursor.as_deref(),
+        )?;
+        Ok(MdbxObjectSummaryPage {
+            items: page
+                .items
+                .into_iter()
+                .map(object_summary_from_core)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
     pub fn update_object(
         &self,
         collection_id: String,

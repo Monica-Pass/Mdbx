@@ -159,7 +159,14 @@ collection 列表和搜索结果页面应使用 `list_object_summaries`。该接
 
 metadata-only 详情页应使用 `get_object_summary(object_id)`。它同样不读取 `payload_json`，并可返回软删除对象的元数据，使客户端无需先解密 payload 就能定位损坏或已删除记录。
 
-不透明的 `next_cursor` 与请求的 collection 和可选 object type 绑定。游标用于其他过滤条件时会返回错误。页大小范围为 1 到 200。
+单个 Collection 的 deleted Object 使用
+`list_deleted_object_summaries(collection_id, object_type_id, page_size, cursor)`；
+全局 tombstone 使用 `list_all_deleted_object_summaries(object_type_id, page_size,
+cursor)`。这些 additive 接口返回相同的无 payload 摘要，页大小为 1 到 200，游标
+上限为 4096 bytes。不透明的 `next_cursor` 绑定 active/deleted 状态、Collection
+范围和可选 object type，换过滤条件复用会返回错误。SQL 投影绝不选择 `payload_ct`，
+所以损坏的对象 payload 不会阻塞 deleted 导航；已有完整 list 方法继续供显式恢复、
+导出和 repair 使用。
 
 ### 授权对象披露
 

@@ -16,9 +16,20 @@ MDBX2 adds `ObjectSummary` and `ObjectSummaryPage` as generic object interfaces.
 
 Pages use descending `updated_at` and stable object ID ordering. Page size is restricted to 1 through 200. The opaque cursor contains a version, collection ID, optional object type, update time, and object ID. A cursor is rejected when its collection or type differs from the current query.
 
+Deleted-object navigation follows the same projection and ordering contract. The
+additive storage methods `list_deleted_by_collection` and `list_deleted_all`
+carry an explicit query discriminator in the cursor, so active, collection-
+deleted, and globally deleted cursors cannot be exchanged. The parser accepts
+the first release's active cursor shape (missing discriminator and a string
+collection field), preserving in-flight MDBX2 client pagination across the
+upgrade.
+
 The cursor is a bounded live-view keyset cursor. Concurrent object updates can move records across the ordering boundary, so clients refresh the first page after local or synchronized mutations. Snapshot-consistent multi-page reads require a separate read-snapshot interface.
 
-The CLI entry list consumes summary pages incrementally. UniFFI exposes `list_object_summaries`; existing `list_objects`, `list_entries`, and `EntryRepo::list_*` methods retain their complete-payload behavior.
+The CLI entry list and deleted-entry view consume summary pages incrementally.
+UniFFI exposes `list_object_summaries`, `list_deleted_object_summaries`, and
+`list_all_deleted_object_summaries`; existing `list_objects`, `list_entries`,
+and `EntryRepo::list_*` methods retain their complete-payload behavior.
 
 ## Consequences
 

@@ -161,7 +161,16 @@ Use `list_object_summaries` for collection and search-result screens. It returns
 
 Use `get_object_summary(object_id)` for a metadata-only detail screen. It also avoids `payload_json` and can return the metadata of a soft-deleted object, which lets a client identify a damaged or deleted record without first decrypting its payload.
 
-The opaque `next_cursor` is bound to the requested collection and optional object type. Reusing it with different filters returns an error. Page sizes must be between 1 and 200.
+Use `list_deleted_object_summaries(collection_id, object_type_id, page_size,
+cursor)` for deleted objects in one Collection, or
+`list_all_deleted_object_summaries(object_type_id, page_size, cursor)` for a
+global tombstone view. These additive methods use the same payload-free record,
+1–200 page bound, and 4096-byte cursor ceiling. The opaque `next_cursor` is
+bound to active/deleted state, Collection scope, and optional object type;
+reusing it with different filters returns an error. The SQL projection never
+selects `payload_ct`, so corrupt object payloads do not block deleted
+navigation. Existing complete list methods remain available for explicit
+restore/export/repair workflows.
 
 ### Authorized Object Disclosure
 

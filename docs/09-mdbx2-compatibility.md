@@ -171,6 +171,16 @@ The existing single-mutation FFI methods remain available as the MDBX1-compatibl
 
 Existing UniFFI `get_object`, `list_objects`, and `list_entries` signatures and complete-payload behavior remain unchanged for MDBX1 and already generated clients. MDBX2 clients use additive `get_object_summary(object_id)` for metadata-only details and `list_object_summaries` for bounded collection screens.
 
+Deleted navigation is additive as well. New clients can call
+`list_deleted_object_summaries(collection_id, object_type_id, page_size,
+cursor)` for one Collection or `list_all_deleted_object_summaries` for a global
+tombstone view. These methods return the same payload-free summary record and
+never select `payload_ct`; page sizes are 1–200 and cursors are bound to query
+state, Collection scope, and ObjectTypeId. An active cursor cannot be reused for
+deleted navigation. The CLI `entry deleted` command uses the global bounded
+method, while `EntryRepo::list_deleted*` and `list_deleted_entries` retain their
+complete-payload compatibility behavior for explicit repair/export consumers.
+
 An explicit plaintext action uses `reveal_object` or `reveal_object_with_device_context`. The returned `MdbxObjectDisclosureResult` contains `object` only for `Allow` or `AllowWithConstraints`, and always contains the typed Tiga authorization decision. Missing/stale sessions and policy denials therefore remain actionable client states without returning payload or allowing corrupt ciphertext to take precedence. Deleted objects and non-authorization storage failures remain errors.
 
 The existing reveal method signatures remain unchanged and use an 8 MiB default plaintext limit. Additive `default_object_disclosure_limits`, `reveal_object_with_limits`, and `reveal_object_with_device_context_and_limits` APIs let a new client choose a smaller or controlled larger resource profile without exceeding the 64 MiB hard ceiling. After policy allows, storage rejects clearly oversized payload ciphertext through a SQL length projection before authenticated decryption, then verifies the actual plaintext length. Tiga denial still precedes those payload checks. MDBX1 large-payload database bytes are not migrated or rewritten, and the original complete-payload compatibility APIs retain their behavior.

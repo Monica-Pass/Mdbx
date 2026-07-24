@@ -133,6 +133,17 @@ After reopening a vault, use `get_collection_summary`, `list_collection_summarie
 
 `MdbxCollectionSummary` contains the Collection ID, title, optional CollectionProfile type/version, group/icon references, favorite/archive state, attachment count, head commit, deletion state, and update time. It never contains `summary_ct` or CollectionProfile payload. Call `default_presentation_metadata_limits` to discover the fixed display contract: 64 KiB title plaintext, 512-byte label name plaintext, and 4096 UTF-8-byte group/icon references. New screens should page summaries, then page Object and Label summaries; they should not use complete list methods as a default navigation path.
 
+For Object navigation, use `list_object_summaries(collection_id, object_type_id,
+page_size, cursor)` for active rows. Deleted rows have two additive paths:
+`list_deleted_object_summaries` is scoped to one Collection and
+`list_all_deleted_object_summaries` is a global tombstone view. Both return the
+same payload-free `MdbxObjectSummary` record and 1–200 row bound. Cursors are
+opaque and bound to active/deleted state, Collection scope, and optional
+ObjectTypeId; never pass an active cursor to a deleted method or reconstruct one
+with offsets. The CLI `entry deleted` command follows the global bounded path.
+The complete `list_objects`/`list_deleted_entries` APIs remain available for
+explicit payload workflows and are not removed for MDBX1 compatibility.
+
 For attachment navigation, call `list_attachment_summaries(collection_id, object_id, page_size, cursor)` with `object_id = None` for a Collection or an Object ID for an Object, and call `list_deleted_attachment_summaries` for tombstones. `get_attachment_summary` is the metadata-only by-ID path. `default_attachment_presentation_limits` reports the 4096-byte file-name limit, 512-byte media-type limit, shared 128 KiB ciphertext-envelope allowance, 200-row page ceiling, and 4096-byte cursor ceiling. These pages never read attachment chunk or external-blob payloads, so a content-corruption report does not prevent the list screen from opening. Cursors are live positions: discard them after metadata changes and restart from the first page.
 
 MDBX1 Collections without a Profile are valid and return empty type/version fields. A legacy title, label name, or reference outside the fixed presentation limit returns a resource-limit error only through the bounded summary path. The complete compatibility APIs remain available for explicit repair/export workflows and must not be removed or reinterpreted.

@@ -1182,6 +1182,122 @@ fn ffi_object_summary_by_id_is_payload_free_and_tombstone_visible() {
 }
 
 #[test]
+fn ffi_deleted_object_summary_pages_are_bounded_and_query_bound() {
+    let vault = ffi_test_vault();
+    let collection = vault
+        .create_project("Deleted summary collection".to_string())
+        .unwrap();
+    let other_collection = vault
+        .create_project("Other deleted summary collection".to_string())
+        .unwrap();
+    let object_type = "com.monica.mail.message".to_string();
+    let mut deleted_ids = Vec::new();
+    for index in 0..3 {
+        let object = vault
+            .create_object(
+                collection.project_id.clone(),
+                object_type.clone(),
+                format!("Deleted {index}"),
+                format!(r#"{{"body":"secret {index}"}}"#),
+                5,
+            )
+            .unwrap();
+        vault
+            .delete_entry(collection.project_id.clone(), object.object_id.clone())
+            .unwrap();
+        deleted_ids.push(object.object_id);
+    }
+    let other_object = vault
+        .create_object(
+            other_collection.project_id.clone(),
+            object_type.clone(),
+            "Other deleted".to_string(),
+            r#"{"body":"other secret"}"#.to_string(),
+            6,
+        )
+        .unwrap();
+    vault
+        .delete_entry(
+            other_collection.project_id.clone(),
+            other_object.object_id.clone(),
+        )
+        .unwrap();
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00', updated_at = '2026-07-25T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let first = vault
+        .list_deleted_object_summaries(
+            collection.project_id.clone(),
+            Some(object_type.clone()),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first.items.iter().all(|item| {
+        item.collection_id == collection.project_id
+            && item.object_type_id == object_type
+            && item.payload_schema_version == 5
+            && item.deleted
+    }));
+    let second = vault
+        .list_deleted_object_summaries(
+            collection.project_id.clone(),
+            Some(object_type.clone()),
+            2,
+            first.next_cursor.clone(),
+        )
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert!(second.next_cursor.is_none());
+
+    let global = vault
+        .list_all_deleted_object_summaries(Some(object_type.clone()), 2, None)
+        .unwrap();
+    assert_eq!(global.items.len(), 2);
+    assert!(global.next_cursor.is_some());
+    let mut global_items = global.items;
+    let global_second = vault
+        .list_all_deleted_object_summaries(Some(object_type.clone()), 2, global.next_cursor)
+        .unwrap();
+    assert_eq!(global_second.items.len(), 2);
+    global_items.extend(global_second.items);
+    assert!(global_items.iter().any(|item| {
+        item.object_id == other_object.object_id && item.payload_schema_version == 6
+    }));
+
+    let cursor = first.next_cursor.unwrap();
+    assert!(vault
+        .list_object_summaries(
+            collection.project_id.clone(),
+            Some(object_type.clone()),
+            2,
+            Some(cursor.clone()),
+        )
+        .is_err());
+    assert!(vault
+        .list_deleted_object_summaries(
+            other_collection.project_id,
+            Some(object_type.clone()),
+            2,
+            Some(cursor.clone()),
+        )
+        .is_err());
+    assert!(vault
+        .list_all_deleted_object_summaries(Some("login".to_string()), 2, Some(cursor))
+        .is_err());
+    assert_eq!(deleted_ids.len(), 3);
+}
+
+#[test]
 fn ffi_metadata_summary_pages_are_bounded_payload_free_and_compatible() {
     let vault = ffi_test_vault();
     let collection = vault

@@ -133,6 +133,16 @@ vault 重开后，顶层导航应使用 `get_collection_summary`、`list_collect
 
 `MdbxCollectionSummary` 包含 Collection ID、标题、可选 CollectionProfile 类型/版本、group/icon 引用、收藏/归档状态、附件计数、head commit、删除状态和更新时间，不包含 `summary_ct` 或 CollectionProfile payload。调用 `default_presentation_metadata_limits` 获取固定展示契约：标题明文 64 KiB、label name 明文 512 bytes、group/icon 引用 4096 UTF-8 bytes。新界面应继续分页 Object 和 Label 摘要，不应把完整 list 方法作为默认导航路径。
 
+Object 导航应使用 `list_object_summaries(collection_id, object_type_id,
+page_size, cursor)` 获取 active 页。deleted Object 提供两个 additive 路径：
+`list_deleted_object_summaries` 按 Collection 查询，
+`list_all_deleted_object_summaries` 查询全局 tombstone。两者返回相同的无
+payload `MdbxObjectSummary`，页大小为 1 到 200。游标是不透明的，并绑定
+active/deleted 状态、Collection 范围和可选 ObjectTypeId；不能把 active 游标传给
+deleted 方法，也不能用 offset 自行重建。CLI `entry deleted` 也使用全局有界路径。
+完整 `list_objects`/`list_deleted_entries` 仍作为显式 payload 流程保留，满足 MDBX1
+兼容，不会删除或重新解释。
+
 附件导航应调用 `list_attachment_summaries(collection_id, object_id, page_size, cursor)`：`object_id = None` 表示整个 Collection，传入 Object ID 表示一个 Object；tombstone 使用 `list_deleted_attachment_summaries`，单个元数据使用 `get_attachment_summary`。`default_attachment_presentation_limits` 返回文件名 4096 bytes、media type 512 bytes、共享 128 KiB 密文信封预留、每页 200 条和游标 4096 bytes 的契约。这些页面不会读取 attachment chunk 或 external blob payload，因此即使内容损坏，列表页仍可打开。游标是 live position，发生 metadata 变化后必须丢弃并从第一页重新开始。
 
 没有 Profile 的 MDBX1 Collection 仍然有效，类型/版本字段为空。旧标题、label name 或引用超出固定展示限制时，只会在有界摘要路径返回 resource-limit error；完整兼容 API 仍可用于显式 repair/export，不能删除或重新解释其行为。

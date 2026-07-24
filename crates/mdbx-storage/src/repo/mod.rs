@@ -47,7 +47,9 @@ pub use object_metadata_summary::{
     ObjectMetadataSummaryRepo, MAX_OBJECT_METADATA_SUMMARY_PAGE_SIZE,
 };
 pub use object_relation::{ObjectRelationCreateRequest, ObjectRelationRepo};
-pub use object_summary::{ObjectSummaryRepo, MAX_OBJECT_SUMMARY_PAGE_SIZE};
+pub use object_summary::{
+    ObjectSummaryRepo, MAX_OBJECT_SUMMARY_CURSOR_BYTES, MAX_OBJECT_SUMMARY_PAGE_SIZE,
+};
 pub use object_version::ObjectVersionRepo;
 pub use payload_migration::{PayloadMigrationPlanRequest, PayloadMigrationRepo};
 pub use project::ProjectRepo;

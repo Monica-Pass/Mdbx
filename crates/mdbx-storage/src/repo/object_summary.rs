@@ -13,14 +13,33 @@ use crate::presentation_metadata::{
 use crate::repo::entry::EntryRepo;
 
 pub const MAX_OBJECT_SUMMARY_PAGE_SIZE: usize = 200;
+pub const MAX_OBJECT_SUMMARY_CURSOR_BYTES: usize = 4096;
+
 const OBJECT_SUMMARY_CURSOR_VERSION: u8 = 1;
-const MAX_OBJECT_SUMMARY_CURSOR_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ObjectSummaryQuery {
+    CollectionActive,
+    CollectionDeleted,
+    AllDeleted,
+}
+
+impl Default for ObjectSummaryQuery {
+    fn default() -> Self {
+        Self::CollectionActive
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ObjectSummaryCursor {
     version: u8,
-    collection_id: String,
+    /// Omitted by cursors produced by the first object-summary release. Those
+    /// cursors are interpreted as collection-scoped active queries.
+    #[serde(default)]
+    query: ObjectSummaryQuery,
+    collection_id: Option<String>,
     object_type_id: Option<String>,
     updated_at: String,
     object_id: String,
@@ -74,6 +93,59 @@ impl ObjectSummaryRepo {
         page_size: usize,
         cursor: Option<&str>,
     ) -> StorageResult<ObjectSummaryPage> {
+        Self::list_scoped(
+            conn,
+            ObjectSummaryQuery::CollectionActive,
+            Some(collection_id),
+            object_type_id,
+            page_size,
+            cursor,
+        )
+    }
+
+    /// List deleted objects owned by one Collection without reading payloads.
+    pub fn list_deleted_by_collection(
+        conn: &VaultConnection,
+        collection_id: &str,
+        object_type_id: Option<&ObjectTypeId>,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> StorageResult<ObjectSummaryPage> {
+        Self::list_scoped(
+            conn,
+            ObjectSummaryQuery::CollectionDeleted,
+            Some(collection_id),
+            object_type_id,
+            page_size,
+            cursor,
+        )
+    }
+
+    /// List all deleted objects using a globally scoped tombstone cursor.
+    pub fn list_deleted_all(
+        conn: &VaultConnection,
+        object_type_id: Option<&ObjectTypeId>,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> StorageResult<ObjectSummaryPage> {
+        Self::list_scoped(
+            conn,
+            ObjectSummaryQuery::AllDeleted,
+            None,
+            object_type_id,
+            page_size,
+            cursor,
+        )
+    }
+
+    fn list_scoped(
+        conn: &VaultConnection,
+        query: ObjectSummaryQuery,
+        collection_id: Option<&str>,
+        object_type_id: Option<&ObjectTypeId>,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> StorageResult<ObjectSummaryPage> {
         if page_size == 0 || page_size > MAX_OBJECT_SUMMARY_PAGE_SIZE {
             return Err(StorageError::Validation(format!(
                 "object summary page size must be between 1 and {MAX_OBJECT_SUMMARY_PAGE_SIZE}"
@@ -81,23 +153,32 @@ impl ObjectSummaryRepo {
         }
         let object_type_value = object_type_id.map(ObjectTypeId::as_str);
         let cursor = cursor
-            .map(|value| parse_cursor(value, collection_id, object_type_value))
+            .map(|value| parse_cursor(value, query, collection_id, object_type_value))
             .transpose()?;
-        let mut stmt = conn.inner().prepare(
+        let deleted = !matches!(query, ObjectSummaryQuery::CollectionActive);
+        let collection_filter = if collection_id.is_some() {
+            "AND project_id = ?2"
+        } else {
+            "AND ?2 IS NULL"
+        };
+        let sql = format!(
             "SELECT entry_id, project_id, entry_type, length(title_ct),
-                    CASE WHEN title_ct IS NULL OR length(title_ct) <= ?5
+                    CASE WHEN title_ct IS NULL OR length(title_ct) <= ?6
                          THEN title_ct END,
                     payload_schema_version, head_commit_id, deleted, updated_at
              FROM entries
-             WHERE deleted = 0 AND project_id = ?1
-               AND (?2 IS NULL OR entry_type = ?2)
-               AND (?3 IS NULL OR updated_at < ?3
-                    OR (updated_at = ?3 AND entry_id < ?4))
+             WHERE deleted = ?1
+               {collection_filter}
+               AND (?3 IS NULL OR entry_type = ?3)
+               AND (?4 IS NULL OR updated_at < ?4
+                    OR (updated_at = ?4 AND entry_id < ?5))
              ORDER BY updated_at DESC, entry_id DESC
-             LIMIT ?6",
-        )?;
+             LIMIT ?7"
+        );
+        let mut stmt = conn.inner().prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params![
+                deleted as i32,
                 collection_id,
                 object_type_value,
                 cursor.as_ref().map(|cursor| cursor.updated_at.as_str()),
@@ -116,10 +197,10 @@ impl ObjectSummaryRepo {
             raw_items.pop();
         }
         let next_cursor = if has_next {
-            raw_items.last().map(|row| {
-                encode_cursor(row, collection_id, object_type_value)
-                    .expect("object summary cursor serialization cannot fail")
-            })
+            raw_items
+                .last()
+                .map(|row| encode_cursor(row, query, collection_id, object_type_value))
+                .transpose()?
         } else {
             None
         };
@@ -184,22 +265,33 @@ fn decode_summary(conn: &VaultConnection, row: RawObjectSummary) -> StorageResul
 
 fn encode_cursor(
     row: &RawObjectSummary,
-    collection_id: &str,
+    query: ObjectSummaryQuery,
+    collection_id: Option<&str>,
     object_type_id: Option<&str>,
 ) -> StorageResult<String> {
-    serde_json::to_string(&ObjectSummaryCursor {
+    let cursor = serde_json::to_string(&ObjectSummaryCursor {
         version: OBJECT_SUMMARY_CURSOR_VERSION,
-        collection_id: collection_id.to_string(),
+        query,
+        collection_id: collection_id.map(str::to_string),
         object_type_id: object_type_id.map(str::to_string),
         updated_at: row.updated_at.clone(),
         object_id: row.object_id.clone(),
     })
-    .map_err(|error| StorageError::Validation(error.to_string()))
+    .map_err(|error| StorageError::Validation(error.to_string()))?;
+    if cursor.len() > MAX_OBJECT_SUMMARY_CURSOR_BYTES {
+        return Err(StorageError::ResourceLimit {
+            resource: "object summary cursor bytes".to_string(),
+            actual: cursor.len() as u64,
+            limit: MAX_OBJECT_SUMMARY_CURSOR_BYTES as u64,
+        });
+    }
+    Ok(cursor)
 }
 
 fn parse_cursor(
     value: &str,
-    collection_id: &str,
+    query: ObjectSummaryQuery,
+    collection_id: Option<&str>,
     object_type_id: Option<&str>,
 ) -> StorageResult<ObjectSummaryCursor> {
     if value.len() > MAX_OBJECT_SUMMARY_CURSOR_BYTES {
@@ -216,9 +308,13 @@ fn parse_cursor(
             cursor.version
         )));
     }
-    if cursor.collection_id != collection_id || cursor.object_type_id.as_deref() != object_type_id {
+    if cursor.query != query
+        || cursor.collection_id.as_deref() != collection_id
+        || cursor.object_type_id.as_deref() != object_type_id
+    {
         return Err(StorageError::Validation(
-            "object summary cursor does not match the requested collection and type".to_string(),
+            "object summary cursor does not match the requested query, collection, and type"
+                .to_string(),
         ));
     }
     if cursor.updated_at.is_empty() || cursor.object_id.is_empty() {
@@ -315,6 +411,128 @@ mod tests {
             }
         }
         assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn deleted_object_summary_pages_are_scoped_stable_and_payload_free() {
+        let (conn, ctx, collection_id, other_collection_id) = setup();
+        let custom_type = ObjectTypeId::custom("com.monica.mail.message").unwrap();
+        let mut expected_collection_ids = Vec::new();
+        for index in 0..5 {
+            let object = EntryRepo::create_with_payload_schema_version(
+                &conn,
+                &ctx,
+                &collection_id,
+                custom_type.clone(),
+                Some(&format!("Deleted {index}")),
+                &serde_json::json!({"body": format!("secret {index}")}),
+                7,
+            )
+            .unwrap();
+            EntryRepo::soft_delete(&conn, &ctx, &object.entry_id).unwrap();
+            conn.inner()
+                .execute(
+                    "UPDATE entries SET payload_ct = X'00', updated_at = '2026-07-25T00:00:00Z'
+                     WHERE entry_id = ?1",
+                    [&object.entry_id],
+                )
+                .unwrap();
+            expected_collection_ids.push(object.entry_id);
+        }
+        let other = EntryRepo::create_with_payload_schema_version(
+            &conn,
+            &ctx,
+            &other_collection_id,
+            custom_type.clone(),
+            Some("Other deleted"),
+            &serde_json::json!({"body": "other secret"}),
+            8,
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &other.entry_id).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00', updated_at = '2026-07-25T00:00:00Z'
+                 WHERE entry_id = ?1",
+                [&other.entry_id],
+            )
+            .unwrap();
+        expected_collection_ids.sort_by(|left, right| right.cmp(left));
+
+        let mut cursor = None;
+        let mut actual_collection_ids = Vec::new();
+        loop {
+            let page = ObjectSummaryRepo::list_deleted_by_collection(
+                &conn,
+                &collection_id,
+                Some(&custom_type),
+                2,
+                cursor.as_deref(),
+            )
+            .unwrap();
+            for item in &page.items {
+                assert_eq!(item.collection_id, collection_id);
+                assert_eq!(item.object_type_id, custom_type);
+                assert_eq!(item.payload_schema_version, 7);
+                assert!(item.deleted);
+                actual_collection_ids.push(item.object_id.clone());
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(actual_collection_ids, expected_collection_ids);
+
+        let mut global_cursor = None;
+        let mut global_count = 0;
+        loop {
+            let page = ObjectSummaryRepo::list_deleted_all(
+                &conn,
+                Some(&custom_type),
+                2,
+                global_cursor.as_deref(),
+            )
+            .unwrap();
+            for item in &page.items {
+                assert!(item.deleted);
+                assert_eq!(item.object_type_id, custom_type);
+                assert!(item.title.is_some());
+                global_count += 1;
+            }
+            match page.next_cursor {
+                Some(next) => global_cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(global_count, 6);
+
+        let deleted_cursor =
+            ObjectSummaryRepo::list_deleted_all(&conn, Some(&custom_type), 1, None)
+                .unwrap()
+                .next_cursor
+                .unwrap();
+        assert!(ObjectSummaryRepo::list(
+            &conn,
+            &collection_id,
+            Some(&custom_type),
+            1,
+            Some(&deleted_cursor),
+        )
+        .is_err());
+        assert!(ObjectSummaryRepo::list_deleted_by_collection(
+            &conn,
+            &other_collection_id,
+            Some(&custom_type),
+            1,
+            Some(&deleted_cursor),
+        )
+        .is_err());
+        let login = ObjectTypeId::Login;
+        assert!(
+            ObjectSummaryRepo::list_deleted_all(&conn, Some(&login), 1, Some(&deleted_cursor),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -475,5 +693,60 @@ mod tests {
         let error = ObjectSummaryRepo::list(&conn, &collection_id, Some(&login), 1, Some(&cursor))
             .unwrap_err();
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn object_summary_generated_cursor_overflow_is_an_error_not_a_panic() {
+        let (conn, ctx, collection_id, _) = setup();
+        for title in ["A", "B"] {
+            EntryRepo::create(
+                &conn,
+                &ctx,
+                &collection_id,
+                ObjectTypeId::Login,
+                Some(title),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        }
+        conn.inner()
+            .execute(
+                "UPDATE entries SET updated_at = ?1 WHERE project_id = ?2",
+                rusqlite::params!["t".repeat(MAX_OBJECT_SUMMARY_CURSOR_BYTES), &collection_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            ObjectSummaryRepo::list(&conn, &collection_id, None, 1, None),
+            Err(StorageError::ResourceLimit { ref resource, .. })
+                if resource == "object summary cursor bytes"
+        ));
+    }
+
+    #[test]
+    fn object_summary_accepts_legacy_active_cursor_shape() {
+        let (conn, ctx, collection_id, _) = setup();
+        for title in ["A", "B"] {
+            EntryRepo::create(
+                &conn,
+                &ctx,
+                &collection_id,
+                ObjectTypeId::Login,
+                Some(title),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        }
+        let first = ObjectSummaryRepo::list(&conn, &collection_id, None, 1, None).unwrap();
+        let item = &first.items[0];
+        let legacy_cursor = serde_json::json!({
+            "version": OBJECT_SUMMARY_CURSOR_VERSION,
+            "collection_id": collection_id,
+            "object_type_id": null,
+            "updated_at": item.updated_at,
+            "object_id": item.object_id,
+        })
+        .to_string();
+        let page = ObjectSummaryRepo::list(&conn, &collection_id, None, 1, Some(&legacy_cursor));
+        assert!(page.is_ok());
     }
 }

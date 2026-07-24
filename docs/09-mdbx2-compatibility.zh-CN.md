@@ -242,6 +242,15 @@ MDBX2 同时收紧以下实现边界：
 
 原有 UniFFI `get_object`、`list_objects` 和 `list_entries` 的签名及完整 payload 行为保持不变，供 MDBX1 和已经生成绑定的客户端继续使用。MDBX2 客户端通过新增 `get_object_summary(object_id)` 获取 metadata-only 详情，通过 `list_object_summaries` 获取有界 collection 页面。
 
+deleted 导航同样只增加接口。新客户端可以调用
+`list_deleted_object_summaries(collection_id, object_type_id, page_size,
+cursor)` 获取单个 Collection 的 tombstone，或调用
+`list_all_deleted_object_summaries` 获取全局 deleted 页面。这些方法返回相同的
+无 payload 摘要，绝不选择 `payload_ct`；页大小为 1 到 200，游标绑定查询状态、
+Collection 范围和 ObjectTypeId，active 游标不能复用于 deleted 查询。CLI
+`entry deleted` 使用全局有界方法；`EntryRepo::list_deleted*` 与
+`list_deleted_entries` 仍保留完整 payload 兼容行为，供显式 repair/export 使用。
+
 显式明文动作调用 `reveal_object` 或 `reveal_object_with_device_context`。返回的 `MdbxObjectDisclosureResult` 只有在 `Allow` 或 `AllowWithConstraints` 时才包含 `object`，并始终包含类型化 Tiga 授权决定。会话缺失/过期和策略拒绝因此仍是客户端可处理的状态，但不会返回 payload，也不会让损坏密文先于拒绝决定报错。已删除对象和非授权类 storage 失败继续返回错误。
 
 既有 reveal 方法签名保持不变，并使用 8 MiB 默认明文上限。新增 `default_object_disclosure_limits`、`reveal_object_with_limits` 和 `reveal_object_with_device_context_and_limits`，允许新客户端选择更小或受控的更大资源配置，但不能超过 64 MiB 硬上限。策略允许后，storage 先通过 SQL 长度投影拒绝明显超限的 payload 密文，再认证解密并复核实际明文长度；Tiga 拒绝仍先于这些 payload 检查。MDBX1 大 payload 的数据库字节不会被迁移或改写，原有完整 payload 兼容 API 也保持行为不变。

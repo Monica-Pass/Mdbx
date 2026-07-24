@@ -44,6 +44,13 @@ An `ObjectRecord` is one encrypted, versioned item inside a collection. Password
 
 An `ObjectSummary` is the bounded list projection of an ObjectRecord. It contains stable identity, collection, exact ObjectTypeId, optional decrypted title, payload schema version, head commit, deletion state, and update time, but never the object payload. Summary pages use query-bound keyset cursors so collection screens do not decrypt every password, mail body, bookmark document, or extension payload.
 
+Active and deleted navigation share the projection but not the cursor scope.
+`list_object_summaries` lists active rows; additive deleted pages distinguish
+Collection-scoped tombstones from the global tombstone view. Their cursors bind
+active/deleted state, Collection, optional ObjectTypeId, and keyset position.
+The CLI and new clients use these pages, while complete MDBX1 list APIs remain
+available for explicit payload consumers.
+
 ### ObjectTypeId
 
 An `ObjectTypeId` is the exact stable identifier for an ObjectRecord payload contract. MDBX legacy identifiers such as `login`, `note`, and `totp` remain valid. Extension identifiers use a namespaced form such as `com.monica.bookmark`, `com.monica.mail.message`, or `com.monica.steam.mafile`.
@@ -157,7 +164,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 21. A permanent receipt prevents the current vault from restoring the same stable identity. Historical snapshot files, exported copies, and external backups remain separate retention media and require independent media erasure or future object-key destruction.
 22. Every path-based migration plan, automatic compatibility open, explicit upgrade, and direct storage-core upgrade verifies database integrity before the first migration write. A failed verification preserves the previous format generation.
 23. Untrusted sync input must have a byte limit before allocation and deserialization. New offline bundles declare their payload length, while legacy bundles are read through a bounded adapter.
-24. Collection listing uses bounded ObjectSummary pages when payloads are not required. Existing MDBX1 complete-record list APIs remain available for callers that intentionally consume payloads.
+24. Collection and tombstone listing use bounded ObjectSummary pages when payloads are not required. Existing MDBX1 complete-record list APIs remain available for callers that intentionally consume payloads; deleted cursors cannot cross active, Collection, or ObjectTypeId scopes.
 25. A CollectionProfile is additive to the MDBX1 project row. Establishing or changing it advances the Collection commit, object clock, head, and ObjectVersion atomically.
 26. CollectionProfile existence is monotonic and CollectionTypeId is immutable. Legacy payloads that omit the profile preserve the receiver's current profile.
 27. User-visible writes to a profiled Collection require every declared ExtensionCapabilityId and must use an allowed ObjectTypeId. Synchronization and recovery preserve unknown profiled data without requiring its adapter.

@@ -979,6 +979,81 @@ fn generic_object_summaries_are_paginated_and_query_bound() {
 }
 
 #[test]
+fn deleted_object_summary_smoke_path_is_bounded_and_payload_free() {
+    let vault_path = temp_vault_path("deleted-object-summaries");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "deleted summary password 12345!".to_string(),
+        "ffi-deleted-summary-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let other_collection = vault.create_project("Other".to_string()).unwrap();
+    for index in 0..3 {
+        let object = vault
+            .create_object(
+                collection.project_id.clone(),
+                "com.monica.mail.message".to_string(),
+                format!("Deleted {index}"),
+                format!(r#"{{"body":"secret {index}"}}"#),
+                9,
+            )
+            .unwrap();
+        vault
+            .delete_entry(collection.project_id.clone(), object.object_id)
+            .unwrap();
+    }
+    let other = vault
+        .create_object(
+            other_collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Other deleted".to_string(),
+            r#"{"body":"other secret"}"#.to_string(),
+            10,
+        )
+        .unwrap();
+    vault
+        .delete_entry(other_collection.project_id.clone(), other.object_id)
+        .unwrap();
+    rusqlite::Connection::open(vault_path.path())
+        .unwrap()
+        .execute(
+            "UPDATE entries SET payload_ct = X'00', updated_at = '2026-07-25T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+
+    let page = vault
+        .list_deleted_object_summaries(
+            collection.project_id.clone(),
+            Some("com.monica.mail.message".to_string()),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert!(page.items.iter().all(|item| item.deleted));
+    let next = vault
+        .list_deleted_object_summaries(
+            collection.project_id,
+            Some("com.monica.mail.message".to_string()),
+            2,
+            page.next_cursor,
+        )
+        .unwrap();
+    assert_eq!(next.items.len(), 1);
+
+    let global = vault
+        .list_all_deleted_object_summaries(Some("com.monica.mail.message".to_string()), 4, None)
+        .unwrap();
+    assert_eq!(global.items.len(), 4);
+    assert!(global
+        .items
+        .iter()
+        .any(|item| item.payload_schema_version == 10));
+}
+
+#[test]
 fn ffi_object_disclosure_is_typed_and_policy_first() {
     let vault_path = temp_vault_path("object-disclosure");
     let vault = create_vault(

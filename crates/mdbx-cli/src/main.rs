@@ -1484,17 +1484,30 @@ fn cmd_entry(conn: &mut VaultConnection, action: EntryAction) -> Result<(), Stri
             println!("Updated entry {}", entry_id);
         }
         EntryAction::Deleted => {
-            let entries = EntryRepo::list_deleted(conn).map_err(|e| format!("{}", e))?;
-            if entries.is_empty() {
-                println!("(no deleted entries)");
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = ObjectSummaryRepo::list_deleted_all(conn, None, 100, cursor.as_deref())
+                    .map_err(|error| error.to_string())?;
+                for object in page.items {
+                    found = true;
+                    let title = object
+                        .title
+                        .as_ref()
+                        .map(|title| String::from_utf8_lossy(title).to_string())
+                        .unwrap_or_else(|| "(untitled)".to_string());
+                    println!(
+                        "{}  {:?}  {}",
+                        object.object_id, object.object_type_id, title
+                    );
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for e in &entries {
-                let title = e
-                    .title_ct
-                    .as_ref()
-                    .map(|t| String::from_utf8_lossy(t).to_string())
-                    .unwrap_or_else(|| "(untitled)".to_string());
-                println!("{}  {:?}  {}", e.entry_id, e.entry_type, title);
+            if !found {
+                println!("(no deleted entries)");
             }
         }
         EntryAction::Move {
@@ -4459,9 +4472,35 @@ mod tests {
             &path,
             Commands::Entry {
                 action: EntryAction::Get {
-                    entry_id: entry.entry_id,
+                    entry_id: entry.entry_id.clone(),
                     reveal: false,
                 },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        let deleted_entry = EntryRepo::create(
+            &conn,
+            &ctx(),
+            &entry.project_id,
+            EntryType::Login,
+            Some("Deleted visible title"),
+            &serde_json::json!({"password": "deleted secret"}),
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx(), &deleted_entry.entry_id).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                params![deleted_entry.entry_id],
+            )
+            .unwrap();
+        drop(conn);
+        run(cli(
+            &path,
+            Commands::Entry {
+                action: EntryAction::Deleted,
             },
         ))
         .unwrap();

@@ -742,6 +742,7 @@ agent serve --stdio
 已通过的测试范围：
 
 - 对象摘要按 ID 查询不读取损坏的 payload，并可返回软删除元数据。
+- `mdbx-cli entry deleted` 使用 global 有界对象摘要页；损坏的 deleted payload 不会阻塞 tombstone 导航。
 - 默认 `mdbx-cli entry get` 不解密 payload；Power 拒绝 `--reveal` 时先返回授权错误而不是 payload 密码学错误。
 - `ObjectDisclosureService` 覆盖允许审计、活动会话续期、拒绝先于解密和软删除拒绝。
 - Android-compatible PBKDF2/AES-GCM 解锁参数解析。
