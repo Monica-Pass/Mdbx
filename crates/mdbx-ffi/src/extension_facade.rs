@@ -98,6 +98,7 @@ impl MdbxVault {
 
     /// Build a migration plan with the caller's real device assurance. The
     /// active session must satisfy the Collection's MigratePayload policy.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_payload_migration_plan_with_device_context(
         &self,
         collection_id: String,
