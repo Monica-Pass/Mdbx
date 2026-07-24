@@ -980,6 +980,7 @@ pub enum TigaOperation {
     ExportData,
     PrintData,
     DecryptAttachment,
+    MigratePayload,
     CreateSnapshot,
     RestoreSnapshot,
     ChangeUnlockMethods,
@@ -1161,7 +1162,8 @@ impl TigaPolicy {
                     constraints.push(AuthorizationConstraint::NoPlaintextPersistence);
                 }
             }
-            TigaOperation::CreateSnapshot
+            TigaOperation::MigratePayload
+            | TigaOperation::CreateSnapshot
             | TigaOperation::RestoreSnapshot
             | TigaOperation::ChangeUnlockMethods
             | TigaOperation::ChangeSecurityPolicy
@@ -1254,7 +1256,8 @@ impl TigaPolicy {
             ),
             AuditLevel::SecurityChanges => matches!(
                 operation,
-                TigaOperation::CreateSnapshot
+                TigaOperation::MigratePayload
+                    | TigaOperation::CreateSnapshot
                     | TigaOperation::RestoreSnapshot
                     | TigaOperation::ChangeUnlockMethods
                     | TigaOperation::ChangeSecurityPolicy
@@ -1584,6 +1587,77 @@ mod tests {
             AuthorizationOutcome::Allow | AuthorizationOutcome::AllowWithConstraints
         ));
         assert!(created.audit_required);
+    }
+
+    #[test]
+    fn migrate_payload_uses_fresh_administration_auth_and_power_factors() {
+        let missing = TigaMode::Multi.policy().authorize(
+            TigaOperation::MigratePayload,
+            AuthorizationContext {
+                session: None,
+                device: &DeviceContext {
+                    assurance: DeviceAssurance::Standard,
+                    ..Default::default()
+                },
+                now_unix_secs: 100,
+            },
+        );
+        assert_eq!(
+            missing.outcome,
+            AuthorizationOutcome::RequireFreshAuthentication
+        );
+        assert!(missing.audit_required);
+
+        let multi = TigaMode::Multi.policy().authorize(
+            TigaOperation::MigratePayload,
+            AuthorizationContext {
+                session: Some(&session(UnlockMethodType::Password, 100)),
+                device: &DeviceContext {
+                    assurance: DeviceAssurance::Standard,
+                    ..Default::default()
+                },
+                now_unix_secs: 101,
+            },
+        );
+        assert_eq!(multi.outcome, AuthorizationOutcome::Allow);
+        assert!(multi.audit_required);
+
+        let power_single = TigaMode::Power.policy().authorize(
+            TigaOperation::MigratePayload,
+            AuthorizationContext {
+                session: Some(&session(UnlockMethodType::Password, 100)),
+                device: &trusted_device(),
+                now_unix_secs: 101,
+            },
+        );
+        assert_eq!(
+            power_single.outcome,
+            AuthorizationOutcome::RequireAdditionalFactor
+        );
+        assert!(power_single
+            .reasons
+            .contains(&AuthorizationReason::SecurityKeyRequired));
+
+        let power_combined = TigaMode::Power.policy().authorize(
+            TigaOperation::MigratePayload,
+            AuthorizationContext {
+                session: Some(&session(UnlockMethodType::PasswordSecurityKey, 100)),
+                device: &trusted_device(),
+                now_unix_secs: 101,
+            },
+        );
+        assert_eq!(power_combined.outcome, AuthorizationOutcome::Allow);
+        assert!(power_combined.audit_required);
+
+        let sky = TigaMode::Sky.policy().authorize(
+            TigaOperation::MigratePayload,
+            AuthorizationContext {
+                session: Some(&session(UnlockMethodType::Password, 100)),
+                device: &DeviceContext::default(),
+                now_unix_secs: 101,
+            },
+        );
+        assert!(sky.audit_required);
     }
 
     #[test]
