@@ -6,6 +6,9 @@ use mdbx_core::model::{
     PayloadMigrationPlanItem, MAX_PAYLOAD_MIGRATION_ITEMS, MAX_PAYLOAD_MIGRATION_ITEM_BYTES,
     MAX_PAYLOAD_MIGRATION_TOTAL_BYTES,
 };
+use mdbx_core::tiga::{
+    AuthorizationDecision, DeviceAssurance, DeviceContext, TigaOperation, TigaScope,
+};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -16,6 +19,8 @@ use crate::repo::{
     BranchRepo, CollectionProfileRepo, CommitChange, CommitContext, CommitOperation, EntryRepo,
     OperationExecution,
 };
+use crate::tiga::TigaService;
+use crate::tiga_policy::TigaAuthorizationContext;
 
 #[derive(Debug, Clone)]
 pub struct PayloadMigrationPlanRequest {
@@ -34,13 +39,40 @@ impl PayloadMigrationRepo {
         conn: &VaultConnection,
         request: PayloadMigrationPlanRequest,
     ) -> StorageResult<PayloadMigrationPlan> {
+        let session = conn.active_session().cloned();
+        let device = conservative_device_context();
+        let context = TigaAuthorizationContext {
+            session: session.as_ref(),
+            device: &device,
+            now_unix_secs: chrono::Utc::now().timestamp(),
+        };
+        Self::create_plan_authorized(conn, request, context).map(|(plan, _)| plan)
+    }
+
+    pub fn create_plan_authorized(
+        conn: &VaultConnection,
+        request: PayloadMigrationPlanRequest,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(PayloadMigrationPlan, AuthorizationDecision)> {
         validate_request(&request)?;
-        conn.with_read_transaction(|| Self::create_plan_in_snapshot(conn, &request))
+        let plan_id = Uuid::new_v4().to_string();
+        let scope = TigaScope::Project {
+            project_id: request.collection_id.clone(),
+        };
+        TigaService::execute_authorized_with_operation_id(
+            conn,
+            &scope,
+            TigaOperation::MigratePayload,
+            context,
+            &plan_id,
+            || Self::create_plan_in_snapshot(conn, &request, plan_id.clone()),
+        )
     }
 
     fn create_plan_in_snapshot(
         conn: &VaultConnection,
         request: &PayloadMigrationPlanRequest,
+        plan_id: String,
     ) -> StorageResult<PayloadMigrationPlan> {
         ensure_active_collection(conn, &request.collection_id)?;
         CollectionProfileRepo::ensure_object_write_allowed(
@@ -103,7 +135,7 @@ impl PayloadMigrationRepo {
         }
 
         let plan = PayloadMigrationPlan {
-            plan_id: Uuid::new_v4().to_string(),
+            plan_id,
             collection_id: request.collection_id.clone(),
             object_type_id: request.object_type_id.clone(),
             source_schema_version: request.source_schema_version,
@@ -126,6 +158,23 @@ impl PayloadMigrationRepo {
         plan: &PayloadMigrationPlan,
         outputs: &[PayloadMigrationOutput],
     ) -> StorageResult<PayloadMigrationExecution> {
+        let session = conn.active_session().cloned();
+        let device = conservative_device_context();
+        let context = TigaAuthorizationContext {
+            session: session.as_ref(),
+            device: &device,
+            now_unix_secs: chrono::Utc::now().timestamp(),
+        };
+        Self::execute_authorized(conn, ctx, plan, outputs, context).map(|(execution, _)| execution)
+    }
+
+    pub fn execute_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        plan: &PayloadMigrationPlan,
+        outputs: &[PayloadMigrationOutput],
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(PayloadMigrationExecution, AuthorizationDecision)> {
         validate_payload_migration_outputs(plan, outputs).map_err(StorageError::Validation)?;
         let intent_hash = migration_intent_hash(plan, outputs)?;
         let changed_objects = plan
@@ -160,41 +209,71 @@ impl PayloadMigrationRepo {
         let migrated_count = u32::try_from(plan.items.len()).map_err(|error| {
             StorageError::Validation(format!("migration item count is invalid: {error}"))
         })?;
-        match ctx.run_operation(conn, operation, |operation_ctx| {
-            validate_plan_bindings(conn, plan)?;
+        let scope = TigaScope::Project {
+            project_id: plan.collection_id.clone(),
+        };
+        TigaService::execute_authorized_with_commit(
+            conn,
+            &scope,
+            TigaOperation::MigratePayload,
+            context,
+            || {
+                let execution =
+                    ctx.run_operation_in_transaction(conn, operation, |operation_ctx| {
+                        validate_plan_bindings(conn, plan)?;
 
-            let mut entries = Vec::with_capacity(plan.items.len());
-            for item in &plan.items {
-                let entry = EntryRepo::get_by_id(conn, &item.object_id)?
-                    .ok_or_else(|| StorageError::NotFound(item.object_id.clone()))?;
-                validate_entry_binding(plan, item, &entry)?;
-                entries.push(entry);
-            }
+                        let mut entries = Vec::with_capacity(plan.items.len());
+                        for item in &plan.items {
+                            let entry = EntryRepo::get_by_id(conn, &item.object_id)?
+                                .ok_or_else(|| StorageError::NotFound(item.object_id.clone()))?;
+                            validate_entry_binding(plan, item, &entry)?;
+                            entries.push(entry);
+                        }
 
-            for mut entry in entries {
-                let output = outputs_by_id.get(entry.entry_id.as_str()).ok_or_else(|| {
-                    StorageError::Validation(format!(
-                        "missing migration output for object {}",
-                        entry.entry_id
-                    ))
-                })?;
-                entry.payload_ct.clone_from(&output.target_payload);
-                entry.payload_schema_version = plan.target_schema_version;
-                EntryRepo::update(conn, operation_ctx, &entry)?;
-            }
-            Ok(())
-        })? {
-            OperationExecution::Applied { commit_id, .. } => Ok(PayloadMigrationExecution {
-                commit_id,
-                migrated_count,
-                already_committed: false,
-            }),
-            OperationExecution::AlreadyCommitted { commit_id } => Ok(PayloadMigrationExecution {
-                commit_id,
-                migrated_count,
-                already_committed: true,
-            }),
-        }
+                        for mut entry in entries {
+                            let output =
+                                outputs_by_id.get(entry.entry_id.as_str()).ok_or_else(|| {
+                                    StorageError::Validation(format!(
+                                        "missing migration output for object {}",
+                                        entry.entry_id
+                                    ))
+                                })?;
+                            entry.payload_ct.clone_from(&output.target_payload);
+                            entry.payload_schema_version = plan.target_schema_version;
+                            EntryRepo::update(conn, operation_ctx, &entry)?;
+                        }
+                        Ok(())
+                    })?;
+                match execution {
+                    OperationExecution::Applied { commit_id, .. } => Ok((
+                        PayloadMigrationExecution {
+                            commit_id: commit_id.clone(),
+                            migrated_count,
+                            already_committed: false,
+                        },
+                        commit_id,
+                    )),
+                    OperationExecution::AlreadyCommitted { commit_id } => Ok((
+                        PayloadMigrationExecution {
+                            commit_id: commit_id.clone(),
+                            migrated_count,
+                            already_committed: true,
+                        },
+                        commit_id,
+                    )),
+                }
+            },
+        )
+    }
+}
+
+fn conservative_device_context() -> DeviceContext {
+    DeviceContext {
+        device_id: None,
+        assurance: DeviceAssurance::Standard,
+        secure_clipboard_available: false,
+        screen_capture_protection_available: false,
+        secure_temp_files_available: false,
     }
 }
 
@@ -336,12 +415,15 @@ fn migration_intent_hash(
 mod tests {
     use super::*;
     use mdbx_core::model::{CollectionTypeId, ExtensionCapabilityId};
+    use mdbx_core::tiga::AuthorizationOutcome;
     use serde_json::json;
 
     use crate::init::{initialize_vault, VaultInitParams};
     use crate::repo::{CollectionProfileSpec, CommitHistoryRepo, ProjectRepo};
+    use crate::tiga::TigaService;
+    use crate::unlock::UnlockService;
 
-    fn setup() -> (VaultConnection, CommitContext, String, ObjectTypeId) {
+    fn setup_locked() -> (VaultConnection, CommitContext, String, ObjectTypeId) {
         let mut conn = VaultConnection::open_in_memory().unwrap();
         initialize_vault(
             &conn,
@@ -351,6 +433,7 @@ mod tests {
             },
         )
         .unwrap();
+        UnlockService::setup_password(&mut conn, "payload-migration-password").unwrap();
         let ctx = CommitContext::new("device-a".to_string());
         let collection = ProjectRepo::create(&conn, &ctx, "Mail", None, None).unwrap();
         let object_type = ObjectTypeId::custom("com.monica.mail.message").unwrap();
@@ -381,7 +464,14 @@ mod tests {
             )
             .unwrap();
         }
+        conn.clear_session();
         (conn, ctx, collection.project_id, object_type)
+    }
+
+    fn setup() -> (VaultConnection, CommitContext, String, ObjectTypeId) {
+        let (mut conn, ctx, collection_id, object_type) = setup_locked();
+        UnlockService::unlock_with_password(&mut conn, "payload-migration-password").unwrap();
+        (conn, ctx, collection_id, object_type)
     }
 
     fn plan(
@@ -428,6 +518,13 @@ mod tests {
             plan.items[0].source_payload.len() as u64
         );
         plan.validate().unwrap();
+        let events = TigaService::list_security_audit_events(&conn, 20).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.operation == TigaOperation::MigratePayload)
+            .expect("plan authorization must be audited");
+        assert_eq!(event.operation_id.as_deref(), Some(plan.plan_id.as_str()));
+        assert!(event.commit_id.is_none());
     }
 
     #[test]
@@ -459,9 +556,33 @@ mod tests {
                 && change.fields == ["payload", "payload_schema_version"]
         }));
 
+        let migration_events = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .collect::<Vec<_>>();
+        assert_eq!(migration_events.len(), 2);
+        let execution_event = migration_events
+            .iter()
+            .find(|event| event.commit_id.as_deref() == Some(applied.commit_id.as_str()))
+            .expect("execution authorization must reference its commit");
+        assert_eq!(
+            execution_event.operation_id.as_deref(),
+            Some(plan.plan_id.as_str())
+        );
+        assert!(migration_events
+            .iter()
+            .any(|event| event.commit_id.is_none()));
+
         let repeated = PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs).unwrap();
         assert!(repeated.already_committed);
         assert_eq!(repeated.commit_id, applied.commit_id);
+        let migration_event_count = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .count();
+        assert_eq!(migration_event_count, 2);
         assert!(PayloadMigrationRepo::create_plan(
             &conn,
             PayloadMigrationPlanRequest {
@@ -485,12 +606,35 @@ mod tests {
             .unwrap();
         changed.payload_ct = b"concurrent-change".to_vec();
         EntryRepo::update(&conn, &ctx, &changed).unwrap();
+        let commit_count = conn
+            .inner()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let audit_count = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .count();
 
         assert!(PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs(&plan)).is_err());
         let untouched = EntryRepo::get_by_id(&conn, &plan.items[1].object_id)
             .unwrap()
             .unwrap();
         assert_eq!(untouched.payload_schema_version, 1);
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count
+        );
+        assert_eq!(
+            TigaService::list_security_audit_events(&conn, 20)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.operation == TigaOperation::MigratePayload)
+                .count(),
+            audit_count
+        );
     }
 
     #[test]
@@ -498,6 +642,15 @@ mod tests {
         let (mut conn, ctx, collection_id, object_type) = setup();
         let plan = plan(&conn, &collection_id, object_type.clone(), 2);
         conn.set_extension_capabilities(Vec::<ExtensionCapabilityId>::new());
+        let commit_count = conn
+            .inner()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let audit_count = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .count();
 
         assert!(matches!(
             PayloadMigrationRepo::create_plan(
@@ -517,5 +670,148 @@ mod tests {
             PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs(&plan)),
             Err(StorageError::MissingExtensionCapabilities { .. })
         ));
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count
+        );
+        assert_eq!(
+            TigaService::list_security_audit_events(&conn, 20)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.operation == TigaOperation::MigratePayload)
+                .count(),
+            audit_count
+        );
+    }
+
+    #[test]
+    fn migration_requires_an_active_authenticated_session() {
+        let (conn, _ctx, collection_id, object_type) = setup_locked();
+        let error = PayloadMigrationRepo::create_plan(
+            &conn,
+            PayloadMigrationPlanRequest {
+                collection_id,
+                object_type_id: object_type,
+                source_schema_version: 1,
+                target_schema_version: 2,
+                max_items: 2,
+                branch_id: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::Authorization(_)));
+        let events = TigaService::list_security_audit_events(&conn, 20).unwrap();
+        let denial = events
+            .iter()
+            .find(|event| event.operation == TigaOperation::MigratePayload)
+            .expect("missing-session denial must be audited");
+        assert_eq!(
+            denial.outcome,
+            AuthorizationOutcome::RequireFreshAuthentication
+        );
+        assert!(denial.commit_id.is_none());
+    }
+
+    #[test]
+    fn malformed_outputs_are_rejected_without_commit_or_audit_side_effects() {
+        let (conn, ctx, collection_id, object_type) = setup();
+        let plan = plan(&conn, &collection_id, object_type, 2);
+        let commit_count = conn
+            .inner()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let audit_count = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .count();
+
+        assert!(matches!(
+            PayloadMigrationRepo::execute(&conn, &ctx, &plan, &[]),
+            Err(StorageError::Validation(_))
+        ));
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count
+        );
+        assert_eq!(
+            TigaService::list_security_audit_events(&conn, 20)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.operation == TigaOperation::MigratePayload)
+                .count(),
+            audit_count
+        );
+        for item in &plan.items {
+            assert_eq!(
+                EntryRepo::get_by_id(&conn, &item.object_id)
+                    .unwrap()
+                    .unwrap()
+                    .payload_schema_version,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn denied_execution_preserves_objects_and_commits_but_records_denial() {
+        let (conn, ctx, collection_id, object_type) = setup();
+        let plan = plan(&conn, &collection_id, object_type, 2);
+        conn.inner()
+            .execute(
+                "UPDATE projects SET tiga_mode_override = 'power' WHERE project_id = ?1",
+                params![collection_id],
+            )
+            .unwrap();
+        let commit_count = conn
+            .inner()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let audit_count = TigaService::list_security_audit_events(&conn, 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.operation == TigaOperation::MigratePayload)
+            .count();
+
+        assert!(matches!(
+            PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs(&plan)),
+            Err(StorageError::Authorization(_))
+        ));
+        assert_eq!(
+            conn.inner()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+                .unwrap(),
+            commit_count
+        );
+        for item in &plan.items {
+            assert_eq!(
+                EntryRepo::get_by_id(&conn, &item.object_id)
+                    .unwrap()
+                    .unwrap()
+                    .payload_schema_version,
+                1
+            );
+        }
+        let events = TigaService::list_security_audit_events(&conn, 20).unwrap();
+        let denials = events
+            .iter()
+            .filter(|event| {
+                event.operation == TigaOperation::MigratePayload
+                    && event.outcome == AuthorizationOutcome::Deny
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 1);
+        assert!(denials[0].commit_id.is_none());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.operation == TigaOperation::MigratePayload)
+                .count(),
+            audit_count + 1
+        );
     }
 }

@@ -134,6 +134,50 @@ impl CommitContext {
         }
 
         conn.inner().execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let result = self.run_operation_in_transaction(conn, operation, action);
+        match result {
+            Ok(OperationExecution::AlreadyCommitted { commit_id }) => {
+                conn.inner().execute_batch("ROLLBACK;")?;
+                Ok(OperationExecution::AlreadyCommitted { commit_id })
+            }
+            Ok(OperationExecution::Applied { value, commit_id }) => {
+                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
+                    conn,
+                    crate::sync_delta::SyncDeltaLimits::default(),
+                ) {
+                    let _ = conn.inner().execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
+                if let Err(error) = conn.inner().execute_batch("COMMIT;") {
+                    let _ = conn.inner().execute_batch("ROLLBACK;");
+                    return Err(StorageError::Database(error));
+                }
+                Ok(OperationExecution::Applied { value, commit_id })
+            }
+            Err(error) => {
+                let _ = conn.inner().execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    /// Execute an operation inside a transaction owned by another Module.
+    ///
+    /// The caller retains commit, audit, and rollback ownership. This Seam lets
+    /// Tiga authorization and one operation commit share one outer transaction.
+    pub(crate) fn run_operation_in_transaction<T>(
+        &self,
+        conn: &VaultConnection,
+        operation: CommitOperation,
+        action: impl FnOnce(&CommitContext) -> StorageResult<T>,
+    ) -> StorageResult<OperationExecution<T>> {
+        Self::validate_operation(&operation)?;
+        if conn.inner().is_autocommit() {
+            return Err(StorageError::ConstraintViolation(
+                "run_operation_in_transaction requires an active transaction".to_string(),
+            ));
+        }
+
         let existing = conn
             .inner()
             .query_row(
@@ -155,14 +199,7 @@ impl CommitContext {
                     ))
                 },
             )
-            .optional();
-        let existing = match existing {
-            Ok(existing) => existing,
-            Err(error) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                return Err(StorageError::Database(error));
-            }
-        };
+            .optional()?;
         if let Some((
             commit_id,
             operation_kind,
@@ -193,23 +230,15 @@ impl CommitContext {
                 || !compatible_scope
                 || !compatible_intent
             {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
                 return Err(StorageError::Validation(format!(
                     "operation {} was reused for a different operation",
                     operation.operation_id
                 )));
             }
-            conn.inner().execute_batch("ROLLBACK;")?;
             return Ok(OperationExecution::AlreadyCommitted { commit_id });
         }
 
-        let operation = match Self::resolve_new_operation_branch(conn, operation) {
-            Ok(operation) => operation,
-            Err(error) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                return Err(error);
-            }
-        };
+        let operation = Self::resolve_new_operation_branch(conn, operation)?;
 
         let scoped = CommitContext {
             device_id: self.device_id.clone(),
@@ -218,38 +247,14 @@ impl CommitContext {
                 commit_id: None,
             })),
         };
-        let result = action(&scoped);
-        match result {
-            Ok(value) => {
-                let commit_id = scoped
-                    .active_operation
-                    .borrow()
-                    .as_ref()
-                    .and_then(|active| active.commit_id.clone());
-                let Some(commit_id) = commit_id else {
-                    let _ = conn.inner().execute_batch("ROLLBACK;");
-                    return Err(StorageError::Validation(
-                        "operation produced no commit".to_string(),
-                    ));
-                };
-                if let Err(error) = crate::sync_delta::materialize_pending_sync_delta(
-                    conn,
-                    crate::sync_delta::SyncDeltaLimits::default(),
-                ) {
-                    let _ = conn.inner().execute_batch("ROLLBACK;");
-                    return Err(error);
-                }
-                if let Err(error) = conn.inner().execute_batch("COMMIT;") {
-                    let _ = conn.inner().execute_batch("ROLLBACK;");
-                    return Err(StorageError::Database(error));
-                }
-                Ok(OperationExecution::Applied { value, commit_id })
-            }
-            Err(error) => {
-                let _ = conn.inner().execute_batch("ROLLBACK;");
-                Err(error)
-            }
-        }
+        let value = action(&scoped)?;
+        let commit_id = scoped
+            .active_operation
+            .borrow()
+            .as_ref()
+            .and_then(|active| active.commit_id.clone())
+            .ok_or_else(|| StorageError::Validation("operation produced no commit".to_string()))?;
+        Ok(OperationExecution::Applied { value, commit_id })
     }
 
     /// 在当前 SQLite 写事务中原子分配设备序列号。
@@ -1506,6 +1511,80 @@ mod tests {
             .unwrap();
         let ids: Vec<String> = serde_json::from_slice(&changed).unwrap();
         assert_eq!(ids, vec![first.project_id, second.project_id]);
+    }
+
+    #[test]
+    fn transaction_owned_operation_seam_defers_commit_and_sync_ownership() {
+        let (conn, ctx) = initialized();
+        let before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let operation = CommitOperation::new(
+            "transaction-owned-operation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+
+        let execution = conn
+            .with_immediate_transaction(|| {
+                let execution = ctx.run_operation_in_transaction(&conn, operation, |scoped| {
+                    let first = ProjectRepo::create(&conn, scoped, "First", None, None)?;
+                    let second = ProjectRepo::create(&conn, scoped, "Second", None, None)?;
+                    Ok((first, second))
+                })?;
+                assert!(!conn.inner().is_autocommit());
+                Ok(execution)
+            })
+            .unwrap();
+
+        let (first, second, commit_id) = match execution {
+            OperationExecution::Applied {
+                value: (first, second),
+                commit_id,
+            } => (first, second, commit_id),
+            OperationExecution::AlreadyCommitted { .. } => panic!("first call must execute"),
+        };
+        assert_eq!(first.head_commit_id, commit_id);
+        assert_eq!(second.head_commit_id, commit_id);
+        let after: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before + 1);
+
+        let rollback_operation = CommitOperation::new(
+            "transaction-owned-rollback",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let result = conn.with_immediate_transaction(|| {
+            ctx.run_operation_in_transaction(
+                &conn,
+                rollback_operation,
+                |scoped| -> StorageResult<()> {
+                    ProjectRepo::create(&conn, scoped, "Rolled back", None, None)?;
+                    Err(StorageError::Validation("cancelled".to_string()))
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 2);
+        let rollback_commit_exists: bool = conn
+            .inner()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commit_operations WHERE operation_id = ?1)",
+                params!["transaction-owned-rollback"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!rollback_commit_exists);
     }
 
     #[test]

@@ -672,6 +672,64 @@ impl TigaService {
         }
     }
 
+    /// Execute a client-owned plaintext action and correlate its audit event
+    /// with a short-lived caller operation such as a payload migration plan.
+    pub(crate) fn execute_authorized_with_operation_id<T>(
+        conn: &VaultConnection,
+        scope: &TigaScope,
+        operation: TigaOperation,
+        context: TigaAuthorizationContext<'_>,
+        operation_id: &str,
+        action: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<(T, AuthorizationDecision)> {
+        if operation_id.trim().is_empty() {
+            return Err(StorageError::Validation(
+                "authorized operation ID must not be empty".to_string(),
+            ));
+        }
+        enum Execution<T> {
+            Allowed(T, AuthorizationDecision),
+            Denied(AuthorizationDecision),
+        }
+
+        let execution = conn.with_immediate_transaction(|| {
+            let evaluated =
+                Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+            if !decision_allows(&evaluated.decision) {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated
+                        .evidence
+                        .audit_context_with_operation(operation_id),
+                )?;
+                return Ok(Execution::Denied(evaluated.decision));
+            }
+            let value = action()?;
+            if evaluated.decision.audit_required {
+                record_authorization_event(
+                    conn,
+                    scope,
+                    operation,
+                    context,
+                    &evaluated.decision,
+                    evaluated
+                        .evidence
+                        .audit_context_with_operation(operation_id),
+                )?;
+            }
+            Ok(Execution::Allowed(value, evaluated.decision))
+        })?;
+
+        match execution {
+            Execution::Allowed(value, decision) => Ok((value, decision)),
+            Execution::Denied(decision) => Err(StorageError::Authorization(decision)),
+        }
+    }
+
     /// Evaluate several existing Tiga scopes as one authorization boundary.
     ///
     /// Scope order is preserved in the returned decisions. If any scope denies, the plaintext
@@ -794,9 +852,15 @@ impl TigaService {
         context: TigaAuthorizationContext<'_>,
         action: impl FnOnce() -> StorageResult<(T, String)>,
     ) -> StorageResult<(T, AuthorizationDecision)> {
-        let evaluated = Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
-        if !decision_allows(&evaluated.decision) {
-            conn.with_immediate_transaction(|| {
+        enum Execution<T> {
+            Allowed(T, AuthorizationDecision),
+            Denied(AuthorizationDecision),
+        }
+
+        let execution = conn.with_immediate_transaction(|| {
+            let evaluated =
+                Self::evaluate_operation_with_evidence(conn, scope, operation, context)?;
+            if !decision_allows(&evaluated.decision) {
                 record_authorization_event(
                     conn,
                     scope,
@@ -804,11 +868,9 @@ impl TigaService {
                     context,
                     &evaluated.decision,
                     evaluated.evidence.audit_context(None, None),
-                )
-            })?;
-            return Err(StorageError::Authorization(evaluated.decision));
-        }
-        conn.with_immediate_transaction(|| {
+                )?;
+                return Ok(Execution::Denied(evaluated.decision));
+            }
             let (value, commit_id) = action()?;
             if evaluated.decision.audit_required
                 && !commit_has_security_audit_event(conn, &commit_id)?
@@ -822,8 +884,13 @@ impl TigaService {
                     evaluated.evidence.audit_context(None, Some(&commit_id)),
                 )?;
             }
-            Ok((value, evaluated.decision))
-        })
+            Ok(Execution::Allowed(value, evaluated.decision))
+        })?;
+
+        match execution {
+            Execution::Allowed(value, decision) => Ok((value, decision)),
+            Execution::Denied(decision) => Err(StorageError::Authorization(decision)),
+        }
     }
 
     pub fn set_vault_profile_authorized(
