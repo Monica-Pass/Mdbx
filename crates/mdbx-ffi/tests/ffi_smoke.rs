@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use mdbx_ffi::{
     create_portable_backup, create_vault, create_vault_with_tiga_mode,
-    default_attachment_batch_limits, default_composite_write_operation_limits,
-    default_object_metadata_disclosure_limits, default_write_operation_limits,
-    inspect_vault_migration, open_vault, open_vault_with_password_security_key,
-    open_vault_with_security_key, upgrade_vault, MdbxAttachmentBatchCommand,
+    default_attachment_batch_limits, default_attachment_presentation_limits,
+    default_composite_write_operation_limits, default_object_metadata_disclosure_limits,
+    default_write_operation_limits, inspect_vault_migration, open_vault,
+    open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
+    MdbxAttachmentBatchCommand, MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
     MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxObjectMetadataDisclosureLimits,
     MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
@@ -523,6 +524,64 @@ fn attachment_batch_is_available_to_external_clients() {
         vault.read_attachment_content(first_id, 64).unwrap(),
         b"first"
     );
+}
+
+#[test]
+fn bounded_attachment_summary_api_is_available_to_external_clients() {
+    let vault_path = temp_vault_path("attachment-summaries");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "attachment summary password 12345!".to_string(),
+        "ffi-attachment-summary-device".to_string(),
+    )
+    .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Message".to_string(),
+            "{}".to_string(),
+            1,
+        )
+        .unwrap();
+    let attachment_id = Uuid::new_v4().to_string();
+    vault
+        .create_attachment_with_content(
+            Uuid::new_v4().to_string(),
+            MdbxAttachmentCreateRequest {
+                attachment_id: attachment_id.clone(),
+                project_id: collection.project_id.clone(),
+                entry_id: Some(object.object_id.clone()),
+                file_name: "message.eml".to_string(),
+                media_type: Some("message/rfc822".to_string()),
+            },
+            b"mail body".to_vec(),
+            MdbxAttachmentContentLimits {
+                chunk_size: 4,
+                max_plaintext_bytes: 64,
+            },
+        )
+        .unwrap();
+
+    let limits = default_attachment_presentation_limits();
+    assert_eq!(limits.max_file_name_bytes, 4096);
+    assert_eq!(limits.max_media_type_bytes, 512);
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+
+    let page = vault
+        .list_attachment_summaries(
+            collection.project_id.clone(),
+            Some(object.object_id),
+            10,
+            None,
+        )
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].attachment_id, attachment_id);
+    assert_eq!(page.items[0].file_name, "message.eml");
+    assert_eq!(page.items[0].media_type.as_deref(), Some("message/rfc822"));
 }
 
 #[test]

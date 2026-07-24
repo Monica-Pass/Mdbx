@@ -259,6 +259,8 @@ Therefore MDBX MUST:
 
 If external referenced attachments are supported, the external content MUST still be integrity-bound to the database metadata.
 
+Metadata-only attachment navigation is a separate bounded surface. File names are limited to 4096 UTF-8 bytes and media types to 512 bytes. A summary query MUST check encrypted display-field length and conditionally project the field before BLOB materialization, with the shared 128 KiB envelope allowance; it MUST NOT read attachment chunk bodies or external URI ciphertext. After authenticated decryption, storage MUST enforce the exact plaintext byte limit and UTF-8 validity. A corrupt chunk or unavailable external provider therefore cannot turn a metadata list into a content disclosure or denial-of-service path. The complete attachment read and integrity APIs remain explicit, separately authorized operations.
+
 ## 9. Memory Safety Rules
 
 MDBX2 MUST keep long-lived keyring fields in automatically zeroizing buffers.

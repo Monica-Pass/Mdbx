@@ -7,7 +7,7 @@ pub mod payload_migration;
 pub mod project;
 pub mod unlock;
 
-pub use attachment::Attachment;
+pub use attachment::{Attachment, AttachmentSummary, AttachmentSummaryPage};
 pub use collection::{
     CollectionProfile, CollectionSummary, CollectionSummaryPage, CollectionTypeId,
     ExtensionCapabilityId, MAX_COLLECTION_PROFILE_CAPABILITIES,

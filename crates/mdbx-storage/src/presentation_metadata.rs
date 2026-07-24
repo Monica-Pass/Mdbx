@@ -9,6 +9,12 @@ pub const MAX_PRESENTATION_LABEL_NAME_BYTES: u64 = 512;
 /// Maximum UTF-8 bytes returned for a presentation reference such as group or icon identity.
 pub const MAX_PRESENTATION_REFERENCE_BYTES: u64 = 4 * 1024;
 
+/// Maximum UTF-8 bytes returned for an attachment file name.
+pub const MAX_PRESENTATION_ATTACHMENT_FILE_NAME_BYTES: u64 = 4 * 1024;
+
+/// Maximum UTF-8 bytes returned for an attachment media type.
+pub const MAX_PRESENTATION_ATTACHMENT_MEDIA_TYPE_BYTES: u64 = 512;
+
 /// Reserved space for authenticated-encryption and field-key epoch envelopes.
 ///
 /// Current committed AEAD adds 80 bytes, while the largest representable field-key epoch
@@ -176,6 +182,8 @@ mod tests {
         assert_eq!(limits.max_title_bytes(), 64 * 1024);
         assert_eq!(limits.max_label_name_bytes(), 512);
         assert_eq!(limits.max_reference_bytes(), 4096);
+        assert_eq!(MAX_PRESENTATION_ATTACHMENT_FILE_NAME_BYTES, 4096);
+        assert_eq!(MAX_PRESENTATION_ATTACHMENT_MEDIA_TYPE_BYTES, 512);
         assert_eq!(
             max_field_ciphertext_bytes(512),
             512 + FIELD_CIPHERTEXT_OVERHEAD_BYTES

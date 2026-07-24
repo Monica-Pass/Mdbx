@@ -115,6 +115,8 @@ Collection、Object 和 Label 摘要 API 都是 additive 的 reader surface，�
 
 新的导航接口使用固定字段和分页限制。旧行如果超出这些限制，只会在有界摘要接口中返回 resource-limit error；完整 Project、Entry、Label repo 和 FFI 方法继续保持历史行为，显式 repair/export 工具仍可读取它们。CLI 和新客户端默认使用摘要接口，不会静默删除或重定义兼容方法。
 
+附件导航遵循同样的 additive 规则。`AttachmentSummaryRepo` 和 UniFFI 的 `MdbxAttachmentSummary` 方法按 Collection 或 Object 分页 active attachment，单独分页 deleted attachment，并按 ID 返回不读取 chunk/blob payload 的元数据。文件名明文最多 4096 个 UTF-8 bytes，media type 明文最多 512 bytes；密文投影预留共享 128 KiB 信封空间，并在认证解密后再次检查精确明文。超出这些限制的旧附件仍可通过 `AttachmentRepo::get_by_id`、`list_by_project`、`list_by_entry`、`list_deleted` 以及已有完整 FFI 方法读取。`attach list` 和 `attach deleted` 使用有界分页；内容导出、repair 和完整性校验继续使用完整路径。
+
 仅增加或读取摘要不会修改 format marker、schema version、commit、object version、同步字段、snapshot 字段、密文或 key epoch。这同时保持 MDBX1 自动升级承诺和历史 reader 看到的物理兼容投影。
 
 ## 4. Schema 演进规则

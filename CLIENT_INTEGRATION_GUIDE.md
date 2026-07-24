@@ -133,6 +133,8 @@ After reopening a vault, use `get_collection_summary`, `list_collection_summarie
 
 `MdbxCollectionSummary` contains the Collection ID, title, optional CollectionProfile type/version, group/icon references, favorite/archive state, attachment count, head commit, deletion state, and update time. It never contains `summary_ct` or CollectionProfile payload. Call `default_presentation_metadata_limits` to discover the fixed display contract: 64 KiB title plaintext, 512-byte label name plaintext, and 4096 UTF-8-byte group/icon references. New screens should page summaries, then page Object and Label summaries; they should not use complete list methods as a default navigation path.
 
+For attachment navigation, call `list_attachment_summaries(collection_id, object_id, page_size, cursor)` with `object_id = None` for a Collection or an Object ID for an Object, and call `list_deleted_attachment_summaries` for tombstones. `get_attachment_summary` is the metadata-only by-ID path. `default_attachment_presentation_limits` reports the 4096-byte file-name limit, 512-byte media-type limit, shared 128 KiB ciphertext-envelope allowance, 200-row page ceiling, and 4096-byte cursor ceiling. These pages never read attachment chunk or external-blob payloads, so a content-corruption report does not prevent the list screen from opening. Cursors are live positions: discard them after metadata changes and restart from the first page.
+
 MDBX1 Collections without a Profile are valid and return empty type/version fields. A legacy title, label name, or reference outside the fixed presentation limit returns a resource-limit error only through the bounded summary path. The complete compatibility APIs remain available for explicit repair/export workflows and must not be removed or reinterpreted.
 
 See `crates/mdbx-ffi/README.md` for the current exported API, JSON payload contract, UniFFI binding generation commands, iOS packaging notes, and rules for extending the facade.
@@ -255,6 +257,8 @@ Clients must:
 - distinguish embedded, chunked, and external hash reference modes
 
 Clients must not rewrite unrelated attachment content when editing an entry title or password.
+
+New attachment screens should use the bounded summary pages above. The complete `get_attachment`, `list_attachments`, and `list_deleted_attachments` methods remain available for MDBX1 compatibility, explicit repair/export, content reads, and integrity verification. A summary resource-limit error means that the legacy display field is outside the new UI contract; it does not mean that the attachment bytes have been deleted or migrated.
 
 ### 4.5 Snapshots
 

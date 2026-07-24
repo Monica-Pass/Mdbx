@@ -2,7 +2,7 @@
 
 语言：[简体中文](README.zh-CN.md) | [English](README.md)
 
-`mdbx-ffi` 是面向非 Rust MDBX 客户端的通用 UniFFI 边界。它把 vault 创建、解锁、project 和 generic entry 操作暴露在安全的 storage/repository facade 上，同时把具体产品 payload 语义留给各客户端。
+`mdbx-ffi` 是面向非 Rust MDBX 客户端的通用 UniFFI 边界。它把 vault 创建、解锁、Collection、generic Object 和 attachment 操作暴露在安全的 storage/repository facade 上，同时把具体产品 payload 语义留给各客户端。
 
 这个 crate 不是低层 SQLite API。如果客户端需要通过 FFI 使用 tag、attachment、sync、conflict、snapshot 或 diagnostics，应该在这里新增明确的 facade 方法并补测试，而不是让客户端直接写 MDBX 底层表。
 
@@ -30,6 +30,7 @@
 - 通过 Tiga 授权轮换数据密钥 epoch，并返回旧 epoch、新 active epoch、rotation commit 与时间戳
 - 创建 project
 - 通过有界、无 payload 的摘要页发现 active 和 deleted Collection
+- 按 Collection 或 Object 分页有界 attachment 摘要、读取 deleted attachment 摘要，并在不加载 chunk/blob payload 的情况下查看单个附件元数据
 - 注册当前客户端实际提供的扩展能力，读取或设置 Collection Profile
 - 创建、列出、更新、软删除、恢复、移动 generic entry
 - 创建、查询、更新和删除通用关系、标签及标签分配
@@ -41,7 +42,7 @@
 - project 更新、删除流程
 - 除 project container 之外的嵌套文件夹专用操作
 - tag
-- attachment 与 attachment content
+- 除上述 attachment API 之外的 external Blob Provider 传输与维护操作
 - sync bundle/apply 操作
 - snapshot
 - diagnostics / maintenance 数据
@@ -79,6 +80,8 @@ vault critical extension、授予密钥访问或协商 peer 会话。
 `MdbxCollectionSummary` 是顶层导航的默认记录。它包含 Collection ID、有界标题、可选 Profile 类型/版本、group/icon 引用、收藏/归档状态、附件计数、head commit、删除状态和更新时间，绝不包含 `summary_ct` 或 Profile payload。`list_collection_summaries` 与 `list_deleted_collection_summaries` 的页大小范围为 1 到 200；返回游标只能用于同一查询。`get_collection_summary` 可以按 ID 返回 tombstone。
 
 调用 `default_presentation_metadata_limits` 获取固定契约：标题明文 64 KiB、label name 明文 512 bytes、UTF-8 引用 4096 bytes、每页最多 200 条摘要、游标最多 4096 bytes。旧行超出展示限制时，有界摘要路径失败关闭；完整兼容读取仍可用于显式 repair/export。
+
+`MdbxAttachmentSummary` 是附件导航的有界记录。Collection 使用 `object_id = None` 调用 `list_attachment_summaries`，Object 传入 Object ID；tombstone 使用 `list_deleted_attachment_summaries`，按 ID 的元数据使用 `get_attachment_summary`。记录包含经过认证的文件名/media type、归属、存储模式、content hash、大小、chunk 数、head commit、删除状态和更新时间，但绝不包含 chunk 内容或 external blob 引用。`default_attachment_presentation_limits` 返回文件名 4096 bytes、media type 512 bytes、共享 128 KiB 密文信封预留、每页 200 条和游标 4096 bytes 的契约。已有完整 attachment 方法继续作为兼容以及显式内容/repair 路径。
 
 客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
 

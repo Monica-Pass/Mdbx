@@ -2,7 +2,7 @@
 
 Language: [简体中文](README.zh-CN.md) | [English](README.md)
 
-`mdbx-ffi` is the generic UniFFI boundary for non-Rust MDBX clients. It exposes the safe storage/repository facade for vault creation, unlock, projects, and generic entries, while keeping product-specific payload semantics in each client.
+`mdbx-ffi` is the generic UniFFI boundary for non-Rust MDBX clients. It exposes the safe storage/repository facade for vault creation, unlock, Collections, generic Objects, and attachments, while keeping product-specific payload semantics in each client.
 
 This crate is intentionally not a low-level SQLite API. If a client needs tags, attachments, sync, conflicts, snapshots, or diagnostics through FFI, add explicit facade methods here with tests instead of writing MDBX tables directly from the client.
 
@@ -30,6 +30,7 @@ The exported boundary covers:
 - rotate the data-key epoch through Tiga authorization and return the old epoch, new active epoch, rotation commit, and timestamp
 - create projects
 - discover active and deleted Collections through bounded payload-free summary pages
+- page bounded attachment summaries by Collection or Object, read deleted attachment summaries, and inspect one attachment's metadata without loading chunk/blob payloads
 - register extension capabilities actually present in the client and read or set Collection Profiles
 - create, list, update, soft-delete, restore, and move generic entries
 - create, query, update, and delete generic relations, labels, and label assignments
@@ -41,7 +42,7 @@ The boundary does not currently expose:
 - project update/delete flows
 - nested folder-specific operations beyond project containers
 - tags
-- attachments and attachment content
+- external Blob Provider transfer and maintenance operations beyond the attachment APIs above
 - sync bundle/apply operations
 - snapshots
 - diagnostics and maintenance data
@@ -81,6 +82,8 @@ peer session.
 `MdbxCollectionSummary` is the default top-level navigation record. It contains the Collection ID, bounded title, optional Profile type/version, group/icon references, favorite/archive state, attachment count, head commit, deletion state, and update time; it never contains `summary_ct` or Profile payload. Use `list_collection_summaries` and `list_deleted_collection_summaries` with a page size from 1 through 200 and pass the returned cursor only to the same query. `get_collection_summary` includes a tombstone by ID.
 
 Call `default_presentation_metadata_limits` to discover the fixed contract: 64 KiB title plaintext, 512-byte label-name plaintext, 4096 UTF-8-byte references, 200 summary rows per page, and 4096-byte cursors. A legacy row outside a presentation limit fails closed on the bounded summary path; complete compatibility reads remain available for explicit repair/export.
+
+`MdbxAttachmentSummary` is the bounded attachment navigation record. Use `list_attachment_summaries` with `object_id = None` for a Collection or an Object ID for an Object, `list_deleted_attachment_summaries` for tombstones, and `get_attachment_summary` for by-ID metadata. The record contains authenticated file name/media type, ownership, storage mode, content hash, sizes, chunk count, head commit, deletion state, and update time, but never chunk bodies or external blob references. `default_attachment_presentation_limits` reports a 4096-byte file-name limit, 512-byte media-type limit, shared 128 KiB ciphertext-envelope allowance, a 200-row page ceiling, and a 4096-byte cursor ceiling. Existing complete attachment methods remain the compatibility and explicit content/repair path.
 
 Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
 

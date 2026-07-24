@@ -72,6 +72,8 @@ An `ObjectLabel` is a stable searchable classification attached to an ObjectReco
 
 An `Attachment` is authenticated binary content or an external content reference owned by a Collection and optionally by an ObjectRecord. Mail attachments and `mafile` source documents use the same attachment integrity rules as password-vault files.
 
+An `AttachmentSummary` is the bounded, payload-free navigation projection of an Attachment. It contains ownership, authenticated file name/media type, storage mode, content hash, sizes, chunk count, head commit, deletion state, and update time, but never attachment chunk bodies or external URI ciphertext. Collection, Object, deleted, and by-ID summary queries use query-bound keyset cursors. File names are limited to 4096 UTF-8 bytes and media types to 512 bytes; complete Attachment reads remain the explicit MDBX1-compatible content/repair path.
+
 ### ExtensionProfile
 
 An `ExtensionProfile` declares the ObjectTypeIds, relation kinds, optional indexes, import/export adapters, and client presentation hints supplied by one domain extension. It never receives raw SQL authority over core history or key tables.
@@ -170,6 +172,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 36. Generic UniFFI write operations are bounded before the vault write lock: defaults are 256 commands, 1 MiB per JSON payload, 8 MiB total JSON payload, and 16 MiB serialized intent. Explicit limits remain under hard ceilings.
 37. A bounded write operation streams its complete command serialization into the intent digest, accepts namespaced ObjectTypeIds, creates one commit, and rolls back every object and head when any command fails.
 38. An established IncrementalIntegrityRoot is updated atomically with every covered local or incoming state mutation; a root collection, encoding, authentication, or resource failure rolls back the enclosing transaction and never downgrades to an unverified warning.
+39. Attachment navigation is metadata-only and bounded: summary SQL never selects chunk/blob payloads, checks encrypted display-field length before materialization, and rechecks authenticated plaintext limits after decryption. Complete attachment APIs remain available without reinterpretation.
 
 ## Module Architecture
 

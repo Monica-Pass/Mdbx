@@ -281,6 +281,8 @@ reader 必须继续按 v1 算法验证已认证的 v1 token；token version 选�
 
 如果支持外部引用附件，那么外部内容也必须和数据库元数据建立完整性绑定。
 
+只读附件元数据导航是独立的有界安全面。文件名最多 4096 个 UTF-8 bytes，media type 最多 512 bytes。摘要查询必须在物化 BLOB 前检查展示字段密文长度并条件投影，使用共享的 128 KiB 信封预留；绝不能读取 attachment chunk 内容或 external URI 密文。认证解密后，storage 还必须复核精确明文字节长度和 UTF-8 有效性。因此损坏 chunk 或不可用的外部 provider 不能把元数据列表变成内容披露或拒绝服务路径。完整附件读取和完整性校验 API 仍是独立、显式授权的操作。
+
 ## 9. 内存安全规则
 
 MDBX2 必须让长期持有的 Keyring 字段使用离开作用域后自动清零的 buffer。

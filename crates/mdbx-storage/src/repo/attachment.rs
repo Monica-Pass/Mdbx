@@ -1330,7 +1330,7 @@ impl AttachmentRepo {
         )
     }
 
-    fn decrypt_attachment_field(
+    pub(crate) fn decrypt_attachment_field(
         conn: &VaultConnection,
         id: &str,
         field: &str,
@@ -1422,7 +1422,7 @@ pub(crate) fn external_blob_read_limit(stored_size: i64) -> StorageResult<usize>
     })
 }
 
-fn parse_storage_mode(column: usize, value: &str) -> rusqlite::Result<StorageMode> {
+pub(crate) fn parse_storage_mode(column: usize, value: &str) -> rusqlite::Result<StorageMode> {
     value.parse().map_err(|message: String| {
         rusqlite::Error::FromSqlConversionFailure(
             column,

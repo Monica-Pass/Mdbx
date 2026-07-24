@@ -112,6 +112,12 @@ Relation, label, and label-assignment navigation MUST use bounded summary projec
 
 Pages contain 1 through 200 items, use descending update time plus stable ID keyset ordering, and return a versioned opaque cursor bound to the exact direction, owner, collection, and optional relation-kind filter. By-ID relation and label summaries retain deleted-state visibility, while list pages contain active rows. Complete-record repositories remain compatibility and explicit-payload interfaces, not the default collection or graph traversal path.
 
+### 5.2.1 Attachment Metadata Navigation
+
+Attachment list and deleted-item navigation MUST use a payload-free `AttachmentSummary` projection. The projection may authenticate the file name and optional media type, but MUST NOT select `attachment_chunks.chunk_ct` or `external_uri_ct`; corrupt binary content or an unavailable external provider must not block a metadata-only page. Collection pages and Object pages use the same 1-to-200 keyset contract, and deleted pages use a separate query-bound cursor. The by-ID summary retains deleted-state visibility.
+
+The fixed display limits are 4096 UTF-8 bytes for a file name and 512 UTF-8 bytes for a media type. SQL MUST check ciphertext length and conditionally project the BLOB before materialization, using the shared 128 KiB envelope allowance. Storage MUST authenticate/decrypt the bounded field, recheck the exact plaintext byte length, and reject invalid UTF-8. Existing complete attachment repositories remain the MDBX1-compatible and explicit content/repair path.
+
 ## 5.3 Generic Metadata Disclosure Boundary
 
 An explicit relation payload read MUST authorize `RevealSecret` against both endpoint Entry scopes, preserving the source and target decisions independently. An explicit label payload read MUST authorize the owning collection's Project scope. These rules reuse existing scopes; Relation and Label MUST NOT be persisted as new scope types merely to implement payload disclosure.

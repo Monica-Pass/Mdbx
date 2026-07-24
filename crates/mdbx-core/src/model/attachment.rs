@@ -38,6 +38,34 @@ pub struct Attachment {
     pub updated_by_device_id: DeviceId,
 }
 
+/// Bounded, payload-free attachment metadata for Collection/Object navigation.
+///
+/// The file name and media type are authenticated display metadata. Attachment
+/// chunk bodies and external blob references are intentionally absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentSummary {
+    pub attachment_id: AttachmentId,
+    pub collection_id: ProjectId,
+    pub object_id: Option<EntryId>,
+    pub file_name: Vec<u8>,
+    pub media_type: Option<Vec<u8>>,
+    pub storage_mode: StorageMode,
+    pub content_hash: ContentHash,
+    pub original_size: u64,
+    pub stored_size: u64,
+    pub chunk_count: u32,
+    pub head_commit_id: CommitId,
+    pub deleted: bool,
+    pub updated_at: String,
+}
+
+/// Bounded page of attachment summaries with a query-bound cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentSummaryPage {
+    pub items: Vec<AttachmentSummary>,
+    pub next_cursor: Option<String>,
+}
+
 /// 附件存储模式。
 ///
 /// 即使 MVP 只支持部分模式，枚举也必须先定义完整。

@@ -112,6 +112,12 @@ schema 必须支持：
 
 每页只能包含 1 到 200 项，按更新时间与稳定 ID 降序执行 keyset 分页，并返回绑定方向、owner、collection 和可选 relation-kind 过滤条件的版本化不透明游标。按 ID 查询 relation/label 摘要时保留删除状态，列表页只返回 active row。完整记录 repo 继续作为兼容及显式 payload 接口，不得作为 collection 或关系图的默认遍历路径。
 
+### 5.2.1 附件元数据导航
+
+附件列表和已删除列表必须使用无 payload 的 `AttachmentSummary` 投影。该投影可以认证文件名和可选 media type，但绝不能选择 `attachment_chunks.chunk_ct` 或 `external_uri_ct`；损坏的二进制内容或不可用的外部 provider 不能阻塞只读元数据页面。Collection 页和 Object 页使用同一个 1 到 200 项的 keyset 契约，deleted 页使用独立且绑定查询的游标；按 ID 查询的摘要保留删除状态。
+
+文件名固定最多 4096 个 UTF-8 bytes，media type 固定最多 512 bytes。SQL 必须先检查密文长度，并在物化 BLOB 前通过条件投影应用共享的 128 KiB 信封预留。storage 必须认证解密有界字段，再复核精确明文字节长度和 UTF-8；原有完整 attachment repo 继续作为 MDBX1 兼容以及显式内容/repair 路径。
+
 ## 5.3 通用元数据披露边界
 
 显式读取 relation payload 时，必须同时对 source Entry 与 target Entry 执行 `RevealSecret` 授权，并分别保留两个决定；显式读取 label payload 时，必须使用所属 collection 的 Project scope。该规则复用既有 scope，不能仅为了披露 payload 就把 Relation/Label 新增为持久化 scope 类型。

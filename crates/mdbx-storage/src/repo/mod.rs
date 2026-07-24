@@ -1,4 +1,5 @@
 pub mod attachment;
+pub mod attachment_summary;
 pub mod branch;
 pub mod collection_profile;
 pub mod collection_summary;
@@ -21,6 +22,9 @@ pub mod tombstone;
 
 pub use attachment::{
     AttachmentCreateRequest, AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions,
+};
+pub use attachment_summary::{
+    AttachmentSummaryRepo, MAX_ATTACHMENT_SUMMARY_CURSOR_BYTES, MAX_ATTACHMENT_SUMMARY_PAGE_SIZE,
 };
 pub use branch::BranchRepo;
 pub use collection_profile::{CollectionProfileRepo, CollectionProfileSpec};

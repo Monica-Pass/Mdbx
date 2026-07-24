@@ -49,8 +49,9 @@ use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 #[cfg(not(test))]
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
 use mdbx_storage::repo::{
-    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions, CollectionSummaryRepo,
-    EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotRepo, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
+    AttachmentPlaintextPurpose, AttachmentRepo, AttachmentSummaryRepo, AttachmentWriteOptions,
+    CollectionSummaryRepo, EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
+    MAX_ATTACHMENT_SUMMARY_PAGE_SIZE, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
 };
 use mdbx_storage::repo::{
     CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
@@ -1535,22 +1536,63 @@ fn cmd_attach(
             project_id,
             entry_id,
         } => {
-            let attachments = if let Some(eid) = entry_id {
-                AttachmentRepo::list_by_entry(conn, &eid).map_err(|e| format!("{}", e))?
-            } else if let Some(pid) = project_id {
-                AttachmentRepo::list_by_project(conn, &pid).map_err(|e| format!("{}", e))?
+            let (collection_id, object_id) = if let Some(object_id) = entry_id {
+                let collection_id = match project_id {
+                    Some(collection_id) => collection_id,
+                    None => conn
+                        .inner()
+                        .query_row(
+                            "SELECT project_id FROM entries WHERE entry_id = ?1",
+                            params![&object_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("entry {object_id} not found"))?,
+                };
+                (collection_id, Some(object_id))
+            } else if let Some(collection_id) = project_id {
+                (collection_id, None)
             } else {
                 return Err("specify --project-id or --entry-id".to_string());
             };
-            if attachments.is_empty() {
-                println!("(no attachments)");
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = match object_id.as_deref() {
+                    Some(object_id) => AttachmentSummaryRepo::list_by_object(
+                        conn,
+                        &collection_id,
+                        object_id,
+                        MAX_ATTACHMENT_SUMMARY_PAGE_SIZE,
+                        cursor.as_deref(),
+                    ),
+                    None => AttachmentSummaryRepo::list_by_collection(
+                        conn,
+                        &collection_id,
+                        MAX_ATTACHMENT_SUMMARY_PAGE_SIZE,
+                        cursor.as_deref(),
+                    ),
+                }
+                .map_err(|error| error.to_string())?;
+                for attachment in page.items {
+                    found = true;
+                    let name = String::from_utf8_lossy(&attachment.file_name);
+                    println!(
+                        "{}  {}  {} bytes  {}",
+                        attachment.attachment_id,
+                        name,
+                        attachment.original_size,
+                        attachment.content_hash
+                    );
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for a in &attachments {
-                let name = String::from_utf8_lossy(&a.file_name_ct);
-                println!(
-                    "{}  {}  {} bytes  {}",
-                    a.attachment_id, name, a.original_size, a.content_hash
-                );
+            if !found {
+                println!("(no attachments)");
             }
         }
         AttachAction::Add {
@@ -1737,16 +1779,33 @@ fn cmd_attach(
             println!("Deleted attachment {}", attachment_id);
         }
         AttachAction::Deleted => {
-            let attachments = AttachmentRepo::list_deleted(conn).map_err(|e| format!("{}", e))?;
-            if attachments.is_empty() {
-                println!("(no deleted attachments)");
+            let mut cursor = None;
+            let mut found = false;
+            loop {
+                let page = AttachmentSummaryRepo::list_deleted(
+                    conn,
+                    MAX_ATTACHMENT_SUMMARY_PAGE_SIZE,
+                    cursor.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
+                for attachment in page.items {
+                    found = true;
+                    let name = String::from_utf8_lossy(&attachment.file_name);
+                    println!(
+                        "{}  {}  {} bytes  {}",
+                        attachment.attachment_id,
+                        name,
+                        attachment.original_size,
+                        attachment.content_hash
+                    );
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            for a in &attachments {
-                let name = String::from_utf8_lossy(&a.file_name_ct);
-                println!(
-                    "{}  {}  {} bytes  {}",
-                    a.attachment_id, name, a.original_size, a.content_hash
-                );
+            if !found {
+                println!("(no deleted attachments)");
             }
         }
     }
@@ -4640,6 +4699,26 @@ mod tests {
             "renamed.txt"
         );
         drop(conn);
+
+        // Attachment navigation must remain metadata-only even when content is corrupt.
+        let conn = open_unlocked(&path);
+        conn.inner()
+            .execute(
+                "UPDATE attachment_chunks SET chunk_ct = X'00' WHERE attachment_id = ?1",
+                params![&attachment.attachment_id],
+            )
+            .unwrap();
+        drop(conn);
+        run(cli(
+            &path,
+            Commands::Attach {
+                action: AttachAction::List {
+                    project_id: Some(project_id.clone()),
+                    entry_id: None,
+                },
+            },
+        ))
+        .unwrap();
 
         run(cli(
             &path,

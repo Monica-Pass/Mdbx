@@ -549,6 +549,116 @@ fn attachment_facade_roundtrips_and_coalesces_content_commits() {
 }
 
 #[test]
+fn attachment_summary_facade_pages_without_chunk_reads_and_binds_cursors() {
+    let vault = ffi_test_vault();
+    let project = vault.create_project("Mail summaries".to_string()).unwrap();
+    let other_project = vault.create_project("Other summaries".to_string()).unwrap();
+    let object = vault
+        .create_object(
+            project.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Message".to_string(),
+            "{}".to_string(),
+            1,
+        )
+        .unwrap();
+
+    let mut attachment_ids = Vec::new();
+    for index in 0..3 {
+        let attachment_id = Uuid::new_v4().to_string();
+        vault
+            .create_attachment_with_content(
+                Uuid::new_v4().to_string(),
+                MdbxAttachmentCreateRequest {
+                    attachment_id: attachment_id.clone(),
+                    project_id: project.project_id.clone(),
+                    entry_id: Some(object.object_id.clone()),
+                    file_name: format!("message-{index}.eml"),
+                    media_type: Some("message/rfc822".to_string()),
+                },
+                b"mail body".to_vec(),
+                MdbxAttachmentContentLimits {
+                    chunk_size: 4,
+                    max_plaintext_bytes: 64,
+                },
+            )
+            .unwrap();
+        attachment_ids.push(attachment_id);
+    }
+
+    let limits = default_attachment_presentation_limits();
+    assert_eq!(limits.max_file_name_bytes, 4096);
+    assert_eq!(limits.max_media_type_bytes, 512);
+    assert_eq!(limits.ciphertext_envelope_allowance_bytes, 128 * 1024);
+    assert_eq!(limits.max_page_size, 200);
+    assert_eq!(limits.max_cursor_bytes, 4096);
+
+    let first = vault
+        .list_attachment_summaries(
+            project.project_id.clone(),
+            Some(object.object_id.clone()),
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    let cursor = first.next_cursor.clone().unwrap();
+    assert!(vault
+        .list_attachment_summaries(other_project.project_id, None, 1, Some(cursor.clone()))
+        .is_err());
+    assert!(vault
+        .list_deleted_attachment_summaries(1, Some(cursor))
+        .is_err());
+
+    {
+        let conn = vault.conn.lock().unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE attachment_chunks SET chunk_ct = X'00' WHERE attachment_id = ?1",
+                [&attachment_ids[0]],
+            )
+            .unwrap();
+    }
+
+    let mut cursor = None;
+    let mut summaries = Vec::new();
+    loop {
+        let page = vault
+            .list_attachment_summaries(
+                project.project_id.clone(),
+                Some(object.object_id.clone()),
+                2,
+                cursor.clone(),
+            )
+            .unwrap();
+        summaries.extend(page.items);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(summaries.len(), attachment_ids.len());
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.file_name.ends_with(".eml")));
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.object_id.as_deref() == Some(object.object_id.as_str())));
+
+    vault.delete_attachment(attachment_ids[0].clone()).unwrap();
+    let deleted = vault.list_deleted_attachment_summaries(10, None).unwrap();
+    assert!(deleted
+        .items
+        .iter()
+        .any(|summary| summary.attachment_id == attachment_ids[0] && summary.deleted));
+    let by_id = vault
+        .get_attachment_summary(attachment_ids[0].clone())
+        .unwrap()
+        .unwrap();
+    assert!(by_id.deleted);
+}
+
+#[test]
 fn attachment_batch_is_atomic_idempotent_and_mixes_content_metadata() {
     let vault = ffi_test_vault();
     let project = vault.create_project("Mail".to_string()).unwrap();

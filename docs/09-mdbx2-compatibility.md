@@ -88,6 +88,8 @@ Collection, Object, and Label summary APIs are additive reader surfaces and do n
 
 New navigation applies fixed field and page limits. A legacy row outside those limits returns a resource-limit error only through the bounded summary surface. Existing complete Project, Entry, and Label repositories and FFI methods retain their historical behavior so an explicit repair/export tool can still inspect the row. The CLI and new clients use summaries by default; compatibility methods are not silently removed or redefined.
 
+Attachment navigation follows the same additive rule. `AttachmentSummaryRepo` and the UniFFI `MdbxAttachmentSummary` methods page active attachments by Collection or Object, page deleted attachments separately, and expose by-ID metadata without selecting chunk/blob payloads. File-name plaintext is limited to 4096 UTF-8 bytes and media type plaintext to 512 bytes; encrypted projections reserve the shared 128 KiB envelope allowance and recheck the exact plaintext after authenticated decryption. A legacy attachment outside those limits remains readable through `AttachmentRepo::get_by_id`, `list_by_project`, `list_by_entry`, `list_deleted`, and the existing complete FFI methods. `attach list` and `attach deleted` use the bounded pages, while content export, repair, and integrity verification keep the complete paths.
+
 No format marker, schema version, commit, object version, synchronization field, snapshot field, ciphertext, or key epoch is changed merely by adding or reading a summary. This preserves both automatic MDBX1 upgrade guarantees and the physical projection observed by the historical reader.
 
 ## MDBX2 Consistency Changes

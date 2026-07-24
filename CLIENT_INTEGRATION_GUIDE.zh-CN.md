@@ -133,6 +133,8 @@ vault 重开后，顶层导航应使用 `get_collection_summary`、`list_collect
 
 `MdbxCollectionSummary` 包含 Collection ID、标题、可选 CollectionProfile 类型/版本、group/icon 引用、收藏/归档状态、附件计数、head commit、删除状态和更新时间，不包含 `summary_ct` 或 CollectionProfile payload。调用 `default_presentation_metadata_limits` 获取固定展示契约：标题明文 64 KiB、label name 明文 512 bytes、group/icon 引用 4096 UTF-8 bytes。新界面应继续分页 Object 和 Label 摘要，不应把完整 list 方法作为默认导航路径。
 
+附件导航应调用 `list_attachment_summaries(collection_id, object_id, page_size, cursor)`：`object_id = None` 表示整个 Collection，传入 Object ID 表示一个 Object；tombstone 使用 `list_deleted_attachment_summaries`，单个元数据使用 `get_attachment_summary`。`default_attachment_presentation_limits` 返回文件名 4096 bytes、media type 512 bytes、共享 128 KiB 密文信封预留、每页 200 条和游标 4096 bytes 的契约。这些页面不会读取 attachment chunk 或 external blob payload，因此即使内容损坏，列表页仍可打开。游标是 live position，发生 metadata 变化后必须丢弃并从第一页重新开始。
+
 没有 Profile 的 MDBX1 Collection 仍然有效，类型/版本字段为空。旧标题、label name 或引用超出固定展示限制时，只会在有界摘要路径返回 resource-limit error；完整兼容 API 仍可用于显式 repair/export，不能删除或重新解释其行为。
 
 当前导出 API、JSON payload 契约、UniFFI binding 生成命令、iOS 打包注意事项和扩展 facade 的规则见 `crates/mdbx-ffi/README.zh-CN.md`。
@@ -252,6 +254,8 @@ MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLi
 - 区分嵌入、chunk、external hash ref
 
 客户端 MUST NOT 在修改条目标题或密码时重写无关附件内容。
+
+新的附件界面应使用上述有界摘要页。完整的 `get_attachment`、`list_attachments` 和 `list_deleted_attachments` 继续用于 MDBX1 兼容、显式 repair/export、内容读取和完整性校验。摘要路径返回 resource-limit error 只表示旧展示字段超出新 UI 契约，不表示附件内容已删除或迁移。
 
 ### 4.5 快照
 
