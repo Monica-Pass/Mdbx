@@ -14,6 +14,7 @@ pub mod object_metadata_summary;
 pub mod object_relation;
 pub mod object_summary;
 pub mod object_version;
+pub mod operation_coordinator;
 pub mod payload_migration;
 pub mod project;
 pub mod snapshot;
@@ -59,6 +60,15 @@ pub use object_summary::{
     ObjectSummaryRepo, MAX_OBJECT_SUMMARY_CURSOR_BYTES, MAX_OBJECT_SUMMARY_PAGE_SIZE,
 };
 pub use object_version::ObjectVersionRepo;
+pub use operation_coordinator::{
+    hash_write_operation_intent, write_operation_changes, write_operation_scope,
+    OperationCoordinator, OperationCoordinatorError, PreparedWriteOperation, WriteCommand,
+    WriteOperationLimits, WriteOperationOutcome, WriteOperationRequest, DEFAULT_MAX_WRITE_COMMANDS,
+    DEFAULT_MAX_WRITE_INTENT_BYTES, DEFAULT_MAX_WRITE_PAYLOAD_BYTES,
+    DEFAULT_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND, HARD_MAX_WRITE_COMMANDS,
+    HARD_MAX_WRITE_INTENT_BYTES, HARD_MAX_WRITE_PAYLOAD_BYTES,
+    HARD_MAX_WRITE_PAYLOAD_BYTES_PER_COMMAND,
+};
 pub use payload_migration::{PayloadMigrationPlanRequest, PayloadMigrationRepo};
 pub use project::ProjectRepo;
 pub use snapshot::SnapshotRepo;
