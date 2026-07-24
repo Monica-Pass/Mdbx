@@ -253,7 +253,9 @@ operation ID 和完整命令列表。operation 命令同时接受 MDBX1 类型�
 
 MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLite schema 和字段密文格式升级始终调用 storage core 迁移器，客户端不得自行转换。ObjectTypeId 的领域 payload 由对应 Adapter 解释。
 
-客户端先注册 CollectionProfile 所需的 ExtensionCapabilityId，再调用 `PayloadMigrationRepo::create_plan`，或者 UniFFI 的 `create_payload_migration_plan`。计划包含有界解密 payload，必须留在受保护的进程内存中，不得写日志、缓存或同步元数据。Adapter 必须为计划中的每个对象生成一次输出，然后调用 `PayloadMigrationRepo::execute` 或 `execute_payload_migration`。执行期间任一对象、Profile 或分支发生变化时，整批失败且保持原状态。成功批次只产生一条 commit；`remaining_count` 大于零时，以新计划继续下一批。
+客户端先注册 CollectionProfile 所需的 ExtensionCapabilityId，并保持已认证的活动 vault 会话，再调用 `PayloadMigrationRepo::create_plan` 或 UniFFI 的 `create_payload_migration_plan`。这两个兼容入口使用保守的 Standard 设备上下文；能够报告真实设备保证的客户端应调用 `create_payload_migration_plan_with_device_context` 和 `execute_payload_migration_with_device_context`。创建计划会在载入或解密源 payload 前执行 `MigratePayload` Tiga 管理授权，因此 Multi/Power 的新鲜认证、因素和设备要求都会生效。
+
+计划包含有界解密 payload，只能留在受保护的进程内存中，不得写入日志、缓存、文件或同步元数据。计划披露审计通过 `plan_id` 关联且不引用 commit。Adapter 必须为每个计划对象生成一次输出，再调用 `PayloadMigrationRepo::execute` 或对应 UniFFI 方法。执行会重新授权、复核全部绑定，并在同一事务中更新整批对象、生成一条幂等 commit 和一条 commit 关联审计。任何拒绝、对象/Profile/分支并发变化、能力缺失、畸形输出或资源超限都会保持整批原状。完全相同的已完成计划重试只返回原 commit，不生成第二条成功审计；`remaining_count` 大于零时，以新计划继续下一批。
 
 ### 4.2 删除必须走 tombstone
 

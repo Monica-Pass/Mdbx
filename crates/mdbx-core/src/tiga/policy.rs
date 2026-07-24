@@ -980,7 +980,6 @@ pub enum TigaOperation {
     ExportData,
     PrintData,
     DecryptAttachment,
-    MigratePayload,
     CreateSnapshot,
     RestoreSnapshot,
     ChangeUnlockMethods,
@@ -994,6 +993,7 @@ pub enum TigaOperation {
     BackgroundAccess,
     SyncCiphertext,
     CreatePlaintextCache,
+    MigratePayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

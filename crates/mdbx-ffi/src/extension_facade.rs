@@ -5,10 +5,12 @@ use mdbx_storage::repo::{
     CollectionProfileRepo, CollectionProfileSpec, CommitContext, PayloadMigrationPlanRequest,
     PayloadMigrationRepo,
 };
+use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 
 use super::{
-    parse_object_type_id, MdbxCollectionProfile, MdbxFfiError, MdbxPayloadMigrationExecution,
-    MdbxPayloadMigrationOutput, MdbxPayloadMigrationPlan, MdbxVault,
+    conservative_ffi_device_context, parse_object_type_id, unix_now, MdbxCollectionProfile,
+    MdbxDeviceContext, MdbxFfiError, MdbxPayloadMigrationExecution, MdbxPayloadMigrationOutput,
+    MdbxPayloadMigrationPlan, MdbxVault,
 };
 
 #[uniffi::export]
@@ -71,9 +73,9 @@ impl MdbxVault {
         Ok(collection_profile_from_core(profile))
     }
 
-    /// Build a bounded Adapter payload migration plan. The returned payloads
-    /// are decrypted bytes; the Adapter owns their interpretation and
-    /// conversion, while storage rechecks every binding during execution.
+    /// Build a bounded Adapter payload migration plan through the active vault
+    /// session and a conservative Standard device context. Tiga authorization
+    /// precedes loading or decrypting the returned source payload bytes.
     pub fn create_payload_migration_plan(
         &self,
         collection_id: String,
@@ -83,8 +85,38 @@ impl MdbxVault {
         max_items: u32,
         branch_id: Option<String>,
     ) -> Result<MdbxPayloadMigrationPlan, MdbxFfiError> {
+        self.create_payload_migration_plan_with_device_context(
+            collection_id,
+            object_type_id,
+            source_schema_version,
+            target_schema_version,
+            max_items,
+            branch_id,
+            conservative_ffi_device_context(),
+        )
+    }
+
+    /// Build a migration plan with the caller's real device assurance. The
+    /// active session must satisfy the Collection's MigratePayload policy.
+    pub fn create_payload_migration_plan_with_device_context(
+        &self,
+        collection_id: String,
+        object_type_id: String,
+        source_schema_version: u32,
+        target_schema_version: u32,
+        max_items: u32,
+        branch_id: Option<String>,
+        device: MdbxDeviceContext,
+    ) -> Result<MdbxPayloadMigrationPlan, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(PayloadMigrationRepo::create_plan(
+        let session = conn.active_session().cloned();
+        let device = device.into_core(&self.device_id);
+        let context = TigaAuthorizationContext {
+            session: session.as_ref(),
+            device: &device,
+            now_unix_secs: unix_now(),
+        };
+        Ok(PayloadMigrationRepo::create_plan_authorized(
             &conn,
             PayloadMigrationPlanRequest {
                 collection_id,
@@ -94,15 +126,33 @@ impl MdbxVault {
                 max_items: max_items as usize,
                 branch_id,
             },
+            context,
         )?
+        .0
         .into())
     }
 
-    /// Apply Adapter-produced payloads as one idempotent user operation.
+    /// Apply Adapter-produced payloads as one Tiga-authorized, idempotent user
+    /// operation using the conservative Standard device context.
     pub fn execute_payload_migration(
         &self,
         plan: MdbxPayloadMigrationPlan,
         outputs: Vec<MdbxPayloadMigrationOutput>,
+    ) -> Result<MdbxPayloadMigrationExecution, MdbxFfiError> {
+        self.execute_payload_migration_with_device_context(
+            plan,
+            outputs,
+            conservative_ffi_device_context(),
+        )
+    }
+
+    /// Reauthorize and apply a migration with the caller's real device
+    /// assurance. Binding checks, one commit, audit, and sync delta are atomic.
+    pub fn execute_payload_migration_with_device_context(
+        &self,
+        plan: MdbxPayloadMigrationPlan,
+        outputs: Vec<MdbxPayloadMigrationOutput>,
+        device: MdbxDeviceContext,
     ) -> Result<MdbxPayloadMigrationExecution, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         let plan = plan.into_core()?;
@@ -114,7 +164,18 @@ impl MdbxVault {
             })
             .collect::<Vec<_>>();
         let ctx = CommitContext::new(self.device_id.clone());
-        Ok(PayloadMigrationRepo::execute(&conn, &ctx, &plan, &outputs)?.into())
+        let session = conn.active_session().cloned();
+        let device = device.into_core(&self.device_id);
+        let context = TigaAuthorizationContext {
+            session: session.as_ref(),
+            device: &device,
+            now_unix_secs: unix_now(),
+        };
+        Ok(
+            PayloadMigrationRepo::execute_authorized(&conn, &ctx, &plan, &outputs, context)?
+                .0
+                .into(),
+        )
     }
 }
 

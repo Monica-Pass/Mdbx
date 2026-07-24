@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-20
+- Security amendment: ADR-0033 requires Tiga authorization before planning and during execution.
 
 ## Context
 

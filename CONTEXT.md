@@ -63,9 +63,9 @@ The core preserves every valid ObjectTypeId exactly. An unknown identifier remai
 
 ### PayloadMigrationPlan
 
-A `PayloadMigrationPlan` is a bounded, short-lived description for advancing one ObjectTypeId payload contract. The storage core creates the plan from one consistent database snapshot and binds it to the CollectionProfile, branch head, object heads, source schema version, and digests of payload bytes obtained after authenticated decryption. The plan returns source payload bytes only to the Adapter that registered the Collection's required capabilities.
+A `PayloadMigrationPlan` is a bounded, short-lived description for advancing one ObjectTypeId payload contract. Before loading or decrypting any source payload, the storage core authorizes `TigaOperation::MigratePayload` against the owning Collection's Project scope. It then creates the plan from one consistent database snapshot and binds it to the CollectionProfile, branch head, object heads, source schema version, and digests of payload bytes obtained after authenticated decryption. The plan returns source payload bytes only to the Adapter that registered the Collection's required capabilities, and its authorization audit is correlated by the transient `plan_id` without a commit.
 
-The Adapter interprets each source payload and returns target payload bytes. The storage core revalidates the complete plan in one write transaction, applies every output through the Generic Object Module, records one CommitOperation, and rolls back the complete batch on any mismatch. Plans are not persisted because they contain decrypted Adapter payloads and become stale whenever bound state changes.
+The Adapter interprets each source payload and returns target payload bytes. Execution reauthorizes `MigratePayload`; policy evaluation, binding checks, object updates, one idempotent CommitOperation, its security audit, and sync-delta materialization share one immediate transaction. Plans are not persisted because they contain decrypted Adapter payloads and become stale whenever bound state changes. Source and target plaintext must never enter audit rows, commit metadata, synchronization state, or another persistent cache.
 
 ### ObjectRelation
 
@@ -205,6 +205,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 39. Attachment navigation is metadata-only and bounded: summary SQL never selects chunk/blob payloads, checks encrypted display-field length before materialization, and rechecks authenticated plaintext limits after decryption. Complete attachment APIs remain available without reinterpretation.
 40. Conflict navigation is metadata-only and bounded: unresolved summary SQL projects conflicting-field length before materialization, enforces 64 KiB/256-path/4096-byte limits, and binds cursors to the query filter. Complete conflict reads and typed resolution APIs remain available without reinterpretation.
 41. Snapshot navigation is metadata-only and bounded: summary SQL projects `length(snapshot_ct)` without selecting the encrypted BLOB, enforces 1–200 pages/4096-byte cursors/4096-byte metadata text, and leaves complete snapshot reads and restore semantics unchanged.
+42. Adapter payload planning and execution require the `MigratePayload` Tiga administration operation. Authorization precedes source payload loading and decryption; execution reauthorizes and atomically couples binding checks, one idempotent CommitOperation, audit correlation, and sync-delta materialization. Decrypted plan bytes are transient and never persisted or synchronized.
 
 ## Module Architecture
 
@@ -212,7 +213,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 
 The Generic Object Module is the primary Interface for Collection, CollectionProfile, ObjectRecord, ObjectRelation, ObjectLabel, and Attachment behavior. Its Implementation owns compatibility mapping to existing tables, encryption, capability checks, commit updates, causal metadata, and sync-state projection. This is a deep Module: callers supply stable domain values and receive complete invariant-preserving behavior.
 
-The module also owns bounded payload migration planning and execution and the bounded generic write-operation facade. It exposes decrypted source bytes only in a short-lived plan, treats Adapter output and client commands as untrusted input, and preserves existing ObjectVersion, synchronization, snapshot, and MDBX1 table semantics by applying target payloads through EntryRepo inside one CommitOperation.
+The module also owns bounded payload migration planning and execution and the bounded generic write-operation facade. It exposes decrypted source bytes only after `MigratePayload` Tiga authorization and only in a short-lived plan, treats Adapter output and client commands as untrusted input, and preserves existing ObjectVersion, synchronization, snapshot, and MDBX1 table semantics by applying target payloads through EntryRepo inside one authorized CommitOperation transaction.
 
 ### Legacy Password Adapter
 

@@ -1906,13 +1906,7 @@ fn ffi_metadata_disclosure_denial_precedes_corrupted_payloads() {
 
 #[test]
 fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
-    let conn = VaultConnection::open_in_memory().unwrap();
-    initialize_vault(&conn, &VaultInitParams::default()).unwrap();
-    let vault = MdbxVault {
-        conn: Mutex::new(conn),
-        device_id: "ffi-migration-device".to_string(),
-        vault_id: "ffi-migration-vault".to_string(),
-    };
+    let vault = ffi_test_vault();
     let collection = vault.create_project("Mail".to_string()).unwrap();
     vault
         .set_extension_capabilities(vec!["com.monica.mail.payload-v2".to_string()])
@@ -1953,7 +1947,7 @@ fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
 
     let result = vault
         .execute_payload_migration(
-            plan,
+            plan.clone(),
             vec![MdbxPayloadMigrationOutput {
                 object_id: object.object_id.clone(),
                 target_payload: br#"{"version":2}"#.to_vec(),
@@ -1963,11 +1957,113 @@ fn payload_migration_facade_exposes_adapter_bytes_and_one_commit_result() {
     assert_eq!(result.migrated_count, 1);
     assert!(!result.already_committed);
     let migrated = vault
-        .get_object(collection.project_id, object.object_id)
+        .get_object(collection.project_id, object.object_id.clone())
         .unwrap()
         .unwrap();
     assert_eq!(migrated.payload_schema_version, 2);
     assert_eq!(migrated.payload_json, r#"{"version":2}"#);
+
+    let repeated = vault
+        .execute_payload_migration(
+            plan,
+            vec![MdbxPayloadMigrationOutput {
+                object_id: object.object_id.clone(),
+                target_payload: br#"{"version":2}"#.to_vec(),
+            }],
+        )
+        .unwrap();
+    assert!(repeated.already_committed);
+    assert_eq!(repeated.commit_id, result.commit_id);
+
+    let events = vault
+        .list_security_audit_events_v2(20)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.operation == MdbxTigaOperation::MigratePayload)
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    let plan_event = events
+        .iter()
+        .find(|event| event.commit_id.is_none())
+        .expect("plan authorization event must not reference a commit");
+    let execution_event = events
+        .iter()
+        .find(|event| event.commit_id.as_deref() == Some(result.commit_id.as_str()))
+        .expect("execution authorization event must reference its commit");
+    assert_eq!(plan_event.operation_id, execution_event.operation_id);
+}
+
+#[test]
+fn payload_migration_facade_requires_session_and_supports_device_context() {
+    let vault = ffi_test_vault();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+    vault
+        .set_extension_capabilities(vec!["com.monica.mail.payload-v2".to_string()])
+        .unwrap();
+    vault
+        .set_collection_profile(
+            collection.project_id.clone(),
+            "com.monica.mail".to_string(),
+            b"profile".to_vec(),
+            1,
+            vec!["com.monica.mail.message".to_string()],
+            vec!["com.monica.mail.payload-v2".to_string()],
+        )
+        .unwrap();
+    let object = vault
+        .create_object(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            "Message".to_string(),
+            r#"{"version":1}"#.to_string(),
+            1,
+        )
+        .unwrap();
+
+    vault.conn.lock().unwrap().clear_session();
+    let denied = vault
+        .create_payload_migration_plan(
+            collection.project_id.clone(),
+            "com.monica.mail.message".to_string(),
+            1,
+            2,
+            16,
+            None,
+        )
+        .unwrap_err();
+    assert!(denied.to_string().contains("Tiga authorization"));
+
+    UnlockService::unlock_with_password(&mut vault.conn.lock().unwrap(), "attachment-password")
+        .unwrap();
+    let device = MdbxDeviceContext {
+        assurance: MdbxDeviceAssurance::Standard,
+        secure_clipboard_available: false,
+        screen_capture_protection_available: false,
+        secure_temp_files_available: true,
+    };
+    let plan = vault
+        .create_payload_migration_plan_with_device_context(
+            collection.project_id,
+            "com.monica.mail.message".to_string(),
+            1,
+            2,
+            16,
+            None,
+            device.clone(),
+        )
+        .unwrap();
+    let result = vault
+        .execute_payload_migration_with_device_context(
+            plan,
+            vec![MdbxPayloadMigrationOutput {
+                object_id: object.object_id,
+                target_payload: br#"{"version":2}"#.to_vec(),
+            }],
+            device,
+        )
+        .unwrap();
+    assert!(!result.already_committed);
+    assert_eq!(result.migrated_count, 1);
 }
 
 #[test]

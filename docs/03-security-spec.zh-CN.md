@@ -179,6 +179,8 @@ scope 路由、全部策略求值、允许后的读取和成功/拒绝审计必�
 
 `EntryRepo::get_by_id` 等完整记录 API 为 MDBX1 和既有 MDBX2 调用方继续保留，不改变其返回完整明文记录的兼容语义；新客户端的列表、默认详情和策略路径不得把这些兼容 API 当作披露边界。
 
+Adapter payload 迁移同时属于明文披露与管理类修改。创建计划前必须针对所属 Collection 的 Project scope 执行 `TigaOperation::MigratePayload`，并且授权必须先于源 payload 长度查询、BLOB 载入和解密。成功计划的审计使用短生命周期 `plan_id` 关联，不引用 commit。执行时必须再次授权同一 scope；策略求值、计划绑定复核、全部对象更新、一条幂等 `CommitOperation`、关联该 commit 的安全审计和 sync-delta 物化必须位于同一个 immediate transaction。拒绝、过期计划或畸形输出不得留下对象或 commit 修改。源/目标明文不得进入审计行、operation 元数据、同步状态、日志或持久缓存。
+
 对象 payload 用于有界结构化数据。超大邮件正文、原始 MIME/EML、网页归档和文件内容必须转入 attachment 或 encrypted blob provider 的分块/流式明文边界，并由对象保存稳定引用。当前整块 AEAD payload 不得被描述成流式解密。
 
 ## 6. 密钥层级
@@ -394,6 +396,8 @@ MDBX 必须定义最低安全底线。
 ## 12. 审计与日志规则
 
 Tiga2 安全审计必须记录类型化操作、结果、scope、会话 ID、设备 ID、原因码、执行约束和例外 ID。审计记录不得包含秘密载荷，并必须通过 vault 完整性子密钥认证；读取或同步应用带标签的策略、例外和审计记录时必须重新校验标签。同步收到相同 event ID 的不同内容时必须拒绝。
+
+`MigratePayload` 的计划披露审计必须通过 `plan_id` 关联；成功执行审计必须关联唯一迁移 commit。对完全相同且已完成的计划重试不得再生成第二条成功审计。
 
 日志绝不能包含：
 

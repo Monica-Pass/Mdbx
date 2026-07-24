@@ -110,7 +110,6 @@ pub enum MdbxTigaOperation {
     ExportData,
     PrintData,
     DecryptAttachment,
-    MigratePayload,
     CreateSnapshot,
     RestoreSnapshot,
     ChangeUnlockMethods,
@@ -124,6 +123,7 @@ pub enum MdbxTigaOperation {
     BackgroundAccess,
     SyncCiphertext,
     CreatePlaintextCache,
+    MigratePayload,
 }
 
 impl From<MdbxTigaOperation> for TigaOperation {

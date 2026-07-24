@@ -136,6 +136,8 @@ Policy routing, all required evaluations, audit recording, deletion checks, reso
 
 Object, relation, and label inline payload disclosure defaults to 8 MiB of plaintext and accepts explicit limits only from 1 byte through the 64 MiB hard ceiling. After authorization and deletion checks, storage uses SQL `length(payload_ct)` with a 128 KiB compatible envelope allowance before loading ciphertext, then checks exact plaintext length after authenticated decryption. Large bodies and files use attachment or encrypted-blob streaming boundaries.
 
+Adapter payload migration is both a plaintext disclosure and an administration mutation. Plan creation MUST authorize `TigaOperation::MigratePayload` against the owning Collection's Project scope before source payload length queries, BLOB loading, or decryption. A successful plan audit uses the transient `plan_id` and has no commit reference. Execution MUST reauthorize the same scope; policy evaluation, plan-binding checks, all object updates, one idempotent `CommitOperation`, its commit-correlated audit event, and sync-delta materialization MUST share one immediate transaction. Denial or any stale/malformed input leaves objects and commits unchanged. Decrypted source or target payloads MUST NOT be written to audit rows, operation metadata, synchronization state, logs, or persistent caches.
+
 ## 6. Key Hierarchy
 
 A compliant implementation SHOULD use a layered hierarchy:
@@ -370,6 +372,8 @@ Even `sky` MUST remain meaningfully secure and MUST NOT degrade into a toy confi
 The exact parameter table SHOULD be published separately and versioned.
 
 ## 12. Audit And Logging Rules
+
+Tiga2 security audit records MUST contain typed operation, outcome, scope, session and device identities, reason codes, constraints, policy evidence, and optional operation/commit correlation. They MUST NOT contain secret payload bytes. `MigratePayload` plan disclosure is correlated by `plan_id`; successful execution is correlated to the single migration commit, and an exact completed retry MUST NOT create a second successful audit event.
 
 Logs MUST NOT contain:
 
