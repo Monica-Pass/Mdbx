@@ -14,6 +14,7 @@ mod integrity_root_facade;
 mod lifecycle_facade;
 mod object_facade;
 mod security_facade;
+mod snapshot_lifecycle_facade;
 mod snapshot_summary_facade;
 mod sync_facade;
 mod vault_facade;
@@ -35,6 +36,7 @@ pub(crate) use object_facade::{
 pub(crate) use security_facade::scope_from_core;
 pub use security_facade::*;
 pub(crate) use security_facade::{conservative_ffi_device_context, unix_now};
+pub use snapshot_lifecycle_facade::*;
 pub use snapshot_summary_facade::*;
 pub use sync_facade::*;
 pub use vault_facade::*;

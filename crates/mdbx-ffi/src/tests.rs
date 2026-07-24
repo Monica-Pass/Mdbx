@@ -1,11 +1,12 @@
 use super::*;
 use std::io::Write;
 
-use mdbx_core::model::ConflictObjectType;
+use mdbx_core::model::{ConflictObjectType, SnapshotKind};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::repo::{
     AttachmentRepo, CommitContext, ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo,
-    ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo, SnapshotRepo, TombstoneRepo,
+    ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo, SnapshotLifecycleRepo,
+    SnapshotRepo, TombstoneRepo,
 };
 use mdbx_storage::unlock::UnlockService;
 use sha2::{Digest, Sha256};
@@ -2274,6 +2275,67 @@ fn snapshot_summary_facade_pages_without_loading_payload_and_preserves_legacy_re
         3
     );
     assert_ne!(first.snapshot_id, second.snapshot_id);
+}
+
+#[test]
+fn snapshot_lifecycle_facade_keeps_legacy_manual_and_prunes_automatic_idempotently() {
+    let vault = ffi_test_vault();
+    let (legacy_id, automatic_id) = {
+        let conn = vault.conn.lock().unwrap();
+        let ctx = CommitContext::new(vault.device_id.clone());
+        let legacy = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        let automatic = SnapshotRepo::create_snapshot(&conn, &ctx).unwrap();
+        SnapshotLifecycleRepo::register(
+            &conn,
+            &automatic.snapshot_id,
+            SnapshotKind::Automatic,
+            Some(&automatic.created_at),
+        )
+        .unwrap();
+        (legacy.snapshot_id, automatic.snapshot_id)
+    };
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let limits = default_snapshot_lifecycle_limits();
+    assert_eq!(limits.max_prune_candidates, 200);
+    assert_eq!(limits.max_keep_latest, 10_000);
+    assert_eq!(
+        vault
+            .get_snapshot_lifecycle(legacy_id.clone())
+            .unwrap()
+            .unwrap()
+            .kind,
+        MdbxSnapshotKind::Manual
+    );
+    assert_eq!(
+        vault
+            .get_snapshot_lifecycle(automatic_id.clone())
+            .unwrap()
+            .unwrap()
+            .kind,
+        MdbxSnapshotKind::Automatic
+    );
+
+    let plan = vault.plan_automatic_snapshot_prune(0).unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].summary.snapshot_id, automatic_id);
+    let commit_count = ffi_test_count(&vault, "commits");
+    let result = vault
+        .prune_automatic_snapshots(
+            plan.plan_token.clone(),
+            0,
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    assert_eq!(result.deleted_snapshot_ids, vec![automatic_id]);
+    assert_eq!(ffi_test_count(&vault, "commits"), commit_count + 1);
+    assert!(vault.get_snapshot_summary(legacy_id).unwrap().is_some());
+
+    let retry = vault
+        .prune_automatic_snapshots(plan.plan_token, 0, conservative_ffi_device_context())
+        .unwrap();
+    assert_eq!(retry, result);
+    assert_eq!(ffi_test_count(&vault, "commits"), commit_count + 1);
 }
 
 #[test]

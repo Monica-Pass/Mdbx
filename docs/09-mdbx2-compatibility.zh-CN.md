@@ -19,7 +19,7 @@
 MDBX2 在 `vault_meta` 中增加：
 
 - `schema_version`
-  - 当前内部 schema 序号；vault header HMAC 使用 `16`。
+  - 当前内部 schema 序号；当前版本为 `17`。vault header HMAC 在 `16` 引入，snapshot lifecycle 在 `17` 引入。
 - `min_reader_version`
   - 可以读取当前 vault 的最低格式代际。
 - `min_writer_version`
@@ -29,7 +29,7 @@ MDBX-1 自动升级后使用：
 
 ```text
 format_version    = MDBX-2
-schema_version    = 16
+schema_version    = 17
 min_reader_version = MDBX-1
 min_writer_version = MDBX-2
 tiga_policy_version = 2
@@ -78,6 +78,14 @@ schema 16 为 `vault_meta` 增加 `header_integrity_profile` 和
 同一事务重新封签，直接篡改会进入 `invalidated` 或产生 tag mismatch。该 additive
 字段不把 MDBX1 reader 变成 MDBX2 writer，`min_writer_version = MDBX-2` 边界不变。
 
+schema 17 增加经过认证的 `snapshot_lifecycle` companion table，但不改变 MDBX1
+六列 `snapshots` 表，也不重写任何旧 snapshot 行。没有 lifecycle 行的 snapshot 永久
+按受保护的 manual recovery point 处理。只有 HMAC 验证通过、类型为 automatic 且
+RFC3339 retention 时间已经到达的行，才可进入 storage 签发的有界 prune plan。每次
+授权裁剪都在事务内重新核对精确计划，最多删除 200 个 automatic snapshot，并只记录
+一个可幂等重试的 operation commit。snapshot lifecycle 属于本地恢复状态，不加入
+`SyncStatePayload`。
+
 storage core 将扩展值视为 opaque JSON：只验证、保存和转发，不解释也不解密。opaque 不等于自动加密。非敏感的能力或版本元数据可以使用普通 JSON；密码、邮件正文、token 或其他敏感材料在进入未知扩展前，MUST 由扩展生产者封装为认证密文。这样旧 reader 才能在锁定状态保存未来敏感状态，同时不会自行产生明文。
 
 storage apply 现在识别经过认证的 `mdbx-storage/state-delta-v1` object payload。commit 关联信封必须附着在最后一个关联 commit 上，所有引用 commit 必须已经可用；commit、稀疏状态行、device head、经过授权的删除、接收批次和 capture 清理必须全部成功，否则整体回滚。fast-forward、divergent 和已有 commit 的延迟 payload 修复使用同一边界。bundle v4 及其压缩表示 v6，以及对应的认证信封 v8/v10，会在同一个外层事务中应用 commit 关联批次与 auxiliary 批次；尾部批次失败时整段回滚，也不会创建用户可见 commit。这些新增能力不会改变 `projects`、`entries`、commit DAG、sync-state v1-v2 或 bundle v1-v6 格式。
@@ -87,8 +95,8 @@ CLI 首次同步继续使用有界完整状态；取得 commit/delta 双 checkpo
 认证 complete/incremental 信封分别使用 v7/v8；对应的 zstd 表示使用 v9/v10。既有逻辑 payload SHA-256 trailer 之后追加 HMAC-SHA-256，密钥取自 vault integrity subkey；tag 绑定版本化 domain、magic、version、20-byte 有界 header 区和逻辑 payload 摘要。密钥绝不会写入或随 bundle 传输。该机制只能证明信封由某个持有共享 vault key 的一方生成并绑定其元数据，不能识别具体设备；它也不提供传输保密性，不替代内部字段、commit 或 delta 的加密认证，因此 bundle 仍不得视为可公开文件。CLI 默认继续输出 legacy v3/v4，显式 `--compression zstd` 才输出 v5/v6，只有显式 `--authenticated` 才选择 v7-v10；apply 会自动使用已打开 vault 的 key，同时继续读取 v1-v6。
 
 已经实现的 `IncrementalIntegrityRoot` profile 是 additive 的，并与 bundle capability
-分开。它保持 schema 16 不变，只有 verified-unlocked 客户端显式启用后才惰性创建 metadata、
-leaf 与 sparse-node 表。建立 profile 时登记 critical extension
+分开。它在 schema 16 时引入但没有占用新的 schema 序号，只有 verified-unlocked 客户端
+显式启用后才惰性创建 metadata、leaf 与 sparse-node 表。建立 profile 时登记 critical extension
 `authenticated-state-root-v1`，因此不支持该 profile 的较早 MDBX2 writer 会在可写打开前
 拒绝 vault。root 与 sync-delta capture 在同一个外层事务中更新；未 opt-in 的现有和旧代
 vault 行为完全不变。O(vault-size) content manifest 仍是精确 schema 检查点；外部 Provider

@@ -50,9 +50,10 @@ use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
 use mdbx_storage::repo::{
     AttachmentPlaintextPurpose, AttachmentRepo, AttachmentSummaryRepo, AttachmentWriteOptions,
-    CollectionSummaryRepo, EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotRepo,
-    SnapshotSummaryRepo, MAX_ATTACHMENT_SUMMARY_PAGE_SIZE, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
-    MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
+    CollectionSummaryRepo, EntryRepo, ObjectSummaryRepo, ProjectRepo, SnapshotLifecycleRepo,
+    SnapshotRepo, SnapshotSummaryRepo, MAX_ATTACHMENT_SUMMARY_PAGE_SIZE,
+    MAX_COLLECTION_SUMMARY_PAGE_SIZE, MAX_SNAPSHOT_PRUNE_CANDIDATES,
+    MAX_SNAPSHOT_PRUNE_KEEP_LATEST, MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
 };
 use mdbx_storage::repo::{
     CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
@@ -582,8 +583,24 @@ enum BlobAction {
 enum SnapshotAction {
     /// 创建快照
     Create,
+    /// 创建经 TIGA 授权的自动快照
+    CreateAutomatic {
+        #[arg(long)]
+        retention_eligible_at: String,
+    },
     /// 列出所有快照
     List,
+    /// 生成自动快照裁剪计划
+    PrunePlan {
+        #[arg(long, default_value_t = 0)]
+        keep_latest: usize,
+    },
+    /// 按计划裁剪自动快照
+    Prune {
+        plan_token: String,
+        #[arg(long, default_value_t = 0)]
+        keep_latest: usize,
+    },
     /// 从快照恢复
     Restore { snapshot_id: String },
 }
@@ -2287,6 +2304,28 @@ fn cmd_snapshot(conn: &mut VaultConnection, action: SnapshotAction) -> Result<()
             println!("  hash: {}", snap.snapshot_hash);
             println!("  time: {}", snap.created_at);
         }
+        SnapshotAction::CreateAutomatic {
+            retention_eligible_at,
+        } => {
+            let device = cli_device_context();
+            let session = conn.active_session().ok_or_else(|| {
+                "automatic snapshot creation requires an active unlock session".to_string()
+            })?;
+            let (snap, _) = SnapshotRepo::create_automatic_snapshot_authorized(
+                conn,
+                &ctx,
+                &retention_eligible_at,
+                TigaAuthorizationContext {
+                    session: Some(session),
+                    device: &device,
+                    now_unix_secs: chrono::Utc::now().timestamp(),
+                },
+            )
+            .map_err(|e| format!("{}", e))?;
+            println!("Created automatic snapshot {}", snap.snapshot_id);
+            println!("  eligible: {}", retention_eligible_at);
+            println!("  commit: {}", snap.base_commit_id);
+        }
         SnapshotAction::List => {
             let mut cursor = None;
             let mut has_snapshots = false;
@@ -2312,6 +2351,62 @@ fn cmd_snapshot(conn: &mut VaultConnection, action: SnapshotAction) -> Result<()
             if !has_snapshots {
                 println!("(no snapshots)");
             }
+        }
+        SnapshotAction::PrunePlan { keep_latest } => {
+            if keep_latest > MAX_SNAPSHOT_PRUNE_KEEP_LATEST {
+                return Err(format!(
+                    "keep_latest must be at most {}",
+                    MAX_SNAPSHOT_PRUNE_KEEP_LATEST
+                ));
+            }
+            let plan = SnapshotLifecycleRepo::plan_automatic_prune(
+                conn,
+                keep_latest,
+                chrono::Utc::now().timestamp(),
+            )
+            .map_err(|e| format!("{}", e))?;
+            println!("Plan token: {}", plan.plan_token);
+            println!("Keep latest: {}", plan.keep_latest);
+            println!("Candidates: {}", plan.candidates.len());
+            println!("Has more: {}", plan.has_more);
+            println!("Ciphertext bytes: {}", plan.total_ciphertext_bytes);
+            if plan.candidates.len() > MAX_SNAPSHOT_PRUNE_CANDIDATES {
+                return Err("snapshot prune plan exceeded its bounded candidate limit".to_string());
+            }
+            for candidate in plan.candidates {
+                println!(
+                    "  {}  {}",
+                    candidate.summary.snapshot_id, candidate.retention_eligible_at
+                );
+            }
+        }
+        SnapshotAction::Prune {
+            plan_token,
+            keep_latest,
+        } => {
+            let device = cli_device_context();
+            let session = conn
+                .active_session()
+                .ok_or_else(|| "snapshot pruning requires an active unlock session".to_string())?;
+            let (result, _) = SnapshotLifecycleRepo::prune_automatic_authorized(
+                conn,
+                &ctx,
+                &plan_token,
+                keep_latest,
+                chrono::Utc::now().timestamp(),
+                TigaAuthorizationContext {
+                    session: Some(session),
+                    device: &device,
+                    now_unix_secs: chrono::Utc::now().timestamp(),
+                },
+            )
+            .map_err(|e| format!("{}", e))?;
+            println!(
+                "Pruned {} automatic snapshots",
+                result.deleted_snapshot_ids.len()
+            );
+            println!("  commit: {}", result.commit_id);
+            println!("  plan: {}", result.plan_token);
         }
         SnapshotAction::Restore { snapshot_id } => {
             let device = cli_device_context();
@@ -4863,6 +4958,81 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn cli_snapshot_lifecycle_commands_parse_and_prune_only_automatic_rows() {
+        let parsed = Cli::try_parse_from([
+            "mdbx",
+            "snapshot",
+            "create-automatic",
+            "--retention-eligible-at",
+            "2099-01-01T00:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Snapshot {
+                action: SnapshotAction::CreateAutomatic { .. }
+            }
+        ));
+        let parsed =
+            Cli::try_parse_from(["mdbx", "snapshot", "prune-plan", "--keep-latest", "3"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Snapshot {
+                action: SnapshotAction::PrunePlan { keep_latest: 3 }
+            }
+        ));
+
+        let vault = TempVault::new();
+        let path = vault.path();
+        run(init_cli(&path)).unwrap();
+        let conn = open_unlocked(&path);
+        let context = ctx();
+        let legacy = SnapshotRepo::create_snapshot(&conn, &context).unwrap();
+        let automatic = SnapshotRepo::create_snapshot(&conn, &context).unwrap();
+        SnapshotLifecycleRepo::register(
+            &conn,
+            &automatic.snapshot_id,
+            mdbx_core::model::SnapshotKind::Automatic,
+            Some(&automatic.created_at),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let plan =
+            SnapshotLifecycleRepo::plan_automatic_prune(&conn, 0, chrono::Utc::now().timestamp())
+                .unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        let before_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        run(cli(
+            &path,
+            Commands::Snapshot {
+                action: SnapshotAction::Prune {
+                    plan_token: plan.plan_token,
+                    keep_latest: 0,
+                },
+            },
+        ))
+        .unwrap();
+
+        let conn = open_unlocked(&path);
+        assert!(SnapshotRepo::get_by_id(&conn, &legacy.snapshot_id)
+            .unwrap()
+            .is_some());
+        assert!(SnapshotRepo::get_by_id(&conn, &automatic.snapshot_id)
+            .unwrap()
+            .is_none());
+        let after_commits: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_commits, before_commits + 1);
     }
 
     #[test]

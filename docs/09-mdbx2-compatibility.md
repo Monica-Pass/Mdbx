@@ -19,10 +19,10 @@ MDBX2 guarantees that the new reader understands the previous generation. Alread
 An upgraded vault records:
 
 ```text
-format_version     = MDBX-2
-schema_version     = 15
-min_reader_version = MDBX-1
-min_writer_version = MDBX-2
+format_version      = MDBX-2
+schema_version      = 17
+min_reader_version  = MDBX-1
+min_writer_version  = MDBX-2
 tiga_policy_version = 2
 ```
 
@@ -44,6 +44,24 @@ Schema 12 adds a local stable commit inventory whose migration preserves commit 
 
 Schema 15 adds `sync_state_extensions` for bounded unknown top-level complete-state fields. Apply upserts only keys present in the incoming state, in the same transaction as the commit and domain rows. A missing key never means deletion, so an older peer cannot erase a future extension merely by omitting it. Collection restores stored values in key order, and migration plus current-schema validation enforce 256 fields, 128-byte keys, a 64 KiB aggregate budget, and the existing nesting-depth limit.
 
+Schema 16 adds `header_integrity_profile` and `header_integrity_tag` to
+`vault_meta`, plus triggers that invalidate an established tag whenever a
+protected header field changes. MDBX1 and earlier MDBX2 vaults retain their
+ciphertext, unlock wrappers, and identities while entering the migration-only
+`pending` state. The first successful unlock seals the header with the vault
+integrity subkey. Later protected mutations must refresh that HMAC in the same
+transaction, and unlock plus health verification fail closed on invalidation or
+tag mismatch.
+
+Schema 17 adds the authenticated `snapshot_lifecycle` companion table without
+changing the six-column MDBX1 `snapshots` table or rewriting any snapshot row.
+A snapshot with no lifecycle row is permanently treated as a protected manual
+recovery point. Only authenticated automatic rows with an elapsed RFC3339
+retention timestamp can enter a storage-issued, bounded prune plan. Each
+authorized prune rechecks the exact plan in its transaction, deletes at most
+200 automatic snapshots, and records one idempotent operation commit. Snapshot
+lifecycle remains local recovery state and is not added to `SyncStatePayload`.
+
 The storage core treats each extension value as opaque JSON: it validates, stores, and forwards the value but does not interpret or decrypt it. Opaque does not mean automatically encrypted. Non-secret capability or version metadata may use ordinary JSON; any value containing passwords, mail content, tokens, or other sensitive material MUST be an authenticated ciphertext envelope produced before it enters the unknown extension. This contract lets a locked older reader preserve future sensitive state without creating plaintext itself.
 
 The storage apply path recognizes authenticated `mdbx-storage/state-delta-v1` object payloads. A commit-associated envelope must be carried by its final associated commit, every referenced commit must be available, and the commit, sparse state rows, device heads, authorized deletions, received batch, and capture cleanup succeed or roll back together. Fast-forward, divergent, and late-payload repair paths share this boundary. Bundle v4 and its compressed v6 representation, plus their authenticated v8/v10 envelopes, apply commit-associated and auxiliary batches in one outer transaction, so a failed tail batch rolls back the complete segment without creating user-visible commits. These additions do not change the `projects`, `entries`, commit DAG, sync-state v1-v2, or bundle v1-v6 formats.
@@ -53,15 +71,15 @@ The CLI uses bounded complete state for bootstrap and bundle v4 after a paired c
 Authenticated complete/incremental envelopes use versions 7/8, while their zstd representations use versions 9/10. Their existing logical payload SHA-256 trailer is followed by HMAC-SHA-256 keyed with the vault integrity subkey. The tag binds a versioned domain, magic, version, the bounded 20-byte header area, and the logical payload digest. The key is never stored in or transported with the bundle. This proves that the envelope was produced by a holder of the shared vault key and binds its metadata; it does not identify a particular device, encrypt the transport, replace inner field/delta encryption, or make a bundle safe to disclose. CLI export remains legacy v3/v4 by default, writes v5/v6 only with `--compression zstd`, and selects v7-v10 only with explicit `--authenticated`. CLI apply supplies the opened vault key automatically and continues to read v1-v6.
 
 The implemented `IncrementalIntegrityRoot` profile is additive and intentionally
-separate from the bundle capability. It keeps schema 16 unchanged and creates
-its metadata, leaf, and sparse-node tables only after explicit verified-unlocked
-opt-in. Establishment records `authenticated-state-root-v1` as a critical
-extension, so a pre-profile MDBX2 writer rejects the vault before writable open.
-The root updates in the same outer transaction as sync-delta capture. Without
-that opt-in, current and legacy vault behavior is unchanged. The O(vault-size)
-content manifest remains the exact schema checkpoint; external Provider bytes
-and unregistered physical extension tables are not silently claimed by the
-incremental root.
+separate from the bundle capability. It did not allocate a schema version when
+introduced at schema 16 and creates its metadata, leaf, and sparse-node tables
+only after explicit verified-unlocked opt-in. Establishment records
+`authenticated-state-root-v1` as a critical extension, so a pre-profile MDBX2
+writer rejects the vault before writable open. The root updates in the same
+outer transaction as sync-delta capture. Without that opt-in, current and
+legacy vault behavior is unchanged. The O(vault-size) content manifest remains
+the exact schema checkpoint; external Provider bytes and unregistered physical
+extension tables are not silently claimed by the incremental root.
 
 Protocol-v2 root exchange is additive: Hello and HelloAck omit the checkpoint
 unless `authenticated-state-root-v1` is configured and both peers provide a
