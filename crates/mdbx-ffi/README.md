@@ -31,7 +31,7 @@ The exported boundary covers:
 - create projects
 - discover active and deleted Collections through bounded payload-free summary pages
 - page bounded attachment summaries by Collection or Object, read deleted attachment summaries, and inspect one attachment's metadata without loading chunk/blob payloads
-- register extension capabilities actually present in the client and read or set Collection Profiles
+- register and discover loaded Extension Profiles, activate capabilities actually present in the client, and read or set Collection Profiles
 - create, list, update, soft-delete, restore, and move generic entries
 - create, query, update, and delete generic relations, labels, and label assignments
 - list unresolved conflicts and resolve project, entry, attachment, relation, label, and assignment conflicts with local-wins or incoming-wins
@@ -61,6 +61,20 @@ contains versioned, canonical enabled and omitted-optional lists for storage and
 sync. It describes compiled code only: it does not register a Collection
 Adapter, accept a vault critical extension, grant key access, or negotiate a
 peer session.
+
+`MdbxExtensionProfile` is the canonical process-local descriptor for one
+loaded Adapter. It declares the Adapter's namespaced Collection types, custom
+Object types, relation kinds, write-gating capabilities, optional indexes,
+import/export paths, and presentation hints. `MdbxExtensionRegistration`
+distinguishes a new registration from an exact idempotent duplicate.
+
+Use `register_extension_profile`, `replace_extension_profiles`,
+`get_extension_profile`, `list_extension_profiles`, and
+`unregister_extension_profile` to manage the registry. Registration and bulk
+replacement are atomic, at most 256 profiles may be present, and reopening a
+vault starts with an empty registry. Profiles are discovery and validation
+metadata only: they are not written to the vault, snapshot, or sync state and
+grant no SQL, key, critical-extension, or Tiga authority.
 
 `VaultInfo` contains:
 
@@ -110,7 +124,7 @@ large snapshots remain navigable. Existing complete snapshot operations are
 outside this facade and must be reached through their authorized storage/API
 boundary when payload-dependent work is required.
 
-Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. The declaration is not persisted and grants no key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When required capabilities are absent, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, and recovery remain available.
+Call `set_extension_capabilities` before mutating a profiled Collection and declare only Adapter capabilities actually present in the current process. Capability activation is separate from Extension Profile registration: registering a descriptor never activates its capabilities. Neither declaration is persisted or grants key access. `set_collection_profile` establishes or advances a Profile; its CollectionTypeId is immutable. When a registered descriptor owns that type, the Collection Profile's allowed ObjectTypeIds and required capabilities must be subsets of the descriptor. When the descriptor contract or required capabilities are not satisfied, user-visible Project, ObjectRecord, Relation, Label, Assignment, Attachment, and conflict-resolution mutations return a storage error. Opaque reads, synchronization, backup, restore, and recovery remain available.
 
 `create_payload_migration_plan` creates a bounded migration plan for one ObjectTypeId and now requires an active authenticated session. It uses the conservative Standard device profile; clients with real device evidence can call `create_payload_migration_plan_with_device_context`. Plan creation authorizes `MigratePayload` against the Collection Project scope before loading or decrypting source bytes. `MdbxPayloadMigrationPlan.items` carries the source payload bytes, source digest, and object head that the Adapter needs to interpret, while the security audit is correlated by `plan_id` without a commit.
 
@@ -236,6 +250,8 @@ All exported functions return `Result<_, MdbxFfiError>`.
 - `InvalidConflictObjectType { object_type }`: unknown conflict object type filter
 - `InvalidCollectionTypeId { collection_type_id }`: invalid or non-namespaced Collection type
 - `InvalidExtensionCapabilityId { capability_id }`: invalid extension capability identifier
+- `InvalidExtensionId { extension_id }`: invalid or non-namespaced extension identifier
+- `InvalidExtensionFeatureId { feature_id }`: invalid optional extension feature identifier
 - `LockPoisoned`: the internal vault mutex was poisoned
 
 Common constraint errors include updating a deleted entry, deleting an already deleted entry, restoring an active entry, moving a deleted entry, or using an entry ID that does not belong to the supplied project ID.

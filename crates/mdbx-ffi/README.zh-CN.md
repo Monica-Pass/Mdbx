@@ -31,7 +31,7 @@
 - 创建 project
 - 通过有界、无 payload 的摘要页发现 active 和 deleted Collection
 - 按 Collection 或 Object 分页有界 attachment 摘要、读取 deleted attachment 摘要，并在不加载 chunk/blob payload 的情况下查看单个附件元数据
-- 注册当前客户端实际提供的扩展能力，读取或设置 Collection Profile
+- 注册并发现已加载的 Extension Profile，激活当前客户端实际提供的扩展能力，并读取或设置 Collection Profile
 - 创建、列出、更新、软删除、恢复、移动 generic entry
 - 创建、查询、更新和删除通用关系、标签及标签分配
 - 列出未解决冲突，并对 project、entry、attachment、关系、标签和标签分配执行本地优先或传入优先解决
@@ -59,6 +59,17 @@
 `MdbxBuildCapabilityManifest`。它以版本化、规范排序的列表分别给出 storage 与 sync
 已启用能力和被裁剪的已知可选能力。它只描述编译内容，不会注册 Collection Adapter、接受
 vault critical extension、授予密钥访问或协商 peer 会话。
+
+`MdbxExtensionProfile` 是一个已加载 Adapter 的规范化进程内描述符。它声明 Adapter 拥有的
+命名空间 Collection 类型、自定义 Object 类型、relation kind、写入门禁能力、可选索引、
+导入/导出路径和展示提示。`MdbxExtensionRegistration` 用于区分首次注册与完全相同的幂等
+重复注册。
+
+客户端通过 `register_extension_profile`、`replace_extension_profiles`、
+`get_extension_profile`、`list_extension_profiles` 和
+`unregister_extension_profile` 管理 registry。注册与批量替换保持原子，最多同时存在 256 个
+Profile，重新打开 vault 后 registry 为空。Profile 只属于发现与校验元数据：不会写入 vault、
+snapshot 或同步状态，也不会授予 SQL、密钥、critical extension 或 Tiga 权限。
 
 `VaultInfo` 包含：
 
@@ -101,7 +112,7 @@ snapshot/base commit 身份、摘要 hash、创建元数据和 `snapshot_ciphert
 反序列化或验证加密 payload，因此损坏或很大的快照仍可导航。完整快照操作不在此 facade
 内；需要 payload 的工作必须走已有授权 storage/API 边界。
 
-客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。声明不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；读取、同步和恢复仍可保存未知密文。
+客户端在修改 profiled Collection 前调用 `set_extension_capabilities`，声明当前进程内实际存在的 Adapter 能力。能力激活与 Extension Profile 注册彼此独立：注册描述符不会自动激活其中的 capability。两种声明都不会写入 vault，也不会授予密钥访问。`set_collection_profile` 建立或升级 Profile；CollectionTypeId 建立后保持不可变。若该类型存在已注册的描述符，Collection Profile 允许的 ObjectTypeId 和所需 capability 必须都是描述符声明的子集。描述符契约不匹配或缺少所需能力时，Project、ObjectRecord、Relation、Label、Assignment、Attachment 和冲突解决等用户修改返回 storage error；不透明读取、同步、备份、恢复仍可保存未知密文。
 
 `create_payload_migration_plan` 为一个 ObjectTypeId 建立有界迁移计划，并要求活动认证会话。该兼容入口使用保守的 Standard 设备画像；能提供真实设备证据的客户端可以调用 `create_payload_migration_plan_with_device_context`。创建计划会在载入或解密源字节前，针对 Collection 的 Project scope 授权 `MigratePayload`。`MdbxPayloadMigrationPlan.items` 包含 Adapter 需要解释的源 payload 字节、源摘要和对象 head；安全审计通过 `plan_id` 关联且不引用 commit。
 
@@ -225,6 +236,8 @@ entry 返回时，`payload_json` 会从已存 JSON 值重新序列化。不要�
 - `InvalidConflictObjectType { object_type }`：未知冲突对象类型过滤器
 - `InvalidCollectionTypeId { collection_type_id }`：Collection 类型缺少有效命名空间
 - `InvalidExtensionCapabilityId { capability_id }`：扩展能力标识无效
+- `InvalidExtensionId { extension_id }`：扩展标识无效或缺少命名空间
+- `InvalidExtensionFeatureId { feature_id }`：可选扩展 feature 标识无效
 - `LockPoisoned`：内部 vault mutex 被 poison
 
 常见 constraint error 包括：更新已删除 entry、删除已删除 entry、恢复未删除 entry、移动已删除 entry，或传入的 entry ID 不属于给定 project ID。

@@ -134,6 +134,17 @@ Tiga2 的有效策略按以下顺序解析：vault 基线、project 覆盖、ent
 - 旧版中已经存在的弱覆盖在迁移时保持原行为，但 vault 标记为 `remediation-required`。
 - 并发同步的策略冲突逐字段采用更严格结果；审计事件和例外 ID 不允许被远端改写。
 
+### 4.1 Extension Profile 的非授权边界
+
+已注册的 `ExtensionProfile` 只是对当前进程中某个已加载 Adapter 所提供语义面的声明，不得被
+视为认证或授权。注册不能授予 raw SQL、vault 或密钥访问、明文披露、Tiga 例外、critical
+extension 接受权或同步 peer 信任。
+
+Profile 注册与 `set_extension_capabilities` 彼此独立。前者描述 Adapter 能理解什么，后者声明
+当前进程实际可执行哪些写入门禁能力；两者都不能绕过 repository 校验或逐操作 Tiga 授权。
+匹配的 registry 描述符可以收紧用户写入校验，但描述符缺失时不得删除、改写或重新解释未知
+密文，也不得阻止不透明读取、同步、备份、恢复。
+
 ## 5. 必需用户警告
 
 当用户切换到更弱模式时，UI 必须：
@@ -433,3 +444,4 @@ MDBX 最好支持：
 - 切换到更弱模式时没有显式用户确认
 - 默认长期存储明文秘密却没有充分理由
 - 把生物识别当作唯一真实秘密
+- 把 Extension Profile 注册或 capability 激活当成访问密钥、绕过 Tiga 或直接写 raw SQL 的权限

@@ -112,6 +112,23 @@ Tiga mode MUST support:
 
 A narrower scope override MUST take precedence over a broader one.
 
+### 4.1 Extension Profile Non-Authority Boundary
+
+A registered `ExtensionProfile` is a process-local claim about the semantic
+surface supplied by one loaded Adapter. Registration MUST NOT be treated as
+authentication or authorization. It cannot grant raw SQL access, vault or key
+access, plaintext disclosure, a Tiga override, critical-extension acceptance,
+or synchronization-peer trust.
+
+Profile registration and `set_extension_capabilities` are independent.
+Registration describes what an Adapter understands; capability activation
+declares which write-gating behavior is executable in the current process.
+Neither declaration bypasses repository validation or per-operation Tiga
+authorization. A matching registry descriptor MAY tighten user-write
+validation, but an absent descriptor MUST NOT erase, rewrite, or reinterpret
+unknown ciphertext and MUST NOT block opaque reads, synchronization, backup,
+restore, or recovery.
+
 ## 5. Required User Warnings
 
 When switching to a weaker mode, the UI MUST:
@@ -409,3 +426,4 @@ A security design is non-compliant if it:
 - allows weaker mode switching without explicit user acknowledgement
 - stores long-lived plaintext secrets by default without strong justification
 - treats biometric unlock as the only real secret
+- treats Extension Profile registration or capability activation as authority to access keys, bypass Tiga, or write raw SQL

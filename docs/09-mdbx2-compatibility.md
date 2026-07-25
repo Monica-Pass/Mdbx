@@ -298,6 +298,31 @@ registration, critical-extension validation for writable open, or Hello/HelloAck
 negotiation with a peer. Existing clients that never request the report retain
 their exact behavior.
 
+### Process-Local Extension Profile Registry
+
+Each open `VaultConnection` can register at most 256 canonical
+`ExtensionProfile` descriptors for the domain Adapters loaded in that process.
+A descriptor assigns one extension namespace to its CollectionTypeIds, custom
+ObjectTypeIds, RelationKindIds, write-gating capabilities, optional indexes,
+import/export Adapters, and presentation hints. Exact duplicate registration is
+idempotent; changed registration, duplicate ownership, and bulk replacement
+fail atomically without exposing a partial registry.
+
+The registry is process metadata and is empty after a vault is reopened. It is
+not stored in the schema, snapshots, synchronization state, or critical
+extensions. Registration does not activate the descriptor's capabilities;
+clients separately call `set_extension_capabilities` for executable Adapter
+capabilities. Neither operation grants raw SQL, encryption-key, or Tiga
+authority.
+
+When a registered descriptor owns a Collection type, subsequent user writes
+validate the stored Collection Profile against that descriptor and the active
+capability set. Existing or synchronized unknown data remains readable through
+opaque compatibility paths. An absent or removed Adapter does not rewrite or
+delete its data and does not prevent synchronization, backup, restore, or
+recovery. Consequently, the additive registry preserves MDBX1 and earlier
+MDBX2 behavior for clients that never use it.
+
 ### Binary KDBX Adapter
 
 Binary KDBX interoperability is an optional Adapter and does not change the

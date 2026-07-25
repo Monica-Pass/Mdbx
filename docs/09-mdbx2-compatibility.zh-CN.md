@@ -358,7 +358,25 @@ columns，并为 nullable primary key 或 collation 相等的行增加带类型�
 的 critical extension 校验或 peer 间 Hello/HelloAck 协商。不查询该报告的旧客户端行为
 完全保持不变。
 
-### 7.13 二进制 KDBX Adapter
+### 7.13 进程内 Extension Profile Registry
+
+每个已打开的 `VaultConnection` 最多可以注册 256 个规范化 `ExtensionProfile`，用于描述当前
+进程实际加载的领域 Adapter。描述符把一个扩展命名空间映射到 CollectionTypeId、自定义
+ObjectTypeId、RelationKindId、写入门禁 capability、可选索引、导入/导出 Adapter 和展示
+提示。完全相同的重复注册保持幂等；内容变化、所有权冲突或批量替换失败时，旧 registry 原子
+保留，不会暴露部分状态。
+
+Registry 属于进程元数据，重新打开 vault 后为空。它不进入 schema、snapshot、同步状态或
+critical extension。注册 Profile 不会激活其中的 capability；客户端仍需单独调用
+`set_extension_capabilities` 声明当前可执行的 Adapter 能力。两者都不会授予 raw SQL、加密
+密钥或 Tiga 权限。
+
+若已注册描述符拥有某个 Collection 类型，后续用户写入会使用该描述符与当前 capability 集合
+复核已存 Collection Profile。既有或同步得到的未知数据仍可通过不透明兼容路径读取；Adapter
+缺失或被裁剪时不会改写或删除其数据，也不会阻止同步、备份、恢复。因此，从未使用 registry
+的 MDBX1 与早期 MDBX2 客户端保持原行为。
+
+### 7.14 二进制 KDBX Adapter
 
 二进制 KDBX 互操作属于可选 Adapter，不改变 MDBX1/MDBX2 schema、迁移、同步或 JSON
 桥接。独立的 `kdbx-binary-import` 与 `kdbx-binary-export` feature 分别公布
