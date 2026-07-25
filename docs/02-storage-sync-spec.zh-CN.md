@@ -168,9 +168,17 @@ MDBX 必须维护类 Git 的逻辑历史。
 - 本地序列号
 - 父 commit ID 列表
 - 变更对象引用
+- 精确且经过认证的 commit kind
+- 精确且经过认证的 change scope
 - 时间戳
 - 可选的 merge 元数据
 - 完整性数据
+
+稳定 ChangeScope 值为 `project`、`entry`、`attachment`、`object-relation`、
+`object-label`、`object-label-assignment`、`vault-meta`、`key-epoch`、`multi`、
+`snapshot`、`branch`。只有一个有限 operation 确实跨越多个已知对象族时才使用 `multi`。
+reader 与 writer 遇到未知 scope 时必须拒绝，不能转换为 `multi`，因为 kind 和 scope 都是
+commit 完整性输入。新的本地 CommitOperation 必须在启动写事务前验证两类值。
 
 ## 9. 冲突检测
 

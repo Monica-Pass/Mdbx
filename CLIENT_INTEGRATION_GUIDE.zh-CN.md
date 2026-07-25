@@ -495,6 +495,12 @@ resource-limit 或 malformed-row error 时，应显示需要 repair 的状态，
 展示层本地化，必须保留原字符串，遇到未知值时绝不能按 `change` 回写。storage 与 bundle
 reader 会拒绝未知值，UI fallback 不得掩盖完整性错误。
 
+`change_scope` 采用同样规则。精确值为 `project`、`entry`、`attachment`、
+`object-relation`、`object-label`、`object-label-assignment`、`vault-meta`、
+`key-epoch`、`multi`、`snapshot`、`branch`。`multi` 表示一次真实 operation 跨越
+多个已知对象族，不是通用 fallback。客户端必须保留原字符串；未知 scope 应显示不支持数据
+错误，不能替换后导出或写回。
+
 ### 5.7 快照页
 
 用途：恢复和结构检查。

@@ -1808,6 +1808,31 @@ mod tests {
     }
 
     #[test]
+    fn bundle_roundtrip_preserves_all_change_scopes() {
+        for scope in [
+            mdbx_core::model::ChangeScope::Project,
+            mdbx_core::model::ChangeScope::Entry,
+            mdbx_core::model::ChangeScope::Attachment,
+            mdbx_core::model::ChangeScope::ObjectRelation,
+            mdbx_core::model::ChangeScope::ObjectLabel,
+            mdbx_core::model::ChangeScope::ObjectLabelAssignment,
+            mdbx_core::model::ChangeScope::VaultMeta,
+            mdbx_core::model::ChangeScope::KeyEpoch,
+            mdbx_core::model::ChangeScope::Multi,
+            mdbx_core::model::ChangeScope::Snapshot,
+            mdbx_core::model::ChangeScope::Branch,
+        ] {
+            let mut bundle = sample_bundle();
+            bundle.commits[0].commit.change_scope = scope.clone();
+
+            let bytes = bundle_to_bytes(&bundle).unwrap();
+            let restored = bundle_from_bytes(&bytes).unwrap();
+
+            assert_eq!(restored.commits[0].commit.change_scope, scope);
+        }
+    }
+
+    #[test]
     fn commit_kind_binary_discriminants_keep_legacy_order() {
         let cases = [
             (mdbx_core::model::CommitKind::Change, 0_u8),
@@ -1823,6 +1848,30 @@ mod tests {
         for (kind, discriminant) in cases {
             assert_eq!(
                 bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap(),
+                vec![discriminant]
+            );
+        }
+    }
+
+    #[test]
+    fn change_scope_binary_discriminants_keep_legacy_order() {
+        let cases = [
+            (mdbx_core::model::ChangeScope::Project, 0_u8),
+            (mdbx_core::model::ChangeScope::Entry, 1),
+            (mdbx_core::model::ChangeScope::Attachment, 2),
+            (mdbx_core::model::ChangeScope::ObjectRelation, 3),
+            (mdbx_core::model::ChangeScope::ObjectLabel, 4),
+            (mdbx_core::model::ChangeScope::ObjectLabelAssignment, 5),
+            (mdbx_core::model::ChangeScope::VaultMeta, 6),
+            (mdbx_core::model::ChangeScope::KeyEpoch, 7),
+            (mdbx_core::model::ChangeScope::Multi, 8),
+            (mdbx_core::model::ChangeScope::Snapshot, 9),
+            (mdbx_core::model::ChangeScope::Branch, 10),
+        ];
+
+        for (scope, discriminant) in cases {
+            assert_eq!(
+                bincode::serde::encode_to_vec(&scope, bincode::config::standard()).unwrap(),
                 vec![discriminant]
             );
         }

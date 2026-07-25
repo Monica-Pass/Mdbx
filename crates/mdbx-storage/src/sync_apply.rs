@@ -567,17 +567,7 @@ mod tests {
     }
 
     fn parse_change_scope_for_test(value: &str) -> ChangeScope {
-        match value {
-            "project" => ChangeScope::Project,
-            "entry" => ChangeScope::Entry,
-            "attachment" => ChangeScope::Attachment,
-            "object-relation" => ChangeScope::ObjectRelation,
-            "object-label" => ChangeScope::ObjectLabel,
-            "object-label-assignment" => ChangeScope::ObjectLabelAssignment,
-            "vault-meta" => ChangeScope::VaultMeta,
-            "key-epoch" => ChangeScope::KeyEpoch,
-            _ => ChangeScope::Multi,
-        }
+        value.parse().unwrap()
     }
 
     fn operation_for_commit(

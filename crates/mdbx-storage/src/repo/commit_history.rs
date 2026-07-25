@@ -360,20 +360,7 @@ fn parse_commit_kind(value: &str) -> StorageResult<mdbx_core::model::CommitKind>
 }
 
 fn parse_change_scope(value: &str) -> StorageResult<mdbx_core::model::ChangeScope> {
-    match value {
-        "project" => Ok(mdbx_core::model::ChangeScope::Project),
-        "entry" => Ok(mdbx_core::model::ChangeScope::Entry),
-        "attachment" => Ok(mdbx_core::model::ChangeScope::Attachment),
-        "object-relation" => Ok(mdbx_core::model::ChangeScope::ObjectRelation),
-        "object-label" => Ok(mdbx_core::model::ChangeScope::ObjectLabel),
-        "object-label-assignment" => Ok(mdbx_core::model::ChangeScope::ObjectLabelAssignment),
-        "vault-meta" => Ok(mdbx_core::model::ChangeScope::VaultMeta),
-        "key-epoch" => Ok(mdbx_core::model::ChangeScope::KeyEpoch),
-        "multi" => Ok(mdbx_core::model::ChangeScope::Multi),
-        _ => Err(StorageError::Validation(format!(
-            "unknown change scope: {value}"
-        ))),
-    }
+    value.parse().map_err(StorageError::Validation)
 }
 
 #[cfg(test)]
@@ -455,6 +442,28 @@ mod tests {
         }
 
         assert!(parse_commit_kind("future-kind").is_err());
+    }
+
+    #[test]
+    fn history_verifies_and_preserves_snapshot_and_branch_scopes() {
+        let (conn, ctx) = setup();
+
+        for scope in ["snapshot", "branch"] {
+            let operation = crate::repo::CommitOperation::new(
+                format!("history-{scope}-scope-operation"),
+                "history-scope-test",
+                "main",
+                "change",
+                scope,
+                Vec::new(),
+            );
+            let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+            let history = CommitHistoryRepo::get(&conn, &commit_id).unwrap().unwrap();
+
+            assert_eq!(history.change_scope, scope);
+        }
+
+        assert!(parse_change_scope("future-scope").is_err());
     }
 
     #[test]

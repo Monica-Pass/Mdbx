@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use mdbx_core::model::Commit;
+use mdbx_core::model::{ChangeScope, Commit, CommitKind};
 
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
@@ -303,6 +303,7 @@ impl CommitContext {
         conn: &VaultConnection,
         operation: &CommitOperation,
     ) -> StorageResult<String> {
+        Self::validate_operation(operation)?;
         conn.with_immediate_transaction(|| self.create_operation_commit_inner(conn, operation))
     }
 
@@ -520,6 +521,7 @@ impl CommitContext {
         changed_object_ids: &[String],
         parents: &[String],
     ) -> StorageResult<String> {
+        Self::validate_commit_taxonomy(commit_kind, change_scope)?;
         let mut active = self
             .active_operation
             .borrow_mut()
@@ -900,6 +902,17 @@ impl CommitContext {
                 "branch_name must not be empty when branch_id is absent".to_string(),
             ));
         }
+        Self::validate_commit_taxonomy(&operation.commit_kind, &operation.change_scope)?;
+        Ok(())
+    }
+
+    fn validate_commit_taxonomy(commit_kind: &str, change_scope: &str) -> StorageResult<()> {
+        commit_kind
+            .parse::<CommitKind>()
+            .map_err(StorageError::Validation)?;
+        change_scope
+            .parse::<ChangeScope>()
+            .map_err(StorageError::Validation)?;
         Ok(())
     }
 
@@ -1175,6 +1188,44 @@ mod tests {
             ],
         )
         .with_message("Move two entries")
+    }
+
+    #[test]
+    fn commit_write_seam_rejects_unknown_kind_and_scope_without_persisting() {
+        let (conn, ctx) = initialized();
+        let before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+
+        let unknown_kind = CommitOperation::new(
+            "unknown-kind-operation",
+            "test",
+            "main",
+            "future-kind",
+            "project",
+            Vec::new(),
+        );
+        assert!(ctx.create_operation_commit(&conn, &unknown_kind).is_err());
+
+        let unknown_scope = CommitOperation::new(
+            "unknown-scope-operation",
+            "test",
+            "main",
+            "change",
+            "future-scope",
+            Vec::new(),
+        );
+        assert!(ctx.create_operation_commit(&conn, &unknown_scope).is_err());
+
+        assert!(conn.inner().is_autocommit());
+        assert_eq!(
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
     }
 
     #[test]

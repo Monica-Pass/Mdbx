@@ -139,6 +139,17 @@ would alter the authenticated commit input. The four extended values are appende
 after the four legacy binary enum variants so existing bundle discriminants
 remain unchanged.
 
+### ChangeScope
+
+`ChangeScope` is the authenticated primary family affected by a commit. Its
+stable values are `project`, `entry`, `attachment`, `object-relation`,
+`object-label`, `object-label-assignment`, `vault-meta`, `key-epoch`, `multi`,
+`snapshot`, and `branch`. `multi` means one finite CommitOperation spans more
+than one family; it is not a fallback for an unknown value. Snapshot lifecycle
+and branch tombstone-retention operations use their exact scopes. New local
+operations validate both CommitKind and ChangeScope before opening their write
+transaction, while unknown stored or transported values fail closed.
+
 ### ConflictResolutionOperation
 
 A `ConflictResolutionOperation` selects local state, incoming state, or a validated custom state for one conflicted object. It atomically writes the selected state, creates a two-parent merge commit, advances the object clock and heads, records a new ObjectVersion, reconciles tombstones, and marks the conflict resolved.
@@ -257,6 +268,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 45. Steam mafile parsing checks input bytes before deserialization and enforces bounded depth, aggregate fields, per-array items, nodes, per-string bytes, and aggregate string/key bytes. Duplicate keys fail, and unknown keys remain available after canonical round-trip.
 46. Steam object identity is a domain-separated, length-framed SHA-256 digest of the canonical unsigned SteamID and trimmed case-preserving serial number. Debug and error interfaces never include mafile payload values.
 47. CommitKind is authenticated data. Every known value round-trips exactly across storage history, CLI, synchronization bundles, and FFI; unknown values are rejected and never coerced to `change`. Legacy binary discriminants 0 through 3 remain frozen.
+48. ChangeScope is authenticated data and `multi` is only a real aggregate scope. Snapshot and Branch are appended after the nine legacy binary variants; history, CLI, synchronization bundles, FFI, and local CommitOperation validation use the core exact parser and never coerce an unknown scope.
 
 ## Module Architecture
 

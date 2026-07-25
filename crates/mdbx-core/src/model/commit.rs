@@ -95,6 +95,10 @@ pub enum ChangeScope {
     KeyEpoch,
     /// 跨越多个对象类型
     Multi,
+    /// Snapshot 生命周期或元数据变更。追加以保持既有二进制 variant 序号。
+    Snapshot,
+    /// 分支元数据或分支墓碑保留操作。
+    Branch,
 }
 
 impl std::fmt::Display for ChangeScope {
@@ -109,6 +113,29 @@ impl std::fmt::Display for ChangeScope {
             ChangeScope::VaultMeta => write!(f, "vault-meta"),
             ChangeScope::KeyEpoch => write!(f, "key-epoch"),
             ChangeScope::Multi => write!(f, "multi"),
+            ChangeScope::Snapshot => write!(f, "snapshot"),
+            ChangeScope::Branch => write!(f, "branch"),
+        }
+    }
+}
+
+impl std::str::FromStr for ChangeScope {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "project" => Ok(Self::Project),
+            "entry" => Ok(Self::Entry),
+            "attachment" => Ok(Self::Attachment),
+            "object-relation" => Ok(Self::ObjectRelation),
+            "object-label" => Ok(Self::ObjectLabel),
+            "object-label-assignment" => Ok(Self::ObjectLabelAssignment),
+            "vault-meta" => Ok(Self::VaultMeta),
+            "key-epoch" => Ok(Self::KeyEpoch),
+            "multi" => Ok(Self::Multi),
+            "snapshot" => Ok(Self::Snapshot),
+            "branch" => Ok(Self::Branch),
+            _ => Err(format!("unknown ChangeScope: {value}")),
         }
     }
 }
@@ -525,6 +552,40 @@ mod tests {
             );
         }
         assert!("unknown".parse::<CommitKind>().is_err());
+    }
+
+    #[test]
+    fn change_scopes_roundtrip_exact_strings_and_reject_unknown_values() {
+        let cases = [
+            (ChangeScope::Project, "project"),
+            (ChangeScope::Entry, "entry"),
+            (ChangeScope::Attachment, "attachment"),
+            (ChangeScope::ObjectRelation, "object-relation"),
+            (ChangeScope::ObjectLabel, "object-label"),
+            (
+                ChangeScope::ObjectLabelAssignment,
+                "object-label-assignment",
+            ),
+            (ChangeScope::VaultMeta, "vault-meta"),
+            (ChangeScope::KeyEpoch, "key-epoch"),
+            (ChangeScope::Multi, "multi"),
+            (ChangeScope::Snapshot, "snapshot"),
+            (ChangeScope::Branch, "branch"),
+        ];
+
+        for (scope, encoded) in cases {
+            assert_eq!(scope.to_string(), encoded);
+            assert_eq!(encoded.parse::<ChangeScope>().unwrap(), scope);
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!(r#""{encoded}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<ChangeScope>(&format!(r#""{encoded}""#)).unwrap(),
+                scope
+            );
+        }
+        assert!("future-scope".parse::<ChangeScope>().is_err());
     }
 
     #[test]

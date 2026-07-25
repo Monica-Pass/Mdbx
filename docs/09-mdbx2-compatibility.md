@@ -457,3 +457,30 @@ safe down-conversion does not exist.
 UniFFI history keeps `commit_kind` as the exact string. Native clients may map
 known values to localized labels, but must retain the original value for
 diagnostics and must never write a display fallback back into MDBX.
+
+### 7.17 Exact Change Scope And Local Write Validation
+
+Change scope is authenticated commit data. Current readers preserve
+`project`, `entry`, `attachment`, `object-relation`, `object-label`,
+`object-label-assignment`, `vault-meta`, `key-epoch`, `multi`, `snapshot`, and
+`branch` exactly. `snapshot` is already produced by automatic snapshot pruning;
+`branch` represents the existing branch object family used by tombstone
+retention paths.
+
+`Snapshot` and `Branch` are appended after the nine existing core enum variants,
+so legacy bincode discriminants 0 through 8 remain unchanged. No schema,
+format-version, bundle-version, or migration field is added. New readers keep
+decoding old bundles and database rows.
+
+The core owns strict ChangeScope parsing. History verification, CLI database
+loading, synchronization tests, and bundle serialization use that exact
+contract. An unknown value fails closed; `multi` is never an unknown-value
+fallback. A pre-fix CLI that converts `snapshot`, `branch`, or a future scope
+to `multi` must not export that history because the converted commit cannot
+retain its authenticated identity.
+
+CommitContext also validates both commit kind and change scope before a direct
+CommitOperation opens its write transaction. Repository commits coalesced into
+an active operation validate their taxonomy before changing aggregate
+metadata. The public string-shaped CommitOperation remains source compatible,
+but it can no longer persist a value the current core cannot read or transport.

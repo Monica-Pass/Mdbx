@@ -3558,7 +3558,7 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
                     device_id: row.get(1)?,
                     local_seq: row.get::<_, i64>(2)? as u64,
                     commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
-                    change_scope: parse_change_scope(&row.get::<_, String>(4)?),
+                    change_scope: parse_change_scope_from_sql(row.get::<_, String>(4)?)?,
                     changed_object_ids_ct: row.get(5)?,
                     vector_clock: row.get(6)?,
                     message_ct: row.get(7)?,
@@ -3599,7 +3599,7 @@ fn load_serialized_commit(
                     device_id: row.get(1)?,
                     local_seq: row.get::<_, i64>(2)? as u64,
                     commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
-                    change_scope: parse_change_scope(&row.get::<_, String>(4)?),
+                    change_scope: parse_change_scope_from_sql(row.get::<_, String>(4)?)?,
                     changed_object_ids_ct: row.get(5)?,
                     vector_clock: row.get(6)?,
                     message_ct: row.get(7)?,
@@ -3702,18 +3702,14 @@ fn parse_commit_kind_from_sql(value: String) -> rusqlite::Result<CommitKind> {
     })
 }
 
-fn parse_change_scope(value: &str) -> ChangeScope {
-    match value {
-        "project" => ChangeScope::Project,
-        "entry" => ChangeScope::Entry,
-        "attachment" => ChangeScope::Attachment,
-        "object-relation" => ChangeScope::ObjectRelation,
-        "object-label" => ChangeScope::ObjectLabel,
-        "object-label-assignment" => ChangeScope::ObjectLabelAssignment,
-        "vault-meta" => ChangeScope::VaultMeta,
-        "key-epoch" => ChangeScope::KeyEpoch,
-        _ => ChangeScope::Multi,
-    }
+fn parse_change_scope_from_sql(value: String) -> rusqlite::Result<ChangeScope> {
+    value.parse().map_err(|error: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3748,6 +3744,33 @@ mod tests {
     }
 
     #[test]
+    fn change_scope_sql_parser_preserves_all_known_values_and_rejects_unknown() {
+        let cases = [
+            ("project", ChangeScope::Project),
+            ("entry", ChangeScope::Entry),
+            ("attachment", ChangeScope::Attachment),
+            ("object-relation", ChangeScope::ObjectRelation),
+            ("object-label", ChangeScope::ObjectLabel),
+            (
+                "object-label-assignment",
+                ChangeScope::ObjectLabelAssignment,
+            ),
+            ("vault-meta", ChangeScope::VaultMeta),
+            ("key-epoch", ChangeScope::KeyEpoch),
+            ("multi", ChangeScope::Multi),
+            ("snapshot", ChangeScope::Snapshot),
+            ("branch", ChangeScope::Branch),
+        ];
+        for (encoded, expected) in cases {
+            assert_eq!(
+                parse_change_scope_from_sql(encoded.to_string()).unwrap(),
+                expected
+            );
+        }
+        assert!(parse_change_scope_from_sql("future-scope".to_string()).is_err());
+    }
+
+    #[test]
     fn serialized_commit_loader_preserves_extended_database_kinds() {
         let conn = VaultConnection::open_in_memory().unwrap();
         initialize_vault(&conn, &VaultInitParams::default()).unwrap();
@@ -3777,6 +3800,36 @@ mod tests {
         assert!(kinds.contains(&CommitKind::Copy));
         assert!(kinds.contains(&CommitKind::Restore));
         assert!(kinds.contains(&CommitKind::Multi));
+    }
+
+    #[test]
+    fn serialized_commit_loader_preserves_snapshot_and_branch_scopes() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("change-scope-loader-device".to_string());
+
+        for scope in ["snapshot", "branch"] {
+            ctx.create_operation_commit(
+                &conn,
+                &CommitOperation::new(
+                    format!("loader-{scope}-scope-operation"),
+                    "loader-scope-test",
+                    "main",
+                    "change",
+                    scope,
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        }
+
+        let scopes = load_serialized_commits(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|commit| commit.commit.change_scope.to_string())
+            .collect::<Vec<_>>();
+        assert!(scopes.iter().any(|scope| scope == "snapshot"));
+        assert!(scopes.iter().any(|scope| scope == "branch"));
     }
 
     const TEST_PASSWORD: &str = "test-password";

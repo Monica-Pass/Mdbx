@@ -528,6 +528,13 @@ Treat `commit_kind` as authenticated protocol data. Current exact values are
 save an unknown value as `change`. Storage and bundle readers reject unknown
 values so integrity failures cannot be hidden by a UI fallback.
 
+Apply the same rule to `change_scope`. Exact values are `project`, `entry`,
+`attachment`, `object-relation`, `object-label`, `object-label-assignment`,
+`vault-meta`, `key-epoch`, `multi`, `snapshot`, and `branch`. `multi` means a
+real operation spans known families; it is not a generic fallback. Clients
+must preserve the original string and surface an unsupported-data error for an
+unknown scope instead of exporting or writing a substituted value.
+
 ### 5.7 Snapshots
 
 Purpose: recovery and structure inspection.

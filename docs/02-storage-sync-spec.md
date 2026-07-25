@@ -168,9 +168,19 @@ A commit record SHOULD include:
 - local sequence number
 - parent commit IDs
 - changed object references
+- exact authenticated commit kind
+- exact authenticated change scope
 - timestamp
 - optional merge metadata
 - integrity data
+
+The stable ChangeScope values are `project`, `entry`, `attachment`,
+`object-relation`, `object-label`, `object-label-assignment`, `vault-meta`,
+`key-epoch`, `multi`, `snapshot`, and `branch`. `multi` is used only when one
+finite operation spans known families. Readers and writers MUST reject an
+unknown scope instead of converting it to `multi`, because kind and scope are
+inputs to commit integrity. A new local CommitOperation MUST validate both
+taxonomies before its write transaction begins.
 
 ## 9. Conflict Detection
 

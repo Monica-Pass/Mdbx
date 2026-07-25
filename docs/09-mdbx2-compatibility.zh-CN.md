@@ -472,3 +472,23 @@ reader 不得导出或 apply 这段历史，必须升级 reader，因为不存�
 
 UniFFI history 继续把 `commit_kind` 作为精确字符串返回。原生客户端可以把已知值映射为
 本地化标签，但必须保留原始值用于诊断，绝不能把 UI fallback 写回 MDBX。
+
+### 7.17 Change Scope 精确往返与本地写入验证
+
+change scope 是经过认证的 commit 数据。当前 reader 精确保留 `project`、`entry`、
+`attachment`、`object-relation`、`object-label`、`object-label-assignment`、
+`vault-meta`、`key-epoch`、`multi`、`snapshot`、`branch`。自动 Snapshot 清理已经
+产生 `snapshot`；`branch` 对应墓碑保留路径使用的既有分支对象族。
+
+`Snapshot` 与 `Branch` 只追加在核心原九个枚举变体之后，因此旧 bincode discriminant
+0 到 8 保持不变。本修复不增加 schema、format version、bundle version 或迁移字段；
+新 reader 继续解码旧 bundle 与数据库行。
+
+ChangeScope 严格解析由核心统一拥有。history 验证、CLI 数据库加载、同步测试和 bundle
+序列化都复用该精确契约。未知值必须 fail closed；`multi` 绝不能充当未知值 fallback。
+会把 `snapshot`、`branch` 或未来 scope 转为 `multi` 的修复前 CLI 不得导出这段历史，
+因为转换后的 commit 无法保持原认证 identity。
+
+CommitContext 还会在直接 CommitOperation 打开写事务前验证 commit kind 与 change scope。
+活动 operation 中聚合的 repository commit 也会先验证分类，再修改聚合元数据。公开的字符串
+CommitOperation 保持源码兼容，但不能再写入当前核心无法读取或传输的值。

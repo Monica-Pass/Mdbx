@@ -2541,6 +2541,11 @@ fn snapshot_lifecycle_facade_keeps_legacy_manual_and_prunes_automatic_idempotent
     assert_eq!(result.deleted_snapshot_ids, vec![automatic_id]);
     assert_eq!(ffi_test_count(&vault, "commits"), commit_count + 1);
     assert!(vault.get_snapshot_summary(legacy_id).unwrap().is_some());
+    let history = vault
+        .get_commit_history(result.commit_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.change_scope, "snapshot");
 
     let retry = vault
         .prune_automatic_snapshots(plan.plan_token, 0, conservative_ffi_device_context())
