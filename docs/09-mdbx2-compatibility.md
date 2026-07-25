@@ -396,12 +396,13 @@ no source values.
 
 The Adapter retains unknown fields and emits deterministic canonical JSON, so
 an older client can preserve fields introduced by a newer Steam producer. It
-derives a stable object ID from a domain-separated, length-framed SHA-256 of a
-canonical unsigned 64-bit SteamID and trimmed, case-preserving serial number.
-A mafile may carry its own SteamID, or the client may supply the authenticated
-account SteamID when that variant omits it; a mismatch is rejected. The hash
-is an opaque identity, not a substitute for encryption, authentication, or a
-Steam credential.
+derives a stable object digest from a domain-separated, length-framed SHA-256
+of a canonical unsigned 64-bit SteamID and trimmed, case-preserving serial
+number. The Generic Object projection uses the first 128 digest bits with the
+RFC variant and custom UUID version 8. A mafile may carry its own SteamID, or
+the client may supply the authenticated account SteamID when that variant
+omits it; a mismatch is rejected. The digest and UUID are opaque identities,
+not substitutes for encryption, authentication, or a Steam credential.
 
 The Adapter never logs or places payload values in Debug/error text. Clients
 must keep parsed documents and canonical bytes in protected process memory and
@@ -410,3 +411,23 @@ persistence. Importing several mafiles remains one bounded
 `CommitOperation`; the Adapter itself creates no tables, schema columns,
 sync fields, commits, or Tiga authority. Removing it must not delete,
 retype, or block opaque reads, synchronization, backup, restore, or recovery.
+
+The optional `crates/mdbx-adapter-steam-storage` bridge maps the pure Adapter
+to existing generic storage APIs. It has no default features and depends only
+on the pure Adapter plus `mdbx-storage` core. Preparation validates the whole
+batch, sorts by stable UUID, rejects duplicate identity, and reads existing
+state only through payload-free Object summaries. It emits existing generic
+create, update, or restore-then-update commands and never adds a Steam table,
+column, snapshot field, sync field, critical extension, or key format.
+
+The default bridge batch is 128 documents and 8 MiB aggregate source bytes;
+hard ceilings are 2,048 documents and 64 MiB. Exact prepared-plan retry returns
+the original commit idempotently, while re-planning against changed vault state
+is a new action. Absent input objects are not automatically deleted. Profile
+registration and activation of `com.monica.steam.store` remain separate, and
+capability failure rolls back the complete operation.
+
+MDBX1 and MDBX1-DRAFT file upgrades remain storage-core migrations. The bridge
+does not move compatibility into a client converter. Removing the bridge, or
+both Steam crates, preserves existing encrypted generic rows and all legacy
+compatibility projections.

@@ -989,6 +989,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "mdbx-adapter-steam-storage"
+version = "0.2.0"
+dependencies = [
+ "mdbx-adapter-steam",
+ "mdbx-storage",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

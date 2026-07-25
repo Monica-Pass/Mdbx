@@ -42,6 +42,12 @@ an exact retry created before the coordinator was introduced still resolves to
 the original commit. Private prepared commands hold parsed `ObjectTypeId`,
 `RelationKindId`, and JSON values for transaction execution.
 
+Preparation also derives the repository commit kind before execution. A
+homogeneous operation retains `change`, `restore`, or `move`; a command set
+that combines repository kinds uses `multi`. This lets restore-then-update
+remain one stable operation without changing the stored request identity while
+the transaction is already running.
+
 ## Compatibility
 
 The change adds no table, column, snapshot field, synchronization-wire field,

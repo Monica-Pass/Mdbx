@@ -264,21 +264,33 @@ Steam mafile 支持是可选能力。集成 `mdbx-adapter-steam` 的客户端应
 用户可见写入时单独激活 `com.monica.steam.store`。Profile 注册不是权限，也不能
 替代 Tiga 授权。
 
-客户端 MUST 把每个 mafile 当作不可信 JSON，在构造通用 `WriteCommand` 前通过 Adapter
-的有界解析器；不得用 `serde_json::from_slice` 再实现一套客户端解析器。默认契约为：
-输入 1 MiB、深度 32、聚合字段 512、每个数组 512 项、聚合节点 8,192、单个字符串/键
-64 KiB、字符串/键聚合 1 MiB。Adapter 拒绝重复键，错误只返回不泄漏值的静态类别，并
-在规范 JSON 中保留未知字段。低端设备可以降低上限，但不能提高硬上限。
+需要存储映射的客户端还应集成可独立裁剪的 `mdbx-adapter-steam-storage`。其中的注册 helper
+只注册进程内描述符；客户端仍需单独激活 capability，并通过普通 tracked storage API 创建或
+更新持久化 CollectionProfile。
+
+客户端 MUST 把每个 mafile 当作不可信 JSON。存储导入应调用
+`SteamMaFileImportPlan::prepare`，不得在 UI 中重新实现解析器、UUID 映射或
+create/update 判断树。桥接层把单文档解析交给纯 Adapter；默认契约为输入 1 MiB、深度 32、
+聚合字段 512、每个数组 512 项、聚合节点 8,192、单个字符串/键 64 KiB、字符串/键聚合
+1 MiB。Adapter 拒绝重复键，错误只返回不泄漏值的静态类别，并在规范 JSON 中保留未知字段。
+低端设备可以降低上限，但不能提高硬上限。
 
 规范 JSON 字节作为 `com.monica.steam.mafile` ObjectTypeId 的不透明 payload 写入。对象
-ID 必须由已认证账号 SteamID 与 mafile serial number 通过 Adapter 的稳定 ID 方法得到；
-不得使用账号名、标题、路径、secret 或列表位置派生。解析值和规范字节在通用认证加密
-写入成功前必须留在受保护进程内存中，不得写日志。多份 mafile 导入应是一个有界的用户级
-`CommitOperation`，不能每个 JSON 字段或对象产生一条 commit。
+ID 由桥接层把 Adapter 的命名空间隔离 identity 投影为确定性的 RFC variant、version-8
+UUID；不得使用账号名、标题、路径、secret 或列表位置派生。桥接层按 UUID 排序并拒绝重复
+identity，只通过不含 payload 的 summary 判断 create、update 或 restore-then-update。已有
+对象必须属于目标 Collection，并保持精确 ObjectTypeId 与 payload schema version；本批输入
+缺失某对象不代表删除。
 
-Adapter 不执行 Steam 网络请求、Android 集成、token 刷新或 storage 写入。裁剪掉它后，
-已有 Steam 对象仍可作为不透明记录进行同步、备份、恢复和诊断；客户端不得删除或重新解释
-这些对象。
+导入默认最多 128 份文档、源字节聚合 8 MiB；硬上限为 2,048 份和 64 MiB，单文档与通用
+write limits 仍分别生效。request 和 prepared plan 都含敏感明文，必须留在受保护进程内存中，
+不得记录源字节或规范字节。一次成功批次只产生一条 commit，包括 restore-then-update。执行
+结果不确定时必须重试同一份 prepared plan；重新读取文件或在 vault 状态变化后重建 plan 是
+新的规划动作，不能伪装成旧计划的幂等重试。
+
+纯 Adapter 不执行 Steam 网络请求、Android 集成、token 刷新或 storage 写入；storage bridge
+只准备并执行通用 MDBX 写入。裁剪任意一层后，已有 Steam 对象仍可作为不透明记录进行同步、
+备份、恢复和诊断；客户端不得删除或重新解释这些对象。
 
 ### 4.2 删除必须走 tombstone
 

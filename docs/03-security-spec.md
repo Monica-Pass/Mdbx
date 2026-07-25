@@ -150,6 +150,22 @@ static field labels, never mafile values or secrets. Its stable object ID is a
 domain-separated hash of canonical identity components and is not a secret or
 a replacement for authentication.
 
+The optional `mdbx-adapter-steam-storage` bridge MUST preserve the same
+plaintext boundary. Its source, request, prepared plan, and error Debug output
+MUST NOT expose mafile bytes, SteamIDs, serial numbers, account names, tokens,
+or secret fields. Aggregate input MUST be bounded before parsing every
+document: defaults are 128 documents and 8 MiB source bytes, with hard ceilings
+of 2,048 documents and 64 MiB. Per-document and generic write limits remain
+independent defense layers.
+
+Planning MUST read existing objects through a payload-free summary path and
+MUST validate Collection ownership, exact ObjectTypeId, and payload schema
+version before mutation. Capability denial or any later command failure MUST
+roll back the complete batch. An exact uncertain retry reuses the same
+memory-only prepared plan; clients MUST NOT serialize the plan to disk or logs,
+and MUST NOT treat a re-plan against changed vault state as the same retry.
+Missing source objects MUST NOT cause implicit deletion.
+
 ## 5. Required User Warnings
 
 When switching to a weaker mode, the UI MUST:

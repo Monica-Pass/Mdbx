@@ -270,10 +270,14 @@ MDBX 必须坚持：
 - CollectionProfile 已进入 schema migration、Project ObjectVersion、sync state v2、snapshot、health 和 UniFFI；旧 sync state v1 缺少 profile 时保留接收端现有描述。
 - MDBX1 核心表未知附加列及其值已通过真实 `upgrade_to_latest` 路径验证；schema 10 重建 Tiga 策略表时会复制受限附加列，无法安全重建时在替换旧表前失败。
 - complete sync-state 会有界保留未知非关键顶层字段并阻止覆盖已知键；字段数、编码字节、键长度和嵌套深度均有硬限制。schema 15 已覆盖 apply、同键更新、旧 peer omission、collect 与重新编码。
+- Steam mafile 已拆成两层可裁剪 Adapter：`mdbx-adapter-steam` 负责有界解析、未知字段保留与稳定 identity；`mdbx-adapter-steam-storage` 负责稳定 UUID、批量排序、create/update/restore 规划、能力门禁和单 operation commit。两层都默认 feature 为空，storage/sync/CLI/FFI 不反向依赖。
+- Steam bridge 默认每批 128 份、源字节聚合 8 MiB，硬上限 2,048 份和 64 MiB；只通过 ObjectSummaryRepo 判断已有状态，不读取 payload，不把输入缺失解释为删除。完全相同的 prepared plan 可幂等重试，重建 plan 属于新规划动作。
+- Native OperationCoordinator 已在执行前确定 commit kind：普通写为 `change`、单独恢复为 `restore`、单独移动为 `move`，混合 repository kind 为 `multi`。restore-then-update 与 move 均有回归测试，避免一次用户动作被迫拆成多条 commit。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：
 
 - 每次发布新代际时继续固化对应 golden vault，并使用上一代 reader 二进制验证只读兼容投影；旧 writer 始终受 `min_writer_version` 边界约束。
 - 为真实二进制 `.kdbx` 导入/导出选择经过审计的独立 Adapter；在此之前继续把现有能力明确标为 KDBX JSON 互操作，不得扩大宣称。
+- 如需 CLI、UniFFI 或 Android 直接导入 mafile，新增入口必须复用现有 Steam storage bridge 的 limits、脱敏、Profile/capability 分离与 prepared-plan retry 契约，不得在客户端复制解析和数据库映射逻辑。
 - 生产客户端继续补齐真实硬件密钥、受保护会话与默认脱敏输出；这些平台能力不能由 storage build manifest 伪造。

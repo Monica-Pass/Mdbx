@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use mdbx_core::model::{ObjectTypeId, RelationKindId};
@@ -290,7 +291,7 @@ impl PreparedWriteOperation {
             self.operation_id.clone(),
             self.operation_kind.clone(),
             if self.branch_id.is_some() { "" } else { "main" },
-            "change",
+            write_operation_commit_kind(&self.commands),
             self.change_scope.clone(),
             self.changed_objects.clone(),
         )
@@ -299,6 +300,30 @@ impl PreparedWriteOperation {
             operation = operation.with_branch_id(branch_id.clone());
         }
         operation
+    }
+}
+
+/// Resolve the semantic commit kind for a prepared generic write.
+///
+/// Most object mutations use the historical `change` kind. Entry restore and
+/// move retain their dedicated repository kinds when they are the only
+/// mutation in an operation. A finite operation that combines different
+/// repository kinds uses the explicit aggregate `multi` kind so all commands
+/// can share one commit without changing the operation identity during
+/// execution.
+fn write_operation_commit_kind(commands: &[PreparedWriteCommand]) -> String {
+    let kinds = commands
+        .iter()
+        .map(PreparedWriteCommand::commit_kind)
+        .collect::<BTreeSet<_>>();
+    if kinds.len() == 1 {
+        kinds
+            .into_iter()
+            .next()
+            .expect("one commit kind must have one value")
+            .to_string()
+    } else {
+        "multi".to_string()
     }
 }
 
@@ -683,6 +708,27 @@ enum PreparedWriteCommand {
     RemoveObjectLabelAssignment {
         assignment_id: String,
     },
+}
+
+impl PreparedWriteCommand {
+    fn commit_kind(&self) -> &'static str {
+        match self {
+            Self::RestoreEntry { .. } => "restore",
+            Self::MoveEntry { .. } => "move",
+            Self::CreateProject { .. }
+            | Self::CreateEntry { .. }
+            | Self::UpdateEntry { .. }
+            | Self::DeleteEntry { .. }
+            | Self::CreateObjectRelation { .. }
+            | Self::UpdateObjectRelation { .. }
+            | Self::DeleteObjectRelation { .. }
+            | Self::CreateObjectLabel { .. }
+            | Self::UpdateObjectLabel { .. }
+            | Self::DeleteObjectLabel { .. }
+            | Self::AssignObjectLabel { .. }
+            | Self::RemoveObjectLabelAssignment { .. } => "change",
+        }
+    }
 }
 
 impl TryFrom<&WriteCommand> for PreparedWriteCommand {
@@ -1224,6 +1270,114 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reused for a different operation"));
+    }
+
+    #[test]
+    fn restore_then_update_uses_one_stable_multi_kind_commit() {
+        let (conn, ctx, _) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Restore target", None, None).unwrap();
+        let object_type = ObjectTypeId::custom("com.monica.test.restorable").unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            object_type.clone(),
+            Some("Before restore"),
+            &serde_json::json!({"state": "before"}),
+        )
+        .unwrap();
+        EntryRepo::soft_delete(&conn, &ctx, &entry.entry_id).unwrap();
+        let commits_before = count(&conn, "commits");
+        let request = WriteOperationRequest::new(
+            "native-restore-update",
+            "restore-update",
+            vec![
+                WriteCommand::RestoreEntry {
+                    entry_id: entry.entry_id.clone(),
+                    project_id: project.project_id.clone(),
+                },
+                WriteCommand::UpdateEntry {
+                    entry_id: entry.entry_id.clone(),
+                    project_id: project.project_id.clone(),
+                    entry_type: object_type.to_string(),
+                    title: "After restore".to_string(),
+                    payload_json: r#"{"state":"after"}"#.to_string(),
+                },
+            ],
+        );
+
+        let first = OperationCoordinator::execute(&conn, &ctx, request.clone()).unwrap();
+        assert!(!first.already_committed);
+        assert_eq!(count(&conn, "commits"), commits_before + 1);
+        let stored_kind: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_kind FROM commits WHERE commit_id = ?1",
+                params![first.commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "multi");
+        let restored = EntryRepo::get_by_id(&conn, &entry.entry_id)
+            .unwrap()
+            .unwrap();
+        assert!(!restored.deleted);
+        assert_eq!(restored.title_ct, Some(b"After restore".to_vec()));
+
+        let retry = OperationCoordinator::execute(&conn, &ctx, request).unwrap();
+        assert!(retry.already_committed);
+        assert_eq!(retry.commit_id, first.commit_id);
+        assert_eq!(count(&conn, "commits"), commits_before + 1);
+    }
+
+    #[test]
+    fn move_command_retains_the_repository_move_commit_kind() {
+        let (conn, ctx, _) = setup();
+        let source = ProjectRepo::create(&conn, &ctx, "Move source", None, None).unwrap();
+        let target = ProjectRepo::create(&conn, &ctx, "Move target", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &source.project_id,
+            ObjectTypeId::custom("com.monica.test.movable").unwrap(),
+            Some("Movable"),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let commits_before = count(&conn, "commits");
+
+        let outcome = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-move-entry",
+                "move-entry",
+                vec![WriteCommand::MoveEntry {
+                    entry_id: entry.entry_id.clone(),
+                    project_id: source.project_id,
+                    target_project_id: target.project_id.clone(),
+                }],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "commits"), commits_before + 1);
+        let stored_kind: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_kind FROM commits WHERE commit_id = ?1",
+                params![outcome.commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "move");
+        assert_eq!(
+            EntryRepo::get_by_id(&conn, &entry.entry_id)
+                .unwrap()
+                .unwrap()
+                .project_id,
+            target.project_id
+        );
     }
 
     #[test]

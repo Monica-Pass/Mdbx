@@ -18,6 +18,7 @@ use serde::Deserializer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const STEAM_EXTENSION_ID: &str = "com.monica.steam";
 /// Collection contract used by Steam account/mafile adapters.
@@ -388,6 +389,35 @@ impl SteamMaFile {
             .ok_or(SteamMaFileError::MissingSteamId)?;
         self.stable_object_id(steam_id)
     }
+
+    /// Derive the deterministic RFC-compatible UUID used by generic MDBX
+    /// write commands. It projects the same domain-separated digest as
+    /// `stable_object_id` into a custom version-8 UUID without exposing either
+    /// identity component.
+    pub fn stable_object_uuid(&self, steam_id: &str) -> Result<String, SteamMaFileError> {
+        let normalized_steam_id = normalize_steam_id(steam_id)?;
+        if let Some(document_steam_id) = self.steam_id.as_deref() {
+            if document_steam_id != normalized_steam_id {
+                return Err(SteamMaFileError::SteamIdMismatch);
+            }
+        }
+        let serial_number = self
+            .serial_number
+            .as_deref()
+            .ok_or(SteamMaFileError::MissingSerialNumber)?;
+        Ok(derive_stable_object_uuid_normalized(
+            &normalized_steam_id,
+            serial_number,
+        ))
+    }
+
+    pub fn stable_object_uuid_from_document(&self) -> Result<String, SteamMaFileError> {
+        let steam_id = self
+            .steam_id
+            .as_deref()
+            .ok_or(SteamMaFileError::MissingSteamId)?;
+        self.stable_object_uuid(steam_id)
+    }
 }
 
 /// Derive a stable, non-secret, domain-separated object ID from an account
@@ -404,12 +434,49 @@ pub fn derive_stable_object_id(
     ))
 }
 
+/// Project the stable Steam object digest into a deterministic custom UUID.
+///
+/// Generic MDBX write operations require UUID object identities. The UUID is
+/// derived from the existing SHA-256 identity rather than introducing a
+/// second identity source or using a random UUID.
+pub fn derive_stable_object_uuid(
+    steam_id: &str,
+    serial_number: &str,
+) -> Result<String, SteamMaFileError> {
+    let normalized_steam_id = normalize_steam_id(steam_id)?;
+    let normalized_serial_number = normalize_serial_number(serial_number)?;
+    Ok(derive_stable_object_uuid_normalized(
+        &normalized_steam_id,
+        &normalized_serial_number,
+    ))
+}
+
 fn derive_stable_object_id_normalized(steam_id: &str, serial_number: &str) -> String {
+    let digest = stable_object_digest_normalized(steam_id, serial_number);
+    let mut encoded = Vec::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize]);
+        encoded.push(HEX[(byte & 0x0f) as usize]);
+    }
+    String::from_utf8(encoded).expect("hex digits are valid UTF-8")
+}
+
+fn derive_stable_object_uuid_normalized(steam_id: &str, serial_number: &str) -> String {
+    let digest = stable_object_digest_normalized(steam_id, serial_number);
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
+}
+
+fn stable_object_digest_normalized(steam_id: &str, serial_number: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(OBJECT_ID_DOMAIN);
     update_length_prefixed(&mut hasher, steam_id.as_bytes());
     update_length_prefixed(&mut hasher, serial_number.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().into()
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
@@ -973,6 +1040,19 @@ mod tests {
             derive_stable_object_id(" 76561198000000001 ", "SERIAL-Case-42").unwrap()
         );
         assert_eq!(parsed.stable_object_id_from_document().unwrap(), first);
+
+        let object_uuid = parsed.stable_object_uuid("76561198000000001").unwrap();
+        assert_eq!(
+            object_uuid,
+            derive_stable_object_uuid("76561198000000001", "SERIAL-Case-42").unwrap()
+        );
+        assert_eq!(
+            parsed.stable_object_uuid_from_document().unwrap(),
+            object_uuid
+        );
+        let object_uuid = Uuid::parse_str(&object_uuid).unwrap();
+        assert_eq!(object_uuid.get_version_num(), 8);
+        assert_eq!(object_uuid.get_variant(), uuid::Variant::RFC4122);
     }
 
     #[test]

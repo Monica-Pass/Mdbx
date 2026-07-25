@@ -282,28 +282,45 @@ process-local ExtensionProfile registry and separately activate
 `com.monica.steam.store` when it is ready to perform user-visible writes.
 Profile registration is not permission and does not replace Tiga authorization.
 
-Treat every mafile as untrusted JSON. Parse it through the Adapter's bounded
-parser before constructing a generic `WriteCommand`; do not create a second
-client-specific parser with `serde_json::from_slice`. The default contract is
-1 MiB input, depth 32, 512 aggregate fields, 512 items per array, 8,192
-aggregate nodes, 64 KiB per string/key, and 1 MiB aggregate string/key bytes.
-The Adapter rejects duplicate keys, returns static non-disclosing errors, and
-preserves unknown fields in canonical JSON. A client may lower limits for a
-smaller device, but cannot raise the hard ceilings.
+Clients that want storage mapping should also ship the independently removable
+`mdbx-adapter-steam-storage` crate. Its registration helper registers only the
+process-local descriptor; the client still activates the capability separately
+and creates or updates the persisted CollectionProfile through the ordinary
+tracked storage API.
+
+Treat every mafile as untrusted JSON. Use `SteamMaFileImportPlan::prepare` for
+storage imports instead of writing a second parser, UUID mapper, or
+create/update decision tree in the UI. The bridge delegates per-document
+parsing to the pure Adapter, whose default contract is 1 MiB input, depth 32,
+512 aggregate fields, 512 items per array, 8,192 aggregate nodes, 64 KiB per
+string/key, and 1 MiB aggregate string/key bytes. The Adapter rejects duplicate
+keys, returns static non-disclosing errors, and preserves unknown fields in
+canonical JSON. A client may lower limits for a smaller device, but cannot
+raise the hard ceilings.
 
 Use the canonical JSON bytes as the opaque payload of an object whose exact
-ObjectTypeId is `com.monica.steam.mafile`. Derive the object ID from the
-authenticated account SteamID and the mafile serial number through the
-Adapter's stable-ID method; never derive it from an account name, title, path,
-secret, or list position. Keep parsed values and canonical bytes in protected
-process memory until the generic authenticated encryption write succeeds, and
-never log them. Importing several mafiles is one bounded user-level
-`CommitOperation`, not one commit per JSON field or object.
+ObjectTypeId is `com.monica.steam.mafile`. The bridge projects the Adapter's
+domain-separated identity into a deterministic RFC-variant version-8 UUID;
+never derive identity from an account name, title, path, secret, or list
+position. It sorts by that UUID, rejects duplicates, and uses payload-free
+summaries to choose create, update, or restore-then-update. An existing object
+must belong to the requested Collection and retain the exact type and payload
+schema version. Missing source documents do not mean delete.
 
-The Adapter performs no Steam network action, Android integration, token
-refresh, or storage write. If a build removes it, existing Steam objects stay
-available as opaque records for synchronization, backup, restore, and recovery;
-the client must not delete or reinterpret them.
+The import default is 128 documents and 8 MiB aggregate source bytes; hard
+ceilings are 2,048 documents and 64 MiB. Per-document and generic write limits
+still apply. Keep the request and prepared plan in protected process memory,
+never log source or canonical bytes, and execute the plan through the provided
+generic coordinator path. One successful batch produces one commit, including
+restore-then-update. If execution outcome is uncertain, retry the same prepared
+plan. Re-reading files or rebuilding a plan after vault state changes is a new
+planning action and must not be presented as the retry of the earlier plan.
+
+The pure Adapter performs no Steam network action, Android integration, token
+refresh, or storage write; the storage bridge only prepares and executes
+generic MDBX writes. If a build removes either layer, existing Steam objects
+stay available as opaque records for synchronization, backup, restore, and
+recovery; the client must not delete or reinterpret them.
 
 ### 4.2 Deletion Must Use Tombstones
 

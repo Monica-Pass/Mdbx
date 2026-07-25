@@ -99,8 +99,26 @@ unknown mafile fields in deterministic canonical output, rejects duplicate
 keys, and exposes a stable non-secret object ID derived from a canonical
 SteamID and serial number. A document may provide its own SteamID; clients may
 also supply the authenticated account SteamID when a mafile variant omits it.
+The same domain-separated digest has a deterministic RFC variant, custom
+version-8 UUID projection for the Generic Object Module.
 The Adapter's profile and parser are process-local code metadata; neither is
 stored in a Collection, snapshot, or synchronization wire payload.
+
+### SteamMaFileStorageBridge
+
+`SteamMaFileStorageBridge` is the independently removable mapping in
+`crates/mdbx-adapter-steam-storage`. It accepts bounded mafile sources, uses
+the pure Adapter for parsing and stable UUID identity, reads existing state
+through payload-free ObjectSummaryRepo, and prepares existing generic
+WriteCommands for one OperationCoordinator commit. It owns create, update,
+restore-then-update, deterministic ordering, aggregate limits, duplicate
+identity rejection, and exact prepared-plan retry rules, but it adds no Steam
+schema, synchronization field, key access, raw SQL, or Tiga authority.
+
+Profile registration and `com.monica.steam.store` capability activation are
+separate client actions. Missing input documents do not imply deletion.
+Removing the bridge removes this mapping only; removing both Steam crates
+still leaves stored objects preservable as opaque generic records.
 
 ### CapabilitySet
 

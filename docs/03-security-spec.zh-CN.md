@@ -159,6 +159,17 @@ Adapter 在规范输出中保留未知字段，但不得让这些字段变成可
 结构/资源类别与静态字段标签，不能输出 mafile 值或 secret。稳定对象 ID 是对规范化身份组成
 部分的命名空间隔离哈希，不是 secret，也不能替代认证。
 
+可选的 `mdbx-adapter-steam-storage` bridge MUST 保持同一明文边界。source、request、
+prepared plan 和 error 的 Debug 输出都不得泄漏 mafile 字节、SteamID、serial number、账号名、
+token 或 secret 字段。整批输入必须在逐份解析前有界：默认最多 128 份文档、源字节聚合
+8 MiB，硬上限为 2,048 份和 64 MiB；单文档限制与通用 write limits 继续作为独立防线。
+
+规划阶段 MUST 只通过不含 payload 的 summary 读取已有对象，并在 mutation 前检查 Collection
+归属、精确 ObjectTypeId 与 payload schema version。capability 拒绝或后续任一命令失败都
+MUST 回滚整批。执行结果不确定时只能复用同一份内存 prepared plan；客户端不得把 plan
+序列化到磁盘或日志，也不得把基于已变化 vault 状态的重新规划当作同一次重试。输入缺失对象
+MUST NOT 触发隐式删除。
+
 ## 5. 必需用户警告
 
 当用户切换到更弱模式时，UI 必须：

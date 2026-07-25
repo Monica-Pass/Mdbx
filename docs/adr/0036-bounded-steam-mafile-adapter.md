@@ -36,6 +36,10 @@ interface:
 - `derive_stable_object_id` and the corresponding document method return a
   lowercase SHA-256 digest over a domain tag and length-framed canonical
   SteamID/serial components. The digest is an opaque object ID, not a secret.
+- `derive_stable_object_uuid` and the corresponding document methods project
+  the first 128 digest bits into an RFC-variant custom version-8 UUID for
+  generic MDBX write commands. They introduce neither randomness nor another
+  identity domain.
 - The document may contain a root SteamID. A client can provide an
   authenticated account SteamID for variants that omit it; a present,
   conflicting document value is rejected.

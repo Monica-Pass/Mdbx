@@ -428,13 +428,28 @@ feature。该 crate 不依赖 storage、sync、CLI、FFI、Android 或网络；�
 限制。解析前先检查输入字节数；重复对象键直接失败；错误文本不包含源字段值。
 
 Adapter 保留未知字段并输出确定性的规范 JSON，因此旧客户端可以原样保存新 Steam
-生产者新增的字段。稳定对象 ID 使用命名空间隔离、长度分帧的 SHA-256，输入是规范化
-的无符号 64 位 SteamID 与去除首尾空白但保留大小写的 serial number。mafile 可以带
-自己的 SteamID；缺失时客户端可提供已认证账号的 SteamID，若两者不一致则拒绝。该
-哈希只是 opaque identity，不能替代加密、认证或 Steam 凭据。
+生产者新增的字段。稳定对象摘要使用命名空间隔离、长度分帧的 SHA-256，输入是规范化
+的无符号 64 位 SteamID 与去除首尾空白但保留大小写的 serial number；Generic Object
+投影使用摘要前 128 bit，并设置 RFC variant 与自定义 UUID version 8。mafile 可以带
+自己的 SteamID；缺失时客户端可提供已认证账号的 SteamID，若两者不一致则拒绝。摘要
+与 UUID 都只是 opaque identity，不能替代加密、认证或 Steam 凭据。
 
 Adapter 的 Debug 和错误接口不得输出 payload 值。客户端必须把解析文档和规范字节留在
 受保护的进程内存中，并在持久化前交给通用认证加密路径。多份 mafile 导入仍应由一个有界
 `CommitOperation` 表示；Adapter 自身不创建表、schema 列、同步字段、commit，也不获得
 Tiga 权限。移除 Adapter 不得删除、改写、重分类或阻止不透明读取、同步、备份、恢复和
 诊断。
+
+可选的 `crates/mdbx-adapter-steam-storage` bridge 把纯 Adapter 映射到已有通用 storage
+API。它默认 feature 为空，只依赖纯 Adapter 与 `mdbx-storage` core。prepare 会先校验整批、
+按稳定 UUID 排序、拒绝重复 identity，并且只通过不含 payload 的 Object summary 读取已有
+状态；输出仍是已有 create、update 或 restore-then-update 通用命令，不增加 Steam 专用表、
+列、snapshot 字段、sync 字段、critical extension 或密钥格式。
+
+bridge 默认每批最多 128 份文档、源字节聚合 8 MiB，硬上限为 2,048 份和 64 MiB。完全
+相同的 prepared plan 重试会幂等返回原 commit；根据已变化 vault 状态重新规划属于新动作。
+输入中缺失的对象不会自动删除。Profile 注册与 `com.monica.steam.store` 激活继续分离，
+capability 缺失会回滚完整 operation。
+
+MDBX1 与 MDBX1-DRAFT 文件升级仍由 storage core 迁移器负责，bridge 不把兼容转换转移给
+客户端。裁剪 bridge 或同时裁剪两个 Steam crate，都不会破坏已有加密通用行和旧兼容投影。

@@ -526,7 +526,9 @@ impl CommitContext {
             .take()
             .ok_or_else(|| StorageError::Validation("missing active operation".to_string()))?;
         let result = (|| -> StorageResult<String> {
-            if active.operation.commit_kind != commit_kind {
+            if active.operation.commit_kind != commit_kind
+                && active.operation.commit_kind != "multi"
+            {
                 return Err(StorageError::Validation(format!(
                     "operation commit kind {} cannot contain {}",
                     active.operation.commit_kind, commit_kind
