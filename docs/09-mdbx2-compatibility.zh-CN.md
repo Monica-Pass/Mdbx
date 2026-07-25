@@ -492,3 +492,24 @@ ChangeScope 严格解析由核心统一拥有。history 验证、CLI 数据库�
 CommitContext 还会在直接 CommitOperation 打开写事务前验证 commit kind 与 change scope。
 活动 operation 中聚合的 repository commit 也会先验证分类，再修改聚合元数据。公开的字符串
 CommitOperation 保持源码兼容，但不能再写入当前核心无法读取或传输的值。
+
+### 7.18 版本化 Operation 请求身份
+
+新的 operation 行复用现有 `request_hash` BLOB 保存版本化
+`OperationRequestIdentity`。版本 1 固定为 40 字节：`MDBXORI1` 后接现有 32 字节规范请求
+摘要。storage 在解析稳定分支后、执行任何 repository mutation 前生成该身份。活动 operation
+在聚合最终 parents、变更对象、change scope、message 和加密摘要时始终保留这份初始身份。
+
+operation 完整性认证完整编码值。重试处理先验证完整性，再比较请求元数据。版本化身份始终
+精确匹配，因此调用方即使没有提供 `intent_hash`，相同 operation ID 搭配变化后的内容也会
+被拒绝。未知长度以及前缀未知的 40 字节值同样 fail closed。
+
+现有未标记 32 字节值保持原样，无需迁移。直接 operation 重试以及带显式 intent 的 legacy
+请求继续精确比较。没有显式 intent 的旧聚合 operation 保留早期重试语义，因为旧 writer
+可能已经用最终聚合摘要覆盖初始请求摘要。迁移无法在保持认证历史不变的前提下恢复已经丢失
+的初始输入。
+
+operation metadata DTO 与 bundle version 均保持不变。CLI export、同步 bundle、incoming
+apply 和数据库重新载入都会精确保留两种字节表示。MDBX1 与 MDBX1-DRAFT 没有 operation
+metadata，其读取和升级行为不受影响。当前 reader 接受旧行；可靠重试当前 40 字节身份时
+需要使用当前 storage core。

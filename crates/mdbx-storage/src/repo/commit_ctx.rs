@@ -14,6 +14,9 @@ use crate::crypto_layer::FieldKeyPurpose;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::branch::BranchRepo;
 
+const OPERATION_REQUEST_IDENTITY_V1_PREFIX: &[u8] = b"MDBXORI1";
+const LEGACY_OPERATION_REQUEST_HASH_BYTES: usize = 32;
+
 /// 一个用户级变更中的对象摘要。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CommitChange {
@@ -99,6 +102,7 @@ pub enum OperationExecution<T> {
 
 struct ActiveOperation {
     operation: CommitOperation,
+    request_identity: Vec<u8>,
     commit_id: Option<String>,
 }
 
@@ -182,7 +186,8 @@ impl CommitContext {
             .inner()
             .query_row(
                 "SELECT o.commit_id, o.operation_kind, o.branch_id, o.branch_name,
-                        c.commit_kind, c.change_scope, o.request_hash
+                        c.commit_kind, c.change_scope, o.change_summary_ct,
+                        o.request_hash, c.created_at, o.integrity_tag
                  FROM commit_operations o
                  JOIN commits c ON c.commit_id = o.commit_id
                  WHERE o.operation_id = ?1",
@@ -196,6 +201,9 @@ impl CommitContext {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
                     ))
                 },
             )
@@ -207,9 +215,24 @@ impl CommitContext {
             branch_name,
             commit_kind,
             change_scope,
+            change_summary_ct,
             request_hash,
+            created_at,
+            operation_integrity_tag,
         )) = existing
         {
+            Self::verify_operation_integrity_values(
+                conn,
+                &operation.operation_id,
+                &commit_id,
+                &operation_kind,
+                branch_id.as_deref(),
+                &branch_name,
+                &change_summary_ct,
+                &request_hash,
+                &created_at,
+                &operation_integrity_tag,
+            )?;
             let compatible_scope =
                 change_scope == operation.change_scope || change_scope == "multi";
             let compatible_branch = Self::branch_request_matches_existing(
@@ -217,13 +240,16 @@ impl CommitContext {
                 branch_id.as_deref(),
                 &branch_name,
             );
-            let compatible_intent = operation.intent_hash.is_none()
-                || request_hash
-                    == Self::operation_request_hash_for_existing(
-                        &operation,
-                        branch_id.as_deref(),
-                        &branch_name,
-                    )?;
+            let request_digest = Self::operation_request_hash_for_existing(
+                &operation,
+                branch_id.as_deref(),
+                &branch_name,
+            )?;
+            let compatible_intent = Self::stored_request_identity_matches(
+                &request_hash,
+                &request_digest,
+                operation.intent_hash.is_some(),
+            )?;
             if operation_kind != operation.operation_kind
                 || !compatible_branch
                 || commit_kind != operation.commit_kind
@@ -239,11 +265,13 @@ impl CommitContext {
         }
 
         let operation = Self::resolve_new_operation_branch(conn, operation)?;
+        let request_identity = Self::operation_request_identity(&operation)?;
 
         let scoped = CommitContext {
             device_id: self.device_id.clone(),
             active_operation: RefCell::new(Some(ActiveOperation {
                 operation,
+                request_identity,
                 commit_id: None,
             })),
         };
@@ -314,31 +342,57 @@ impl CommitContext {
     ) -> StorageResult<String> {
         Self::validate_operation(operation)?;
 
-        if let Some((commit_id, stored_hash, branch_id, branch_name)) = conn
+        if let Some((
+            commit_id,
+            operation_kind,
+            branch_id,
+            branch_name,
+            change_summary_ct,
+            stored_hash,
+            created_at,
+            operation_integrity_tag,
+        )) = conn
             .inner()
             .query_row(
-                "SELECT commit_id, request_hash, branch_id, branch_name
+                "SELECT commit_id, operation_kind, branch_id, branch_name,
+                        change_summary_ct, request_hash, created_at, integrity_tag
                  FROM commit_operations WHERE operation_id = ?1",
                 params![operation.operation_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
                     ))
                 },
             )
             .optional()
             .map_err(StorageError::Database)?
         {
-            let request_hash = Self::operation_request_hash_for_existing(
+            Self::verify_operation_integrity_values(
+                conn,
+                &operation.operation_id,
+                &commit_id,
+                &operation_kind,
+                branch_id.as_deref(),
+                &branch_name,
+                &change_summary_ct,
+                &stored_hash,
+                &created_at,
+                &operation_integrity_tag,
+            )?;
+            let request_digest = Self::operation_request_hash_for_existing(
                 operation,
                 branch_id.as_deref(),
                 &branch_name,
             )?;
             if !Self::branch_request_matches_existing(operation, branch_id.as_deref(), &branch_name)
-                || stored_hash != request_hash
+                || !Self::stored_request_identity_matches(&stored_hash, &request_digest, true)?
             {
                 return Err(StorageError::Validation(format!(
                     "operation {} was reused with different content",
@@ -349,7 +403,16 @@ impl CommitContext {
         }
 
         let operation = Self::resolve_new_operation_branch(conn, operation.clone())?;
-        let request_hash = Self::operation_request_hash(&operation)?;
+        let request_hash = Self::operation_request_identity(&operation)?;
+        self.insert_operation_commit_inner(conn, &operation, &request_hash)
+    }
+
+    fn insert_operation_commit_inner(
+        &self,
+        conn: &VaultConnection,
+        operation: &CommitOperation,
+        request_hash: &[u8],
+    ) -> StorageResult<String> {
         let branch_id = operation.branch_id.as_deref().ok_or_else(|| {
             StorageError::Validation("resolved operation has no branch ID".to_string())
         })?;
@@ -401,10 +464,10 @@ impl CommitContext {
         )?;
         let operation_integrity = Self::operation_integrity(
             conn,
-            &operation,
+            operation,
             &commit_id,
             &change_summary_ct,
-            &request_hash,
+            request_hash,
             &now,
         )?;
 
@@ -560,7 +623,11 @@ impl CommitContext {
                 self.rewrite_active_commit(conn, &mut active)?;
                 Ok(commit_id)
             } else {
-                let commit_id = self.create_operation_commit_inner(conn, &active.operation)?;
+                let commit_id = self.insert_operation_commit_inner(
+                    conn,
+                    &active.operation,
+                    &active.request_identity,
+                )?;
                 active.commit_id = Some(commit_id.clone());
                 active.operation.parents = self.parents_for_commit(conn, &commit_id)?;
                 Ok(commit_id)
@@ -628,7 +695,7 @@ impl CommitContext {
             .as_deref()
             .map(|message| Self::encrypt_history(conn, commit_id, "message", message.as_bytes()))
             .transpose()?;
-        let request_hash = Self::operation_request_hash(&active.operation)?;
+        let request_hash = active.request_identity.clone();
         let integrity_tag = compute_commit_integrity_tag(
             conn.keyring(),
             &CommitIntegrityInput {
@@ -875,6 +942,34 @@ impl CommitContext {
         Self::operation_request_hash(&canonical)
     }
 
+    fn operation_request_identity(operation: &CommitOperation) -> StorageResult<Vec<u8>> {
+        let digest = Self::operation_request_hash(operation)?;
+        let mut identity =
+            Vec::with_capacity(OPERATION_REQUEST_IDENTITY_V1_PREFIX.len() + digest.len());
+        identity.extend_from_slice(OPERATION_REQUEST_IDENTITY_V1_PREFIX);
+        identity.extend_from_slice(&digest);
+        Ok(identity)
+    }
+
+    fn stored_request_identity_matches(
+        stored: &[u8],
+        requested_digest: &[u8],
+        require_legacy_exact_match: bool,
+    ) -> StorageResult<bool> {
+        if stored.len()
+            == OPERATION_REQUEST_IDENTITY_V1_PREFIX.len() + LEGACY_OPERATION_REQUEST_HASH_BYTES
+            && stored.starts_with(OPERATION_REQUEST_IDENTITY_V1_PREFIX)
+        {
+            return Ok(&stored[OPERATION_REQUEST_IDENTITY_V1_PREFIX.len()..] == requested_digest);
+        }
+        if stored.len() == LEGACY_OPERATION_REQUEST_HASH_BYTES {
+            return Ok(!require_legacy_exact_match || stored == requested_digest);
+        }
+        Err(StorageError::Validation(
+            "unsupported operation request identity encoding".to_string(),
+        ))
+    }
+
     fn validate_operation(operation: &CommitOperation) -> StorageResult<()> {
         for (name, value) in [
             ("operation_id", operation.operation_id.as_str()),
@@ -1048,43 +1143,69 @@ impl CommitContext {
         commit: &Commit,
         operation: &mdbx_sync::CommitOperationMetadata,
     ) -> StorageResult<()> {
-        let parts = if let Some(branch_id) = operation.branch_id.as_deref() {
+        Self::verify_operation_integrity_values(
+            conn,
+            &operation.operation_id,
+            &commit.commit_id,
+            &operation.operation_kind,
+            operation.branch_id.as_deref(),
+            &operation.branch_name,
+            &operation.change_summary_ct,
+            &operation.request_hash,
+            &commit.created_at,
+            &operation.integrity_tag,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_operation_integrity_values(
+        conn: &VaultConnection,
+        operation_id: &str,
+        commit_id: &str,
+        operation_kind: &str,
+        branch_id: Option<&str>,
+        branch_name: &str,
+        change_summary_ct: &[u8],
+        request_hash: &[u8],
+        created_at: &str,
+        integrity_tag: &[u8],
+    ) -> StorageResult<()> {
+        let parts = if let Some(branch_id) = branch_id {
             vec![
                 b"mdbx-operation-integrity-v2".as_slice(),
-                operation.operation_id.as_bytes(),
-                commit.commit_id.as_bytes(),
-                operation.operation_kind.as_bytes(),
+                operation_id.as_bytes(),
+                commit_id.as_bytes(),
+                operation_kind.as_bytes(),
                 branch_id.as_bytes(),
-                operation.branch_name.as_bytes(),
-                operation.change_summary_ct.as_slice(),
-                operation.request_hash.as_slice(),
-                commit.created_at.as_bytes(),
+                branch_name.as_bytes(),
+                change_summary_ct,
+                request_hash,
+                created_at.as_bytes(),
             ]
         } else {
             vec![
                 b"mdbx-operation-integrity-v1".as_slice(),
-                operation.operation_id.as_bytes(),
-                commit.commit_id.as_bytes(),
-                operation.operation_kind.as_bytes(),
-                operation.branch_name.as_bytes(),
-                operation.change_summary_ct.as_slice(),
-                operation.request_hash.as_slice(),
-                commit.created_at.as_bytes(),
+                operation_id.as_bytes(),
+                commit_id.as_bytes(),
+                operation_kind.as_bytes(),
+                branch_name.as_bytes(),
+                change_summary_ct,
+                request_hash,
+                created_at.as_bytes(),
             ]
         };
         let expected = Self::authenticate_operation_parts(conn, &parts)?;
-        let mut valid = expected == operation.integrity_tag;
+        let mut valid = expected.as_slice() == integrity_tag;
         if !valid
             && conn.keyring().is_some()
-            && serde_json::from_slice::<serde_json::Value>(&operation.change_summary_ct).is_ok()
+            && serde_json::from_slice::<serde_json::Value>(change_summary_ct).is_ok()
         {
-            valid = Self::plain_operation_parts_hash(&parts).as_slice()
-                == operation.integrity_tag.as_slice();
+            valid = Self::plain_operation_parts_hash(&parts).as_slice() == integrity_tag;
         }
         if !valid {
             return Err(StorageError::Validation(format!(
                 "incoming operation {} integrity mismatch",
-                operation.operation_id
+                operation_id
             )));
         }
         Ok(())
@@ -1705,6 +1826,233 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
             .unwrap();
         assert_eq!(projects, 1);
+    }
+
+    #[test]
+    fn operation_retry_without_explicit_intent_rejects_changed_request_metadata() {
+        let (conn, ctx) = initialized();
+        let original = CommitOperation::new(
+            "no-intent-changed-request",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        )
+        .with_message("first request");
+        ctx.run_operation(&conn, original, |scoped| {
+            ProjectRepo::create(&conn, scoped, "First", None, None)
+        })
+        .unwrap();
+
+        let changed = CommitOperation::new(
+            "no-intent-changed-request",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        )
+        .with_message("different request");
+        let error = ctx
+            .run_operation(&conn, changed, |_| -> StorageResult<()> {
+                panic!("changed retry closure must not execute")
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("different operation"));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn operation_retry_rejects_tampered_stored_request_identity() {
+        let (conn, ctx) = initialized();
+        let operation = CommitOperation::new(
+            "tampered-request-identity",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        ctx.run_operation(&conn, operation.clone(), |scoped| {
+            ProjectRepo::create(&conn, scoped, "First", None, None)
+        })
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE commit_operations SET request_hash = X'00' WHERE operation_id = ?1",
+                params![operation.operation_id],
+            )
+            .unwrap();
+
+        let error = ctx
+            .run_operation(&conn, operation, |_| -> StorageResult<()> {
+                panic!("tampered retry closure must not execute")
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("integrity mismatch"));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn operation_retry_rejects_authenticated_unknown_request_identity_encoding() {
+        let (conn, ctx) = initialized();
+        let operation = CommitOperation::new(
+            "unknown-request-identity-encoding",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let resolved =
+            CommitContext::resolve_new_operation_branch(&conn, operation.clone()).unwrap();
+        let execution = ctx
+            .run_operation(&conn, operation.clone(), |scoped| {
+                ProjectRepo::create(&conn, scoped, "First", None, None)
+            })
+            .unwrap();
+        let commit_id = match execution {
+            OperationExecution::Applied { commit_id, .. } => commit_id,
+            OperationExecution::AlreadyCommitted { .. } => panic!("first call must execute"),
+        };
+        let (change_summary_ct, created_at): (Vec<u8>, String) = conn
+            .inner()
+            .query_row(
+                "SELECT change_summary_ct, created_at FROM commit_operations
+                 WHERE operation_id = ?1",
+                params![operation.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut unknown_identity = b"MDBXORI2".to_vec();
+        unknown_identity.extend([0_u8; LEGACY_OPERATION_REQUEST_HASH_BYTES]);
+        let integrity_tag = CommitContext::operation_integrity(
+            &conn,
+            &resolved,
+            &commit_id,
+            &change_summary_ct,
+            &unknown_identity,
+            &created_at,
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE commit_operations SET request_hash = ?1, integrity_tag = ?2
+                 WHERE operation_id = ?3",
+                params![unknown_identity, integrity_tag, operation.operation_id],
+            )
+            .unwrap();
+
+        let error = ctx
+            .run_operation(&conn, operation, |_| -> StorageResult<()> {
+                panic!("unknown identity retry closure must not execute")
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported operation request identity encoding"));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coalesced_operation_keeps_the_versioned_initial_request_identity() {
+        let (conn, ctx) = initialized();
+        let operation = CommitOperation::new(
+            "stable-initial-request-identity",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        )
+        .with_message("create two projects");
+        let resolved =
+            CommitContext::resolve_new_operation_branch(&conn, operation.clone()).unwrap();
+        let expected = CommitContext::operation_request_identity(&resolved).unwrap();
+
+        ctx.run_operation(&conn, operation, |scoped| {
+            ProjectRepo::create(&conn, scoped, "First", None, None)?;
+            ProjectRepo::create(&conn, scoped, "Second", None, None)
+        })
+        .unwrap();
+
+        let stored: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT request_hash FROM commit_operations WHERE operation_id = ?1",
+                params!["stable-initial-request-identity"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected);
+        assert!(stored.starts_with(OPERATION_REQUEST_IDENTITY_V1_PREFIX));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_untagged_coalesced_operation_remains_retryable() {
+        let (conn, ctx) = initialized();
+        let operation = CommitOperation::new(
+            "legacy-untagged-coalesced-operation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let resolved =
+            CommitContext::resolve_new_operation_branch(&conn, operation.clone()).unwrap();
+        let legacy_request_hash = CommitContext::operation_request_hash(&resolved).unwrap();
+        let execution = ctx
+            .run_operation(&conn, operation.clone(), |scoped| {
+                ProjectRepo::create(&conn, scoped, "Legacy", None, None)
+            })
+            .unwrap();
+        let commit_id = match execution {
+            OperationExecution::Applied { commit_id, .. } => commit_id,
+            OperationExecution::AlreadyCommitted { .. } => panic!("first call must execute"),
+        };
+        let (change_summary_ct, created_at): (Vec<u8>, String) = conn
+            .inner()
+            .query_row(
+                "SELECT change_summary_ct, created_at FROM commit_operations
+                 WHERE operation_id = ?1",
+                params![operation.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let integrity_tag = CommitContext::operation_integrity(
+            &conn,
+            &resolved,
+            &commit_id,
+            &change_summary_ct,
+            &legacy_request_hash,
+            &created_at,
+        )
+        .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE commit_operations SET request_hash = ?1, integrity_tag = ?2
+                 WHERE operation_id = ?3",
+                params![legacy_request_hash, integrity_tag, operation.operation_id],
+            )
+            .unwrap();
+
+        let retried = ctx
+            .run_operation(&conn, operation, |_| -> StorageResult<()> {
+                panic!("legacy retry closure must not execute")
+            })
+            .unwrap();
+
+        assert!(matches!(
+            retried,
+            OperationExecution::AlreadyCommitted { .. }
+        ));
+        assert_eq!(ProjectRepo::list_all(&conn).unwrap().len(), 1);
     }
 
     #[test]

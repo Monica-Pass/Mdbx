@@ -3832,6 +3832,44 @@ mod tests {
         assert!(scopes.iter().any(|scope| scope == "branch"));
     }
 
+    #[test]
+    fn serialized_commit_loader_preserves_versioned_request_identity() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("request-identity-loader-device".to_string());
+        let operation_id = "loader-versioned-request-identity";
+        ctx.create_operation_commit(
+            &conn,
+            &CommitOperation::new(
+                operation_id,
+                "loader-request-identity-test",
+                "main",
+                "change",
+                "project",
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let stored: Vec<u8> = conn
+            .inner()
+            .query_row(
+                "SELECT request_hash FROM commit_operations WHERE operation_id = ?1",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let loaded = load_serialized_commits(&conn).unwrap();
+        let serialized = loaded
+            .iter()
+            .filter_map(|commit| commit.operation.as_ref())
+            .find(|operation| operation.operation_id == operation_id)
+            .unwrap();
+        assert_eq!(serialized.request_hash, stored);
+        assert!(serialized.request_hash.starts_with(b"MDBXORI1"));
+        assert_eq!(serialized.request_hash.len(), 40);
+    }
+
     const TEST_PASSWORD: &str = "test-password";
 
     struct TempVault {
@@ -6112,6 +6150,26 @@ mod tests {
         .unwrap();
 
         let target_conn = open_unlocked(&target_path);
+        let mut versioned_operation_count = 0;
+        for operation in bundle
+            .commits
+            .iter()
+            .filter_map(|commit| commit.operation.as_ref())
+        {
+            let applied_request_hash: Vec<u8> = target_conn
+                .inner()
+                .query_row(
+                    "SELECT request_hash FROM commit_operations WHERE operation_id = ?1",
+                    params![operation.operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(applied_request_hash, operation.request_hash);
+            if operation.request_hash.starts_with(b"MDBXORI1") {
+                versioned_operation_count += 1;
+            }
+        }
+        assert!(versioned_operation_count > 0);
         let target_projects = ProjectRepo::list_all(&target_conn).unwrap();
         let synced_project = target_projects
             .iter()

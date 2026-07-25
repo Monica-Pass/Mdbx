@@ -182,6 +182,23 @@ unknown scope instead of converting it to `multi`, because kind and scope are
 inputs to commit integrity. A new local CommitOperation MUST validate both
 taxonomies before its write transaction begins.
 
+Every new `CommitOperation` MUST persist the immutable submitted-request
+identity before executing repository mutations. The existing `request_hash`
+BLOB carries version 1 as the eight-byte `MDBXORI1` prefix followed by the
+existing 32-byte canonical request digest. The digest is derived after stable
+branch resolution. Commit coalescing MAY update the resulting commit metadata
+and encrypted change summary, but MUST preserve this initial 40-byte identity.
+
+Retry processing MUST verify operation integrity before using stored metadata.
+A versioned identity MUST match the submitted request exactly, including when
+`intent_hash` is absent. Existing untagged 32-byte hashes remain legacy input:
+direct operations and explicit legacy intents still compare exactly, while a
+legacy coalesced operation without explicit intent retains historical retry
+behavior because its original digest may have been overwritten by an earlier
+writer. Every other length or 40-byte value with an unknown prefix MUST fail
+closed. Synchronization MUST carry either recognized representation as opaque
+authenticated bytes without normalization.
+
 ## 9. Conflict Detection
 
 MDBX MUST detect concurrent edits using causal metadata, not timestamp alone.

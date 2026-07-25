@@ -1597,7 +1597,7 @@ pub fn bundle_file_from_bytes_authenticated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ObjectPayload;
+    use crate::message::{CommitOperationMetadata, ObjectPayload};
     use mdbx_core::model::Commit;
 
     struct FailingWriter {
@@ -1830,6 +1830,30 @@ mod tests {
 
             assert_eq!(restored.commits[0].commit.change_scope, scope);
         }
+    }
+
+    #[test]
+    fn bundle_roundtrip_preserves_versioned_operation_request_identity() {
+        let mut bundle = sample_bundle();
+        let mut request_identity = b"MDBXORI1".to_vec();
+        request_identity.extend(0_u8..32);
+        bundle.commits[0].operation = Some(CommitOperationMetadata {
+            operation_id: "operation-1".to_string(),
+            operation_kind: "edit-session".to_string(),
+            branch_id: Some("branch-1".to_string()),
+            branch_name: "main".to_string(),
+            change_summary_ct: vec![1, 2, 3],
+            request_hash: request_identity.clone(),
+            integrity_tag: vec![4, 5, 6],
+        });
+
+        let bytes = bundle_to_bytes(&bundle).unwrap();
+        let restored = bundle_from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            restored.commits[0].operation.as_ref().unwrap().request_hash,
+            request_identity
+        );
     }
 
     #[test]

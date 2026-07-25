@@ -231,6 +231,11 @@ MDBX2 写入客户端 SHOULD 在用户动作开始时生成稳定的 `operation_
 必须复用同一个 `operation_id`；storage core 会幂等返回原 commit。不得对内容不同的请求
 复用同一个 ID。
 
+完整初始请求应作为不可变重试状态保存。在调用结果确定前，客户端需要保留原命令列表、
+message、parents、分支选择条件和可选 `intent_hash`；根据当前 UI 状态重新构造的请求可能已经
+变化，此时会被拒绝。客户端无需计算或持久化数据库中的 `request_hash`。当前 storage core
+会在 mutation 前生成版本化身份，并在每次重试时比较，即使没有显式 `intent_hash` 也适用。
+
 `CommitOperation` 还应明确提供 `operation_kind`、目标 `branch_name`、对象类型、动作和字段
 摘要。storage core 负责原子分配设备 `local_seq`、合并 parent 向量时钟、写入旧 `commits`
 兼容投影，并同步更新 device head 和指定 branch head。客户端不得自行计算 `MAX(local_seq)+1`。

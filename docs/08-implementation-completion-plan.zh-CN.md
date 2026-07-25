@@ -275,6 +275,7 @@ MDBX 必须坚持：
 - Native OperationCoordinator 已在执行前确定 commit kind：普通写为 `change`、单独恢复为 `restore`、单独移动为 `move`，混合 repository kind 为 `multi`。restore-then-update 与 move 均有回归测试，避免一次用户动作被迫拆成多条 commit。
 - commit kind 已统一为核心严格契约：`change`、`merge`、`snapshot`、`key-rotation`、`move`、`copy`、`restore`、`multi` 在 storage history、CLI、sync bundle 与 FFI 中精确往返；未知值 fail closed，不再静默降级为 `change`。旧四种 bincode 枚举序号保持不变。
 - change scope 已统一为核心严格契约并补齐真实 `snapshot` 与 `branch` 范围；CLI 不再把未知值降级为 `multi`。CommitContext 在本地 operation 写事务前验证 kind/scope，活动 operation 聚合 repository commit 时也先验证，旧九种 bincode 枚举序号保持不变。
+- CommitOperation 初始请求身份已与最终聚合摘要分离：新行在现有 `request_hash` BLOB 中保存 `MDBXORI1` 加 32 字节摘要，聚合重写保持该 40 字节身份不变；无显式 intent 的变化请求也会拒绝。旧 32 字节行继续读取和同步，旧聚合 operation 保留历史重试语义，未知编码 fail closed。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：

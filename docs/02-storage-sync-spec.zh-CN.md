@@ -180,6 +180,18 @@ MDBX 必须维护类 Git 的逻辑历史。
 reader 与 writer 遇到未知 scope 时必须拒绝，不能转换为 `multi`，因为 kind 和 scope 都是
 commit 完整性输入。新的本地 CommitOperation 必须在启动写事务前验证两类值。
 
+每条新的 `CommitOperation` 必须在执行 repository mutation 前保存不可变的初始请求身份。
+现有 `request_hash` BLOB 使用版本 1 编码：八字节 `MDBXORI1` 前缀后接现有 32 字节规范请求
+摘要。摘要在稳定分支解析完成后生成。commit 聚合可以更新最终 commit 元数据和加密变更摘要，
+但必须始终保留这份 40 字节初始身份。
+
+重试处理必须先验证 operation 完整性，再使用已经保存的元数据。版本化身份必须与提交请求
+精确匹配，即使 `intent_hash` 为空也适用。现有未标记 32 字节摘要继续作为 legacy 输入：直接
+operation 与显式 legacy intent 仍然精确比较；没有显式 intent 的旧聚合 operation 保留历史
+重试语义，因为早期 writer 可能已经用最终聚合摘要覆盖其初始摘要。其他长度以及前缀未知的
+40 字节值必须 fail closed。同步层必须把两种已识别表示作为经过认证的不透明字节精确保留，
+不得规范化或重算。
+
 ## 9. 冲突检测
 
 MDBX 必须基于因果元数据检测并发修改，不能只靠时间戳。

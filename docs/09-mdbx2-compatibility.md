@@ -484,3 +484,33 @@ CommitOperation opens its write transaction. Repository commits coalesced into
 an active operation validate their taxonomy before changing aggregate
 metadata. The public string-shaped CommitOperation remains source compatible,
 but it can no longer persist a value the current core cannot read or transport.
+
+### 7.18 Versioned Operation Request Identity
+
+New operation rows use the existing `request_hash` BLOB as a versioned
+`OperationRequestIdentity`. Version 1 is exactly 40 bytes:
+`MDBXORI1` followed by the existing 32-byte canonical request digest. Storage
+derives it after resolving the stable branch and before executing any repository
+mutation. The active operation keeps this initial identity while its final
+parents, changed objects, change scope, message, and encrypted summary are
+coalesced.
+
+Operation integrity authenticates the complete encoded identity. Retry handling
+verifies that integrity before comparing request metadata. A versioned identity
+always matches exactly, so reusing an operation ID with changed content is
+rejected even when the caller omitted `intent_hash`. An unknown length or an
+unknown 40-byte prefix also fails closed.
+
+Existing untagged 32-byte values are preserved without migration. Direct
+operation retries and legacy requests with an explicit intent compare exactly.
+A legacy coalesced operation without explicit intent retains its earlier retry
+semantics because older writers may have replaced the initial request digest
+with the final aggregate digest. No migration can reconstruct that lost input
+without changing authenticated history.
+
+The operation metadata DTO and bundle versions remain unchanged. CLI export,
+synchronization bundles, incoming apply, and database reload carry either byte
+representation exactly. MDBX1 and MDBX1-DRAFT contain no operation metadata;
+their read and upgrade behavior is unaffected. Current readers accept legacy
+rows, while reliable retry of a current 40-byte identity requires a current
+storage core.

@@ -128,6 +128,24 @@ A `CapabilitySet` is the compile-time and runtime set of optional adapters prese
 
 A `CommitOperation` is one finite user intent executed atomically and represented by one commit whenever practical. Importing one `mafile`, moving a bookmark group, or applying one mail synchronization batch can contain multiple row mutations without producing a commit per internal row.
 
+### OperationRequestIdentity
+
+`OperationRequestIdentity` is the immutable identity of the submitted
+`CommitOperation`, distinct from the final aggregate change summary. New rows
+encode it in the existing `request_hash` BLOB as the eight-byte `MDBXORI1`
+prefix followed by the existing 32-byte canonical request digest. The identity
+is derived after stable branch resolution and before repository mutations, then
+remains unchanged while coalescing updates commit metadata. Operation integrity
+authenticates the complete encoded value, and synchronization transports it as
+opaque bytes.
+
+Existing untagged 32-byte request hashes remain legacy-compatible. Exact
+comparison is mandatory for new versioned identities and direct legacy
+operations. A legacy coalesced operation without an explicit intent retains
+historical retry behavior because an earlier writer may have replaced its
+initial digest with the final aggregate digest. Unknown lengths or version
+prefixes fail closed.
+
 ### CommitKind
 
 `CommitKind` is authenticated commit semantics, not a presentation hint. The
@@ -269,6 +287,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 46. Steam object identity is a domain-separated, length-framed SHA-256 digest of the canonical unsigned SteamID and trimmed case-preserving serial number. Debug and error interfaces never include mafile payload values.
 47. CommitKind is authenticated data. Every known value round-trips exactly across storage history, CLI, synchronization bundles, and FFI; unknown values are rejected and never coerced to `change`. Legacy binary discriminants 0 through 3 remain frozen.
 48. ChangeScope is authenticated data and `multi` is only a real aggregate scope. Snapshot and Branch are appended after the nine legacy binary variants; history, CLI, synchronization bundles, FFI, and local CommitOperation validation use the core exact parser and never coerce an unknown scope.
+49. OperationRequestIdentity is derived from the submitted operation before mutation and is never replaced by aggregate commit metadata. New tagged identities match exactly on every retry; authenticated unknown encodings fail closed, while untagged 32-byte rows retain their documented legacy behavior.
 
 ## Module Architecture
 

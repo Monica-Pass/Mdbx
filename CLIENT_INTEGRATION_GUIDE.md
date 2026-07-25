@@ -245,6 +245,14 @@ it through `CommitOperation` / `CommitContext::create_operation_commit`. A retry
 process restart must reuse that ID; storage returns the original commit idempotently. The same ID
 must never be reused for different request content.
 
+Treat the complete initial request as immutable retry state. Persist or retain
+the original command list, message, parents, branch selector, and optional
+`intent_hash` until the outcome is known; rebuilding a retry from the current UI
+state can produce a different request and will be rejected. Clients do not
+calculate or persist the database `request_hash`. Current storage derives a
+versioned identity before mutations and compares it on every retry, including
+requests without an explicit `intent_hash`.
+
 `CommitOperation` also carries the `operation_kind`, target `branch_name`, object types, actions,
 and field summaries. Storage atomically allocates the device `local_seq`, merges parent vector
 clocks, writes the legacy `commits` compatibility projection, and advances device and selected
