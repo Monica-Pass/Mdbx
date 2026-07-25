@@ -513,3 +513,23 @@ operation metadata DTO 与 bundle version 均保持不变。CLI export、同步 
 apply 和数据库重新载入都会精确保留两种字节表示。MDBX1 与 MDBX1-DRAFT 没有 operation
 metadata，其读取和升级行为不受影响。当前 reader 接受旧行；可靠重试当前 40 字节身份时
 需要使用当前 storage core。
+
+### 7.19 已存在 Commit 的精确重放
+
+同步可能在 commit 行已经存在后收到对应的 state delta 或其他传输 payload。应用迟到 payload
+前，storage 会比较 incoming 与本地行的设备、序列、精确 kind 和 scope、加密变更 ID、
+vector clock、message、创建时间、完整性标签和规范 parent 成员。相同 commit ID 下任一值
+发生变化时，会在状态 mutation 前拒绝。
+
+首次接收 commit 时仍使用活动连接 keyring 重新计算完整性标签。已存在记录的重放则把
+incoming 字节和标签与本地已经接受的身份精确比较。该区分可以保留无法从连接当前状态重建
+原验证方式的历史 commit，同时阻止同一 ID 出现第二种认证含义。
+
+legacy bundle 中的 operation metadata 继续保持可选。commit 首次接收时缺少该信息，后续
+可以补入原始认证 metadata。一旦记录存在，operation ID 与 commit ID 构成一对一映射；
+operation kind、分支 ID 与名称、加密摘要、请求身份、创建时间和完整性标签都必须完全一致。
+旧重放省略 metadata 时保留本地行。
+
+本次修改不增加数据库或 bundle version。MDBX1、MDBX1-DRAFT 与 bundle v1 继续省略
+operation metadata。精确 commit 的迟到 payload 修复继续保持幂等；重新生成 commit 或
+operation metadata 的 peer 必须恢复原始认证值后才能继续同步。

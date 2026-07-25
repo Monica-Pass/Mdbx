@@ -675,6 +675,12 @@ Tiga2 不只是模式显示。成功解锁后，客户端 MUST 保留 `VaultSess
 
 完整同步状态由 storage core 施加独立资源限制。默认状态编码上限为 96 MiB、逻辑行数上限为 250,000；桌面端需要更大批次时，应同时为状态收集、状态解码和 apply 传入同一个 `SyncStateLimits`，仍受 512 MiB 和 2,000,000 行硬上限约束。超限或保留状态身份错误会使整个同步事务回滚。增量状态传输协议尚未进入当前格式，客户端应把资源限制错误显示为可重试的同步容量问题。
 
+重传接收端可能已经保存的 commit 时，客户端必须精确保留原始 serialized commit 字段、
+完整性标签和 parent 集合。后续 segment 可以附加之前缺少的对象 payload 或 state delta；较新
+bundle 也可以补充旧 bundle 省略的 operation metadata。vector clock、时间、message、分类、
+分支 metadata、变更摘要和请求身份都必须来自原始认证记录，不能根据应用当前状态重新生成。
+相同 commit 或 operation ID 表示不同认证内容时，storage 会在应用迟到 payload 前拒绝。
+
 密钥 epoch 轮换的同步顺序属于安全不变量。客户端收到成功结果后，必须先传播 rotation commit 与 authenticated key epoch sync state，再上传或广播使用新 epoch 写入的 `MDBXFE2` 字段。接收端改变 epoch 状态时必须处于经过验证的解锁状态，并使用会刷新连接 keyring 的可变 apply 入口。旧 payload 缺少 key epoch state 时保留本地状态；并发轮换必须保留全部 wrapper，并接受 storage core 选出的 active epoch。
 
 轮换调用本身代表一次新的安全管理动作，不使用普通 `operation_id` 幂等重试语义。响应状态未知时，客户端应先按返回 commit、commit history 或 Tiga 审计关联查询，再决定是否发起另一轮轮换。

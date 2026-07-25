@@ -716,6 +716,15 @@ Complete state is the initial bootstrap and old-peer fallback. After bootstrap, 
 
 Use the transport-neutral `mdbx_sync::SyncClient` for capability selection and checkpoint state. Incremental v4 requires all four additive capabilities: commit inventory paging, delta inventory paging, bundle v4, and incremental resume. Paging-capable Hello messages omit the legacy complete commit-ID vector. The client facade creates bounded commit/delta page requests and keeps the old checkpoint while a segment is only validated; call its acknowledgement method only after storage reports durable apply. Missing capabilities select complete-state fallback.
 
+When retransmitting a commit that the receiver may already have, reuse the
+original serialized commit fields, integrity tag, and parent set exactly. A
+later segment may attach a missing object payload or state delta, and a newer
+bundle may supply operation metadata that an older bundle omitted. Do not
+rebuild the vector clock, timestamp, message, taxonomy, branch metadata, change
+summary, or request identity from current application state. Storage rejects a
+different authenticated meaning for an existing commit or operation ID before
+applying the late payload.
+
 Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
 
 Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.

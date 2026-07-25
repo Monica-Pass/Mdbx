@@ -199,6 +199,22 @@ writer. Every other length or 40-byte value with an unknown prefix MUST fail
 closed. Synchronization MUST carry either recognized representation as opaque
 authenticated bytes without normalization.
 
+An incoming commit whose `commit_id` already exists MUST match the stored
+device ID, local sequence, exact kind and scope, encrypted changed-object IDs,
+vector clock, optional message, creation time, integrity tag, and canonical
+parent set before any payload is applied. First insertion verifies the tag with
+the active connection keyring. Replay compares the complete incoming identity
+and tag with the already accepted local bytes; it MUST NOT reinterpret or
+regenerate historical commit metadata.
+
+Late object payloads and state-delta envelopes MAY be applied after that exact
+match. Incoming operation metadata is additive when the local commit has no
+operation row. When a row already exists under either the operation ID or
+commit ID, both IDs plus operation kind, branch identity and name, encrypted
+summary, request identity, creation time, and integrity tag MUST match exactly.
+An older bundle MAY omit operation metadata without deleting or weakening the
+local row. Any mismatch MUST fail before payload mutation.
+
 ## 9. Conflict Detection
 
 MDBX MUST detect concurrent edits using causal metadata, not timestamp alone.

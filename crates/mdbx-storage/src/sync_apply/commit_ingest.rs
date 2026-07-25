@@ -43,6 +43,7 @@ fn apply_commit(
 ) -> StorageResult<ApplyOutcome> {
     if commit_graph_apply::commit_exists(conn, &serialized.commit.commit_id)? {
         return conn.with_immediate_transaction(|| {
+            verify_existing_commit_metadata(conn, serialized)?;
             if let Some(operation) = &serialized.operation {
                 CommitContext::verify_operation_integrity(conn, &serialized.commit, operation)?;
                 insert_operation(
@@ -152,26 +153,8 @@ pub(super) fn insert_commit(
     conn: &VaultConnection,
     serialized: &SerializedCommit,
 ) -> StorageResult<()> {
+    verify_incoming_commit_integrity(conn, serialized)?;
     let commit = &serialized.commit;
-    let commit_integrity_input = CommitIntegrityInput {
-        commit_id: &commit.commit_id,
-        device_id: &commit.device_id,
-        local_seq: commit.local_seq,
-        commit_kind: &commit.commit_kind.to_string(),
-        change_scope: &commit.change_scope.to_string(),
-        changed_object_ids_ct: &commit.changed_object_ids_ct,
-        vector_clock: &commit.vector_clock,
-        message_ct: commit.message_ct.as_deref(),
-        created_at: &commit.created_at,
-        parents: &serialized.parent_ids,
-    };
-    let expected = compute_commit_integrity_tag(conn.keyring(), &commit_integrity_input)?;
-    if expected != commit.integrity_tag {
-        return Err(StorageError::Validation(format!(
-            "incoming commit {} integrity mismatch",
-            commit.commit_id
-        )));
-    }
 
     conn.inner().execute(
         "INSERT INTO commits (commit_id, device_id, local_seq, commit_kind, change_scope,
@@ -265,6 +248,106 @@ pub(super) fn insert_commit(
     Ok(())
 }
 
+fn verify_incoming_commit_integrity(
+    conn: &VaultConnection,
+    serialized: &SerializedCommit,
+) -> StorageResult<()> {
+    let commit = &serialized.commit;
+    let commit_kind = commit.commit_kind.to_string();
+    let change_scope = commit.change_scope.to_string();
+    let commit_integrity_input = CommitIntegrityInput {
+        commit_id: &commit.commit_id,
+        device_id: &commit.device_id,
+        local_seq: commit.local_seq,
+        commit_kind: &commit_kind,
+        change_scope: &change_scope,
+        changed_object_ids_ct: &commit.changed_object_ids_ct,
+        vector_clock: &commit.vector_clock,
+        message_ct: commit.message_ct.as_deref(),
+        created_at: &commit.created_at,
+        parents: &serialized.parent_ids,
+    };
+    let expected = compute_commit_integrity_tag(conn.keyring(), &commit_integrity_input)?;
+    if expected != commit.integrity_tag {
+        return Err(StorageError::Validation(format!(
+            "incoming commit {} integrity mismatch",
+            commit.commit_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn verify_existing_commit_metadata(
+    conn: &VaultConnection,
+    serialized: &SerializedCommit,
+) -> StorageResult<()> {
+    let commit = &serialized.commit;
+    let stored = conn
+        .inner()
+        .query_row(
+            "SELECT device_id, local_seq, commit_kind, change_scope,
+                    changed_object_ids_ct, vector_clock, message_ct, created_at,
+                    integrity_tag
+             FROM commits WHERE commit_id = ?1",
+            params![commit.commit_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        device_id,
+        local_seq,
+        commit_kind,
+        change_scope,
+        changed_object_ids_ct,
+        vector_clock,
+        message_ct,
+        created_at,
+        integrity_tag,
+    )) = stored
+    else {
+        return Err(StorageError::Validation(format!(
+            "incoming commit {} disappeared during replay validation",
+            commit.commit_id
+        )));
+    };
+    let stored_parents = commit_graph_apply::parent_ids_for_commit(conn, &commit.commit_id)?;
+    let mut incoming_parents = serialized.parent_ids.clone();
+    incoming_parents.sort();
+
+    if device_id != commit.device_id
+        || local_seq < 0
+        || local_seq as u64 != commit.local_seq
+        || commit_kind != commit.commit_kind.to_string()
+        || change_scope != commit.change_scope.to_string()
+        || changed_object_ids_ct != commit.changed_object_ids_ct
+        || vector_clock != commit.vector_clock
+        || message_ct != commit.message_ct
+        || created_at != commit.created_at
+        || integrity_tag != commit.integrity_tag
+        || stored_parents != incoming_parents
+    {
+        return Err(StorageError::Validation(format!(
+            "incoming commit {} conflicts with existing metadata",
+            commit.commit_id
+        )));
+    }
+
+    Ok(())
+}
+
 pub(super) fn acknowledge_received_tombstones(
     conn: &VaultConnection,
     ctx: &CommitContext,
@@ -302,21 +385,55 @@ fn insert_operation(
     created_at: &str,
     operation: &CommitOperationMetadata,
 ) -> StorageResult<()> {
-    let existing: Option<(String, Vec<u8>)> = conn
-        .inner()
-        .query_row(
-            "SELECT commit_id, request_hash FROM commit_operations WHERE operation_id = ?1",
-            params![operation.operation_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((existing_commit_id, request_hash)) = existing {
-        if existing_commit_id != commit_id || request_hash != operation.request_hash {
+    let mut stmt = conn.inner().prepare(
+        "SELECT operation_id, commit_id, operation_kind, branch_id, branch_name,
+                change_summary_ct, request_hash, created_at, integrity_tag
+         FROM commit_operations WHERE operation_id = ?1 OR commit_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![operation.operation_id, commit_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Vec<u8>>(8)?,
+        ))
+    })?;
+    let mut found = false;
+    for row in rows {
+        found = true;
+        let (
+            operation_id,
+            existing_commit_id,
+            operation_kind,
+            branch_id,
+            branch_name,
+            change_summary_ct,
+            request_hash,
+            existing_created_at,
+            integrity_tag,
+        ) = row?;
+        if operation_id != operation.operation_id
+            || existing_commit_id != commit_id
+            || operation_kind != operation.operation_kind
+            || branch_id != operation.branch_id
+            || branch_name != operation.branch_name
+            || change_summary_ct != operation.change_summary_ct
+            || request_hash != operation.request_hash
+            || existing_created_at != created_at
+            || integrity_tag != operation.integrity_tag
+        {
             return Err(StorageError::Validation(format!(
                 "incoming operation {} conflicts with existing metadata",
                 operation.operation_id
             )));
         }
+    }
+    if found {
         return Ok(());
     }
 

@@ -192,6 +192,17 @@ operation 与显式 legacy intent 仍然精确比较；没有显式 intent 的�
 40 字节值必须 fail closed。同步层必须把两种已识别表示作为经过认证的不透明字节精确保留，
 不得规范化或重算。
 
+incoming `commit_id` 已经存在时，设备 ID、本地序列、精确 kind 与 scope、加密变更对象 ID、
+vector clock、可选 message、创建时间、完整性标签和规范 parent 集合必须与本地记录完全一致，
+随后才能应用任何 payload。首次插入使用活动连接 keyring 验证标签；重放则把 incoming 完整
+身份和标签与本地已经接受的字节精确比较，不得重新解释或生成历史 commit 元数据。
+
+精确匹配后可以补收迟到的对象 payload 与 state-delta envelope。本地 commit 缺少 operation
+行时，经过完整性验证的 incoming operation metadata 可以作为附加信息写入。operation ID 或
+commit ID 任一方向已经存在映射时，两个 ID、operation kind、分支身份与名称、加密摘要、请求
+身份、创建时间和完整性标签必须全部一致。旧 bundle 可以省略 operation metadata，但不得删除
+或削弱本地已有记录。任何差异都必须在 payload mutation 前拒绝。
+
 ## 9. 冲突检测
 
 MDBX 必须基于因果元数据检测并发修改，不能只靠时间戳。

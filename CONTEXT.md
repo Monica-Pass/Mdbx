@@ -146,6 +146,22 @@ historical retry behavior because an earlier writer may have replaced its
 initial digest with the final aggregate digest. Unknown lengths or version
 prefixes fail closed.
 
+### ExistingCommitReplay
+
+`ExistingCommitReplay` is a synchronization input whose `commit_id` is already
+present locally. The commit row and canonical parent set are immutable: device,
+sequence, exact taxonomy, encrypted changed IDs, vector clock, message,
+timestamp, and stored integrity tag must equal the accepted local values before
+any payload is processed. Historical tags are compared byte-for-byte rather
+than recomputed with the connection's current verification state.
+
+Transport payloads may arrive later for that exact commit. Previously omitted
+operation metadata may also be added after its integrity is verified. An
+existing operation row is a one-to-one mapping between operation and commit and
+must match kind, branch, encrypted summary, request identity, timestamp, and
+integrity tag exactly. A legacy replay may omit operation metadata without
+removing the local row.
+
 ### CommitKind
 
 `CommitKind` is authenticated commit semantics, not a presentation hint. The
@@ -288,6 +304,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 47. CommitKind is authenticated data. Every known value round-trips exactly across storage history, CLI, synchronization bundles, and FFI; unknown values are rejected and never coerced to `change`. Legacy binary discriminants 0 through 3 remain frozen.
 48. ChangeScope is authenticated data and `multi` is only a real aggregate scope. Snapshot and Branch are appended after the nine legacy binary variants; history, CLI, synchronization bundles, FFI, and local CommitOperation validation use the core exact parser and never coerce an unknown scope.
 49. OperationRequestIdentity is derived from the submitted operation before mutation and is never replaced by aggregate commit metadata. New tagged identities match exactly on every retry; authenticated unknown encodings fail closed, while untagged 32-byte rows retain their documented legacy behavior.
+50. ExistingCommitReplay may add transport payloads or previously omitted authenticated operation metadata only after the complete commit and canonical parent identity matches local storage. Reusing a commit or operation ID with different authenticated metadata fails before payload application.
 
 ## Module Architecture
 

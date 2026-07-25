@@ -514,3 +514,31 @@ representation exactly. MDBX1 and MDBX1-DRAFT contain no operation metadata;
 their read and upgrade behavior is unaffected. Current readers accept legacy
 rows, while reliable retry of a current 40-byte identity requires a current
 storage core.
+
+### 7.19 Exact Existing Commit Replay
+
+Synchronization may receive a state delta or other transport payload after its
+commit row already exists. Before applying that late payload, storage compares
+the incoming commit with the local row across device, sequence, exact kind and
+scope, encrypted changed IDs, vector clock, message, creation time, integrity
+tag, and canonical parent membership. A changed value under the same commit ID
+is rejected before state mutation.
+
+First receipt of a commit still recomputes its integrity tag with the active
+connection keyring. Existing replay compares the incoming bytes and tag with
+the already accepted local identity. This distinction preserves historical
+commits whose original verification mode cannot be reconstructed from the
+connection's current state while still preventing a second authenticated
+meaning for the same ID.
+
+Operation metadata remains optional for legacy bundles. A commit first received
+without it can later accept the original authenticated metadata. Once present,
+the operation ID and commit ID form a one-to-one mapping, and operation kind,
+branch ID/name, encrypted summary, request identity, creation time, and
+integrity tag must all match. An older replay that omits the metadata leaves the
+local row intact.
+
+No database or bundle version changes. MDBX1, MDBX1-DRAFT, and bundle v1 continue
+to omit operation metadata. Exact late payload repair remains idempotent; a peer
+that regenerates commit or operation metadata must resend the original
+authenticated values before synchronization can continue.

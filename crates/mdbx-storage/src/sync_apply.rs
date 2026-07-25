@@ -358,6 +358,27 @@ mod tests {
         }
     }
 
+    fn resign_serialized_commit(conn: &VaultConnection, serialized: &mut SerializedCommit) {
+        let commit_kind = serialized.commit.commit_kind.to_string();
+        let change_scope = serialized.commit.change_scope.to_string();
+        serialized.commit.integrity_tag = compute_commit_integrity_tag(
+            conn.keyring(),
+            &CommitIntegrityInput {
+                commit_id: &serialized.commit.commit_id,
+                device_id: &serialized.commit.device_id,
+                local_seq: serialized.commit.local_seq,
+                commit_kind: &commit_kind,
+                change_scope: &change_scope,
+                changed_object_ids_ct: &serialized.commit.changed_object_ids_ct,
+                vector_clock: &serialized.commit.vector_clock,
+                message_ct: serialized.commit.message_ct.as_deref(),
+                created_at: &serialized.commit.created_at,
+                parents: &serialized.parent_ids,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn synced_device_head_preserves_local_revocation() {
         let (conn, _) = setup();
@@ -2343,6 +2364,153 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}-wal", path.display()));
             let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         }
+    }
+
+    #[test]
+    fn existing_commit_replay_rejects_changed_authenticated_commit_metadata() {
+        let (conn, ctx) = setup();
+        let operation = CommitOperation::new(
+            "existing-commit-equivocation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let mut replay = serialized_commits_from(&conn)
+            .into_iter()
+            .find(|serialized| serialized.commit.commit_id == commit_id)
+            .unwrap();
+        replay.commit.vector_clock = r#"{"device-a":999}"#.to_string();
+        resign_serialized_commit(&conn, &mut replay);
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![replay], 0, true))
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("conflicts with existing metadata"));
+    }
+
+    #[test]
+    fn existing_commit_replay_rejects_changed_parent_membership() {
+        let (conn, ctx) = setup();
+        let operation = CommitOperation::new(
+            "existing-commit-parent-equivocation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let mut replay = serialized_commits_from(&conn)
+            .into_iter()
+            .find(|serialized| serialized.commit.commit_id == commit_id)
+            .unwrap();
+        replay.parent_ids.clear();
+        resign_serialized_commit(&conn, &mut replay);
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![replay], 0, true))
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("conflicts with existing metadata"));
+    }
+
+    #[test]
+    fn existing_commit_replay_rejects_conflicting_operation_metadata() {
+        let (conn, ctx) = setup();
+        let operation = CommitOperation::new(
+            "existing-operation-equivocation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let replay = serialized_commits_from(&conn)
+            .into_iter()
+            .find(|serialized| serialized.commit.commit_id == commit_id)
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE commit_operations SET operation_kind = 'tampered-local-kind'
+                 WHERE operation_id = ?1",
+                params![operation.operation_id],
+            )
+            .unwrap();
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![replay], 0, true))
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("conflicts with existing metadata"));
+    }
+
+    #[test]
+    fn existing_commit_replay_restores_previously_omitted_operation_metadata() {
+        let (conn, ctx) = setup();
+        let operation = CommitOperation::new(
+            "late-operation-metadata",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let replay = serialized_commits_from(&conn)
+            .into_iter()
+            .find(|serialized| serialized.commit.commit_id == commit_id)
+            .unwrap();
+        let expected = replay.operation.clone();
+        conn.inner()
+            .execute(
+                "DELETE FROM commit_operations WHERE operation_id = ?1",
+                params![operation.operation_id],
+            )
+            .unwrap();
+
+        let result =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![replay], 0, true))
+                .unwrap();
+
+        assert_eq!(result.skipped_commits, 1);
+        assert_eq!(operation_for_commit(&conn, &commit_id).unwrap(), expected);
+    }
+
+    #[test]
+    fn legacy_existing_commit_replay_may_omit_local_operation_metadata() {
+        let (conn, ctx) = setup();
+        let operation = CommitOperation::new(
+            "legacy-replay-without-operation",
+            "edit-session",
+            "main",
+            "change",
+            "project",
+            Vec::new(),
+        );
+        let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+        let mut replay = serialized_commits_from(&conn)
+            .into_iter()
+            .find(|serialized| serialized.commit.commit_id == commit_id)
+            .unwrap();
+        let expected = replay.operation.take();
+
+        let result =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![replay], 0, true))
+                .unwrap();
+
+        assert_eq!(result.skipped_commits, 1);
+        assert_eq!(operation_for_commit(&conn, &commit_id).unwrap(), expected);
     }
 
     #[test]
