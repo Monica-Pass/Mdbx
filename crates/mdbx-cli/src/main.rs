@@ -3557,7 +3557,7 @@ fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommi
                     commit_id,
                     device_id: row.get(1)?,
                     local_seq: row.get::<_, i64>(2)? as u64,
-                    commit_kind: parse_commit_kind(&row.get::<_, String>(3)?),
+                    commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
                     change_scope: parse_change_scope(&row.get::<_, String>(4)?),
                     changed_object_ids_ct: row.get(5)?,
                     vector_clock: row.get(6)?,
@@ -3598,7 +3598,7 @@ fn load_serialized_commit(
                     commit_id: row.get(0)?,
                     device_id: row.get(1)?,
                     local_seq: row.get::<_, i64>(2)? as u64,
-                    commit_kind: parse_commit_kind(&row.get::<_, String>(3)?),
+                    commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
                     change_scope: parse_change_scope(&row.get::<_, String>(4)?),
                     changed_object_ids_ct: row.get(5)?,
                     vector_clock: row.get(6)?,
@@ -3692,13 +3692,14 @@ fn load_tombstones(conn: &VaultConnection) -> Result<Vec<TombstoneRecord>, Strin
     Ok(tombstones)
 }
 
-fn parse_commit_kind(value: &str) -> CommitKind {
-    match value {
-        "merge" => CommitKind::Merge,
-        "snapshot" => CommitKind::Snapshot,
-        "key-rotation" => CommitKind::KeyRotation,
-        _ => CommitKind::Change,
-    }
+fn parse_commit_kind_from_sql(value: String) -> rusqlite::Result<CommitKind> {
+    value.parse().map_err(|error: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })
 }
 
 fn parse_change_scope(value: &str) -> ChangeScope {
@@ -3724,6 +3725,59 @@ mod tests {
     use mdbx_storage::tiga::TigaService;
     use mdbx_sync::CommitBatch;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn commit_kind_sql_parser_preserves_all_known_values_and_rejects_unknown() {
+        let cases = [
+            ("change", CommitKind::Change),
+            ("merge", CommitKind::Merge),
+            ("snapshot", CommitKind::Snapshot),
+            ("key-rotation", CommitKind::KeyRotation),
+            ("move", CommitKind::Move),
+            ("copy", CommitKind::Copy),
+            ("restore", CommitKind::Restore),
+            ("multi", CommitKind::Multi),
+        ];
+        for (encoded, expected) in cases {
+            assert_eq!(
+                parse_commit_kind_from_sql(encoded.to_string()).unwrap(),
+                expected
+            );
+        }
+        assert!(parse_commit_kind_from_sql("future-kind".to_string()).is_err());
+    }
+
+    #[test]
+    fn serialized_commit_loader_preserves_extended_database_kinds() {
+        let conn = VaultConnection::open_in_memory().unwrap();
+        initialize_vault(&conn, &VaultInitParams::default()).unwrap();
+        let ctx = CommitContext::new("commit-kind-loader-device".to_string());
+
+        for kind in ["move", "copy", "restore", "multi"] {
+            ctx.create_operation_commit(
+                &conn,
+                &CommitOperation::new(
+                    format!("loader-{kind}-operation"),
+                    "loader-kind-test",
+                    "main",
+                    kind,
+                    "project",
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        }
+
+        let loaded = load_serialized_commits(&conn).unwrap();
+        let kinds = loaded
+            .iter()
+            .map(|commit| commit.commit.commit_kind.clone())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&CommitKind::Move));
+        assert!(kinds.contains(&CommitKind::Copy));
+        assert!(kinds.contains(&CommitKind::Restore));
+        assert!(kinds.contains(&CommitKind::Multi));
+    }
 
     const TEST_PASSWORD: &str = "test-password";
 

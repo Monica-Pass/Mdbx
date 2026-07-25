@@ -356,15 +356,7 @@ fn parse_cursor(value: &str) -> StorageResult<HistoryCursor> {
 }
 
 fn parse_commit_kind(value: &str) -> StorageResult<mdbx_core::model::CommitKind> {
-    match value {
-        "change" => Ok(mdbx_core::model::CommitKind::Change),
-        "merge" => Ok(mdbx_core::model::CommitKind::Merge),
-        "snapshot" => Ok(mdbx_core::model::CommitKind::Snapshot),
-        "key-rotation" => Ok(mdbx_core::model::CommitKind::KeyRotation),
-        _ => Err(StorageError::Validation(format!(
-            "unknown commit kind: {value}"
-        ))),
-    }
+    value.parse().map_err(StorageError::Validation)
 }
 
 fn parse_change_scope(value: &str) -> StorageResult<mdbx_core::model::ChangeScope> {
@@ -437,6 +429,32 @@ mod tests {
         assert_eq!(second.items.len(), 1);
         assert!(second.items[0].legacy);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn history_verifies_and_preserves_extended_commit_kinds() {
+        let (conn, ctx) = setup();
+
+        for kind in ["move", "copy", "restore", "multi"] {
+            let operation = crate::repo::CommitOperation::new(
+                format!("history-{kind}-operation"),
+                "history-kind-test",
+                "main",
+                kind,
+                "project",
+                Vec::new(),
+            );
+            let commit_id = ctx.create_operation_commit(&conn, &operation).unwrap();
+            let history = CommitHistoryRepo::get(&conn, &commit_id).unwrap().unwrap();
+
+            assert_eq!(history.commit_kind, kind);
+            assert_eq!(
+                history.operation_id.as_deref(),
+                Some(operation.operation_id.as_str())
+            );
+        }
+
+        assert!(parse_commit_kind("future-kind").is_err());
     }
 
     #[test]

@@ -453,3 +453,22 @@ capability 缺失会回滚完整 operation。
 
 MDBX1 与 MDBX1-DRAFT 文件升级仍由 storage core 迁移器负责，bridge 不把兼容转换转移给
 客户端。裁剪 bridge 或同时裁剪两个 Steam crate，都不会破坏已有加密通用行和旧兼容投影。
+
+### 7.16 Commit Kind 精确往返
+
+commit kind 是经过认证的 commit 表示的一部分，不是单纯的 UI 展示提示。MDBX reader 必须
+精确保留以下稳定值：`change`、`merge`、`snapshot`、`key-rotation`、`move`、
+`copy`、`restore`、`multi`。遇到无法识别的数据库或 bundle 值时，不得降级为
+`change`，因为重写后的值已经不再描述生成该行的原认证 commit。
+
+核心枚举冻结原有 `change`、`merge`、`snapshot`、`key-rotation` 的二进制顺序，
+扩展值只追加在其后。因此既有 bincode discriminant 与旧 bundle fixture 保持不变。
+本修复不增加 schema 列、format version 字段、bundle version 字段或数据库迁移。
+
+storage history 与 CLI bundle loader 统一调用核心严格解析器。已知值必须原样保留；未知值
+在导出、历史认证或 apply 有机会重新解释 commit 之前明确报错。bundle decoder 对不支持的
+枚举 discriminant 同样拒绝。新 reader 继续读取旧 bundle。会把扩展数据库值降级的修复前
+reader 不得导出或 apply 这段历史，必须升级 reader，因为不存在安全的向下转换。
+
+UniFFI history 继续把 `commit_kind` 作为精确字符串返回。原生客户端可以把已知值映射为
+本地化标签，但必须保留原始值用于诊断，绝不能把 UI fallback 写回 MDBX。

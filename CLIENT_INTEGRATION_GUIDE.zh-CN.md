@@ -490,6 +490,11 @@ resource-limit 或 malformed-row error 时，应显示需要 repair 的状态，
 
 删除对象 SHOULD 显示为“删除了密码条目 / 文件夹”，不应把“删除状态 true/false”作为主要字段变更展示。
 
+客户端必须把 `commit_kind` 当作经过认证的协议数据。当前精确值为 `change`、`merge`、
+`snapshot`、`key-rotation`、`move`、`copy`、`restore`、`multi`。客户端只能在
+展示层本地化，必须保留原字符串，遇到未知值时绝不能按 `change` 回写。storage 与 bundle
+reader 会拒绝未知值，UI fallback 不得掩盖完整性错误。
+
 ### 5.7 快照页
 
 用途：恢复和结构检查。

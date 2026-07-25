@@ -128,6 +128,17 @@ A `CapabilitySet` is the compile-time and runtime set of optional adapters prese
 
 A `CommitOperation` is one finite user intent executed atomically and represented by one commit whenever practical. Importing one `mafile`, moving a bookmark group, or applying one mail synchronization batch can contain multiple row mutations without producing a commit per internal row.
 
+### CommitKind
+
+`CommitKind` is authenticated commit semantics, not a presentation hint. The
+stable values are `change`, `merge`, `snapshot`, `key-rotation`, `move`,
+`copy`, `restore`, and `multi`. Database history, synchronization bundles,
+CLI serialization, and native facades preserve the exact value. Unknown
+stored or transported values fail closed because replacing one with `change`
+would alter the authenticated commit input. The four extended values are appended
+after the four legacy binary enum variants so existing bundle discriminants
+remain unchanged.
+
 ### ConflictResolutionOperation
 
 A `ConflictResolutionOperation` selects local state, incoming state, or a validated custom state for one conflicted object. It atomically writes the selected state, creates a two-parent merge commit, advances the object clock and heads, records a new ObjectVersion, reconciles tombstones, and marks the conflict resolved.
@@ -245,6 +256,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 44. The SteamMaFileAdapter is optional and removable. It owns mafile syntax, canonicalization, identity derivation, and parser resource errors; the Generic Object Module owns encryption, history, synchronization, recovery, and opaque preservation.
 45. Steam mafile parsing checks input bytes before deserialization and enforces bounded depth, aggregate fields, per-array items, nodes, per-string bytes, and aggregate string/key bytes. Duplicate keys fail, and unknown keys remain available after canonical round-trip.
 46. Steam object identity is a domain-separated, length-framed SHA-256 digest of the canonical unsigned SteamID and trimmed case-preserving serial number. Debug and error interfaces never include mafile payload values.
+47. CommitKind is authenticated data. Every known value round-trips exactly across storage history, CLI, synchronization bundles, and FFI; unknown values are rejected and never coerced to `change`. Legacy binary discriminants 0 through 3 remain frozen.
 
 ## Module Architecture
 

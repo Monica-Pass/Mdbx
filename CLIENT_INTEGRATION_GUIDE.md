@@ -522,6 +522,12 @@ This is a unified diff structure, not a code view. The UI should parse fields an
 
 Deleted objects should be shown as "deleted password entry / folder", not primarily as a low-level `deleted: true/false` field change.
 
+Treat `commit_kind` as authenticated protocol data. Current exact values are
+`change`, `merge`, `snapshot`, `key-rotation`, `move`, `copy`, `restore`, and
+`multi`. Localize them only for display; retain the original string and never
+save an unknown value as `change`. Storage and bundle readers reject unknown
+values so integrity failures cannot be hidden by a UI fallback.
+
 ### 5.7 Snapshots
 
 Purpose: recovery and structure inspection.

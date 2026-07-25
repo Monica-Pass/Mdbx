@@ -431,3 +431,29 @@ MDBX1 and MDBX1-DRAFT file upgrades remain storage-core migrations. The bridge
 does not move compatibility into a client converter. Removing the bridge, or
 both Steam crates, preserves existing encrypted generic rows and all legacy
 compatibility projections.
+
+### 7.16 Exact Commit Kind Round-Trip
+
+Commit kind is part of the authenticated commit representation. MDBX readers
+must preserve these stable values exactly: `change`, `merge`, `snapshot`,
+`key-rotation`, `move`, `copy`, `restore`, and `multi`. A reader must not map
+an unrecognized database or bundle value to `change`, because the rewritten
+value no longer describes the authenticated commit that produced the row.
+
+The core enum retains the original binary order for `change`, `merge`,
+`snapshot`, and `key-rotation`; the extended variants are appended after them.
+This keeps existing bincode discriminants and legacy bundle fixtures stable.
+No schema column, format-version field, bundle-version field, or migration is
+added for this repair.
+
+Storage history and CLI bundle loading use the core strict parser. Known values
+remain exact; unknown values return an explicit error before export, history
+verification, or apply can reinterpret the commit. Bundle decoders likewise
+reject an enum discriminant they do not support. New readers continue to read
+legacy bundles. A pre-fix reader that coerces an extended database value must
+not export or apply that history; upgrading the reader is required because a
+safe down-conversion does not exist.
+
+UniFFI history keeps `commit_kind` as the exact string. Native clients may map
+known values to localized labels, but must retain the original value for
+diagnostics and must never write a display fallback back into MDBX.

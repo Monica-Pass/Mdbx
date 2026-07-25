@@ -920,6 +920,65 @@ fn branch_history_pages_include_stable_identity_and_legacy_records() {
 }
 
 #[test]
+fn commit_history_preserves_extended_commit_kind_at_ffi_boundary() {
+    let vault_path = temp_vault_path("commit-history-kind");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "history kind password 12345!".to_string(),
+        "ffi-history-kind-device".to_string(),
+    )
+    .unwrap();
+    let source_project_id = Uuid::new_v4().to_string();
+    let target_project_id = Uuid::new_v4().to_string();
+    let entry_id = Uuid::new_v4().to_string();
+
+    vault
+        .execute_write_operation(
+            "history-kind-create".to_string(),
+            "create-movable-entry".to_string(),
+            vec![
+                MdbxWriteCommand::CreateProject {
+                    project_id: source_project_id.clone(),
+                    title: "Source".to_string(),
+                },
+                MdbxWriteCommand::CreateProject {
+                    project_id: target_project_id.clone(),
+                    title: "Target".to_string(),
+                },
+                MdbxWriteCommand::CreateEntry {
+                    entry_id: entry_id.clone(),
+                    project_id: source_project_id.clone(),
+                    entry_type: "login".to_string(),
+                    title: "Movable".to_string(),
+                    payload_json: "{}".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    let moved = vault
+        .execute_write_operation(
+            "history-kind-move".to_string(),
+            "move-entry".to_string(),
+            vec![MdbxWriteCommand::MoveEntry {
+                entry_id,
+                project_id: source_project_id,
+                target_project_id,
+            }],
+        )
+        .unwrap();
+
+    let page = vault.list_commit_history(1, None).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].commit_id, moved.commit_id);
+    assert_eq!(page.items[0].commit_kind, "move");
+    let detail = vault
+        .get_commit_history(page.items[0].commit_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.commit_kind, "move");
+}
+
+#[test]
 fn creates_reopens_and_preserves_generic_entries() {
     let vault_path = temp_vault_path("roundtrip");
     let path = vault_path.as_path_string();

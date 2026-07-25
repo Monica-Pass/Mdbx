@@ -1790,6 +1790,45 @@ mod tests {
     }
 
     #[test]
+    fn bundle_roundtrip_preserves_extended_commit_kinds() {
+        for kind in [
+            mdbx_core::model::CommitKind::Move,
+            mdbx_core::model::CommitKind::Copy,
+            mdbx_core::model::CommitKind::Restore,
+            mdbx_core::model::CommitKind::Multi,
+        ] {
+            let mut bundle = sample_bundle();
+            bundle.commits[0].commit.commit_kind = kind.clone();
+
+            let bytes = bundle_to_bytes(&bundle).unwrap();
+            let restored = bundle_from_bytes(&bytes).unwrap();
+
+            assert_eq!(restored.commits[0].commit.commit_kind, kind);
+        }
+    }
+
+    #[test]
+    fn commit_kind_binary_discriminants_keep_legacy_order() {
+        let cases = [
+            (mdbx_core::model::CommitKind::Change, 0_u8),
+            (mdbx_core::model::CommitKind::Merge, 1),
+            (mdbx_core::model::CommitKind::Snapshot, 2),
+            (mdbx_core::model::CommitKind::KeyRotation, 3),
+            (mdbx_core::model::CommitKind::Move, 4),
+            (mdbx_core::model::CommitKind::Copy, 5),
+            (mdbx_core::model::CommitKind::Restore, 6),
+            (mdbx_core::model::CommitKind::Multi, 7),
+        ];
+
+        for (kind, discriminant) in cases {
+            assert_eq!(
+                bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap(),
+                vec![discriminant]
+            );
+        }
+    }
+
+    #[test]
     fn authenticated_v7_complete_round_trip_and_tamper_detection() {
         let bundle = sample_bundle();
         let key = auth_test_key();

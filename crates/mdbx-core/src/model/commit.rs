@@ -38,6 +38,14 @@ pub enum CommitKind {
     Snapshot,
     /// 密钥轮换
     KeyRotation,
+    /// 对象移动。追加在历史枚举之后以保持既有二进制 variant 序号。
+    Move,
+    /// 对象复制。
+    Copy,
+    /// 已删除对象恢复。
+    Restore,
+    /// 一个 operation 聚合了不同 repository commit kind。
+    Multi,
 }
 
 impl std::fmt::Display for CommitKind {
@@ -47,6 +55,28 @@ impl std::fmt::Display for CommitKind {
             CommitKind::Merge => write!(f, "merge"),
             CommitKind::Snapshot => write!(f, "snapshot"),
             CommitKind::KeyRotation => write!(f, "key-rotation"),
+            CommitKind::Move => write!(f, "move"),
+            CommitKind::Copy => write!(f, "copy"),
+            CommitKind::Restore => write!(f, "restore"),
+            CommitKind::Multi => write!(f, "multi"),
+        }
+    }
+}
+
+impl std::str::FromStr for CommitKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "change" => Ok(Self::Change),
+            "merge" => Ok(Self::Merge),
+            "snapshot" => Ok(Self::Snapshot),
+            "key-rotation" => Ok(Self::KeyRotation),
+            "move" => Ok(Self::Move),
+            "copy" => Ok(Self::Copy),
+            "restore" => Ok(Self::Restore),
+            "multi" => Ok(Self::Multi),
+            _ => Err(format!("unknown CommitKind: {value}")),
         }
     }
 }
@@ -468,6 +498,34 @@ impl std::str::FromStr for ConflictResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_kinds_roundtrip_exact_strings_and_reject_unknown_values() {
+        let cases = [
+            (CommitKind::Change, "change"),
+            (CommitKind::Merge, "merge"),
+            (CommitKind::Snapshot, "snapshot"),
+            (CommitKind::KeyRotation, "key-rotation"),
+            (CommitKind::Move, "move"),
+            (CommitKind::Copy, "copy"),
+            (CommitKind::Restore, "restore"),
+            (CommitKind::Multi, "multi"),
+        ];
+
+        for (kind, encoded) in cases {
+            assert_eq!(kind.to_string(), encoded);
+            assert_eq!(encoded.parse::<CommitKind>().unwrap(), kind);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!(r#""{encoded}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<CommitKind>(&format!(r#""{encoded}""#)).unwrap(),
+                kind
+            );
+        }
+        assert!("unknown".parse::<CommitKind>().is_err());
+    }
 
     #[test]
     fn snapshot_summary_roundtrips_without_snapshot_ciphertext() {

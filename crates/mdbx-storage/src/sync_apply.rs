@@ -563,12 +563,7 @@ mod tests {
     }
 
     fn parse_commit_kind_for_test(value: &str) -> CommitKind {
-        match value {
-            "merge" => CommitKind::Merge,
-            "snapshot" => CommitKind::Snapshot,
-            "key-rotation" => CommitKind::KeyRotation,
-            _ => CommitKind::Change,
-        }
+        value.parse().unwrap()
     }
 
     fn parse_change_scope_for_test(value: &str) -> ChangeScope {

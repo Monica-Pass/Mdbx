@@ -273,6 +273,7 @@ MDBX 必须坚持：
 - Steam mafile 已拆成两层可裁剪 Adapter：`mdbx-adapter-steam` 负责有界解析、未知字段保留与稳定 identity；`mdbx-adapter-steam-storage` 负责稳定 UUID、批量排序、create/update/restore 规划、能力门禁和单 operation commit。两层都默认 feature 为空，storage/sync/CLI/FFI 不反向依赖。
 - Steam bridge 默认每批 128 份、源字节聚合 8 MiB，硬上限 2,048 份和 64 MiB；只通过 ObjectSummaryRepo 判断已有状态，不读取 payload，不把输入缺失解释为删除。完全相同的 prepared plan 可幂等重试，重建 plan 属于新规划动作。
 - Native OperationCoordinator 已在执行前确定 commit kind：普通写为 `change`、单独恢复为 `restore`、单独移动为 `move`，混合 repository kind 为 `multi`。restore-then-update 与 move 均有回归测试，避免一次用户动作被迫拆成多条 commit。
+- commit kind 已统一为核心严格契约：`change`、`merge`、`snapshot`、`key-rotation`、`move`、`copy`、`restore`、`multi` 在 storage history、CLI、sync bundle 与 FFI 中精确往返；未知值 fail closed，不再静默降级为 `change`。旧四种 bincode 枚举序号保持不变。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：
