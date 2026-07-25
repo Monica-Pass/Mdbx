@@ -3,10 +3,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use mdbx_core::model::{ExtensionCapabilityId, VaultSession};
+use mdbx_core::model::{ExtensionCapabilityId, ExtensionId, ExtensionProfile, VaultSession};
 use mdbx_crypto::keyring::Keyring;
 
 use crate::error::{StorageError, StorageResult};
+use crate::extension_registry::{ExtensionRegistration, ExtensionRegistry};
 use crate::schema;
 
 /// 打开的 vault 数据库连接。
@@ -25,6 +26,7 @@ pub struct VaultConnection {
     pub(crate) epoch_keyrings: HashMap<String, Keyring>,
     pub(crate) active_session: Option<VaultSession>,
     pub(crate) extension_capabilities: BTreeSet<ExtensionCapabilityId>,
+    pub(crate) extension_registry: ExtensionRegistry,
 }
 
 /// A newly reserved vault file that is removed unless creation is committed.
@@ -92,6 +94,7 @@ impl VaultConnection {
             epoch_keyrings: HashMap::new(),
             active_session: None,
             extension_capabilities: BTreeSet::new(),
+            extension_registry: ExtensionRegistry::default(),
         })
     }
 
@@ -116,6 +119,7 @@ impl VaultConnection {
                 epoch_keyrings: HashMap::new(),
                 active_session: None,
                 extension_capabilities: BTreeSet::new(),
+                extension_registry: ExtensionRegistry::default(),
             })
         })();
         if result.is_err() {
@@ -138,6 +142,7 @@ impl VaultConnection {
             epoch_keyrings: HashMap::new(),
             active_session: None,
             extension_capabilities: BTreeSet::new(),
+            extension_registry: ExtensionRegistry::default(),
         })
     }
 
@@ -322,6 +327,39 @@ impl VaultConnection {
         &self.extension_capabilities
     }
 
+    pub fn register_extension_profile(
+        &mut self,
+        profile: ExtensionProfile,
+    ) -> StorageResult<ExtensionRegistration> {
+        self.extension_registry.register(profile)
+    }
+
+    pub fn replace_extension_profiles<I>(&mut self, profiles: I) -> StorageResult<()>
+    where
+        I: IntoIterator<Item = ExtensionProfile>,
+    {
+        self.extension_registry.replace_all(profiles)
+    }
+
+    pub fn unregister_extension_profile(
+        &mut self,
+        extension_id: &ExtensionId,
+    ) -> Option<ExtensionProfile> {
+        self.extension_registry.unregister(extension_id)
+    }
+
+    pub fn extension_profile(&self, extension_id: &ExtensionId) -> Option<&ExtensionProfile> {
+        self.extension_registry.get(extension_id)
+    }
+
+    pub fn extension_profiles(&self) -> Vec<ExtensionProfile> {
+        self.extension_registry.list()
+    }
+
+    pub fn extension_registry(&self) -> &ExtensionRegistry {
+        &self.extension_registry
+    }
+
     pub(crate) fn touch_active_session(&mut self, now_unix_secs: i64) {
         if let Some(session) = self.active_session.as_mut() {
             session.assurance = session.assurance.touched(now_unix_secs);
@@ -410,6 +448,7 @@ fn remove_vault_files(path: &Path) {
 mod tests {
     use super::*;
     use crate::init::{initialize_vault, VaultInitParams};
+    use mdbx_core::model::{CollectionTypeId, ExtensionFeatureId, ObjectTypeId, RelationKindId};
     use uuid::Uuid;
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
@@ -446,6 +485,23 @@ mod tests {
             |row| row.get::<_, bool>(0),
         )
         .unwrap()
+    }
+
+    fn test_extension_profile() -> ExtensionProfile {
+        ExtensionProfile {
+            extension_id: ExtensionId::new("com.monica.mail").unwrap(),
+            profile_version: 1,
+            collection_type_ids: vec![CollectionTypeId::new("com.monica.mail").unwrap()],
+            object_type_ids: vec![ObjectTypeId::custom("com.monica.mail.message").unwrap()],
+            relation_kind_ids: vec![RelationKindId::new("com.monica.mail.reply-to").unwrap()],
+            capability_ids: vec![ExtensionCapabilityId::new("com.monica.mail.store").unwrap()],
+            optional_index_ids: vec![
+                ExtensionFeatureId::new("com.monica.mail.index.messages").unwrap()
+            ],
+            import_adapter_ids: Vec::new(),
+            export_adapter_ids: Vec::new(),
+            presentation_hint_ids: Vec::new(),
+        }
     }
 
     #[test]
@@ -602,6 +658,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(vault_id, initialized.vault_id);
+        drop(reopened);
+        remove_vault_files(&path);
+    }
+
+    #[test]
+    fn extension_profiles_are_process_local_and_absent_after_reopen() {
+        let path = temp_db_path("process-local-extension-profile");
+        let creation = PendingVaultCreation::begin(&path).unwrap();
+        initialize_vault(creation.connection(), &VaultInitParams::default()).unwrap();
+        let mut connection = creation.commit();
+        connection
+            .register_extension_profile(test_extension_profile())
+            .unwrap();
+        assert_eq!(connection.extension_profiles().len(), 1);
+        drop(connection);
+
+        let reopened = VaultConnection::open(&path).unwrap();
+        assert!(reopened.extension_profiles().is_empty());
         drop(reopened);
         remove_vault_files(&path);
     }

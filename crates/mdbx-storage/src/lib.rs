@@ -12,6 +12,7 @@ pub mod conflict;
 pub mod connection;
 pub(crate) mod crypto_layer;
 pub mod error;
+pub mod extension_registry;
 #[cfg(any(feature = "kdbx-import", feature = "kdbx-export"))]
 pub mod import;
 pub mod init;

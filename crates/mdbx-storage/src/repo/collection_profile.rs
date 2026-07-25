@@ -297,6 +297,8 @@ impl CollectionProfileRepo {
         conn: &VaultConnection,
         profile: &CollectionProfile,
     ) -> StorageResult<()> {
+        conn.extension_registry()
+            .validate_collection_profile(profile)?;
         let missing = profile
             .missing_capabilities(conn.extension_capabilities())
             .into_iter()
@@ -460,6 +462,11 @@ fn ensure_metadata_capabilities(
     collection_id: &str,
     metadata: &StoredProfileMetadata,
 ) -> StorageResult<()> {
+    conn.extension_registry().validate_collection_contract(
+        &metadata.collection_type_id,
+        &metadata.allowed_object_type_ids,
+        &metadata.required_capability_ids,
+    )?;
     let missing = metadata
         .required_capability_ids
         .iter()
@@ -652,7 +659,7 @@ mod tests {
         AttachmentRepo, EntryRepo, ObjectLabelCreateRequest, ObjectLabelRepo,
         ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo,
     };
-    use mdbx_core::model::RelationKindId;
+    use mdbx_core::model::{ExtensionFeatureId, ExtensionId, ExtensionProfile, RelationKindId};
 
     fn setup() -> (VaultConnection, CommitContext, String) {
         let mut conn = VaultConnection::open_in_memory().unwrap();
@@ -675,6 +682,23 @@ mod tests {
             required_capability_ids: vec![
                 ExtensionCapabilityId::new("com.monica.mail.store").unwrap()
             ],
+        }
+    }
+
+    fn extension_profile() -> ExtensionProfile {
+        ExtensionProfile {
+            extension_id: ExtensionId::new("com.monica.mail").unwrap(),
+            profile_version: 1,
+            collection_type_ids: vec![CollectionTypeId::new("com.monica.mail").unwrap()],
+            object_type_ids: vec![ObjectTypeId::custom("com.monica.mail.message").unwrap()],
+            relation_kind_ids: vec![RelationKindId::new("com.monica.mail.reply-to").unwrap()],
+            capability_ids: vec![ExtensionCapabilityId::new("com.monica.mail.store").unwrap()],
+            optional_index_ids: vec![
+                ExtensionFeatureId::new("com.monica.mail.index.messages").unwrap()
+            ],
+            import_adapter_ids: Vec::new(),
+            export_adapter_ids: Vec::new(),
+            presentation_hint_ids: Vec::new(),
         }
     }
 
@@ -716,6 +740,64 @@ mod tests {
                 .collection_profile
                 .is_some()
         );
+    }
+
+    #[test]
+    fn registered_extension_constrains_new_collection_profiles_atomically() {
+        let (mut conn, ctx, collection_id) = setup();
+        conn.register_extension_profile(extension_profile())
+            .unwrap();
+        let commits_before: i64 = conn
+            .inner()
+            .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+            .unwrap();
+        let mut foreign_object = spec(&collection_id);
+        foreign_object.allowed_object_type_ids =
+            vec![ObjectTypeId::custom("com.monica.mail.folder").unwrap()];
+
+        assert!(CollectionProfileRepo::set(&conn, &ctx, foreign_object).is_err());
+        assert!(
+            CollectionProfileRepo::get_by_collection_id(&conn, &collection_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row("SELECT COUNT(*) FROM commits", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commits_before
+        );
+
+        let mut foreign_capability = spec(&collection_id);
+        foreign_capability.required_capability_ids =
+            vec![ExtensionCapabilityId::new("com.monica.mail.export").unwrap()];
+        assert!(CollectionProfileRepo::set(&conn, &ctx, foreign_capability).is_err());
+
+        CollectionProfileRepo::set(&conn, &ctx, spec(&collection_id)).unwrap();
+    }
+
+    #[test]
+    fn registering_an_adapter_rechecks_existing_profiles_only_for_writes() {
+        let (mut conn, ctx, collection_id) = setup();
+        let mut broader = spec(&collection_id);
+        broader.allowed_object_type_ids =
+            vec![ObjectTypeId::custom("com.monica.mail.folder").unwrap()];
+        CollectionProfileRepo::set(&conn, &ctx, broader).unwrap();
+        conn.register_extension_profile(extension_profile())
+            .unwrap();
+
+        assert!(
+            CollectionProfileRepo::get_by_collection_id(&conn, &collection_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(CollectionProfileRepo::ensure_object_write_allowed(
+            &conn,
+            &collection_id,
+            &ObjectTypeId::custom("com.monica.mail.folder").unwrap(),
+        )
+        .is_err());
     }
 
     #[test]
