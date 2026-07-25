@@ -278,6 +278,7 @@ MDBX 必须坚持：
 - CommitOperation 初始请求身份已与最终聚合摘要分离：新行在现有 `request_hash` BLOB 中保存 `MDBXORI1` 加 32 字节摘要，聚合重写保持该 40 字节身份不变；无显式 intent 的变化请求也会拒绝。旧 32 字节行继续读取和同步，旧聚合 operation 保留历史重试语义，未知编码 fail closed。
 - 已存在 commit 的同步重放会在迟到 payload 应用前精确比较设备、序列、kind/scope、加密变更 ID、vector clock、message、时间、完整性标签和规范 parent 集合。operation ID 与 commit ID 保持一对一完整 metadata 映射；旧 bundle 仍可省略 operation，后续可以补入原始认证记录。
 - 首次同步导入 commit 在完整性验证后、首条 SQL 前执行结构预检：拒绝重复 parent、畸形 vector clock 和超出 SQLite INTEGER 范围的 `local_seq`，并确认失败不留下 commit graph、sequence 或 branch 状态。legacy `{}` clock 继续兼容。
+- device head 已统一为设备全局序列规则：commit 与 state-delta 导入都会验证 commit 创作设备，按 `local_seq` 跨 branch 单调推进，迟到低序列不能回退 head，`last_seen_at` 与 revocation 单调合并。序列复用在 INSERT 前返回 validation error；health check 会报告设备归属错误与序列落后的 legacy head。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：

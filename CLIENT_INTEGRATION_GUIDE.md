@@ -733,6 +733,15 @@ compatibility representation. Do not deduplicate parents, repair clock text, or
 wrap a sequence in the transport layer, because each conversion would change
 the authenticated commit meaning.
 
+Treat device heads as storage-owned device-sequence state. Do not derive them
+from branch ancestry or update `device_heads` in client SQL. The receiver checks
+that the referenced commit was authored by the claimed device and advances by
+`local_seq` even when commits are siblings on different branches. Out-of-order
+lower commits remain valid history without moving the head backward, and local
+revocation remains set. A sequence-reuse validation error indicates conflicting
+device identity; stop that synchronization input and surface diagnostics rather
+than renumbering or regenerating the commit.
+
 Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
 
 Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.
@@ -786,6 +795,8 @@ Before claiming MDBX support, another client should pass at least these scenario
 - Batch delete 100 entries and create one user-level commit with tombstones.
 - Two clients open the same vault and show the same item count.
 - One client deletes an item; another client syncs and does not resurrect it.
+- Receive a higher-sequence branch sibling before a delayed lower sequence and keep the higher device head.
+- Reject a device-head row that points at a commit authored by another device, while preserving local revocation.
 - Concurrent edits to the same field create a conflict.
 - Concurrent edits to different fields auto-merge or present a clear merge prompt.
 - Create a manual snapshot.

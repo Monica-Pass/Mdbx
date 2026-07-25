@@ -75,7 +75,7 @@ Configurable defaults remain below hard byte and logical-row ceilings.
 | Security audit | Include every inserted authenticated event, including events without a commit. | Verify evidence and optional commit correlation, then insert immutably by event ID. |
 | Key epochs | Include the complete authenticated epoch state whenever epoch rows or the active epoch changes. | Require mutable unlocked apply for changes, verify wrappers and legal transitions, then refresh verified keyrings. |
 | Branches | Include each changed branch row with stable `branch_id`. | Match by branch ID, preserve branch-name uniqueness, and advance only to an available commit. |
-| Device heads | Include each changed device head, including revocation state. | Advance causally or merge revocation monotonically after the referenced commit exists. |
+| Device heads | Include each changed device head, including revocation state. | Apply ADR-0043: require commit authorship, advance by device-local sequence across branches, and merge observation time and revocation monotonically. |
 
 `object_versions` is the historical source for commit-owned logical objects; it is not copied as
 an unrelated second history stream. The receiving side records accepted versions while applying

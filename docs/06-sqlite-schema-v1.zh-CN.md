@@ -267,6 +267,14 @@ trigger 自动进入 `invalidated/NULL`，合法 mutation 必须在同一事务�
 - `last_seen_at TEXT NOT NULL`
 - `revoked INTEGER NOT NULL DEFAULT 0`
 
+语义约束：
+
+- `head_commit_id` 必须引用 `commits.device_id = device_heads.device_id` 的 commit
+- head 按该设备的 `local_seq` 单调前进，不按 branch DAG 祖先关系判断
+- 迟到的低序列 commit 可以进入历史，但不能覆盖较高序列 head
+- `last_seen_at` 保留较晚值，`revoked` 只能从 0 变为 1
+- health check 报告悬空、设备归属错误或低于已知最大序列的 head
+
 ## 3.9 branches
 
 用途：

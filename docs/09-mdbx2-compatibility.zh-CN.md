@@ -553,3 +553,22 @@ legacy `{}` vector clock 对 MDBX1 与迁移历史继续有效。预检不要求
 本次修改不增加 schema、format、bundle 或 DTO version。当前 producer 已经生成可表示值。
 无效新 commit 会在 commit inventory、parent、sequence floor、payload、tombstone、device head
 或 branch head 发生变化前拒绝。
+
+### 7.21 Device Head 设备序列单调性
+
+serialized commit 导入与 state-delta 导入现在共用一条 storage 规则。head 引用的 commit
+必须由所声明设备创作。较高 `local_seq` 可以跨 branch 推进 head；迟到的较低序列仍会保存并
+继续转发，但不能覆盖较新的 head。同一 commit 重放保持幂等，观察时间保留较晚值，device
+revocation 不能被同步清除。
+
+既有 `(device_id, local_seq)` 唯一索引已经规定每个设备序列只能对应一个 commit 身份。新的
+同步预检会在 INSERT 前检查该身份；序列已经属于另一 commit ID 时返回 validation error。
+重新编号不属于兼容转换，因为序列是经过认证的 commit 身份与因果顺序的一部分。
+
+health verification 会报告引用缺失 commit、引用其他设备 commit 或低于同设备后续已接受
+序列的 device head。检查只报告 legacy 状态，不重写历史。
+
+本次修改不增加 schema、migration、format、bundle、DTO 或 capability version。MDBX1 与
+MDBX1-DRAFT 的迟到 commit 仍是合法输入，当前 receiver 会保留较新的 head。接收端需要使用
+当前 storage core 才能获得与交付顺序无关的合并行为；wire 表示保持不变，因此旧 receiver
+继续使用其历史 apply 规则。

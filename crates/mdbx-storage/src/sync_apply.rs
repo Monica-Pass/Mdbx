@@ -99,7 +99,7 @@ mod tests {
     };
     use crate::sync_delta::{
         decode_sync_delta_body, load_sync_delta_envelope, sync_delta_object_payload,
-        DeletedSyncEntity, NewSyncDeltaEnvelope, SyncDeltaBatchKind, SyncDeltaBody,
+        DeletedSyncEntity, DeviceHeadRow, NewSyncDeltaEnvelope, SyncDeltaBatchKind, SyncDeltaBody,
         SyncDeltaEnvelope, SyncDeltaLimits,
     };
     use crate::sync_state::{collect_sync_state, collect_sync_state_payload, SyncStateLimits};
@@ -488,6 +488,209 @@ mod tests {
             .unwrap();
         assert_eq!(stored.0, second.commit.commit_id);
         assert_eq!(stored.1, 1);
+    }
+
+    #[test]
+    fn synced_device_head_does_not_regress_to_delayed_commit() {
+        let (conn, ctx) = setup();
+        let genesis = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let mut newer =
+            graph_only_commit("remote-newer", "remote-device", 2, vec![genesis.clone()]);
+        newer.commit.created_at = "2026-05-22T02:00:00Z".to_string();
+        resign_serialized_commit(&conn, &mut newer);
+        SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![newer], 0, true)).unwrap();
+
+        let mut delayed = graph_only_commit("remote-delayed", "remote-device", 1, vec![genesis]);
+        delayed.commit.created_at = "2026-05-22T01:00:00Z".to_string();
+        resign_serialized_commit(&conn, &mut delayed);
+        SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![delayed], 0, true)).unwrap();
+
+        let stored: (String, String) = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id, last_seen_at FROM device_heads
+                 WHERE device_id = 'remote-device'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "remote-newer");
+        assert_eq!(stored.1, "2026-05-22T02:00:00Z");
+    }
+
+    #[test]
+    fn synced_commit_rejects_reused_device_sequence() {
+        let (conn, ctx) = setup();
+        let genesis = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let first = graph_only_commit(
+            "remote-sequence-first",
+            "remote-device",
+            1,
+            vec![genesis.clone()],
+        );
+        SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![first], 0, true)).unwrap();
+
+        let conflicting = graph_only_commit(
+            "remote-sequence-conflict",
+            "remote-device",
+            1,
+            vec![genesis],
+        );
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![conflicting], 0, true))
+                .unwrap_err();
+        assert!(matches!(&error, StorageError::Validation(_)));
+        assert!(error.to_string().contains("local sequence 1"));
+        assert!(!SyncApplyRepo::commit_exists(&conn, "remote-sequence-conflict").unwrap());
+        assert_eq!(
+            SyncApplyRepo::current_branch_head(&conn, None, "main")
+                .unwrap()
+                .as_deref(),
+            Some("remote-sequence-first")
+        );
+        let device_head: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM device_heads WHERE device_id = 'remote-device'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(device_head, "remote-sequence-first");
+    }
+
+    #[test]
+    fn sync_delta_device_head_advances_by_device_sequence_across_branches() {
+        let (conn, _) = setup();
+        let genesis = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let older = graph_only_commit(
+            "delta-device-older",
+            "delta-device",
+            1,
+            vec![genesis.clone()],
+        );
+        let newer = graph_only_commit("delta-device-newer", "delta-device", 2, vec![genesis]);
+        commit_ingest_apply::insert_commit(&conn, &older).unwrap();
+        commit_ingest_apply::insert_commit(&conn, &newer).unwrap();
+
+        lifecycle_apply::apply_delta_device_heads(
+            &conn,
+            &[DeviceHeadRow {
+                device_id: "delta-device".to_string(),
+                head_commit_id: "delta-device-older".to_string(),
+                last_seen_at: "2026-05-22T02:00:00Z".to_string(),
+                revoked: true,
+            }],
+        )
+        .unwrap();
+        lifecycle_apply::apply_delta_device_heads(
+            &conn,
+            &[DeviceHeadRow {
+                device_id: "delta-device".to_string(),
+                head_commit_id: "delta-device-newer".to_string(),
+                last_seen_at: "2026-05-22T01:00:00Z".to_string(),
+                revoked: false,
+            }],
+        )
+        .unwrap();
+
+        let stored: (String, String, bool) = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id, last_seen_at, revoked FROM device_heads
+                 WHERE device_id = 'delta-device'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "delta-device-newer");
+        assert_eq!(stored.1, "2026-05-22T02:00:00Z");
+        assert!(stored.2);
+    }
+
+    #[test]
+    fn sync_delta_device_head_rejects_commit_from_another_device() {
+        let (conn, _) = setup();
+        let genesis = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let commit = graph_only_commit("actual-device-commit", "actual-device", 1, vec![genesis]);
+        commit_ingest_apply::insert_commit(&conn, &commit).unwrap();
+
+        let error = lifecycle_apply::apply_delta_device_heads(
+            &conn,
+            &[DeviceHeadRow {
+                device_id: "claimed-device".to_string(),
+                head_commit_id: "actual-device-commit".to_string(),
+                last_seen_at: "2026-05-22T01:00:00Z".to_string(),
+                revoked: false,
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("authored by actual-device"));
+        let stored: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM device_heads WHERE device_id = 'claimed-device'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[test]
+    fn sync_delta_device_head_rejects_wrong_existing_commit_device() {
+        let (conn, _) = setup();
+        let genesis = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let wrong = graph_only_commit(
+            "wrong-existing-head",
+            "wrong-device",
+            1,
+            vec![genesis.clone()],
+        );
+        let incoming = graph_only_commit("claimed-device-head", "claimed-device", 1, vec![genesis]);
+        commit_ingest_apply::insert_commit(&conn, &wrong).unwrap();
+        commit_ingest_apply::insert_commit(&conn, &incoming).unwrap();
+        conn.inner()
+            .execute(
+                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked)
+                 VALUES ('claimed-device', 'wrong-existing-head',
+                         '2026-05-22T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+
+        let error = lifecycle_apply::apply_delta_device_heads(
+            &conn,
+            &[DeviceHeadRow {
+                device_id: "claimed-device".to_string(),
+                head_commit_id: "claimed-device-head".to_string(),
+                last_seen_at: "2026-05-22T01:00:00Z".to_string(),
+                revoked: false,
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("authored by wrong-device"));
+        let stored: (String, bool) = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id, revoked FROM device_heads
+                 WHERE device_id = 'claimed-device'",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "wrong-existing-head");
+        assert!(stored.1);
     }
 
     #[test]

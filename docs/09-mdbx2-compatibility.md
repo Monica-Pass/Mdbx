@@ -568,3 +568,28 @@ No schema, format, bundle, or DTO version changes. Current producers already
 emit representable values. Invalid new commits fail before commit inventory,
 parents, sequence floors, payloads, tombstones, device heads, or branch heads
 can change.
+
+### 7.21 Monotonic Device-Local Heads
+
+Device heads now use one storage rule for serialized commit ingestion and
+state-delta ingestion. The referenced commit must be authored by the claimed
+device. A higher `local_seq` advances the head across branch boundaries; a
+delayed lower sequence remains stored and forwardable without replacing the
+newer head. Reapplying the same commit is idempotent. Observation time keeps the
+later value, and revocation cannot be cleared by synchronization.
+
+The existing `(device_id, local_seq)` unique index already defines one commit
+identity per device sequence. New synchronization preflights that identity and
+returns a validation error before INSERT when another commit ID owns the slot.
+Renumbering is not a compatibility conversion because the sequence is part of
+authenticated commit identity and causal order.
+
+Health verification reports device heads that reference a missing commit, a
+commit authored by another device, or a sequence below a later accepted commit
+from the same device. It reports the legacy state without rewriting history.
+
+No schema, migration, format, bundle, DTO, or capability version changes. MDBX1
+and MDBX1-DRAFT delayed commits remain valid input, and current receivers retain
+their newer head. A receiver needs the current storage core to obtain the new
+delivery-order-independent merge behavior; older receivers continue to use
+their historical apply rule because the wire representation is unchanged.

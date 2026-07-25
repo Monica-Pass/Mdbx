@@ -804,7 +804,7 @@ impl RecoveryVerifier {
         }))
     }
 
-    /// 检查陈旧 device head：head 对应的 commit 是否存在。
+    /// 检查 device head 的引用、设备归属与设备本地序列。
     pub fn check_stale_heads(conn: &VaultConnection) -> StorageResult<Vec<HealthIssue>> {
         let mut issues: Vec<HealthIssue> = Vec::new();
 
@@ -831,6 +831,62 @@ impl RecoveryVerifier {
                 description: format!(
                     "device {} head {} references non-existent commit",
                     device_id, head_id
+                ),
+            });
+        }
+
+        let mut stmt = conn
+            .inner()
+            .prepare(
+                "SELECT dh.device_id, dh.head_commit_id, c.device_id
+                 FROM device_heads dh
+                 JOIN commits c ON dh.head_commit_id = c.commit_id
+                 WHERE dh.device_id <> c.device_id",
+            )
+            .map_err(StorageError::Database)?;
+        let wrong_device_heads: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+        for (device_id, head_id, commit_device_id) in wrong_device_heads {
+            issues.push(HealthIssue {
+                severity: IssueSeverity::Critical,
+                category: "stale-heads".to_string(),
+                description: format!(
+                    "device {} head {} is authored by device {}",
+                    device_id, head_id, commit_device_id
+                ),
+            });
+        }
+
+        let mut stmt = conn
+            .inner()
+            .prepare(
+                "SELECT dh.device_id, dh.head_commit_id, head_commit.local_seq,
+                        MAX(candidate.local_seq)
+                 FROM device_heads dh
+                 JOIN commits head_commit ON dh.head_commit_id = head_commit.commit_id
+                 JOIN commits candidate ON candidate.device_id = dh.device_id
+                 WHERE head_commit.device_id = dh.device_id
+                 GROUP BY dh.device_id, dh.head_commit_id, head_commit.local_seq
+                 HAVING MAX(candidate.local_seq) > head_commit.local_seq",
+            )
+            .map_err(StorageError::Database)?;
+        let regressed_heads: Vec<(String, String, i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(StorageError::Database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Database)?;
+        for (device_id, head_id, head_sequence, latest_sequence) in regressed_heads {
+            issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "stale-heads".to_string(),
+                description: format!(
+                    "device {} head {} at local sequence {} is behind local sequence {}",
+                    device_id, head_id, head_sequence, latest_sequence
                 ),
             });
         }
@@ -1697,6 +1753,62 @@ mod tests {
             .iter()
             .any(|i| i.severity == IssueSeverity::Info && i.description.contains("old-device"));
         assert!(has_info);
+    }
+
+    #[test]
+    fn test_check_stale_heads_detects_wrong_commit_device() {
+        let (conn, _ctx, project_id) = setup();
+        let head_commit_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM projects WHERE project_id = ?1",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at)
+                 VALUES ('claimed-device', ?1, '2026-07-26T00:00:00Z')",
+                [&head_commit_id],
+            )
+            .unwrap();
+
+        let issues = RecoveryVerifier::check_stale_heads(&conn).unwrap();
+        assert!(issues.iter().any(|issue| {
+            issue.severity >= IssueSeverity::Critical
+                && issue.description.contains("claimed-device")
+                && issue.description.contains("test-device")
+        }));
+    }
+
+    #[test]
+    fn test_check_stale_heads_detects_regressed_sequence() {
+        let (conn, ctx, _project_id) = setup();
+        ProjectRepo::create(&conn, &ctx, "Second", None, None).unwrap();
+        let older_commit_id: String = conn
+            .inner()
+            .query_row(
+                "SELECT commit_id FROM commits WHERE device_id = 'test-device'
+                 ORDER BY local_seq ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE device_heads SET head_commit_id = ?1
+                 WHERE device_id = 'test-device'",
+                [&older_commit_id],
+            )
+            .unwrap();
+
+        let issues = RecoveryVerifier::check_stale_heads(&conn).unwrap();
+        assert!(issues.iter().any(|issue| {
+            issue.severity >= IssueSeverity::Error
+                && issue.description.contains("test-device")
+                && issue.description.contains("behind local sequence")
+        }));
     }
 
     // -----------------------------------------------------------------------

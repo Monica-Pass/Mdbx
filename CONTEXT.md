@@ -175,6 +175,20 @@ Parent order is canonicalized, while duplicate membership is rejected because
 are not rewritten to invent causal detail. Existing exact replay uses its
 already accepted local identity rather than reapplying first-insertion rules.
 
+### DeviceHead
+
+`DeviceHead` is the current accepted position of one device's global commit
+sequence. Its commit must be authored by the same device. Ordering uses
+`local_seq`, not DAG ancestry, because one device can author commits on
+different branches while retaining one sequence.
+
+A higher sequence advances the head; a delayed lower sequence remains history
+without moving the head backward. The same commit is idempotent, while a second
+commit at the same device sequence is invalid. `last_seen_at` keeps the later
+known value and revocation is monotonic. Commit ingestion and state-delta
+ingestion share this rule. Health diagnostics report dangling, wrong-device,
+and regressed heads.
+
 ### CommitKind
 
 `CommitKind` is authenticated commit semantics, not a presentation hint. The
@@ -319,6 +333,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 49. OperationRequestIdentity is derived from the submitted operation before mutation and is never replaced by aggregate commit metadata. New tagged identities match exactly on every retry; authenticated unknown encodings fail closed, while untagged 32-byte rows retain their documented legacy behavior.
 50. ExistingCommitReplay may add transport payloads or previously omitted authenticated operation metadata only after the complete commit and canonical parent identity matches local storage. Reusing a commit or operation ID with different authenticated metadata fails before payload application.
 51. IncomingCommitStructure must be authenticated and exactly representable before first insertion: local sequence fits SQLite INTEGER, vector clock parses as a string-to-u64 map, and parent IDs are unique. Structural rejection leaves commit graph and branch state unchanged, while legacy empty clocks remain valid.
+52. DeviceHead identifies the greatest accepted device-local sequence, references a commit authored by the same device, advances independently of branch ancestry, and merges observation time and revocation monotonically. Delayed commits cannot move it backward, and health diagnostics report wrong-device or regressed rows.
 
 ## Module Architecture
 
@@ -358,7 +373,7 @@ Permanent purge receipts are applied before ordinary objects during complete syn
 
 ### Recovery and Health Module
 
-The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, typed tombstones, and permanent purge receipts. It reports missing markers for deleted rows, unexplained markers for active rows, duplicate markers, invalid receipt authentication tags, and active rows that contradict a permanent receipt. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
+The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, typed tombstones, and permanent purge receipts. It reports dangling, wrong-device, and regressed device heads, missing markers for deleted rows, unexplained markers for active rows, duplicate markers, invalid receipt authentication tags, and active rows that contradict a permanent receipt. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
 
 ### Integrity Root Module
 

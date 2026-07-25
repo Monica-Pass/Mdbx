@@ -156,7 +156,7 @@ pub(super) fn insert_commit(
     serialized: &SerializedCommit,
 ) -> StorageResult<()> {
     verify_incoming_commit_integrity(conn, serialized)?;
-    let local_seq = validate_new_commit_structure(serialized)?;
+    let local_seq = validate_new_commit_structure(conn, serialized)?;
     let commit = &serialized.commit;
 
     conn.inner().execute(
@@ -251,7 +251,10 @@ pub(super) fn insert_commit(
     Ok(())
 }
 
-fn validate_new_commit_structure(serialized: &SerializedCommit) -> StorageResult<i64> {
+fn validate_new_commit_structure(
+    conn: &VaultConnection,
+    serialized: &SerializedCommit,
+) -> StorageResult<i64> {
     let commit = &serialized.commit;
     let local_seq = i64::try_from(commit.local_seq).map_err(|_| {
         StorageError::Validation(format!(
@@ -274,6 +277,21 @@ fn validate_new_commit_structure(serialized: &SerializedCommit) -> StorageResult
                 commit.commit_id, parent_id
             )));
         }
+    }
+
+    let existing_commit_id: Option<String> = conn
+        .inner()
+        .query_row(
+            "SELECT commit_id FROM commits WHERE device_id = ?1 AND local_seq = ?2",
+            params![commit.device_id, local_seq],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing_commit_id) = existing_commit_id {
+        return Err(StorageError::Validation(format!(
+            "incoming commit {} reuses device {} local sequence {} already assigned to commit {}",
+            commit.commit_id, commit.device_id, commit.local_seq, existing_commit_id
+        )));
     }
 
     Ok(local_seq)

@@ -225,6 +225,18 @@ multiplicity. The legacy empty clock `{}` remains valid. Structural rejection
 MUST leave commit, inventory, parent, sequence, payload, tombstone, device-head,
 and branch state unchanged.
 
+The `(device_id, local_seq)` identity MUST remain unique. A new commit that
+reuses an accepted sequence for a different commit ID MUST receive a validation
+error before insertion; the existing unique index remains a storage backstop.
+
+A device head MUST reference a commit authored by the same device and represent
+that device's greatest accepted local sequence. Ordering uses `local_seq`, not
+DAG ancestry, because one device can author commits on different branches. A
+higher sequence advances the head; a delayed lower sequence remains in history
+without moving the head backward; the same commit is idempotent. `last_seen_at`
+keeps the later known value and `revoked` merges monotonically. Health checks
+MUST report dangling, wrong-device, and regressed heads.
+
 ## 9. Conflict Detection
 
 MDBX MUST detect concurrent edits using causal metadata, not timestamp alone.
@@ -253,7 +265,7 @@ After the bootstrap floor, an outer write transaction SHOULD materialize one bou
 
 The receiver MUST authenticate vault and batch identity, payload digest, row count, commit ownership, and resource limits before accepting state. Every associated commit MUST be available. A recognized delta cannot be mixed with complete sync state or a second delta on the same serialized commit. Commit insertion, sparse state application, attachment chunk replacement, device-head merge, authorized deletion, received-batch persistence, and incoming capture cleanup MUST commit or roll back together.
 
-Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones. Device revocation merges monotonically. Physical object or tombstone deletion requires a matching authenticated permanent-purge receipt. Key epoch changes require the mutable verified-unlocked apply path; the immutable compatibility path rejects them atomically.
+Delta tombstone rows are sparse and MUST NOT replace unrelated local tombstones. Device-head rows use the same authored device-local sequence rule as commit ingestion, and device revocation merges monotonically. Physical object or tombstone deletion requires a matching authenticated permanent-purge receipt. Key epoch changes require the mutable verified-unlocked apply path; the immutable compatibility path rejects them atomically.
 
 Complete sync state remains the bootstrap and old-peer fallback. Bundle v1-v3 retain their existing formats. Bundle v4 carries bounded commit and delta inventories after a paired checkpoint, binds resumed segments by transfer ID, segment index, and the previous payload digest, and advances the receiver checkpoint only after one segment is durably applied. Commit-associated and auxiliary deltas in a segment share one database transaction. A client MUST NOT claim incremental convergence until it exchanges both checkpoint classes and preserves the segment resume state.
 

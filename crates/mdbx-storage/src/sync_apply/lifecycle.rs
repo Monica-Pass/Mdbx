@@ -139,43 +139,12 @@ pub(super) fn apply_delta_device_heads(
     device_heads: &[DeviceHeadRow],
 ) -> StorageResult<()> {
     for incoming in device_heads {
-        if !commit_graph_apply::commit_exists(conn, &incoming.head_commit_id)? {
-            return Err(StorageError::ConstraintViolation(format!(
-                "device head {} references unavailable commit {}",
-                incoming.device_id, incoming.head_commit_id
-            )));
-        }
-        let local: Option<(String, String, bool)> = conn.inner().query_row(
-            "SELECT head_commit_id, last_seen_at, revoked FROM device_heads WHERE device_id = ?1",
-            [&incoming.device_id], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2)? != 0)),
-        ).optional()?;
-        let (head_commit_id, last_seen_at, revoked) = match local {
-            None => (
-                incoming.head_commit_id.clone(),
-                incoming.last_seen_at.clone(),
-                incoming.revoked,
-            ),
-            Some((local_head, local_seen, local_revoked)) => {
-                let head = if local_head == incoming.head_commit_id
-                    || commit_graph_apply::is_ancestor_commit(
-                        conn,
-                        &local_head,
-                        &incoming.head_commit_id,
-                    )? {
-                    incoming.head_commit_id.clone()
-                } else {
-                    local_head
-                };
-                (
-                    head,
-                    std::cmp::max(local_seen, incoming.last_seen_at.clone()),
-                    local_revoked || incoming.revoked,
-                )
-            }
-        };
-        conn.inner().execute(
-            "INSERT INTO device_heads (device_id, head_commit_id, last_seen_at, revoked) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(device_id) DO UPDATE SET head_commit_id = excluded.head_commit_id, last_seen_at = excluded.last_seen_at, revoked = excluded.revoked",
-            params![incoming.device_id, head_commit_id, last_seen_at, revoked as i32],
+        commit_graph_apply::merge_device_head(
+            conn,
+            &incoming.device_id,
+            &incoming.head_commit_id,
+            &incoming.last_seen_at,
+            incoming.revoked,
         )?;
     }
     Ok(())
