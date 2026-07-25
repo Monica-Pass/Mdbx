@@ -83,7 +83,11 @@ An `AttachmentSummary` is the bounded, payload-free navigation projection of an 
 
 ### ExtensionProfile
 
-An `ExtensionProfile` declares the ObjectTypeIds, relation kinds, optional indexes, import/export adapters, and client presentation hints supplied by one domain extension. It never receives raw SQL authority over core history or key tables.
+An `ExtensionProfile` is the bounded canonical process-local declaration supplied by one loaded domain Adapter. It declares an ExtensionId, profile version, CollectionTypeIds, custom ObjectTypeIds, relation kinds, capabilities, optional indexes, import/export Adapters, and presentation hints. Every identifier belongs to the extension namespace. The profile is never persisted, synchronized, or treated as key, Tiga, SQL, or write authority.
+
+### ExtensionFeatureId
+
+An `ExtensionFeatureId` is a namespaced non-authority identifier for an optional index, import/export Adapter, or presentation hint declared by an ExtensionProfile. It describes code or presentation behavior present in the process and is separate from ExtensionCapabilityId, which gates user-visible Collection mutations.
 
 ### CapabilitySet
 
@@ -206,6 +210,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 40. Conflict navigation is metadata-only and bounded: unresolved summary SQL projects conflicting-field length before materialization, enforces 64 KiB/256-path/4096-byte limits, and binds cursors to the query filter. Complete conflict reads and typed resolution APIs remain available without reinterpretation.
 41. Snapshot navigation is metadata-only and bounded: summary SQL projects `length(snapshot_ct)` without selecting the encrypted BLOB, enforces 1–200 pages/4096-byte cursors/4096-byte metadata text, and leaves complete snapshot reads and restore semantics unchanged.
 42. Adapter payload planning and execution require the `MigratePayload` Tiga administration operation. Authorization precedes source payload loading and decryption; execution reauthorizes and atomically couples binding checks, one idempotent CommitOperation, audit correlation, and sync-delta materialization. Decrypted plan bytes are transient and never persisted or synchronized.
+43. ExtensionProfile registration is bounded, canonical, and process-local. It cannot claim legacy ObjectTypeIds or identifiers outside its namespace and never changes persisted data merely by registration or omission.
 
 ## Module Architecture
 

@@ -2,6 +2,7 @@ pub mod attachment;
 pub mod collection;
 pub mod commit;
 pub mod entry;
+pub mod extension;
 pub mod object_metadata;
 pub mod payload_migration;
 pub mod project;
@@ -20,6 +21,11 @@ pub use commit::{
     SnapshotSummary, SnapshotSummaryPage, Tombstone, TombstoneTargetType,
 };
 pub use entry::{Entry, EntryType, ObjectSummary, ObjectSummaryPage, ObjectTypeId};
+pub use extension::{
+    ExtensionFeatureId, ExtensionId, ExtensionProfile, MAX_EXTENSION_PROFILE_CAPABILITIES,
+    MAX_EXTENSION_PROFILE_COLLECTION_TYPES, MAX_EXTENSION_PROFILE_FEATURES_PER_CATEGORY,
+    MAX_EXTENSION_PROFILE_OBJECT_TYPES, MAX_EXTENSION_PROFILE_RELATION_KINDS,
+};
 pub use object_metadata::{
     ObjectLabel, ObjectLabelAssignment, ObjectLabelAssignmentSummary,
     ObjectLabelAssignmentSummaryPage, ObjectLabelSummary, ObjectLabelSummaryPage, ObjectRelation,
