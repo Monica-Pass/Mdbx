@@ -23,6 +23,21 @@ fn ffi_test_vault() -> MdbxVault {
     }
 }
 
+fn ffi_test_extension_profile(namespace: &str) -> MdbxExtensionProfile {
+    MdbxExtensionProfile {
+        extension_id: namespace.to_string(),
+        profile_version: 1,
+        collection_type_ids: vec![namespace.to_string()],
+        object_type_ids: vec![format!("{namespace}.item")],
+        relation_kind_ids: vec![format!("{namespace}.member")],
+        capability_ids: vec![format!("{namespace}.store")],
+        optional_index_ids: vec![format!("{namespace}.index.main")],
+        import_adapter_ids: Vec::new(),
+        export_adapter_ids: Vec::new(),
+        presentation_hint_ids: Vec::new(),
+    }
+}
+
 fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
     let conn = vault.conn.lock().unwrap();
     conn.inner()
@@ -71,6 +86,106 @@ fn build_capability_manifest_is_available_without_a_vault() {
             .disabled_optional_sync_capability_ids
             .contains(&zstd)
     );
+}
+
+#[test]
+fn extension_profile_registry_is_canonical_idempotent_and_atomic() {
+    let vault = ffi_test_vault();
+    let mut mail = ffi_test_extension_profile("com.monica.mail");
+    mail.object_type_ids
+        .push("com.monica.mail.contact".to_string());
+    mail.object_type_ids
+        .push("com.monica.mail.item".to_string());
+
+    assert_eq!(
+        vault.register_extension_profile(mail.clone()).unwrap(),
+        MdbxExtensionRegistration::Registered
+    );
+    assert_eq!(
+        vault.register_extension_profile(mail.clone()).unwrap(),
+        MdbxExtensionRegistration::AlreadyRegistered
+    );
+    let stored = vault
+        .get_extension_profile("com.monica.mail".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.object_type_ids,
+        vec![
+            "com.monica.mail.contact".to_string(),
+            "com.monica.mail.item".to_string(),
+        ]
+    );
+
+    let mut changed = mail.clone();
+    changed.profile_version = 2;
+    assert!(vault.register_extension_profile(changed).is_err());
+    assert_eq!(
+        vault.list_extension_profiles().unwrap(),
+        vec![stored.clone()]
+    );
+
+    let mut umbrella = ffi_test_extension_profile("com.monica");
+    umbrella.collection_type_ids = stored.collection_type_ids.clone();
+    umbrella.object_type_ids = stored.object_type_ids.clone();
+    umbrella.relation_kind_ids = stored.relation_kind_ids.clone();
+    umbrella.capability_ids = stored.capability_ids.clone();
+    umbrella.optional_index_ids = stored.optional_index_ids.clone();
+    assert!(vault
+        .replace_extension_profiles(vec![stored.clone(), umbrella])
+        .is_err());
+    assert_eq!(
+        vault.list_extension_profiles().unwrap(),
+        vec![stored.clone()]
+    );
+
+    assert_eq!(
+        vault
+            .unregister_extension_profile("com.monica.mail".to_string())
+            .unwrap(),
+        Some(stored)
+    );
+    assert!(vault.list_extension_profiles().unwrap().is_empty());
+}
+
+#[test]
+fn registered_extension_profile_constrains_collection_profile_writes() {
+    let vault = ffi_test_vault();
+    let mut mail = ffi_test_extension_profile("com.monica.mail");
+    mail.object_type_ids = vec!["com.monica.mail.message".to_string()];
+    mail.relation_kind_ids = vec!["com.monica.mail.reply-to".to_string()];
+    mail.optional_index_ids = vec!["com.monica.mail.index.messages".to_string()];
+    vault.register_extension_profile(mail).unwrap();
+    vault
+        .set_extension_capabilities(vec!["com.monica.mail.store".to_string()])
+        .unwrap();
+    let collection = vault.create_project("Mail".to_string()).unwrap();
+
+    assert!(vault
+        .set_collection_profile(
+            collection.project_id.clone(),
+            "com.monica.mail".to_string(),
+            Vec::new(),
+            1,
+            vec!["com.monica.mail.folder".to_string()],
+            vec!["com.monica.mail.store".to_string()],
+        )
+        .is_err());
+    assert!(vault
+        .get_collection_profile(collection.project_id.clone())
+        .unwrap()
+        .is_none());
+
+    vault
+        .set_collection_profile(
+            collection.project_id,
+            "com.monica.mail".to_string(),
+            Vec::new(),
+            1,
+            vec!["com.monica.mail.message".to_string()],
+            vec!["com.monica.mail.store".to_string()],
+        )
+        .unwrap();
 }
 
 #[test]

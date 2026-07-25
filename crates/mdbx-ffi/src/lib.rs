@@ -25,6 +25,7 @@ pub use attachment_summary_facade::*;
 pub use capability_facade::*;
 pub use collection_facade::*;
 pub use conflict_facade::*;
+pub use extension_facade::*;
 pub use history_facade::*;
 pub use integrity_root_facade::*;
 pub use lifecycle_facade::*;
@@ -83,6 +84,10 @@ pub enum MdbxFfiError {
     LockPoisoned,
     #[error("invalid conflict object type: {object_type}")]
     InvalidConflictObjectType { object_type: String },
+    #[error("invalid extension ID: {extension_id}")]
+    InvalidExtensionId { extension_id: String },
+    #[error("invalid extension feature ID: {feature_id}")]
+    InvalidExtensionFeatureId { feature_id: String },
 }
 
 impl From<StorageError> for MdbxFfiError {

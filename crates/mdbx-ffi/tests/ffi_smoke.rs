@@ -10,9 +10,9 @@ use mdbx_ffi::{
     open_vault_with_password_security_key, open_vault_with_security_key, upgrade_vault,
     MdbxAttachmentBatchCommand, MdbxAttachmentContentLimits, MdbxAttachmentCreateRequest,
     MdbxAuthorizationConstraintKind, MdbxAuthorizationOutcome, MdbxAuthorizationReason,
-    MdbxDeviceAssurance, MdbxDeviceContext, MdbxFfiError, MdbxObjectMetadataDisclosureLimits,
-    MdbxPolicyCompliance, MdbxTigaMode, MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType,
-    MdbxUnlockMethodType, MdbxWriteCommand,
+    MdbxDeviceAssurance, MdbxDeviceContext, MdbxExtensionProfile, MdbxExtensionRegistration,
+    MdbxFfiError, MdbxObjectMetadataDisclosureLimits, MdbxPolicyCompliance, MdbxTigaMode,
+    MdbxTigaOperation, MdbxTigaScope, MdbxTigaScopeType, MdbxUnlockMethodType, MdbxWriteCommand,
 };
 use mdbx_storage::migration::CURRENT_SCHEMA_VERSION;
 use uuid::Uuid;
@@ -73,6 +73,50 @@ fn trusted_device() -> MdbxDeviceContext {
         screen_capture_protection_available: true,
         secure_temp_files_available: true,
     }
+}
+
+fn mail_extension_profile() -> MdbxExtensionProfile {
+    MdbxExtensionProfile {
+        extension_id: "com.monica.mail".to_string(),
+        profile_version: 1,
+        collection_type_ids: vec!["com.monica.mail".to_string()],
+        object_type_ids: vec!["com.monica.mail.message".to_string()],
+        relation_kind_ids: vec!["com.monica.mail.reply-to".to_string()],
+        capability_ids: vec!["com.monica.mail.store".to_string()],
+        optional_index_ids: vec!["com.monica.mail.index.messages".to_string()],
+        import_adapter_ids: vec!["com.monica.mail.import.eml".to_string()],
+        export_adapter_ids: vec!["com.monica.mail.export.eml".to_string()],
+        presentation_hint_ids: vec!["com.monica.mail.presentation.threaded".to_string()],
+    }
+}
+
+#[test]
+fn extension_profile_registry_is_available_and_process_local() {
+    let vault_path = temp_vault_path("extension-profile-registry");
+    let path = vault_path.as_path_string();
+    let password = "extension profile password 12345!";
+    let vault = create_vault(
+        path.clone(),
+        password.to_string(),
+        "ffi-extension-device".to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        vault
+            .register_extension_profile(mail_extension_profile())
+            .unwrap(),
+        MdbxExtensionRegistration::Registered
+    );
+    assert_eq!(vault.list_extension_profiles().unwrap().len(), 1);
+    drop(vault);
+
+    let reopened = open_vault(
+        path,
+        password.to_string(),
+        "ffi-extension-device".to_string(),
+    )
+    .unwrap();
+    assert!(reopened.list_extension_profiles().unwrap().is_empty());
 }
 
 fn count_rows(path: &Path, table: &str) -> i64 {
