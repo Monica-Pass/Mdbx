@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mdbx-core",
+    "crates/mdbx-adapter-steam",
     "crates/mdbx-crypto",
     "crates/mdbx-storage",
     "crates/mdbx-sync",

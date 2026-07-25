@@ -89,6 +89,19 @@ An `ExtensionProfile` is the bounded canonical process-local declaration supplie
 
 An `ExtensionFeatureId` is a namespaced non-authority identifier for an optional index, import/export Adapter, or presentation hint declared by an ExtensionProfile. It describes code or presentation behavior present in the process and is separate from ExtensionCapabilityId, which gates user-visible Collection mutations.
 
+### SteamMaFileAdapter
+
+`SteamMaFileAdapter` is the optional pure-Rust Adapter in
+`crates/mdbx-adapter-steam`. It declares the `com.monica.steam` ExtensionProfile
+and interprets `com.monica.steam.mafile` only as a bounded JSON document. The
+Adapter has no network, Android, SQLite, key, or Tiga dependency. It preserves
+unknown mafile fields in deterministic canonical output, rejects duplicate
+keys, and exposes a stable non-secret object ID derived from a canonical
+SteamID and serial number. A document may provide its own SteamID; clients may
+also supply the authenticated account SteamID when a mafile variant omits it.
+The Adapter's profile and parser are process-local code metadata; neither is
+stored in a Collection, snapshot, or synchronization wire payload.
+
 ### CapabilitySet
 
 A `CapabilitySet` is the compile-time and runtime set of optional adapters present in a build. Core readers, MDBX1 compatibility, encryption, commits, and synchronization are mandatory. KDBX import/export, benchmarks, mail indexes, bookmark indexes, and Steam adapters can be excluded when unused.
@@ -211,6 +224,9 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 41. Snapshot navigation is metadata-only and bounded: summary SQL projects `length(snapshot_ct)` without selecting the encrypted BLOB, enforces 1–200 pages/4096-byte cursors/4096-byte metadata text, and leaves complete snapshot reads and restore semantics unchanged.
 42. Adapter payload planning and execution require the `MigratePayload` Tiga administration operation. Authorization precedes source payload loading and decryption; execution reauthorizes and atomically couples binding checks, one idempotent CommitOperation, audit correlation, and sync-delta materialization. Decrypted plan bytes are transient and never persisted or synchronized.
 43. ExtensionProfile registration is bounded, canonical, and process-local. It cannot claim legacy ObjectTypeIds or identifiers outside its namespace and never changes persisted data merely by registration or omission.
+44. The SteamMaFileAdapter is optional and removable. It owns mafile syntax, canonicalization, identity derivation, and parser resource errors; the Generic Object Module owns encryption, history, synchronization, recovery, and opaque preservation.
+45. Steam mafile parsing checks input bytes before deserialization and enforces bounded depth, aggregate fields, per-array items, nodes, per-string bytes, and aggregate string/key bytes. Duplicate keys fail, and unknown keys remain available after canonical round-trip.
+46. Steam object identity is a domain-separated, length-framed SHA-256 digest of the canonical unsigned SteamID and trimmed case-preserving serial number. Debug and error interfaces never include mafile payload values.
 
 ## Module Architecture
 
@@ -226,7 +242,7 @@ The Legacy Password Adapter maps existing EntryType values and MDBX1 methods ont
 
 ### Domain Adapters
 
-Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payload schemas. They may add rebuildable indexes through explicit seams. One adapter alone does not justify a core interface; shared behavior moves into the core only after at least two adapters need the same seam.
+Bookmark, mail, and Steam adapters interpret namespaced ObjectTypeIds and payload schemas. The SteamMaFileAdapter is the first concrete removable Adapter: it exercises the ExtensionProfile seam without making the core understand Steam fields. Domain Adapters may add rebuildable indexes through explicit seams. One adapter alone does not justify a new core interface; shared behavior moves into the core only after at least two adapters need the same seam.
 
 ### Conflict Resolution Module
 

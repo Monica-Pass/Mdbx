@@ -274,6 +274,37 @@ Register every ExtensionCapabilityId required by the CollectionProfile and keep 
 
 A plan contains bounded decrypted payloads and must remain in protected process memory rather than logs, caches, files, or sync metadata. Its disclosure audit is correlated by `plan_id` and has no commit. The Adapter supplies exactly one output for every planned object and then calls `PayloadMigrationRepo::execute` or the corresponding UniFFI method. Execution reauthorizes, rechecks every binding, applies the whole batch, creates one idempotent commit, and records one commit-correlated audit in the same transaction. Any denial, concurrent object/Profile/branch change, missing capability, malformed output, or limit failure leaves the batch unchanged. Retrying the exact completed plan returns the original commit without a second successful audit. When `remaining_count` is greater than zero, create a fresh plan for the next batch.
 
+#### Steam mafile Adapter
+
+Steam mafile support is optional. A client that ships the
+`mdbx-adapter-steam` crate should register its `extension_profile()` in the
+process-local ExtensionProfile registry and separately activate
+`com.monica.steam.store` when it is ready to perform user-visible writes.
+Profile registration is not permission and does not replace Tiga authorization.
+
+Treat every mafile as untrusted JSON. Parse it through the Adapter's bounded
+parser before constructing a generic `WriteCommand`; do not create a second
+client-specific parser with `serde_json::from_slice`. The default contract is
+1 MiB input, depth 32, 512 aggregate fields, 512 items per array, 8,192
+aggregate nodes, 64 KiB per string/key, and 1 MiB aggregate string/key bytes.
+The Adapter rejects duplicate keys, returns static non-disclosing errors, and
+preserves unknown fields in canonical JSON. A client may lower limits for a
+smaller device, but cannot raise the hard ceilings.
+
+Use the canonical JSON bytes as the opaque payload of an object whose exact
+ObjectTypeId is `com.monica.steam.mafile`. Derive the object ID from the
+authenticated account SteamID and the mafile serial number through the
+Adapter's stable-ID method; never derive it from an account name, title, path,
+secret, or list position. Keep parsed values and canonical bytes in protected
+process memory until the generic authenticated encryption write succeeds, and
+never log them. Importing several mafiles is one bounded user-level
+`CommitOperation`, not one commit per JSON field or object.
+
+The Adapter performs no Steam network action, Android integration, token
+refresh, or storage write. If a build removes it, existing Steam objects stay
+available as opaque records for synchronization, backup, restore, and recovery;
+the client must not delete or reinterpret them.
+
 ### 4.2 Deletion Must Use Tombstones
 
 Deleting an object must:

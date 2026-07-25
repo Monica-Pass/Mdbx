@@ -257,6 +257,29 @@ MDBX 文件格式迁移与领域 payload 迁移采用不同接口。MDBX1、SQLi
 
 计划包含有界解密 payload，只能留在受保护的进程内存中，不得写入日志、缓存、文件或同步元数据。计划披露审计通过 `plan_id` 关联且不引用 commit。Adapter 必须为每个计划对象生成一次输出，再调用 `PayloadMigrationRepo::execute` 或对应 UniFFI 方法。执行会重新授权、复核全部绑定，并在同一事务中更新整批对象、生成一条幂等 commit 和一条 commit 关联审计。任何拒绝、对象/Profile/分支并发变化、能力缺失、畸形输出或资源超限都会保持整批原状。完全相同的已完成计划重试只返回原 commit，不生成第二条成功审计；`remaining_count` 大于零时，以新计划继续下一批。
 
+#### Steam mafile Adapter
+
+Steam mafile 支持是可选能力。集成 `mdbx-adapter-steam` 的客户端应把
+`extension_profile()` 注册到进程内 ExtensionProfile registry，并在确实可以执行
+用户可见写入时单独激活 `com.monica.steam.store`。Profile 注册不是权限，也不能
+替代 Tiga 授权。
+
+客户端 MUST 把每个 mafile 当作不可信 JSON，在构造通用 `WriteCommand` 前通过 Adapter
+的有界解析器；不得用 `serde_json::from_slice` 再实现一套客户端解析器。默认契约为：
+输入 1 MiB、深度 32、聚合字段 512、每个数组 512 项、聚合节点 8,192、单个字符串/键
+64 KiB、字符串/键聚合 1 MiB。Adapter 拒绝重复键，错误只返回不泄漏值的静态类别，并
+在规范 JSON 中保留未知字段。低端设备可以降低上限，但不能提高硬上限。
+
+规范 JSON 字节作为 `com.monica.steam.mafile` ObjectTypeId 的不透明 payload 写入。对象
+ID 必须由已认证账号 SteamID 与 mafile serial number 通过 Adapter 的稳定 ID 方法得到；
+不得使用账号名、标题、路径、secret 或列表位置派生。解析值和规范字节在通用认证加密
+写入成功前必须留在受保护进程内存中，不得写日志。多份 mafile 导入应是一个有界的用户级
+`CommitOperation`，不能每个 JSON 字段或对象产生一条 commit。
+
+Adapter 不执行 Steam 网络请求、Android 集成、token 刷新或 storage 写入。裁剪掉它后，
+已有 Steam 对象仍可作为不透明记录进行同步、备份、恢复和诊断；客户端不得删除或重新解释
+这些对象。
+
 ### 4.2 删除必须走 tombstone
 
 删除对象时 MUST：

@@ -411,3 +411,30 @@ Adapter 在格式可表达时保留标题、用户名、密码、URL、备注、
 明文上限前完成内部 gzip 解压。加密源大小和最终返回投影均有上限，但 gzip 解压期间的瞬时内存
 峰值没有独立上限。需要严格限制不可信文件处理进程内存的服务必须增加进程隔离，或改用支持有界
 流式解压的解析器。
+
+### 7.15 有界 Steam mafile Adapter
+
+Steam `mafile` 的解释属于可独立裁剪的 Rust Adapter，位于
+`crates/mdbx-adapter-steam`。它声明进程内的 `com.monica.steam`
+ExtensionProfile、`com.monica.steam.mafile` ObjectTypeId、
+`com.monica.steam.store` 写入 capability 以及同一命名空间下的导入/导出
+feature。该 crate 不依赖 storage、sync、CLI、FFI、Android 或网络；裁剪它的
+构建仍能把已有对象作为不透明密文保存。
+
+客户端 MUST 把 mafile 当作不可信 JSON，并在创建通用写操作前使用 Adapter 的
+有界解析器。默认上限为：输入 1 MiB、深度 32、聚合字段 512、每个数组元素
+512、聚合节点 8,192、单个字符串/键 64 KiB、字符串/键聚合 1 MiB。硬上限分别为
+8 MiB、64、4,096、4,096、65,536、1 MiB 和 8 MiB；客户端可以降低但不能关闭这些
+限制。解析前先检查输入字节数；重复对象键直接失败；错误文本不包含源字段值。
+
+Adapter 保留未知字段并输出确定性的规范 JSON，因此旧客户端可以原样保存新 Steam
+生产者新增的字段。稳定对象 ID 使用命名空间隔离、长度分帧的 SHA-256，输入是规范化
+的无符号 64 位 SteamID 与去除首尾空白但保留大小写的 serial number。mafile 可以带
+自己的 SteamID；缺失时客户端可提供已认证账号的 SteamID，若两者不一致则拒绝。该
+哈希只是 opaque identity，不能替代加密、认证或 Steam 凭据。
+
+Adapter 的 Debug 和错误接口不得输出 payload 值。客户端必须把解析文档和规范字节留在
+受保护的进程内存中，并在持久化前交给通用认证加密路径。多份 mafile 导入仍应由一个有界
+`CommitOperation` 表示；Adapter 自身不创建表、schema 列、同步字段、commit，也不获得
+Tiga 权限。移除 Adapter 不得删除、改写、重分类或阻止不透明读取、同步、备份、恢复和
+诊断。

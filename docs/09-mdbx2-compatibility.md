@@ -374,3 +374,39 @@ returned projection are bounded, while peak memory during gzip decompression is
 not independently bounded by this Adapter version. Untrusted-file services that
 require a strict process-memory ceiling must add process isolation or a parser
 with bounded streaming decompression.
+
+### 7.15 Bounded Steam mafile Adapter
+
+Steam `mafile` interpretation is an optional, independently removable Rust
+Adapter in `crates/mdbx-adapter-steam`. It declares the process-local
+`com.monica.steam` ExtensionProfile, the `com.monica.steam.mafile` ObjectTypeId,
+the `com.monica.steam.store` write capability, and namespaced import/export
+feature IDs. The crate is not a storage, sync, CLI, FFI, Android, or network
+dependency; a build that omits it continues to preserve the object as opaque
+ciphertext.
+
+Clients must treat input mafiles as untrusted JSON and use the Adapter's
+bounded parser before creating a generic write operation. Defaults are 1 MiB
+input, depth 32, 512 aggregate fields, 512 items per array, 8,192 aggregate
+nodes, 64 KiB per string/key, and 1 MiB aggregate string/key bytes. Hard
+ceilings are 8 MiB, 64, 4,096, 4,096, 65,536, 1 MiB, and 8 MiB respectively;
+clients can lower but cannot disable these limits. Input bytes are checked
+before deserialization, duplicate object keys fail, and parser errors contain
+no source values.
+
+The Adapter retains unknown fields and emits deterministic canonical JSON, so
+an older client can preserve fields introduced by a newer Steam producer. It
+derives a stable object ID from a domain-separated, length-framed SHA-256 of a
+canonical unsigned 64-bit SteamID and trimmed, case-preserving serial number.
+A mafile may carry its own SteamID, or the client may supply the authenticated
+account SteamID when that variant omits it; a mismatch is rejected. The hash
+is an opaque identity, not a substitute for encryption, authentication, or a
+Steam credential.
+
+The Adapter never logs or places payload values in Debug/error text. Clients
+must keep parsed documents and canonical bytes in protected process memory and
+must pass them through the generic authenticated encryption path before
+persistence. Importing several mafiles remains one bounded
+`CommitOperation`; the Adapter itself creates no tables, schema columns,
+sync fields, commits, or Tiga authority. Removing it must not delete,
+retype, or block opaque reads, synchronization, backup, restore, or recovery.

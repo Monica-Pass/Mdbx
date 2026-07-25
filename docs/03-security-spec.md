@@ -129,6 +129,27 @@ validation, but an absent descriptor MUST NOT erase, rewrite, or reinterpret
 unknown ciphertext and MUST NOT block opaque reads, synchronization, backup,
 restore, or recovery.
 
+### 4.2 Optional Steam mafile plaintext boundary
+
+The optional `mdbx-adapter-steam` crate treats a mafile as untrusted plaintext
+before the Generic Object Module encrypts it. Input bytes MUST be checked before
+JSON deserialization. The default parser limits are 1 MiB input, depth 32, 512
+aggregate object fields, 512 items per array, 8,192 aggregate nodes, 64 KiB
+per string/key, and 1 MiB aggregate string/key bytes. Hard ceilings are 8 MiB,
+64, 4,096, 4,096, 65,536, 1 MiB, and 8 MiB; a client MAY lower limits but
+MUST NOT disable them. Duplicate object keys MUST fail instead of receiving
+last-wins semantics.
+
+The Adapter preserves unknown fields in canonical output but does not make
+them searchable, executable, or authoritative. Parsed values and canonical
+bytes MUST remain in protected process memory until they enter the generic
+authenticated-encryption write path. They MUST NOT appear in logs, audit rows,
+operation metadata, synchronization state, or persistent caches. The Adapter's
+Debug and error interfaces MUST contain only structural/resource categories and
+static field labels, never mafile values or secrets. Its stable object ID is a
+domain-separated hash of canonical identity components and is not a secret or
+a replacement for authentication.
+
 ## 5. Required User Warnings
 
 When switching to a weaker mode, the UI MUST:
