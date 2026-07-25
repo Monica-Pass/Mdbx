@@ -533,3 +533,23 @@ operation kind、分支 ID 与名称、加密摘要、请求身份、创建时�
 本次修改不增加数据库或 bundle version。MDBX1、MDBX1-DRAFT 与 bundle v1 继续省略
 operation metadata。精确 commit 的迟到 payload 修复继续保持幂等；重新生成 commit 或
 operation metadata 的 peer 必须恢复原始认证值后才能继续同步。
+
+### 7.20 Incoming Commit 结构可表示性
+
+合法完整性标签能够证明 incoming commit 字节真实，但首次写入本地时还必须能够由当前存储
+模型精确表示。首条 SQL mutation 前，storage 检查 `local_seq` 是否位于 SQLite 有符号
+64 位 INTEGER 范围内、vector clock 是否能够解码为值为无符号 64 位整数的 JSON object，
+以及 parent 列表中是否存在重复 ID。
+
+commit 完整性会排序 parent，因此 parent 顺序保持兼容。重复成员没有兼容投影：
+`commit_parents` 每对 ID 只能保存一行，静默去重会改变认证 parent 数量。畸形 clock 文本无法
+保留，因为创建本地 child commit 时会把已存 clock 作为 map 使用。超过 `i64::MAX` 的 sequence
+也不能通过环绕转换保存，否则设备顺序会改变。
+
+legacy `{}` vector clock 对 MDBX1 与迁移历史继续有效。预检不要求现代 self-device clock
+条目，也不重写历史因果信息。已存在 commit 的精确重放继续采用 7.19 节规则，比较本地已经
+接受的字节，不把新的首次插入规则追溯应用到旧记录。
+
+本次修改不增加 schema、format、bundle 或 DTO version。当前 producer 已经生成可表示值。
+无效新 commit 会在 commit inventory、parent、sequence floor、payload、tombstone、device head
+或 branch head 发生变化前拒绝。

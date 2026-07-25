@@ -681,6 +681,11 @@ bundle 也可以补充旧 bundle 省略的 operation metadata。vector clock、�
 分支 metadata、变更摘要和请求身份都必须来自原始认证记录，不能根据应用当前状态重新生成。
 相同 commit 或 operation ID 表示不同认证内容时，storage 会在应用迟到 payload 前拒绝。
 
+首次接收 commit 时，认证不能替代结构验证。producer 必须让每个 parent ID 只出现一次，
+把 vector clock 编码为值为无符号 64 位整数的 JSON object，并确保 `local_seq` 位于 SQLite
+有符号 64 位 INTEGER 范围内。空 `{}` clock 继续作为 legacy 兼容表示。传输层不得自行去重
+parent、修补 clock 文本或环绕 sequence，因为这些转换都会改变已经认证的 commit 含义。
+
 密钥 epoch 轮换的同步顺序属于安全不变量。客户端收到成功结果后，必须先传播 rotation commit 与 authenticated key epoch sync state，再上传或广播使用新 epoch 写入的 `MDBXFE2` 字段。接收端改变 epoch 状态时必须处于经过验证的解锁状态，并使用会刷新连接 keyring 的可变 apply 入口。旧 payload 缺少 key epoch state 时保留本地状态；并发轮换必须保留全部 wrapper，并接受 storage core 选出的 active epoch。
 
 轮换调用本身代表一次新的安全管理动作，不使用普通 `operation_id` 幂等重试语义。响应状态未知时，客户端应先按返回 commit、commit history 或 Tiga 审计关联查询，再决定是否发起另一轮轮换。

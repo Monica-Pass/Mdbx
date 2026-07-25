@@ -379,6 +379,68 @@ mod tests {
         .unwrap();
     }
 
+    fn graph_only_commit(
+        commit_id: &str,
+        device_id: &str,
+        local_seq: u64,
+        parents: Vec<String>,
+    ) -> SerializedCommit {
+        let mut commit = make_commit(
+            commit_id,
+            device_id,
+            local_seq,
+            parents,
+            Vec::new(),
+            "unused-object",
+            "project",
+        );
+        commit.tombstones.clear();
+        commit.object_payloads.clear();
+        commit
+    }
+
+    fn assert_rejected_commit_has_no_graph_side_effects(
+        conn: &VaultConnection,
+        commit_id: &str,
+        device_id: &str,
+        original_head: &str,
+    ) {
+        assert!(!SyncApplyRepo::commit_exists(conn, commit_id).unwrap());
+        let inventory_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_inventory WHERE commit_id = ?1",
+                params![commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inventory_count, 0);
+        let parent_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_parents WHERE commit_id = ?1",
+                params![commit_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_count, 0);
+        let sequence_count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_device_sequences WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence_count, 0);
+        assert_eq!(
+            SyncApplyRepo::current_branch_head(conn, None, "main")
+                .unwrap()
+                .as_deref(),
+            Some(original_head)
+        );
+    }
+
     #[test]
     fn synced_device_head_preserves_local_revocation() {
         let (conn, _) = setup();
@@ -2392,6 +2454,109 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conflicts with existing metadata"));
+    }
+
+    #[test]
+    fn incoming_commit_structure_rejects_duplicate_parents() {
+        let (conn, ctx) = setup();
+        let original_head = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let incoming = graph_only_commit(
+            "duplicate-parent-commit",
+            "remote-duplicate-parent-device",
+            1,
+            vec![original_head.clone(), original_head.clone()],
+        );
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![incoming], 0, true))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate parent"));
+        assert_rejected_commit_has_no_graph_side_effects(
+            &conn,
+            "duplicate-parent-commit",
+            "remote-duplicate-parent-device",
+            &original_head,
+        );
+    }
+
+    #[test]
+    fn incoming_commit_structure_rejects_malformed_vector_clock() {
+        let (conn, ctx) = setup();
+        let original_head = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let mut incoming = graph_only_commit(
+            "malformed-vector-clock-commit",
+            "remote-malformed-clock-device",
+            1,
+            vec![original_head.clone()],
+        );
+        incoming.commit.vector_clock = "not-json".to_string();
+        resign_serialized_commit(&conn, &mut incoming);
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![incoming], 0, true))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid vector clock"));
+        assert_rejected_commit_has_no_graph_side_effects(
+            &conn,
+            "malformed-vector-clock-commit",
+            "remote-malformed-clock-device",
+            &original_head,
+        );
+    }
+
+    #[test]
+    fn incoming_commit_structure_rejects_unrepresentable_local_sequence() {
+        let (conn, ctx) = setup();
+        let original_head = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let incoming = graph_only_commit(
+            "oversized-local-sequence-commit",
+            "remote-oversized-sequence-device",
+            u64::MAX,
+            vec![original_head.clone()],
+        );
+
+        let error =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![incoming], 0, true))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("does not fit SQLite INTEGER"));
+        assert_rejected_commit_has_no_graph_side_effects(
+            &conn,
+            "oversized-local-sequence-commit",
+            "remote-oversized-sequence-device",
+            &original_head,
+        );
+    }
+
+    #[test]
+    fn incoming_commit_structure_accepts_legacy_empty_vector_clock() {
+        let (conn, ctx) = setup();
+        let original_head = SyncApplyRepo::current_branch_head(&conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let mut incoming = graph_only_commit(
+            "legacy-empty-vector-clock-commit",
+            "remote-legacy-clock-device",
+            1,
+            vec![original_head],
+        );
+        incoming.commit.vector_clock = "{}".to_string();
+        resign_serialized_commit(&conn, &mut incoming);
+
+        let result =
+            SyncApplyRepo::apply_batch(&conn, &ctx, &CommitBatch::new(vec![incoming], 0, true))
+                .unwrap();
+
+        assert_eq!(result.applied_commits, 1);
+        assert!(SyncApplyRepo::commit_exists(&conn, "legacy-empty-vector-clock-commit").unwrap());
     }
 
     #[test]

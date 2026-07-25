@@ -542,3 +542,29 @@ No database or bundle version changes. MDBX1, MDBX1-DRAFT, and bundle v1 continu
 to omit operation metadata. Exact late payload repair remains idempotent; a peer
 that regenerates commit or operation metadata must resend the original
 authenticated values before synchronization can continue.
+
+### 7.20 Representable Incoming Commit Structure
+
+A valid integrity tag proves the incoming commit bytes are authentic, but the
+first local insertion also requires an exact representation in the current
+storage model. Before SQL mutation, storage checks that `local_seq` fits a
+signed 64-bit SQLite INTEGER, the vector clock decodes as a JSON object of
+unsigned 64-bit values, and the parent list contains no duplicate ID.
+
+Parent order remains compatible because commit integrity sorts it. Duplicate
+membership has no compatible projection: `commit_parents` stores one row per
+pair, so silently deduplicating would change the authenticated parent count.
+Malformed clock text cannot be retained because local child creation consumes
+the stored clock as a map. A sequence above `i64::MAX` cannot be wrapped without
+changing device order.
+
+Legacy `{}` vector clocks remain valid for MDBX1 and migrated history. The
+preflight does not require a modern self-device clock entry and does not rewrite
+historical causal detail. Existing exact replay continues through section 7.19
+and compares the already accepted local bytes instead of applying new
+first-insertion rules retroactively.
+
+No schema, format, bundle, or DTO version changes. Current producers already
+emit representable values. Invalid new commits fail before commit inventory,
+parents, sequence floors, payloads, tombstones, device heads, or branch heads
+can change.

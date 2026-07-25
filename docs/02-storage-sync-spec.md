@@ -215,6 +215,16 @@ summary, request identity, creation time, and integrity tag MUST match exactly.
 An older bundle MAY omit operation metadata without deleting or weakening the
 local row. Any mismatch MUST fail before payload mutation.
 
+For a commit that is not yet present, successful integrity verification MUST be
+followed by structural preflight before the first SQL mutation. `local_seq` MUST
+fit a signed 64-bit SQLite INTEGER, `vector_clock` MUST decode as a JSON object
+whose values are unsigned 64-bit integers, and every parent ID MUST occur once.
+Parent order MAY differ because integrity canonicalizes it; duplicate parent
+membership MUST be rejected because the relational parent table cannot preserve
+multiplicity. The legacy empty clock `{}` remains valid. Structural rejection
+MUST leave commit, inventory, parent, sequence, payload, tombstone, device-head,
+and branch state unchanged.
+
 ## 9. Conflict Detection
 
 MDBX MUST detect concurrent edits using causal metadata, not timestamp alone.

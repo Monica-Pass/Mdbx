@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+
 use rusqlite::{params, OptionalExtension};
 
 use mdbx_sync::{CommitBatch, CommitOperationMetadata, SerializedCommit};
@@ -154,6 +156,7 @@ pub(super) fn insert_commit(
     serialized: &SerializedCommit,
 ) -> StorageResult<()> {
     verify_incoming_commit_integrity(conn, serialized)?;
+    let local_seq = validate_new_commit_structure(serialized)?;
     let commit = &serialized.commit;
 
     conn.inner().execute(
@@ -163,7 +166,7 @@ pub(super) fn insert_commit(
         params![
             commit.commit_id,
             commit.device_id,
-            commit.local_seq as i64,
+            local_seq,
             commit.commit_kind.to_string(),
             commit.change_scope.to_string(),
             &commit.changed_object_ids_ct,
@@ -179,7 +182,7 @@ pub(super) fn insert_commit(
          VALUES (?1, ?2)
          ON CONFLICT(device_id) DO UPDATE SET
             last_local_seq = MAX(last_local_seq, excluded.last_local_seq)",
-        params![commit.device_id, commit.local_seq as i64],
+        params![commit.device_id, local_seq],
     )?;
 
     for parent_id in &serialized.parent_ids {
@@ -246,6 +249,34 @@ pub(super) fn insert_commit(
     }
 
     Ok(())
+}
+
+fn validate_new_commit_structure(serialized: &SerializedCommit) -> StorageResult<i64> {
+    let commit = &serialized.commit;
+    let local_seq = i64::try_from(commit.local_seq).map_err(|_| {
+        StorageError::Validation(format!(
+            "incoming commit {} local sequence {} does not fit SQLite INTEGER",
+            commit.commit_id, commit.local_seq
+        ))
+    })?;
+    serde_json::from_str::<BTreeMap<String, u64>>(&commit.vector_clock).map_err(|error| {
+        StorageError::Validation(format!(
+            "incoming commit {} has invalid vector clock: {error}",
+            commit.commit_id
+        ))
+    })?;
+
+    let mut seen = HashSet::with_capacity(serialized.parent_ids.len());
+    for parent_id in &serialized.parent_ids {
+        if !seen.insert(parent_id.as_str()) {
+            return Err(StorageError::Validation(format!(
+                "incoming commit {} has duplicate parent {}",
+                commit.commit_id, parent_id
+            )));
+        }
+    }
+
+    Ok(local_seq)
 }
 
 fn verify_incoming_commit_integrity(

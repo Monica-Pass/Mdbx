@@ -162,6 +162,19 @@ must match kind, branch, encrypted summary, request identity, timestamp, and
 integrity tag exactly. A legacy replay may omit operation metadata without
 removing the local row.
 
+### IncomingCommitStructure
+
+`IncomingCommitStructure` is the minimum authenticated shape that a new
+synchronized commit must satisfy before storage mutation. Its `local_seq` fits
+SQLite's signed INTEGER, its vector clock parses as a string-to-`u64` map, and
+its parent IDs are unique. Authentication precedes this preflight; successful
+authentication never authorizes a lossy relational projection.
+
+Parent order is canonicalized, while duplicate membership is rejected because
+`commit_parents` stores a set. Legacy `{}` vector clocks remain consumable and
+are not rewritten to invent causal detail. Existing exact replay uses its
+already accepted local identity rather than reapplying first-insertion rules.
+
 ### CommitKind
 
 `CommitKind` is authenticated commit semantics, not a presentation hint. The
@@ -305,6 +318,7 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 48. ChangeScope is authenticated data and `multi` is only a real aggregate scope. Snapshot and Branch are appended after the nine legacy binary variants; history, CLI, synchronization bundles, FFI, and local CommitOperation validation use the core exact parser and never coerce an unknown scope.
 49. OperationRequestIdentity is derived from the submitted operation before mutation and is never replaced by aggregate commit metadata. New tagged identities match exactly on every retry; authenticated unknown encodings fail closed, while untagged 32-byte rows retain their documented legacy behavior.
 50. ExistingCommitReplay may add transport payloads or previously omitted authenticated operation metadata only after the complete commit and canonical parent identity matches local storage. Reusing a commit or operation ID with different authenticated metadata fails before payload application.
+51. IncomingCommitStructure must be authenticated and exactly representable before first insertion: local sequence fits SQLite INTEGER, vector clock parses as a string-to-u64 map, and parent IDs are unique. Structural rejection leaves commit graph and branch state unchanged, while legacy empty clocks remain valid.
 
 ## Module Architecture
 

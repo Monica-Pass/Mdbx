@@ -725,6 +725,14 @@ summary, or request identity from current application state. Storage rejects a
 different authenticated meaning for an existing commit or operation ID before
 applying the late payload.
 
+For a newly received commit, authentication does not replace structural
+validation. Producers must emit each parent ID once, encode the vector clock as
+a JSON object with unsigned 64-bit integer values, and keep `local_seq` within
+SQLite's signed 64-bit INTEGER range. The empty `{}` clock remains the legacy
+compatibility representation. Do not deduplicate parents, repair clock text, or
+wrap a sequence in the transport layer, because each conversion would change
+the authenticated commit meaning.
+
 Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
 
 Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.

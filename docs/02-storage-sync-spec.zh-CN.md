@@ -203,6 +203,13 @@ commit ID 任一方向已经存在映射时，两个 ID、operation kind、分�
 身份、创建时间和完整性标签必须全部一致。旧 bundle 可以省略 operation metadata，但不得删除
 或削弱本地已有记录。任何差异都必须在 payload mutation 前拒绝。
 
+commit 尚未存在时，完整性验证成功后还必须在首条 SQL mutation 前执行结构预检。
+`local_seq` 必须能够表示为 SQLite 有符号 64 位 INTEGER；`vector_clock` 必须解码为值为
+无符号 64 位整数的 JSON object；每个 parent ID 只能出现一次。完整性计算会规范 parent
+顺序，因此顺序可以不同；关系表无法保留重复次数，所以重复 parent 必须拒绝。legacy 空 clock
+`{}` 继续有效。结构拒绝后不得留下 commit、inventory、parent、sequence、payload、tombstone、
+device head 或 branch 状态变化。
+
 ## 9. 冲突检测
 
 MDBX 必须基于因果元数据检测并发修改，不能只靠时间戳。
