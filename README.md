@@ -39,6 +39,8 @@ MDBX 的准则是 **4ever And 4ever**：旧 vault 必须长期可读，新增能
   - 面向非 Rust 客户端的 UniFFI 边界参考。
 - `docs/android/README.zh-CN.md` / `docs/android/README.md`
   - Monica for Android 当前 MDBX 1.0 接入结构、working copy、Room 索引和后续 FFI 迁移建议。
+- `docs/android/MDBX2_ANDROID_INTEGRATION.zh-CN.md`
+  - 面向 Android 客户端实现方的 MDBX2 `mdbx-ffi` 接入实施文档。
 
 ## 规范文档
 

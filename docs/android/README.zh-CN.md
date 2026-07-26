@@ -203,3 +203,7 @@ Android 接入至少保留这些测试层：
 6. 迁移期间必须继续打开 `MDBX-1-DRAFT` 和 Android 已创建的 `MDBX-1.0` vault。
 
 迁移目标不是把 SQLite 细节搬到 Kotlin，而是把更多格式规则收回 MDBX Rust workspace，同时保持 Android 低使用成本和完整管理能力。
+
+具体实施步骤、真实导出方法签名、限额常量、Tiga 授权流程和当前尚未通过 FFI
+暴露的能力清单见 `docs/android/MDBX2_ANDROID_INTEGRATION.zh-CN.md`。注意上面
+第 3 步提到的 sync bundle 目前 **不在** FFI 导出面中，迁移范围需据此收窄。
