@@ -124,6 +124,12 @@ dependencies {
 3. 校验生成结果与仓库中的绑定一致（若选择提交绑定）；
 4. 不一致即失败。
 
+引擎侧 CI 使用 **Rust 1.86.0**（钉死在 `.github/workflows/ci.yml`，仓库中
+没有 `rust-toolchain.toml`）。构建 `mdbx-ffi` 时建议使用同一版本，避免
+编译器版本差异导致的行为差异。注意 UniFFI 必须是 `0.31.1`，与
+`crates/mdbx-ffi/Cargo.toml` 中的依赖版本严格一致，否则生成的绑定与
+cdylib 的 scaffolding 不匹配。
+
 ---
 
 ## 3. 能力发现
@@ -1113,3 +1119,14 @@ payload 迁移是两阶段的：先 `createPayloadMigrationPlan` 得到计划，
 - 某个限额在真实设备上不合理；
 
 请提出，由引擎侧新增对应责任块解决，**不要在客户端绕过 FFI 自行实现**。
+
+引擎侧对 `master` 的每次改动都会在 GitHub Actions 上执行八项门禁
+（`.github/workflows/ci.yml`）：格式、空白、`clippy -D warnings`、workspace
+测试、storage core profile 测试，以及三项构建检查。其中
+`cargo check -p mdbx-ffi --no-default-features` 专门保证 FFI 导出面在裁剪
+构建下不被破坏。
+
+这对你的意义是：**本文档引用的方法签名一旦在引擎侧被改动，CI 会先失败。**
+所以你可以把某个已发布 tag 的绑定当作稳定契约；如果升级引擎版本后绑定
+出现不兼容变化，那一定是引擎侧的显式决定，而不是意外漂移，届时会同步更新
+本文档。

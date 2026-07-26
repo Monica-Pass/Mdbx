@@ -1,4 +1,4 @@
-# ADR-0002: Bounded Binary KDBX Adapter
+# ADR-0045: Bounded Binary KDBX Adapter
 
 - Status: Accepted
 - Date: 2026-07-23

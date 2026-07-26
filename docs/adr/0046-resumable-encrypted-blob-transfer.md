@@ -1,4 +1,4 @@
-# ADR-0015: Resumable encrypted Blob transfer and Provider leases
+# ADR-0046: Resumable encrypted Blob transfer and Provider leases
 
 ## Status
 
