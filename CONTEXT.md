@@ -175,6 +175,15 @@ Parent order is canonicalized, while duplicate membership is rejected because
 are not rewritten to invent causal detail. Existing exact replay uses its
 already accepted local identity rather than reapplying first-insertion rules.
 
+### CommitGraph
+
+`CommitGraph` is the storage-owned causal relation over immutable commits and
+their canonical parent sets. It provides commit existence, ordered parent
+reads, ancestor checks, and nearest known common-parent discovery. Branch
+fast-forward decisions, conflict bases, deletion observation proofs, permanent
+cleanup eligibility, and health diagnostics use this same relation rather than
+reconstructing causality from timestamps or device heads.
+
 ### DeviceHead
 
 `DeviceHead` is the current accepted position of one device's global commit
@@ -244,7 +253,20 @@ and restore remain the explicit MDBX1-compatible recovery path.
 
 ### TombstoneAcknowledgement
 
-A `TombstoneAcknowledgement` records that one registered device observed a deletion commit. It is separate from `DeviceHead`, because receiving a commit does not require the device to author a later commit. A tombstone can enter the authorized cleanup stage only after every non-revoked device has a causally valid acknowledgement.
+A `TombstoneAcknowledgement` records that one registered device observed a
+deletion commit. It is separate from `DeviceHead`, because receiving a commit
+does not require the device to author a later commit. A tombstone can enter the
+authorized cleanup stage only after every non-revoked device has a causally
+valid acknowledgement.
+
+For a tombstone with `delete_commit_id`, the observed commit must equal that
+commit or causally descend from it. One `(tombstone_id, device_id)` row keeps
+the strongest known proof: a descendant advances an ancestor, an ancestor
+cannot replace a descendant, and concurrent valid proofs select the greater
+`(acknowledged_at, observed_commit_id)` pair after causal comparison.
+`acknowledged_at` itself keeps the later known value. A schema-8 legacy
+tombstone with no delete commit retains its historical representation and
+requires only that the observed commit exists.
 
 ### PermanentPurgeReceipt
 
@@ -334,6 +356,8 @@ A `HealthReport` is a read-only structured diagnosis of vault integrity. Each is
 50. ExistingCommitReplay may add transport payloads or previously omitted authenticated operation metadata only after the complete commit and canonical parent identity matches local storage. Reusing a commit or operation ID with different authenticated metadata fails before payload application.
 51. IncomingCommitStructure must be authenticated and exactly representable before first insertion: local sequence fits SQLite INTEGER, vector clock parses as a string-to-u64 map, and parent IDs are unique. Structural rejection leaves commit graph and branch state unchanged, while legacy empty clocks remain valid.
 52. DeviceHead identifies the greatest accepted device-local sequence, references a commit authored by the same device, advances independently of branch ancestry, and merges observation time and revocation monotonically. Delayed commits cannot move it backward, and health diagnostics report wrong-device or regressed rows.
+53. TombstoneAcknowledgement is a causal proof, not a timestamp claim. Its observed commit exists and, when `delete_commit_id` exists, contains that delete commit. Descendant evidence advances, ancestor evidence cannot regress it, concurrent evidence has a deterministic canonical winner, and acknowledgement time never decreases.
+54. Commit ancestry has one storage-owned interpretation. Synchronization, conflict-base discovery, branch advancement, tombstone acknowledgement, permanent cleanup eligibility, and health verification use the same canonical parent traversal.
 
 ## Module Architecture
 
@@ -367,13 +391,44 @@ the encrypted snapshot payload.
 
 The synchronization state carries an optional complete TombstoneState. New producers always emit it. Legacy payloads omit it and retain their existing per-commit delete-event behavior. Receivers replace the complete collection only for conflict-free fast-forward commits; divergent commits continue to preserve local markers until a merge resolution becomes authoritative.
 
-Tombstone acknowledgements are monotonic synchronized metadata. Per-commit tombstones acknowledge the deleting and receiving devices; complete state transfers accumulated acknowledgements. `device_heads` supplies the active-device set but is not treated as proof that a device observed a deletion.
+### Commit Graph And Tombstone Acknowledgement Module
+
+The crate-private `CommitGraphRepo` owns read-only commit existence, canonical
+parent reads, ancestry, and nearest-known-common-parent discovery. Synchronization,
+permanent cleanup eligibility, and recovery call this Module instead of carrying
+separate graph walkers.
+
+The crate-private `TombstoneAcknowledgementRepo` is the runtime write boundary
+for local deletion, imported deletion, receiving-device evidence, conflict
+resolution, and synchronized state. It validates the incoming proof before
+mutation and performs the causal, monotonic, delivery-order-independent merge.
+Schema migration backfill remains a fixed historical conversion rather than a
+runtime merge path.
+
+Tombstone acknowledgements are monotonic synchronized metadata. Per-commit
+tombstones acknowledge the deleting and receiving devices; complete state
+transfers accumulated acknowledgements. Complete-state rows whose tombstone or
+observed commit is absent retain the existing skip behavior. A row whose
+references exist but whose observed commit precedes or is concurrent with the
+delete commit fails the enclosing apply transaction. `device_heads` supplies
+the active-device set but is not treated as proof that a device observed a
+deletion.
 
 Permanent purge receipts are applied before ordinary objects during complete synchronization. Applying a receipt removes stale local state in dependency order, and every later object, relation, label, assignment, attachment, version, and tombstone application checks the receipt guard. Snapshot restoration uses the same guard before restoring owner rows, attachment chunks, and project labels.
 
 ### Recovery and Health Module
 
-The Recovery and Health Module performs read-only checks for SQLite integrity, authenticated commit history, snapshots, attachment chunks, references, device heads, typed tombstones, and permanent purge receipts. It reports dangling, wrong-device, and regressed device heads, missing markers for deleted rows, unexplained markers for active rows, duplicate markers, invalid receipt authentication tags, and active rows that contradict a permanent receipt. Health projection leaves unknown physical tombstone types untouched, while typed TombstoneRepo reads return an explicit unsupported-type error. Branch tombstones remain event records because branches have no deleted-row state. The CLI and UniFFI expose the same underlying structured report.
+The Recovery and Health Module performs read-only checks for SQLite integrity,
+authenticated commit history, snapshots, attachment chunks, references, device
+heads, typed tombstones, tombstone acknowledgements, and permanent purge
+receipts. It reports dangling, wrong-device, and regressed device heads,
+non-causal acknowledgement proofs, missing markers for deleted rows,
+unexplained markers for active rows, duplicate markers, invalid receipt
+authentication tags, and active rows that contradict a permanent receipt.
+Health projection leaves unknown physical tombstone types untouched, while
+typed TombstoneRepo reads return an explicit unsupported-type error. Branch
+tombstones remain event records because branches have no deleted-row state. The
+CLI and UniFFI expose the same underlying structured report.
 
 ### Integrity Root Module
 

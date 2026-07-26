@@ -4,7 +4,9 @@ use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::init::INIT_KEY_EPOCH_PROFILE_ID;
-use crate::repo::{CollectionProfileRepo, TombstoneRepo};
+use crate::repo::{
+    CollectionProfileRepo, CommitGraphRepo, TombstoneAcknowledgementRepo, TombstoneRepo,
+};
 
 /// 数据库健康检查结果。
 #[derive(Debug, Clone)]
@@ -146,6 +148,15 @@ impl RecoveryVerifier {
                 severity: IssueSeverity::Error,
                 category: "tombstones".to_string(),
                 description: format!("tombstone consistency check failed: {}", e),
+            }),
+        }
+
+        match Self::check_tombstone_acknowledgements(conn) {
+            Ok(acknowledgement_issues) => issues.extend(acknowledgement_issues),
+            Err(e) => issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "tombstone-acknowledgements".to_string(),
+                description: format!("tombstone acknowledgement check failed: {e}"),
             }),
         }
 
@@ -331,7 +342,7 @@ impl RecoveryVerifier {
             .map_err(StorageError::Database)?;
 
         for commit in commits {
-            let parents = Self::parent_ids_for_commit(conn, &commit.commit_id)?;
+            let parents = CommitGraphRepo::parent_ids(conn, &commit.commit_id)?;
             let input = CommitIntegrityInput {
                 commit_id: &commit.commit_id,
                 device_id: &commit.device_id,
@@ -378,26 +389,6 @@ impl RecoveryVerifier {
         }
 
         Ok(issues)
-    }
-
-    fn parent_ids_for_commit(
-        conn: &VaultConnection,
-        commit_id: &str,
-    ) -> StorageResult<Vec<String>> {
-        let mut stmt = conn
-            .inner()
-            .prepare(
-                "SELECT parent_commit_id FROM commit_parents
-                 WHERE commit_id = ?1
-                 ORDER BY parent_commit_id",
-            )
-            .map_err(StorageError::Database)?;
-        let parents = stmt
-            .query_map(rusqlite::params![commit_id], |row| row.get(0))
-            .map_err(StorageError::Database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::Database)?;
-        Ok(parents)
     }
 
     /// 检查附件 chunk 完整性。
@@ -721,6 +712,42 @@ impl RecoveryVerifier {
             }
         }
 
+        Ok(issues)
+    }
+
+    pub fn check_tombstone_acknowledgements(
+        conn: &VaultConnection,
+    ) -> StorageResult<Vec<HealthIssue>> {
+        let mut issues = Vec::new();
+        let mut stmt = conn.inner().prepare(
+            "SELECT tombstone_id, device_id, observed_commit_id
+             FROM tombstone_acknowledgements
+             ORDER BY tombstone_id, device_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let acknowledgements = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (tombstone_id, device_id, observed_commit_id) in acknowledgements {
+            if let Err(error) = TombstoneAcknowledgementRepo::validate_causal_proof(
+                conn,
+                &tombstone_id,
+                &observed_commit_id,
+            ) {
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Error,
+                    category: "tombstone-acknowledgements".to_string(),
+                    description: format!(
+                        "device {} tombstone acknowledgement failed causal validation: {}",
+                        device_id, error
+                    ),
+                });
+            }
+        }
         Ok(issues)
     }
 
@@ -1753,6 +1780,38 @@ mod tests {
             .iter()
             .any(|i| i.severity == IssueSeverity::Info && i.description.contains("old-device"));
         assert!(has_info);
+    }
+
+    #[test]
+    fn full_health_check_detects_non_causal_tombstone_acknowledgement() {
+        let (conn, ctx, project_id) = setup();
+        let before_delete: String = conn
+            .inner()
+            .query_row(
+                "SELECT head_commit_id FROM projects WHERE project_id = ?1",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        ProjectRepo::soft_delete(&conn, &ctx, &project_id).unwrap();
+        conn.inner()
+            .execute(
+                "UPDATE tombstone_acknowledgements
+                 SET observed_commit_id = ?1
+                 WHERE device_id = 'test-device'
+                   AND tombstone_id = (
+                       SELECT tombstone_id FROM tombstones
+                       WHERE target_object_type = 'project' AND target_object_id = ?2
+                   )",
+                rusqlite::params![before_delete, project_id],
+            )
+            .unwrap();
+
+        let health = RecoveryVerifier::full_health_check(&conn).unwrap();
+        assert!(health.issues.iter().any(|issue| {
+            issue.category == "tombstone-acknowledgements"
+                && issue.description.contains("does not causally contain")
+        }));
     }
 
     #[test]

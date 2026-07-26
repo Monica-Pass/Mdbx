@@ -73,6 +73,7 @@ MDBX 必须坚持：
 - 未知非关键字段兼容矩阵已覆盖 MDBX1 `vault_meta`/`projects`/`entries` 附加列自动升级、schema 10 Tiga 策略表重建，以及 complete sync-state 顶层扩展的有界 decode、事务 apply、持久化、collect 和重新编码。旧 peer 缺少扩展键不会删除本地值；严格 delta/bundle 记录仍拒绝未知字段。
 - UniFFI 通用原子 operation 已覆盖 project、ObjectRecord、Relation、Label 和 Assignment；Attachment 另有受命令数、单项字节数、总字节数和 chunk 大小限制的原子批量 operation。
 - schema 16 已为影响格式、解密、key epoch 与 Tiga 的 `vault_meta` header 建立统一 HMAC；受保护 mutation 由 trigger 先失效旧标签并在同一事务重新封签，解锁与 health check 都会拒绝篡改。MDBX1/早期 MDBX2 升级保持原数据，首次成功解锁后从 `pending` 建立标签。
+- tombstone acknowledgement 现在由统一 storage Module 验证并合并：observed commit 必须因果包含删除 commit，后代证据单调推进，祖先证据无法回退，并发证据与接收顺序无关，确认时间保留较晚值。同步、永久清理资格和 recovery 共用 CommitGraph Module；health check 会报告非因果证明。
 
 ## 3. 主要差距
 
@@ -187,6 +188,7 @@ MDBX 必须坚持：
 - project 不同字段并发修改会写双 parent merge commit，同字段并发修改会保留本地状态并记录具体字段 conflict。（storage 回归已覆盖）
 - attachment metadata 与 incoming-only 内容更新可自动合并，双方同时替换内容会保留本地内容并记录 `content_hash` conflict。（storage 回归已覆盖）
 - 删除与修改并发不会误复活 tombstone。（storage 回归已覆盖）
+- tombstone acknowledgement 会拒绝删除前证明、保留较强后代证明，并让两个有效并发证明按规范规则合并。（storage 与 health 回归已覆盖）
 
 ### P3：附件与性能完成
 
@@ -279,6 +281,7 @@ MDBX 必须坚持：
 - 已存在 commit 的同步重放会在迟到 payload 应用前精确比较设备、序列、kind/scope、加密变更 ID、vector clock、message、时间、完整性标签和规范 parent 集合。operation ID 与 commit ID 保持一对一完整 metadata 映射；旧 bundle 仍可省略 operation，后续可以补入原始认证记录。
 - 首次同步导入 commit 在完整性验证后、首条 SQL 前执行结构预检：拒绝重复 parent、畸形 vector clock 和超出 SQLite INTEGER 范围的 `local_seq`，并确认失败不留下 commit graph、sequence 或 branch 状态。legacy `{}` clock 继续兼容。
 - device head 已统一为设备全局序列规则：commit 与 state-delta 导入都会验证 commit 创作设备，按 `local_seq` 跨 branch 单调推进，迟到低序列不能回退 head，`last_seen_at` 与 revocation 单调合并。序列复用在 INSERT 前返回 validation error；health check 会报告设备归属错误与序列落后的 legacy head。
+- tombstone acknowledgement 已统一为因果证明规则：全部运行时写入使用 TombstoneAcknowledgement Module，删除前 commit 会被拒绝，祖先无法覆盖后代，后代推进时确认时间不会降低，并发有效证明按 `(acknowledged_at, observed_commit_id)` 规范选择。缺失引用的 complete-state 兼容行为保持不变，schema 8 migration backfill 保持原样。
 - 已通过 `cargo test -p mdbx-storage repo::snapshot`、`cargo test -p mdbx-storage sync_apply`、`cargo test -p mdbx-storage init`、`cargo test -p mdbx-storage unlock`、`cargo test -p mdbx-storage recovery`。
 
 下一刀建议：

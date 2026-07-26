@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -12,7 +10,7 @@ use mdbx_core::tiga::{AuthorizationDecision, TigaOperation, TigaScope};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{CommitChange, CommitContext, CommitOperation};
+use crate::repo::{CommitChange, CommitContext, CommitGraphRepo, CommitOperation};
 use crate::tiga::TigaService;
 use crate::tiga_policy::{
     optional_integrity_tag, verify_optional_integrity_tag, TigaAuthorizationContext,
@@ -259,11 +257,7 @@ impl TombstoneRepo {
         match tombstone.delete_commit_id.as_deref() {
             None => blockers.push(TombstonePurgeBlocker::MissingDeleteCommit),
             Some(delete_commit_id) => {
-                let commit_exists: bool = conn.inner().query_row(
-                    "SELECT EXISTS(SELECT 1 FROM commits WHERE commit_id = ?1)",
-                    params![delete_commit_id],
-                    |row| row.get(0),
-                )?;
+                let commit_exists = CommitGraphRepo::commit_exists(conn, delete_commit_id)?;
                 if !commit_exists {
                     blockers.push(TombstonePurgeBlocker::DeleteCommitMissing {
                         commit_id: delete_commit_id.to_string(),
@@ -287,7 +281,7 @@ impl TombstoneRepo {
                             )
                             .optional()?;
                         let acknowledged = match observed_commit_id {
-                            Some(observed_commit_id) => Self::is_ancestor_commit(
+                            Some(observed_commit_id) => CommitGraphRepo::is_ancestor(
                                 conn,
                                 delete_commit_id,
                                 &observed_commit_id,
@@ -618,35 +612,6 @@ impl TombstoneRepo {
             })
             .optional()
             .map_err(StorageError::Database)
-    }
-
-    fn is_ancestor_commit(
-        conn: &VaultConnection,
-        ancestor: &str,
-        descendant: &str,
-    ) -> StorageResult<bool> {
-        if ancestor == descendant {
-            return Ok(true);
-        }
-        let mut stack = vec![descendant.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !seen.insert(commit_id.clone()) {
-                continue;
-            }
-            let mut stmt = conn
-                .inner()
-                .prepare("SELECT parent_commit_id FROM commit_parents WHERE commit_id = ?1")?;
-            let parents = stmt.query_map(params![commit_id], |row| row.get::<_, String>(0))?;
-            for parent in parents {
-                let parent = parent?;
-                if parent == ancestor {
-                    return Ok(true);
-                }
-                stack.push(parent);
-            }
-        }
-        Ok(false)
     }
 
     fn dependent_object_counts(

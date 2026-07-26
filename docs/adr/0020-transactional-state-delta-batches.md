@@ -67,7 +67,7 @@ Configurable defaults remain below hard byte and logical-row ceilings.
 | Collection profiles | Include the complete profile or an explicit deletion marker whenever its project changes. | Replace or delete the profile after validating collection type and capability identifiers. |
 | Project tags | Include the complete sorted tag set, including an empty set, whenever tracked tags change. | Replace the complete set so deletion of the final tag converges. |
 | Tombstones | Include rows created or updated by the transaction and retain `delete_commit_id`. | Apply causal deletion rules and reject unavailable or inconsistent delete commits. |
-| Tombstone acknowledgements | Include each new or updated `(tombstone_id, device_id)` row. | Upsert only after the tombstone and observed commit exist. |
+| Tombstone acknowledgements | Include each new or updated `(tombstone_id, device_id)` row. | Apply ADR-0044 after references exist: require observation of the delete commit, advance descendant evidence, reject ancestor regression, select concurrent evidence deterministically, and preserve the later acknowledgement time. |
 | Purge receipts | Include immutable receipts by `purge_id`. | Verify integrity, referenced commits, retention evidence, and dependency order before permanent deletion. |
 | Vault Tiga state | Include the complete singleton when any policy or compliance field changes. | Merge toward the stricter compatible policy and reject unsupported policy versions. |
 | Tiga overrides | Include the complete scoped row or an explicit deletion marker. | Verify integrity and scope identity, then replace or delete the exact scope. |

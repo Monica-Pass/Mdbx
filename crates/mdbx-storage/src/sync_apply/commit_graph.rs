@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension};
 
@@ -7,12 +6,12 @@ use mdbx_sync::SerializedCommit;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::BranchRepo;
+use crate::repo::{BranchRepo, CommitGraphRepo};
 use crate::sync_state::BranchRow;
 
 pub(super) fn apply_branches(conn: &VaultConnection, branches: &[BranchRow]) -> StorageResult<()> {
     for row in branches {
-        if !commit_exists(conn, &row.head_commit_id)? {
+        if !CommitGraphRepo::commit_exists(conn, &row.head_commit_id)? {
             continue;
         }
         let local_head: Option<String> = conn
@@ -27,7 +26,9 @@ pub(super) fn apply_branches(conn: &VaultConnection, branches: &[BranchRow]) -> 
         let should_upsert = match local_head {
             None => true,
             Some(local_head) if local_head == row.head_commit_id => false,
-            Some(local_head) => is_ancestor_commit(conn, &local_head, &row.head_commit_id)?,
+            Some(local_head) => {
+                CommitGraphRepo::is_ancestor(conn, &local_head, &row.head_commit_id)?
+            }
         };
         if should_upsert {
             conn.inner().execute(
@@ -72,96 +73,13 @@ pub(super) fn object_apply_decision(
     if local_head == incoming_head {
         return Ok(ObjectDecision::Skip);
     }
-    if is_ancestor_commit(conn, &local_head, incoming_head)? {
+    if CommitGraphRepo::is_ancestor(conn, &local_head, incoming_head)? {
         return Ok(ObjectDecision::FastForward);
     }
-    if is_ancestor_commit(conn, incoming_head, &local_head)? {
+    if CommitGraphRepo::is_ancestor(conn, incoming_head, &local_head)? {
         return Ok(ObjectDecision::Skip);
     }
     Ok(ObjectDecision::Conflict { local_head })
-}
-
-pub(super) fn is_ancestor_commit(
-    conn: &VaultConnection,
-    ancestor: &str,
-    descendant: &str,
-) -> StorageResult<bool> {
-    if ancestor == descendant {
-        return Ok(true);
-    }
-    let mut stack = vec![descendant.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(commit_id) = stack.pop() {
-        if !seen.insert(commit_id.clone()) {
-            continue;
-        }
-        let parents = parent_ids_for_commit(conn, &commit_id)?;
-        for parent in parents {
-            if parent == ancestor {
-                return Ok(true);
-            }
-            stack.push(parent);
-        }
-    }
-    Ok(false)
-}
-
-pub(super) fn parent_ids_for_commit(
-    conn: &VaultConnection,
-    commit_id: &str,
-) -> StorageResult<Vec<String>> {
-    let mut stmt = conn.inner().prepare(
-        "SELECT parent_commit_id FROM commit_parents
-         WHERE commit_id = ?1
-         ORDER BY parent_commit_id",
-    )?;
-    let rows = stmt.query_map(params![commit_id], |row| row.get(0))?;
-    let mut parents = Vec::new();
-    for row in rows {
-        parents.push(row?);
-    }
-    Ok(parents)
-}
-
-pub(super) fn nearest_known_common_parent(
-    conn: &VaultConnection,
-    left: &str,
-    right: &str,
-) -> StorageResult<Option<String>> {
-    let left_ancestors = ancestor_set(conn, left)?;
-    let mut stack = vec![right.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(commit_id) = stack.pop() {
-        if !seen.insert(commit_id.clone()) {
-            continue;
-        }
-        if left_ancestors.contains(&commit_id) {
-            return Ok(Some(commit_id));
-        }
-        stack.extend(parent_ids_for_commit(conn, &commit_id)?);
-    }
-    Ok(None)
-}
-
-fn ancestor_set(conn: &VaultConnection, head: &str) -> StorageResult<HashSet<String>> {
-    let mut result = HashSet::new();
-    let mut stack = vec![head.to_string()];
-    while let Some(commit_id) = stack.pop() {
-        if !result.insert(commit_id.clone()) {
-            continue;
-        }
-        stack.extend(parent_ids_for_commit(conn, &commit_id)?);
-    }
-    Ok(result)
-}
-
-pub(super) fn commit_exists(conn: &VaultConnection, commit_id: &str) -> StorageResult<bool> {
-    let count: i64 = conn.inner().query_row(
-        "SELECT COUNT(*) FROM commits WHERE commit_id = ?1",
-        params![commit_id],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
 }
 
 pub(super) fn sync_device_head(

@@ -204,6 +204,7 @@ Unless you are implementing the low-level storage library itself, client code sh
 - `commit_parents`
 - `object_versions`
 - `tombstones`
+- `tombstone_acknowledgements`
 - `snapshots`
 - `key_epochs`
 - `conflicts`
@@ -343,6 +344,12 @@ Deleting an object must:
 Sync clients must use tombstones to prevent old remote state or another client from resurrecting deleted objects.
 
 Clients must not only remove a row from the current list.
+
+Tombstone acknowledgements are storage-owned synchronization evidence. Clients
+must not insert, overwrite, or pre-merge acknowledgement rows. Submit the
+original authenticated commit and state payload through storage apply; storage
+records deleting-device and receiving-device evidence, verifies that the
+observed commit contains the deletion, and preserves the strongest proof.
 
 ### 4.3 Folders And Paths
 
@@ -742,6 +749,14 @@ revocation remains set. A sequence-reuse validation error indicates conflicting
 device identity; stop that synchronization input and surface diagnostics rather
 than renumbering or regenerating the commit.
 
+Treat tombstone acknowledgements as storage-owned causal evidence. Do not pick
+the newest row by timestamp, derive acknowledgement from a device head, or
+rewrite `observed_commit_id` in the transport layer. Storage first compares
+commit ancestry, then uses acknowledgement time and commit ID only to choose
+between valid concurrent proofs. A causal-validation error identifies an
+invalid synchronization input and must be surfaced without retrying a locally
+rewritten proof.
+
 Key epoch rotation has a security-sensitive ordering rule. After a successful rotation, distribute the rotation commit and authenticated key epoch sync state before uploading or broadcasting `MDBXFE2` fields written under the new epoch. A receiver that changes epoch state must be verified-unlocked and use the mutable apply entry that refreshes the connection keyring. Older payloads without epoch state preserve local state. Concurrent rotations retain every wrapper and accept the active epoch selected by storage.
 
 Each rotation request is a new security-administration action and does not use ordinary `operation_id` retry semantics. When the response status is unknown, inspect commit history or Tiga audit correlation before requesting another rotation.
@@ -795,6 +810,9 @@ Before claiming MDBX support, another client should pass at least these scenario
 - Batch delete 100 entries and create one user-level commit with tombstones.
 - Two clients open the same vault and show the same item count.
 - One client deletes an item; another client syncs and does not resurrect it.
+- Reject an acknowledgement whose observed commit precedes the delete commit.
+- Apply descendant and ancestor acknowledgement proofs in both orders and keep the descendant with the later known acknowledgement time.
+- Apply concurrent valid acknowledgement proofs in both orders and obtain the same stored row.
 - Receive a higher-sequence branch sibling before a delayed lower sequence and keep the higher device head.
 - Reject a device-head row that points at a commit authored by another device, while preserving local revocation.
 - Concurrent edits to the same field create a conflict.

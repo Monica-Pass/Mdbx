@@ -190,6 +190,7 @@ Monica for Android 的当前 MDBX 1.0 接入样板见 `docs/android/README.zh-CN
 - `commit_parents`
 - `object_versions`
 - `tombstones`
+- `tombstone_acknowledgements`
 - `snapshots`
 - `key_epochs`
 - `conflicts`
@@ -310,6 +311,10 @@ write limits 仍分别生效。request 和 prepared plan 都含敏感明文，�
 同步客户端 MUST 使用 tombstone 防止旧客户端或远端旧状态把已删除对象复活。
 
 客户端 MUST NOT 只从当前列表里删掉行。
+
+tombstone acknowledgement 属于 storage core 管理的同步证据。客户端不得插入、覆盖或预先
+合并 acknowledgement 行。原始认证 commit 与 state payload 必须交给 storage apply；storage
+会记录删除设备和接收设备的证据，验证 observed commit 因果包含删除，并保留最强证明。
 
 ### 4.3 文件夹和路径
 
@@ -692,6 +697,11 @@ device head 属于 storage core 管理的设备序列状态。客户端不能根
 仍是合法历史，但不能让 head 回退，本地 revocation 也会保留。出现 sequence reuse validation
 error 时，应停止处理该同步输入并显示诊断，不能重新编号或重新生成 commit。
 
+tombstone acknowledgement 属于 storage core 管理的因果证据。客户端不能按时间戳选择最新
+行，不能根据 device head 推导确认，也不能在传输层重写 `observed_commit_id`。storage 会先
+比较 commit 祖先关系，仅在两个有效证明并发时使用确认时间与 commit ID 决定规范行。出现
+causal validation error 时，应把该同步输入报告为无效，不能改写本地证明后重试。
+
 密钥 epoch 轮换的同步顺序属于安全不变量。客户端收到成功结果后，必须先传播 rotation commit 与 authenticated key epoch sync state，再上传或广播使用新 epoch 写入的 `MDBXFE2` 字段。接收端改变 epoch 状态时必须处于经过验证的解锁状态，并使用会刷新连接 keyring 的可变 apply 入口。旧 payload 缺少 key epoch state 时保留本地状态；并发轮换必须保留全部 wrapper，并接受 storage core 选出的 active epoch。
 
 轮换调用本身代表一次新的安全管理动作，不使用普通 `operation_id` 幂等重试语义。响应状态未知时，客户端应先按返回 commit、commit history 或 Tiga 审计关联查询，再决定是否发起另一轮轮换。
@@ -745,6 +755,9 @@ error 时，应停止处理该同步输入并显示诊断，不能重新编号�
 - 批量删除 100 条，只产生一个用户级 commit，并写入 tombstone。
 - 两个客户端打开同一 vault，数量一致。
 - 一个客户端删除，另一个客户端同步后不会复活。
+- observed commit 位于 delete commit 之前的 acknowledgement 必须拒绝。
+- 以两种顺序应用后代与祖先 acknowledgement，均保留后代证明和较晚确认时间。
+- 以两种顺序应用两个有效并发 acknowledgement，最终保存行必须相同。
 - 先接收较高序列的 branch sibling，再接收迟到的较低序列，device head 仍保留较高序列。
 - device-head 行指向其他设备创作的 commit 时必须拒绝，同时保留本地 revocation。
 - 并发修改同一字段，产生冲突。

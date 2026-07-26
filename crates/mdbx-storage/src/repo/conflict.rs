@@ -13,7 +13,9 @@ use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::CommitContext;
 use crate::repo::entry::EntryRepo;
 use crate::repo::object_version::ObjectVersionRepo;
-use crate::repo::{AttachmentRepo, CollectionProfileRepo, ProjectRepo};
+use crate::repo::{
+    AttachmentRepo, CollectionProfileRepo, ProjectRepo, TombstoneAcknowledgementRepo,
+};
 use crate::sync_state::{
     AttachmentRow, EntryRow, ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow,
     ProjectRow,
@@ -1617,22 +1619,26 @@ impl ConflictRepo {
                      WHERE target_object_type = ?1 AND target_object_id = ?2",
                     params![object_type, object_id, delete_commit_id],
                 )?;
-                conn.inner().execute(
-                    "INSERT INTO tombstone_acknowledgements
-                        (tombstone_id, device_id, observed_commit_id, acknowledged_at)
-                     SELECT tombstone_id, ?3, ?4, ?5 FROM tombstones
+                let mut stmt = conn.inner().prepare(
+                    "SELECT tombstone_id FROM tombstones
                      WHERE target_object_type = ?1 AND target_object_id = ?2
-                     ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
-                        observed_commit_id = excluded.observed_commit_id,
-                        acknowledged_at = excluded.acknowledged_at",
-                    params![
-                        object_type,
-                        object_id,
-                        ctx.device_id,
-                        delete_commit_id,
-                        chrono::Utc::now().to_rfc3339(),
-                    ],
+                     ORDER BY tombstone_id",
                 )?;
+                let tombstone_ids = stmt
+                    .query_map(params![object_type, object_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let acknowledged_at = chrono::Utc::now().to_rfc3339();
+                for tombstone_id in tombstone_ids {
+                    TombstoneAcknowledgementRepo::merge(
+                        conn,
+                        &tombstone_id,
+                        &ctx.device_id,
+                        delete_commit_id,
+                        &acknowledged_at,
+                    )?;
+                }
             }
         } else {
             conn.inner().execute(

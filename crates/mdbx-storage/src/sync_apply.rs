@@ -54,7 +54,7 @@ pub struct SyncApplyRepo;
 impl SyncApplyRepo {
     #[cfg(test)]
     fn commit_exists(conn: &VaultConnection, commit_id: &str) -> StorageResult<bool> {
-        commit_graph_apply::commit_exists(conn, commit_id)
+        crate::repo::CommitGraphRepo::commit_exists(conn, commit_id)
     }
 
     #[cfg(test)]
@@ -62,7 +62,7 @@ impl SyncApplyRepo {
         conn: &VaultConnection,
         commit_id: &str,
     ) -> StorageResult<Vec<String>> {
-        commit_graph_apply::parent_ids_for_commit(conn, commit_id)
+        crate::repo::CommitGraphRepo::parent_ids(conn, commit_id)
     }
 
     #[cfg(test)]
@@ -102,7 +102,10 @@ mod tests {
         DeletedSyncEntity, DeviceHeadRow, NewSyncDeltaEnvelope, SyncDeltaBatchKind, SyncDeltaBody,
         SyncDeltaEnvelope, SyncDeltaLimits,
     };
-    use crate::sync_state::{collect_sync_state, collect_sync_state_payload, SyncStateLimits};
+    use crate::sync_state::{
+        collect_sync_state, collect_sync_state_payload, SyncStateLimits,
+        TombstoneAcknowledgementRow,
+    };
     use crate::tiga::TigaService;
     use crate::tiga_policy::TigaAuthorizationContext;
     use crate::unlock::UnlockService;
@@ -397,6 +400,98 @@ mod tests {
         commit.tombstones.clear();
         commit.object_payloads.clear();
         commit
+    }
+
+    struct AcknowledgementGraph {
+        before_delete: &'static str,
+        delete: &'static str,
+        descendant: &'static str,
+        concurrent_left: &'static str,
+        concurrent_right: &'static str,
+    }
+
+    fn insert_acknowledgement_graph(conn: &VaultConnection) -> AcknowledgementGraph {
+        let graph = AcknowledgementGraph {
+            before_delete: "ack-before-delete",
+            delete: "ack-delete",
+            descendant: "ack-descendant",
+            concurrent_left: "ack-concurrent-left",
+            concurrent_right: "ack-concurrent-right",
+        };
+        let genesis = SyncApplyRepo::current_branch_head(conn, None, "main")
+            .unwrap()
+            .unwrap();
+        let commits = [
+            graph_only_commit(graph.before_delete, "ack-graph-device", 1, vec![genesis]),
+            graph_only_commit(
+                graph.delete,
+                "ack-graph-device",
+                2,
+                vec![graph.before_delete.to_string()],
+            ),
+            graph_only_commit(
+                graph.descendant,
+                "ack-graph-device",
+                3,
+                vec![graph.delete.to_string()],
+            ),
+            graph_only_commit(
+                graph.concurrent_left,
+                "ack-graph-device",
+                4,
+                vec![graph.delete.to_string()],
+            ),
+            graph_only_commit(
+                graph.concurrent_right,
+                "ack-graph-device",
+                5,
+                vec![graph.delete.to_string()],
+            ),
+        ];
+        for commit in &commits {
+            commit_ingest_apply::insert_commit(conn, commit).unwrap();
+        }
+        conn.inner()
+            .execute(
+                "INSERT INTO tombstones
+                    (tombstone_id, target_object_type, target_object_id, delete_clock,
+                     deleted_by_device_id, deleted_at, purge_eligible_at, delete_commit_id)
+                 VALUES ('ack-tombstone', 'entry', 'ack-object', '{}',
+                         'ack-device', '2026-05-22T00:00:00Z', NULL, ?1)",
+                [graph.delete],
+            )
+            .unwrap();
+        graph
+    }
+
+    fn write_acknowledgement(
+        conn: &VaultConnection,
+        observed_commit_id: &str,
+        acknowledged_at: &str,
+    ) {
+        conn.inner()
+            .execute(
+                "INSERT INTO tombstone_acknowledgements
+                    (tombstone_id, device_id, observed_commit_id, acknowledged_at)
+                 VALUES ('ack-tombstone', 'ack-device', ?1, ?2)
+                 ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
+                    observed_commit_id = excluded.observed_commit_id,
+                    acknowledged_at = excluded.acknowledged_at",
+                params![observed_commit_id, acknowledged_at],
+            )
+            .unwrap();
+    }
+
+    fn read_acknowledgement(conn: &VaultConnection) -> (String, String) {
+        conn.inner()
+            .query_row(
+                "SELECT observed_commit_id, acknowledged_at
+                 FROM tombstone_acknowledgements
+                 WHERE tombstone_id = 'ack-tombstone' AND device_id = 'ack-device'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     }
 
     fn assert_rejected_commit_has_no_graph_side_effects(
@@ -730,6 +825,151 @@ mod tests {
                 ("remote-device".to_string(), "remote-delete".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn synced_acknowledgement_rejects_commit_before_delete() {
+        let (conn, _) = setup();
+        let graph = insert_acknowledgement_graph(&conn);
+        write_acknowledgement(&conn, graph.descendant, "2026-05-22T02:00:00Z");
+
+        let error = lifecycle_apply::apply_tombstone_acknowledgements(
+            &conn,
+            &[TombstoneAcknowledgementRow {
+                tombstone_id: "ack-tombstone".to_string(),
+                device_id: "ack-device".to_string(),
+                observed_commit_id: graph.before_delete.to_string(),
+                acknowledged_at: "2026-05-22T03:00:00Z".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(&error, StorageError::Validation(_)));
+        assert!(error.to_string().contains("does not causally contain"));
+        assert_eq!(
+            read_acknowledgement(&conn),
+            (
+                graph.descendant.to_string(),
+                "2026-05-22T02:00:00Z".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn synced_acknowledgement_does_not_regress_to_ancestor() {
+        let (conn, _) = setup();
+        let graph = insert_acknowledgement_graph(&conn);
+        write_acknowledgement(&conn, graph.descendant, "2026-05-22T02:00:00Z");
+
+        lifecycle_apply::apply_tombstone_acknowledgements(
+            &conn,
+            &[TombstoneAcknowledgementRow {
+                tombstone_id: "ack-tombstone".to_string(),
+                device_id: "ack-device".to_string(),
+                observed_commit_id: graph.delete.to_string(),
+                acknowledged_at: "2026-05-22T03:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_acknowledgement(&conn),
+            (
+                graph.descendant.to_string(),
+                "2026-05-22T03:00:00Z".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn synced_acknowledgement_advances_without_regressing_time() {
+        let (conn, _) = setup();
+        let graph = insert_acknowledgement_graph(&conn);
+        write_acknowledgement(&conn, graph.delete, "2026-05-22T03:00:00Z");
+
+        lifecycle_apply::apply_tombstone_acknowledgements(
+            &conn,
+            &[TombstoneAcknowledgementRow {
+                tombstone_id: "ack-tombstone".to_string(),
+                device_id: "ack-device".to_string(),
+                observed_commit_id: graph.descendant.to_string(),
+                acknowledged_at: "2026-05-22T02:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_acknowledgement(&conn),
+            (
+                graph.descendant.to_string(),
+                "2026-05-22T03:00:00Z".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn synced_concurrent_acknowledgements_converge_independent_of_arrival_order() {
+        let (conn, _) = setup();
+        let graph = insert_acknowledgement_graph(&conn);
+        let left = TombstoneAcknowledgementRow {
+            tombstone_id: "ack-tombstone".to_string(),
+            device_id: "ack-device".to_string(),
+            observed_commit_id: graph.concurrent_left.to_string(),
+            acknowledged_at: "2026-05-22T01:00:00Z".to_string(),
+        };
+        let right = TombstoneAcknowledgementRow {
+            tombstone_id: "ack-tombstone".to_string(),
+            device_id: "ack-device".to_string(),
+            observed_commit_id: graph.concurrent_right.to_string(),
+            acknowledged_at: "2026-05-22T02:00:00Z".to_string(),
+        };
+
+        write_acknowledgement(&conn, &left.observed_commit_id, &left.acknowledged_at);
+        lifecycle_apply::apply_tombstone_acknowledgements(&conn, &[right.clone()]).unwrap();
+        let left_then_right = read_acknowledgement(&conn);
+
+        conn.inner()
+            .execute(
+                "DELETE FROM tombstone_acknowledgements
+                 WHERE tombstone_id = 'ack-tombstone' AND device_id = 'ack-device'",
+                [],
+            )
+            .unwrap();
+        write_acknowledgement(&conn, &right.observed_commit_id, &right.acknowledged_at);
+        lifecycle_apply::apply_tombstone_acknowledgements(&conn, &[left]).unwrap();
+        let right_then_left = read_acknowledgement(&conn);
+
+        assert_eq!(left_then_right, right_then_left);
+        assert_eq!(
+            left_then_right,
+            (
+                graph.concurrent_right.to_string(),
+                "2026-05-22T02:00:00Z".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn synced_acknowledgement_keeps_missing_reference_compatibility() {
+        let (conn, _) = setup();
+        lifecycle_apply::apply_tombstone_acknowledgements(
+            &conn,
+            &[TombstoneAcknowledgementRow {
+                tombstone_id: "missing-tombstone".to_string(),
+                device_id: "ack-device".to_string(),
+                observed_commit_id: "missing-commit".to_string(),
+                acknowledged_at: "2026-05-22T00:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .inner()
+            .query_row(
+                "SELECT COUNT(*) FROM tombstone_acknowledgements",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     fn temp_vault_path(label: &str) -> PathBuf {

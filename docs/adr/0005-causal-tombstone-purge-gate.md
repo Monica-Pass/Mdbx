@@ -15,7 +15,19 @@ Schema 8 adds `tombstones.delete_commit_id` and `tombstone_acknowledgements`.
 
 The delete commit is a causal proof whose object version certifies the deleted state. New local deletion paths store the real commit vector clock and commit ID. MDBX1 migration backfills the proof from the head commit of an object that is still deleted. A migrated tombstone also records an acknowledgement for its deleting device.
 
-Each acknowledgement identifies the tombstone, device, observed commit, and acknowledgement time. Local deletion acknowledges the deleting device. Receiving a per-commit tombstone acknowledges both the deleting device and the receiving device. Complete synchronization state carries acknowledgement rows as an optional additive field; old state payloads remain valid.
+Each acknowledgement identifies the tombstone, device, observed commit, and
+acknowledgement time. Local deletion acknowledges the deleting device.
+Receiving a per-commit tombstone acknowledges both the deleting device and the
+receiving device. Complete synchronization state carries acknowledgement rows
+as an optional additive field; old state payloads remain valid.
+
+Runtime acknowledgement writes follow ADR-0044. When `delete_commit_id` is
+present, the observed commit must equal or causally contain it. Descendant
+evidence advances an ancestor, an ancestor cannot replace a descendant,
+concurrent valid evidence uses a deterministic canonical tie-break, and
+acknowledgement time never decreases. These rules make the row itself a valid
+input to the cleanup gate instead of relying on the gate to compensate for an
+unvalidated upsert.
 
 Eligibility evaluation checks all of the following:
 

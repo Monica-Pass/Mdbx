@@ -572,3 +572,24 @@ health verification 会报告引用缺失 commit、引用其他设备 commit 或
 MDBX1-DRAFT 的迟到 commit 仍是合法输入，当前 receiver 会保留较新的 head。接收端需要使用
 当前 storage core 才能获得与交付顺序无关的合并行为；wire 表示保持不变，因此旧 receiver
 继续使用其历史 apply 规则。
+
+### 7.22 Tombstone Acknowledgement 因果单调性
+
+既有 schema 8 acknowledgement 行现在由 storage core 的单一运行时合并规则管理。
+`observed_commit_id` 必须引用可用 commit；tombstone 带有 `delete_commit_id` 时，该 commit
+必须等于删除 commit 或位于其后代。删除之前的 commit 以及与删除并发的 commit 均不能作为
+观察证明。
+
+对于同一 tombstone 与设备，后代证据覆盖祖先证据，祖先证据不能覆盖后代证据。两个有效并发
+证明先完成因果比较，再选择较大的 `(acknowledged_at, observed_commit_id)`，因此接收顺序
+不会改变最终保存行。无论选择哪一个 commit，确认时间都保留较晚值。
+
+完整状态与 state delta 在本地缺少 tombstone 或 observed commit 时继续跳过对应
+acknowledgement。两项引用均存在后，非因果证明会拒绝整个事务。`delete_commit_id` 为
+`NULL` 的 tombstone 保留 legacy 表示，只要求 observed commit 可用。health verification
+会报告违反这些规则的保存行，同时保持只读，不会重写历史。
+
+本次修改不增加表、列、索引、migration、format generation、同步 DTO、state version、
+bundle version 或 capability bit。schema 8 migration backfill 保持原样，MDBX1 与
+MDBX1-DRAFT 继续使用同一 storage-core 升级序列。旧 reader 可以解析相同数据库行与 wire
+payload，但仍采用早期覆盖规则；因果验证和与接收顺序无关的合并需要当前 storage core。

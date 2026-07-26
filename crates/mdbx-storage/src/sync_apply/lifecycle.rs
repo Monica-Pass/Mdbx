@@ -2,7 +2,9 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{PermanentPurgeReceipt, TombstoneRepo};
+use crate::repo::{
+    CommitGraphRepo, PermanentPurgeReceipt, TombstoneAcknowledgementRepo, TombstoneRepo,
+};
 use crate::sync_delta::{DeletedSyncEntity, DeviceHeadRow, SyncDeltaBody};
 use crate::sync_state::{PurgeReceiptRow, TombstoneAcknowledgementRow, TombstoneRow};
 
@@ -30,8 +32,8 @@ pub(super) fn apply_purge_receipts(
         .collect::<Vec<_>>();
     receipts.sort_by_key(|receipt| purge_dependency_order(&receipt.target_object_type));
     for receipt in receipts {
-        if !commit_graph_apply::commit_exists(conn, &receipt.delete_commit_id)?
-            || !commit_graph_apply::commit_exists(conn, &receipt.purge_commit_id)?
+        if !CommitGraphRepo::commit_exists(conn, &receipt.delete_commit_id)?
+            || !CommitGraphRepo::commit_exists(conn, &receipt.purge_commit_id)?
         {
             return Err(StorageError::ConstraintViolation(format!(
                 "permanent purge receipt {} references unavailable commits",
@@ -57,9 +59,7 @@ pub(super) fn apply_complete_tombstone_state(
             continue;
         }
         let delete_commit_id = match row.delete_commit_id.as_deref() {
-            Some(commit_id) if commit_graph_apply::commit_exists(conn, commit_id)? => {
-                Some(commit_id)
-            }
+            Some(commit_id) if CommitGraphRepo::commit_exists(conn, commit_id)? => Some(commit_id),
             _ => None,
         };
         conn.inner().execute(
@@ -83,9 +83,7 @@ pub(super) fn apply_delta_tombstone_state(
             continue;
         }
         let delete_commit_id = match row.delete_commit_id.as_deref() {
-            Some(commit_id) if commit_graph_apply::commit_exists(conn, commit_id)? => {
-                Some(commit_id)
-            }
+            Some(commit_id) if CommitGraphRepo::commit_exists(conn, commit_id)? => Some(commit_id),
             Some(commit_id) => {
                 return Err(StorageError::ConstraintViolation(format!(
                     "delta tombstone {} references unavailable commit {commit_id}",
@@ -126,9 +124,12 @@ pub(super) fn apply_tombstone_acknowledgements(
         if !references_exist {
             continue;
         }
-        conn.inner().execute(
-            "INSERT INTO tombstone_acknowledgements (tombstone_id, device_id, observed_commit_id, acknowledged_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(tombstone_id, device_id) DO UPDATE SET observed_commit_id = excluded.observed_commit_id, acknowledged_at = excluded.acknowledged_at",
-            params![row.tombstone_id, row.device_id, row.observed_commit_id, row.acknowledged_at],
+        TombstoneAcknowledgementRepo::merge(
+            conn,
+            &row.tombstone_id,
+            &row.device_id,
+            &row.observed_commit_id,
+            &row.acknowledged_at,
         )?;
     }
     Ok(())

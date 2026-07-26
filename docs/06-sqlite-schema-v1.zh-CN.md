@@ -514,7 +514,32 @@ vault
 - 能确认全文搜索不会把解密标题持久化
 - 能支持后续 KDBX 导入映射
 
-## 9. MDBX2 Collection Profile 附加结构
+## 9. MDBX2 因果删除证明附加结构
+
+schema 8 为 `tombstones` 增加可空的
+`delete_commit_id TEXT REFERENCES commits(commit_id)`，并增加
+`tombstone_acknowledgements`：
+
+- `tombstone_id TEXT NOT NULL`
+- `device_id TEXT NOT NULL`
+- `observed_commit_id TEXT NOT NULL`
+- `acknowledged_at TEXT NOT NULL`
+- `PRIMARY KEY (tombstone_id, device_id)`
+- tombstone 外键使用 `ON DELETE CASCADE`
+- observed commit 外键引用 `commits(commit_id)`
+
+外键只能确认引用存在，无法表达 commit DAG 祖先关系。运行时写入必须经过统一的
+TombstoneAcknowledgement Module：带有 `delete_commit_id` 时，observed commit 必须等于删除
+commit 或位于其后代；后代证明可以推进祖先证明，祖先证明不能覆盖后代证明；有效并发证明在
+完成因果比较后按 `(acknowledged_at, observed_commit_id)` 选择规范行；保存的确认时间始终
+取较晚值。
+
+schema 8 的历史迁移继续从仍处于 deleted 状态的对象 head 回填 `delete_commit_id`，并为删除
+设备生成初始 acknowledgement。无法重建 delete commit 的 legacy tombstone 保留 `NULL`，
+运行时只校验 observed commit 存在，不虚构历史因果关系。health check 使用
+`tombstone-acknowledgements` 类别报告非因果保存行。
+
+## 10. MDBX2 Collection Profile 附加结构
 
 schema 11 增加 `collection_profiles`，以 `project_id` 一对一引用 `projects`。该表不替代 `projects`，只保存 MDBX2 Collection 的领域描述：
 

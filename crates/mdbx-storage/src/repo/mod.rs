@@ -4,6 +4,7 @@ pub mod branch;
 pub mod collection_profile;
 pub mod collection_summary;
 pub mod commit_ctx;
+pub(crate) mod commit_graph;
 pub mod commit_history;
 pub mod commit_inventory;
 pub mod conflict;
@@ -23,6 +24,7 @@ pub mod snapshot_lifecycle;
 pub mod snapshot_summary;
 pub mod sync_delta_inventory;
 pub mod tombstone;
+pub(crate) mod tombstone_acknowledgement;
 
 pub use attachment::{
     AttachmentCreateRequest, AttachmentPlaintextPurpose, AttachmentRepo, AttachmentWriteOptions,
@@ -36,6 +38,7 @@ pub use collection_summary::{
     CollectionSummaryRepo, MAX_COLLECTION_SUMMARY_CURSOR_BYTES, MAX_COLLECTION_SUMMARY_PAGE_SIZE,
 };
 pub use commit_ctx::{CommitChange, CommitContext, CommitOperation, OperationExecution};
+pub(crate) use commit_graph::CommitGraphRepo;
 pub use commit_history::{CommitHistoryItem, CommitHistoryPage, CommitHistoryRepo};
 pub use commit_inventory::{
     CommitInventoryItem, CommitInventoryPage, CommitInventoryRepo, MAX_COMMIT_INVENTORY_PAGE_SIZE,
@@ -89,3 +92,4 @@ pub use tombstone::{
     PermanentPurgeReceipt, TombstonePurgeBlocker, TombstonePurgeEligibility,
     TombstonePurgeScheduleResult, TombstoneRepo,
 };
+pub(crate) use tombstone_acknowledgement::TombstoneAcknowledgementRepo;

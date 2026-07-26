@@ -5,7 +5,8 @@ use mdbx_core::model::ConflictObjectType;
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::{
-    CollectionProfileRepo, CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo,
+    CollectionProfileRepo, CommitContext, CommitGraphRepo, ConflictRepo, ObjectVersionRepo,
+    TombstoneRepo,
 };
 use crate::sync_state::{ProjectRow, ProjectTagSetRow};
 
@@ -22,7 +23,7 @@ pub(super) fn apply_projects(
         if TombstoneRepo::is_permanently_purged(conn, "project", &row.project_id)? {
             continue;
         }
-        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
+        if CommitGraphRepo::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_project_row(conn, &row.head_commit_id, row)?;
         }
         match commit_graph_apply::object_apply_decision(
@@ -156,7 +157,7 @@ fn merge_or_record_project_conflict(
 ) -> StorageResult<u32> {
     let incoming_commit_id = &incoming.head_commit_id;
     let Some(base_commit_id) =
-        commit_graph_apply::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
+        CommitGraphRepo::nearest_known_common_parent(conn, local_commit_id, incoming_commit_id)?
     else {
         return record_project_field_conflict(
             conn,

@@ -593,3 +593,31 @@ and MDBX1-DRAFT delayed commits remain valid input, and current receivers retain
 their newer head. A receiver needs the current storage core to obtain the new
 delivery-order-independent merge behavior; older receivers continue to use
 their historical apply rule because the wire representation is unchanged.
+
+### 7.22 Causal Monotonic Tombstone Acknowledgements
+
+The existing schema-8 acknowledgement row now has one storage-owned runtime
+merge. Its `observed_commit_id` must reference an available commit and, when the
+tombstone has `delete_commit_id`, must equal or causally descend from that
+deletion. A pre-delete commit and a commit concurrent with the deletion are not
+observation proofs.
+
+For one tombstone and device, a descendant replaces an ancestor while an
+ancestor cannot replace a descendant. Two valid concurrent proofs select the
+greater `(acknowledged_at, observed_commit_id)` after causal comparison, so
+arrival order does not change the stored row. The acknowledgement time itself
+keeps the later value even when the selected commit does not change.
+
+Complete-state and state-delta rows still skip an acknowledgement when its
+tombstone or observed commit is absent locally. When both references exist, a
+non-causal proof rejects the transaction. Tombstones with a `NULL`
+`delete_commit_id` preserve their legacy representation and require only an
+available observed commit. Health verification reports a stored proof that does
+not satisfy these rules without rewriting it.
+
+No table, column, index, migration, format generation, synchronization DTO,
+state version, bundle version, or capability bit changes. The schema-8
+migration backfill is unchanged, and MDBX1 plus MDBX1-DRAFT continue through the
+same storage-core upgrade sequence. Older readers can parse the same rows and
+wire payloads but retain their earlier overwrite behavior; a current storage
+core is required for causal validation and delivery-order-independent merging.

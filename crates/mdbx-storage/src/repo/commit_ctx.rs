@@ -13,6 +13,7 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::FieldKeyPurpose;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::branch::BranchRepo;
+use crate::repo::TombstoneAcknowledgementRepo;
 
 const OPERATION_REQUEST_IDENTITY_V1_PREFIX: &[u8] = b"MDBXORI1";
 const LEGACY_OPERATION_REQUEST_HASH_BYTES: usize = 32;
@@ -852,11 +853,12 @@ impl CommitContext {
                 delete_commit_id,
             ],
         )?;
-        conn.inner().execute(
-            "INSERT INTO tombstone_acknowledgements
-                (tombstone_id, device_id, observed_commit_id, acknowledged_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![tombstone_id, self.device_id, delete_commit_id, now],
+        TombstoneAcknowledgementRepo::merge(
+            conn,
+            &tombstone_id,
+            &self.device_id,
+            delete_commit_id,
+            &now,
         )?;
 
         Ok(tombstone_id)

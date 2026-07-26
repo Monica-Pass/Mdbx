@@ -4,7 +4,7 @@ use mdbx_core::model::ConflictObjectType;
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{CommitContext, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
+use crate::repo::{CommitContext, CommitGraphRepo, ConflictRepo, ObjectVersionRepo, TombstoneRepo};
 use crate::sync_state::{ObjectLabelAssignmentRow, ObjectLabelRow, ObjectRelationRow};
 
 use super::{commit_graph_apply, commit_graph_apply::ObjectDecision, object_merge_apply};
@@ -23,7 +23,7 @@ pub(super) fn apply_object_relations(
             .parse::<mdbx_core::model::RelationKindId>()
             .map_err(StorageError::Validation)?;
         object_merge_apply::validate_payload_schema_version(row.payload_schema_version)?;
-        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
+        if CommitGraphRepo::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_relation_row(conn, &row.head_commit_id, row)?;
         }
         match commit_graph_apply::object_apply_decision(
@@ -120,7 +120,7 @@ pub(super) fn apply_object_labels(
             continue;
         }
         object_merge_apply::validate_payload_schema_version(row.payload_schema_version)?;
-        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
+        if CommitGraphRepo::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_label_row(conn, &row.head_commit_id, row)?;
         }
         match commit_graph_apply::object_apply_decision(
@@ -217,7 +217,7 @@ pub(super) fn apply_object_label_assignments(
         )? {
             continue;
         }
-        if commit_graph_apply::commit_exists(conn, &row.head_commit_id)? {
+        if CommitGraphRepo::commit_exists(conn, &row.head_commit_id)? {
             ObjectVersionRepo::record_object_label_assignment_row(conn, &row.head_commit_id, row)?;
         }
         match commit_graph_apply::object_apply_decision(
@@ -345,7 +345,7 @@ fn record_generic_metadata_conflict(
         return Ok(0);
     }
     let base_commit_id =
-        commit_graph_apply::nearest_known_common_parent(conn, local_head, incoming_head)?
+        CommitGraphRepo::nearest_known_common_parent(conn, local_head, incoming_head)?
             .unwrap_or_else(|| local_head.to_string());
     let fields = fields
         .iter()

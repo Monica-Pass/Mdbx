@@ -219,6 +219,17 @@ device head 必须引用由同一设备创作的 commit，并表示该设备已�
 回退；同一 commit 重放保持幂等。`last_seen_at` 保留较晚值，`revoked` 单调合并。health check
 必须报告悬空、设备归属错误和序列落后的 head。
 
+tombstone acknowledgement 必须构成因果证据。observed commit 必须存在；tombstone 带有
+`delete_commit_id` 时，observed commit 必须等于该删除 commit 或位于其后代。对于同一
+tombstone 与设备，后代证据推进祖先证据，祖先证据不能覆盖后代证据；两个有效并发证据先做
+因果比较，再选择较大的 `(acknowledged_at, observed_commit_id)`。保存的确认时间必须保留
+较晚值。没有 delete commit 的 legacy tombstone 仍要求 observed commit 存在，但不得虚构
+历史因果祖先。
+
+同步、冲突基点查找、acknowledgement 验证、永久清理资格和 health verification 使用的
+commit parent 读取与祖先关系必须由 storage core 统一解释。时间戳与 device head 不能替代
+commit 祖先关系。
+
 ## 9. 冲突检测
 
 MDBX 必须基于因果元数据检测并发修改，不能只靠时间戳。
@@ -247,7 +258,7 @@ sync state 中的 key epoch 字段必须保持可选，使 MDBX1 和早期 MDBX2
 
 接收端接受状态前，必须验证 vault 与批次身份、payload digest、逻辑行数、commit 归属和资源限制。所有关联 commit 必须可用。一个 serialized commit 上不得混用已识别 delta 与完整 sync state，也不得携带第二个 delta。commit 插入、稀疏状态应用、附件 chunk 替换、device-head 合并、授权删除、接收批次持久化和 incoming capture 清理必须全部提交或全部回滚。
 
-delta 中的 tombstone 是稀疏集合，不得替换无关的本地 tombstone。device-head 行与 commit 导入使用同一设备创作序列规则，device revocation 必须单调合并。物理删除对象或 tombstone 必须有匹配且经过认证的永久清理凭证。key epoch 变更只能通过经过验证解锁的可变 apply 路径完成；不可变兼容入口必须原子拒绝。
+delta 中的 tombstone 是稀疏集合，不得替换无关的本地 tombstone。引用均存在的 tombstone acknowledgement 行必须采用与本地删除及完整状态 apply 相同的因果单调合并；非因果证明会拒绝整个事务。缺失引用的行继续使用完整状态兼容行为并跳过。device-head 行与 commit 导入使用同一设备创作序列规则，device revocation 必须单调合并。物理删除对象或 tombstone 必须有匹配且经过认证的永久清理凭证。key epoch 变更只能通过经过验证解锁的可变 apply 路径完成；不可变兼容入口必须原子拒绝。
 
 完整 sync state 继续承担首次 bootstrap 和旧 peer fallback。bundle v1-v3 格式保持不变。bundle v4 在取得成对 checkpoint 后携带有界 commit/delta inventory，以 transfer ID、segment index 和上一段 payload digest 绑定恢复链；接收端只有在整段持久应用后才能推进 checkpoint。同一段内的 commit 关联 delta 与 auxiliary delta 必须处于同一个数据库事务。客户端在同时交换两类 checkpoint 并保存 segment resume 状态之前，不得宣称已经实现增量收敛。
 
@@ -382,4 +393,5 @@ compaction 可以重写较大部分内容，但必须满足：
 - 没有一等 `attachments` 结构
 - 设计上普通小修改就必须重写整个 vault
 - 不能表达并发历史
+- 把任意存在的 commit 当作设备已经观察到后续删除的证明
 - 不能说明中断后如何恢复

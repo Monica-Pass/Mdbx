@@ -7,7 +7,7 @@ use mdbx_sync::{CommitBatch, CommitOperationMetadata, SerializedCommit};
 use crate::commit_integrity::{compute_commit_integrity_tag, CommitIntegrityInput};
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{CommitContext, TombstoneRepo};
+use crate::repo::{CommitContext, CommitGraphRepo, TombstoneAcknowledgementRepo, TombstoneRepo};
 use crate::sync_state::SyncStateLimits;
 
 use super::{commit_graph_apply, payload_apply, ApplyBatchResult};
@@ -43,7 +43,7 @@ fn apply_commit(
     allow_key_epoch_changes: bool,
     sync_limits: SyncStateLimits,
 ) -> StorageResult<ApplyOutcome> {
-    if commit_graph_apply::commit_exists(conn, &serialized.commit.commit_id)? {
+    if CommitGraphRepo::commit_exists(conn, &serialized.commit.commit_id)? {
         return conn.with_immediate_transaction(|| {
             verify_existing_commit_metadata(conn, serialized)?;
             if let Some(operation) = &serialized.operation {
@@ -73,7 +73,7 @@ fn apply_commit(
     }
 
     for parent in &serialized.parent_ids {
-        if !commit_graph_apply::commit_exists(conn, parent)? {
+        if !CommitGraphRepo::commit_exists(conn, parent)? {
             return Ok(ApplyOutcome::MissingParent);
         }
     }
@@ -232,19 +232,12 @@ pub(super) fn insert_commit(
                 serialized.commit.commit_id,
             ],
         )?;
-        conn.inner().execute(
-            "INSERT INTO tombstone_acknowledgements
-                (tombstone_id, device_id, observed_commit_id, acknowledged_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
-                observed_commit_id = excluded.observed_commit_id,
-                acknowledged_at = excluded.acknowledged_at",
-            params![
-                tombstone.tombstone_id,
-                tombstone.deleted_by_device_id,
-                serialized.commit.commit_id,
-                tombstone.deleted_at,
-            ],
+        TombstoneAcknowledgementRepo::merge(
+            conn,
+            &tombstone.tombstone_id,
+            &tombstone.deleted_by_device_id,
+            &serialized.commit.commit_id,
+            &tombstone.deleted_at,
         )?;
     }
 
@@ -372,7 +365,7 @@ fn verify_existing_commit_metadata(
             commit.commit_id
         )));
     };
-    let stored_parents = commit_graph_apply::parent_ids_for_commit(conn, &commit.commit_id)?;
+    let stored_parents = CommitGraphRepo::parent_ids(conn, &commit.commit_id)?;
     let mut incoming_parents = serialized.parent_ids.clone();
     incoming_parents.sort();
 
@@ -410,19 +403,12 @@ pub(super) fn acknowledge_received_tombstones(
         )? {
             continue;
         }
-        conn.inner().execute(
-            "INSERT INTO tombstone_acknowledgements
-                (tombstone_id, device_id, observed_commit_id, acknowledged_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(tombstone_id, device_id) DO UPDATE SET
-                observed_commit_id = excluded.observed_commit_id,
-                acknowledged_at = excluded.acknowledged_at",
-            params![
-                tombstone.tombstone_id,
-                ctx.device_id,
-                serialized.commit.commit_id,
-                chrono::Utc::now().to_rfc3339(),
-            ],
+        TombstoneAcknowledgementRepo::merge(
+            conn,
+            &tombstone.tombstone_id,
+            &ctx.device_id,
+            &serialized.commit.commit_id,
+            &chrono::Utc::now().to_rfc3339(),
         )?;
     }
     Ok(())

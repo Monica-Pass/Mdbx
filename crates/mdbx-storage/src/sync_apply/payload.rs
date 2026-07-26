@@ -7,14 +7,14 @@ use mdbx_sync::{ObjectPayload, SerializedCommit};
 
 use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
-use crate::repo::{CommitContext, ConflictRepo};
+use crate::repo::{CommitContext, CommitGraphRepo, ConflictRepo};
 use crate::sync_delta::{
     decode_sync_delta_body, decode_sync_delta_object_payload, load_sync_delta_envelope,
     persist_envelope, SyncDeltaBatchKind, SyncDeltaEnvelope, SyncDeltaLimits,
 };
 use crate::sync_state::{decode_sync_state_payload_with_limits, SyncStateLimits};
 
-use super::{commit_graph_apply, key_epoch_apply, lifecycle_apply, state_apply};
+use super::{key_epoch_apply, lifecycle_apply, state_apply};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct PayloadApplyResult {
@@ -143,7 +143,7 @@ fn apply_commit_sync_delta(
         ));
     }
     for commit_id in &envelope.commit_ids {
-        if !commit_graph_apply::commit_exists(conn, commit_id)? {
+        if !CommitGraphRepo::commit_exists(conn, commit_id)? {
             return Err(StorageError::ConstraintViolation(format!(
                 "sync delta references unavailable commit {commit_id}"
             )));
@@ -236,7 +236,7 @@ fn record_payload_conflict(
         return Ok(0);
     }
 
-    let base_commit_id = commit_graph_apply::nearest_known_common_parent(
+    let base_commit_id = CommitGraphRepo::nearest_known_common_parent(
         conn,
         local_head,
         &serialized.commit.commit_id,
