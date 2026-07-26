@@ -106,6 +106,25 @@ cargo test
 cargo run -p mdbx-cli -- --help
 ```
 
+## 提交门禁
+
+`master` 的 push 和 pull request 由 `.github/workflows/ci.yml` 在 Linux、Rust
+1.86.0 上执行以下八项，全部通过才算合格：
+
+```text
+cargo fmt --all -- --check
+git diff --check <empty-tree> HEAD
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --no-fail-fast
+cargo test -p mdbx-storage --no-default-features --features core
+cargo check --workspace --all-targets
+cargo check -p mdbx-cli --no-default-features --features core
+cargo check -p mdbx-ffi --no-default-features
+```
+
+两项 `--no-default-features` 检查和 core profile 测试专门用于捕捉全 feature
+构建会掩盖的裁剪构建破坏，不能因为 workspace 构建通过就跳过。
+
 当前 `mdbx-cli` 是 Rust workspace 的开发/验证入口，已经覆盖：
 
 - `init` / `unlock`

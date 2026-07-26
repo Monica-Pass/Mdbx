@@ -104,6 +104,26 @@ Run the CLI during local development:
 cargo run -p mdbx-cli -- --help
 ```
 
+## Merge Gates
+
+Pushes and pull requests targeting `master` run `.github/workflows/ci.yml` on
+Linux with Rust 1.86.0. All eight gates must pass:
+
+```text
+cargo fmt --all -- --check
+git diff --check <empty-tree> HEAD
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --no-fail-fast
+cargo test -p mdbx-storage --no-default-features --features core
+cargo check --workspace --all-targets
+cargo check -p mdbx-cli --no-default-features --features core
+cargo check -p mdbx-ffi --no-default-features
+```
+
+The two `--no-default-features` checks and the core-profile test exist to catch
+trimmed-build breakage that an all-features workspace build hides. A green
+workspace build is not a reason to skip them.
+
 The current `mdbx-cli` is a development and validation entry point for this Rust workspace. It covers:
 
 - `init` / `unlock`
