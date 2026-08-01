@@ -327,6 +327,46 @@ impl ProjectRepo {
         })
     }
 
+    pub fn move_to_group(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        group_id: Option<&str>,
+    ) -> StorageResult<Project> {
+        CollectionProfileRepo::ensure_collection_write_capabilities(conn, project_id)?;
+        conn.with_immediate_transaction(|| {
+            let project = ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+            if project.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "deleted projects cannot be moved".to_string(),
+                ));
+            }
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let commit_id =
+                ctx.commit_object_change(conn, "projects", project_id, "move", "project")?;
+            let object_clock = bump_clock(&project.object_clock);
+            conn.inner().execute(
+                "UPDATE projects SET group_id = ?2, object_clock = ?3,
+                 head_commit_id = ?4, updated_at = ?5, updated_by_device_id = ?6
+                 WHERE project_id = ?1",
+                params![
+                    project_id,
+                    group_id,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id
+                ],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
+
+            ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))
+        })
+    }
+
     // -----------------------------------------------------------------------
     // SOFT DELETE
     // -----------------------------------------------------------------------
@@ -369,6 +409,47 @@ impl ProjectRepo {
             ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
 
             Ok(())
+        })
+    }
+
+    pub fn restore(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        project_id: &str,
+        group_id: Option<&str>,
+    ) -> StorageResult<Project> {
+        conn.with_immediate_transaction(|| {
+            let project = ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+            if !project.deleted {
+                return Err(StorageError::ConstraintViolation(
+                    "project is not deleted".to_string(),
+                ));
+            }
+            CollectionProfileRepo::ensure_collection_write_capabilities(conn, project_id)?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let commit_id =
+                ctx.commit_object_change(conn, "projects", project_id, "restore", "project")?;
+            let object_clock = bump_clock(&project.object_clock);
+
+            conn.inner().execute(
+                "UPDATE projects SET deleted = 0, group_id = ?2, object_clock = ?3,
+                 head_commit_id = ?4, updated_at = ?5, updated_by_device_id = ?6
+                 WHERE project_id = ?1",
+                params![
+                    project_id,
+                    group_id,
+                    object_clock,
+                    commit_id,
+                    now,
+                    ctx.device_id
+                ],
+            )?;
+            ObjectVersionRepo::record_project_current(conn, &commit_id, project_id)?;
+
+            ProjectRepo::get_by_id(conn, project_id)?
+                .ok_or_else(|| StorageError::NotFound(project_id.to_string()))
         })
     }
 

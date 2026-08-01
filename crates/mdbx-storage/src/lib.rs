@@ -21,6 +21,7 @@ pub mod key_epoch;
 pub mod migration;
 pub mod object_disclosure;
 pub mod object_metadata_disclosure;
+pub mod peer_sync;
 pub mod presentation_metadata;
 pub mod recovery;
 pub mod repo;

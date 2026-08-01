@@ -29,6 +29,26 @@ pub enum MdbxWriteCommand {
         project_id: String,
         title: String,
     },
+    CreateProjectWithParent {
+        project_id: String,
+        title: String,
+        parent_project_id: Option<String>,
+    },
+    RenameProject {
+        project_id: String,
+        title: String,
+    },
+    MoveProject {
+        project_id: String,
+        parent_project_id: Option<String>,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    RestoreProject {
+        project_id: String,
+        parent_project_id: Option<String>,
+    },
     CreateEntry {
         entry_id: String,
         project_id: String,
@@ -211,6 +231,33 @@ impl From<MdbxWriteCommand> for StorageWriteCommand {
             MdbxWriteCommand::CreateProject { project_id, title } => {
                 Self::CreateProject { project_id, title }
             }
+            MdbxWriteCommand::CreateProjectWithParent {
+                project_id,
+                title,
+                parent_project_id,
+            } => Self::CreateProjectWithParent {
+                project_id,
+                title,
+                parent_project_id,
+            },
+            MdbxWriteCommand::RenameProject { project_id, title } => {
+                Self::RenameProject { project_id, title }
+            }
+            MdbxWriteCommand::MoveProject {
+                project_id,
+                parent_project_id,
+            } => Self::MoveProject {
+                project_id,
+                parent_project_id,
+            },
+            MdbxWriteCommand::DeleteProject { project_id } => Self::DeleteProject { project_id },
+            MdbxWriteCommand::RestoreProject {
+                project_id,
+                parent_project_id,
+            } => Self::RestoreProject {
+                project_id,
+                parent_project_id,
+            },
             MdbxWriteCommand::CreateEntry {
                 entry_id,
                 project_id,

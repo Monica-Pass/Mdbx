@@ -1,12 +1,12 @@
 use super::*;
 use std::io::Write;
 
-use mdbx_core::model::{ConflictObjectType, SnapshotKind};
+use mdbx_core::model::{ConflictObjectType, EntryType, SnapshotKind};
 use mdbx_storage::init::{initialize_vault, VaultInitParams};
 use mdbx_storage::repo::{
-    AttachmentRepo, CommitContext, ConflictRepo, ObjectLabelAssignmentRepo, ObjectLabelRepo,
-    ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo, SnapshotLifecycleRepo,
-    SnapshotRepo, TombstoneRepo,
+    AttachmentRepo, CommitContext, ConflictRepo, EntryRepo, ObjectLabelAssignmentRepo,
+    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, ProjectRepo,
+    SnapshotLifecycleRepo, SnapshotRepo, TombstoneRepo,
 };
 use mdbx_storage::unlock::UnlockService;
 use sha2::{Digest, Sha256};
@@ -48,6 +48,135 @@ fn ffi_test_count(vault: &MdbxVault, table: &str) -> i64 {
 }
 
 #[test]
+fn diagnostics_summary_matches_storage_counts() {
+    let vault = ffi_test_vault();
+    let summary = vault.diagnostics_summary().unwrap();
+
+    assert_eq!(
+        summary.commit_count,
+        ffi_test_count(&vault, "commits") as u64
+    );
+    assert_eq!(
+        summary.tombstone_count,
+        ffi_test_count(&vault, "tombstones") as u64
+    );
+    assert_eq!(
+        summary.branch_count,
+        ffi_test_count(&vault, "branches") as u64
+    );
+    assert_eq!(
+        summary.device_count,
+        ffi_test_count(&vault, "device_heads") as u64
+    );
+    assert_eq!(
+        summary.snapshot_count,
+        ffi_test_count(&vault, "snapshots") as u64
+    );
+    assert_eq!(summary.unresolved_conflict_count, 0);
+    assert_eq!(summary.deleted_project_count, 0);
+    assert_eq!(summary.deleted_entry_count, 0);
+    assert_eq!(summary.deleted_attachment_count, 0);
+    assert_eq!(summary.external_attachment_count, 0);
+    assert_eq!(summary.original_attachment_bytes, 0);
+    assert_eq!(summary.stored_attachment_bytes, 0);
+}
+
+#[test]
+fn managed_snapshot_and_commit_actions_round_trip_through_ffi() {
+    let vault = ffi_test_vault();
+    let entry_id = {
+        let conn = vault.conn.lock().unwrap();
+        let ctx = CommitContext::new(vault.device_id.clone());
+        let project = ProjectRepo::create(&conn, &ctx, "Snapshot project", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Before"),
+            &serde_json::json!({"password":"one"}),
+        )
+        .unwrap();
+        entry.entry_id
+    };
+    let created_snapshot = vault
+        .create_manual_snapshot(
+            "Before update".to_string(),
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    assert_eq!(created_snapshot.name, "Before update");
+    let update_commit_id = {
+        let conn = vault.conn.lock().unwrap();
+        let ctx = CommitContext::new(vault.device_id.clone());
+        let mut changed = EntryRepo::get_by_id(&conn, &entry_id).unwrap().unwrap();
+        changed.title_ct = Some(b"After".to_vec());
+        changed.payload_ct = serde_json::to_vec(&serde_json::json!({"password":"two"})).unwrap();
+        let updated = EntryRepo::update(&conn, &ctx, &changed).unwrap();
+        updated.head_commit_id
+    };
+
+    let diff = vault.list_commit_diff(update_commit_id.clone()).unwrap();
+    assert_eq!(diff.len(), 1);
+    assert_eq!(diff[0].previous_title.as_deref(), Some("Before"));
+    assert_eq!(diff[0].current_title.as_deref(), Some("After"));
+
+    let page = vault.list_managed_snapshots(20, None).unwrap();
+    let snapshot = page
+        .items
+        .iter()
+        .find(|item| item.name == "Before update")
+        .unwrap()
+        .clone();
+    let preview = vault
+        .get_snapshot_structure_preview(snapshot.snapshot_id.clone())
+        .unwrap();
+    assert!(preview
+        .current_nodes
+        .iter()
+        .any(|node| node.id == entry_id && node.status == "modified"));
+
+    let restored = vault
+        .restore_snapshot(
+            snapshot.snapshot_id.clone(),
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    assert!(restored.affected_object_count >= 1);
+    {
+        let conn = vault.conn.lock().unwrap();
+        let entry = EntryRepo::get_by_id(&conn, &entry_id).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(entry.title_ct.unwrap()).unwrap(),
+            "Before"
+        );
+    }
+
+    let revert = vault
+        .revert_commit(
+            update_commit_id,
+            uuid::Uuid::new_v4().to_string(),
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    assert_eq!(revert.reverted_object_count, 1);
+
+    let deleted = vault
+        .delete_snapshot(
+            snapshot.snapshot_id.clone(),
+            conservative_ffi_device_context(),
+        )
+        .unwrap();
+    assert_eq!(deleted.snapshot_id, snapshot.snapshot_id);
+    assert!(vault
+        .list_managed_snapshots(20, None)
+        .unwrap()
+        .items
+        .iter()
+        .all(|item| item.snapshot_id != deleted.snapshot_id));
+}
+
+#[test]
 fn build_capability_manifest_is_available_without_a_vault() {
     let manifest = mdbx_build_capability_manifest();
     assert_eq!(manifest.profile, "mdbx-build-capabilities-v1");
@@ -86,6 +215,97 @@ fn build_capability_manifest_is_available_without_a_vault() {
             .disabled_optional_sync_capability_ids
             .contains(&zstd)
     );
+}
+
+#[test]
+fn authenticated_manual_bundle_round_trip_replay_and_tamper_guard() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.mdbx");
+    let target_path = directory.path().join("target.mdbx");
+    let bundle_path = directory.path().join("manual.mdbx-sync");
+    let tampered_path = directory.path().join("tampered.mdbx-sync");
+    let password = "manual-bundle-password";
+    let source = create_vault_with_tiga_mode(
+        source_path.to_string_lossy().into_owned(),
+        password.to_string(),
+        "manual-source".to_string(),
+        MdbxTigaMode::Sky,
+    )
+    .unwrap();
+    create_portable_backup(
+        source_path.to_string_lossy().into_owned(),
+        target_path.to_string_lossy().into_owned(),
+    )
+    .unwrap();
+
+    let project_id = Uuid::new_v4().to_string();
+    source
+        .execute_write_operation(
+            Uuid::new_v4().to_string(),
+            "manual-bundle-source-change".to_string(),
+            vec![MdbxWriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Transferred project".to_string(),
+            }],
+        )
+        .unwrap();
+    let exported = source
+        .export_manual_sync_bundle(bundle_path.to_string_lossy().into_owned())
+        .unwrap();
+    assert_eq!(exported.vault_id, source.info().vault_id);
+    assert!(exported.commit_count >= 2);
+    assert_eq!(exported.payload_sha256.len(), 32);
+    assert_eq!(
+        exported.file_size_bytes,
+        std::fs::metadata(&bundle_path).unwrap().len()
+    );
+
+    let target = open_vault(
+        target_path.to_string_lossy().into_owned(),
+        password.to_string(),
+        "manual-target".to_string(),
+    )
+    .unwrap();
+    let first = target
+        .apply_manual_sync_bundle(bundle_path.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(first.applied_commits >= 1);
+    assert_eq!(first.missing_parent_count, 0);
+    assert!(target
+        .list_collection_summaries(100, None)
+        .unwrap()
+        .items
+        .iter()
+        .any(|project| project.collection_id == project_id));
+
+    let replay = target
+        .apply_manual_sync_bundle(bundle_path.to_string_lossy().into_owned())
+        .unwrap();
+    assert_eq!(replay.applied_commits, 0);
+    assert!(replay.skipped_commits >= exported.commit_count);
+
+    let commits_before_tamper = ffi_test_count(&target, "commits");
+    let mut tampered = std::fs::read(&bundle_path).unwrap();
+    let last = tampered.last_mut().unwrap();
+    *last ^= 1;
+    std::fs::write(&tampered_path, tampered).unwrap();
+    assert!(target
+        .apply_manual_sync_bundle(tampered_path.to_string_lossy().into_owned())
+        .is_err());
+    assert_eq!(ffi_test_count(&target, "commits"), commits_before_tamper);
+}
+
+#[test]
+fn metadata_benchmark_is_bounded_and_appends_only_requested_commits() {
+    let vault = ffi_test_vault();
+    let before = ffi_test_count(&vault, "commits");
+    let result = vault.run_metadata_benchmark(3).unwrap();
+    assert_eq!(result.operation_count, 3);
+    assert_eq!(ffi_test_count(&vault, "commits"), before + 3);
+    assert!(vault.run_metadata_benchmark(0).is_err());
+    assert!(vault
+        .run_metadata_benchmark(MAX_METADATA_BENCHMARK_OPERATIONS + 1)
+        .is_err());
 }
 
 #[test]
@@ -528,6 +748,200 @@ fn ffi_blob_sync_session_restores_resume_and_rejects_partial_negotiation() {
     resumed.accept_hello_ack(ack).unwrap();
     resumed.restore_blob_sync(restored.clone()).unwrap();
     assert_eq!(resumed.blob_resume().unwrap().unwrap(), restored);
+}
+
+#[test]
+fn ffi_incremental_segment_files_are_authenticated_atomic_and_idempotent() {
+    const PASSWORD: &str = "ffi-incremental-password";
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.mdbx");
+    let target_path = directory.path().join("target.mdbx");
+    let segment_path = directory.path().join("pending.mdbxsync");
+    let tampered_path = directory.path().join("tampered.mdbxsync");
+    let source = create_vault(
+        source_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "source-device".to_string(),
+    )
+    .unwrap();
+    let bootstrap = source
+        .create_incremental_sync_bootstrap(target_path.to_string_lossy().into_owned())
+        .unwrap();
+    source
+        .create_project("Incremental project".to_string())
+        .unwrap();
+    let exported = source
+        .export_incremental_sync_segment(
+            segment_path.to_string_lossy().into_owned(),
+            bootstrap.checkpoint.clone(),
+            None,
+            128,
+        )
+        .unwrap();
+    assert!(segment_path.is_file());
+    assert_eq!(exported.segment_index, 0);
+    assert_eq!(exported.payload_sha256.len(), 32);
+    assert_eq!(
+        source
+            .inspect_incremental_sync_segment(segment_path.to_string_lossy().into_owned())
+            .unwrap(),
+        exported
+    );
+
+    let original_bytes = std::fs::read(&segment_path).unwrap();
+    assert!(source
+        .export_incremental_sync_segment(
+            segment_path.to_string_lossy().into_owned(),
+            bootstrap.checkpoint.clone(),
+            None,
+            128,
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&segment_path).unwrap(), original_bytes);
+
+    let mut tampered = original_bytes.clone();
+    let middle = tampered.len() / 2;
+    tampered[middle] ^= 0x40;
+    std::fs::write(&tampered_path, tampered).unwrap();
+    assert!(source
+        .inspect_incremental_sync_segment(tampered_path.to_string_lossy().into_owned())
+        .is_err());
+
+    let target = open_vault(
+        target_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "target-device".to_string(),
+    )
+    .unwrap();
+    let applied = target
+        .apply_incremental_sync_segment(
+            segment_path.to_string_lossy().into_owned(),
+            bootstrap.checkpoint.clone(),
+            None,
+        )
+        .unwrap();
+    assert!(applied.applied_commits > 0);
+    assert!(target
+        .list_collection_summaries(100, None)
+        .unwrap()
+        .items
+        .iter()
+        .any(|item| item.title == "Incremental project"));
+    let replay = target
+        .apply_incremental_sync_segment(
+            segment_path.to_string_lossy().into_owned(),
+            bootstrap.checkpoint,
+            None,
+        )
+        .unwrap();
+    assert_eq!(replay.applied_commits, 0);
+    assert!(replay.skipped_commits > 0);
+}
+
+#[test]
+fn ffi_external_blob_transfer_pages_chunks_resumes_and_aborts() {
+    const PASSWORD: &str = "ffi-blob-transfer-password";
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("blob-source.mdbx");
+    let target_path = directory.path().join("blob-target.mdbx");
+    let source = create_vault(
+        source_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "blob-source-device".to_string(),
+    )
+    .unwrap();
+    source
+        .create_incremental_sync_bootstrap(target_path.to_string_lossy().into_owned())
+        .unwrap();
+    let project = source.create_project("Blob project".to_string()).unwrap();
+    source
+        .create_attachment_with_external_content(
+            Uuid::new_v4().to_string(),
+            MdbxAttachmentCreateRequest {
+                attachment_id: Uuid::new_v4().to_string(),
+                project_id: project.project_id,
+                entry_id: None,
+                file_name: "blob.bin".to_string(),
+                media_type: None,
+            },
+            b"bounded encrypted Blob transfer".to_vec(),
+            MdbxAttachmentContentLimits {
+                chunk_size: 8,
+                max_plaintext_bytes: 1024,
+            },
+        )
+        .unwrap();
+    let page = source.list_external_blob_references(None, 100).unwrap();
+    assert!(page.raw_reference_count > 0);
+    assert!(!page.items.is_empty());
+    assert!(page
+        .items
+        .iter()
+        .all(|item| item.state == MdbxExternalBlobState::Available));
+
+    let target = open_vault(
+        target_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "blob-target-device".to_string(),
+    )
+    .unwrap();
+    for reference in page.items {
+        let total_size = reference.total_size.unwrap();
+        let owner = format!("transfer-{}", reference.blob_id);
+        target
+            .acquire_external_blob_lease(reference.blob_id.clone(), owner.clone(), 1_000, 60)
+            .unwrap();
+        let mut offset = 0;
+        while offset < total_size {
+            let chunk = source
+                .read_external_blob_chunk(reference.blob_id.clone(), total_size, offset, 5)
+                .unwrap();
+            target
+                .write_external_blob_chunk(
+                    chunk.blob_id,
+                    chunk.total_size,
+                    chunk.offset,
+                    chunk.ciphertext.clone(),
+                    chunk.is_last,
+                )
+                .unwrap();
+            offset += chunk.ciphertext.len() as u64;
+        }
+        target
+            .release_external_blob_lease(reference.blob_id.clone(), owner)
+            .unwrap();
+        assert!(target
+            .has_external_blob(reference.blob_id, total_size)
+            .unwrap());
+    }
+
+    let abandoned = b"abandoned transfer bytes";
+    let abandoned_id = format!("{:x}", Sha256::digest(abandoned));
+    target
+        .acquire_external_blob_lease(
+            abandoned_id.clone(),
+            "abandoned-owner".to_string(),
+            2_000,
+            60,
+        )
+        .unwrap();
+    target
+        .write_external_blob_chunk(
+            abandoned_id.clone(),
+            abandoned.len() as u64,
+            0,
+            abandoned[..5].to_vec(),
+            false,
+        )
+        .unwrap();
+    target
+        .abort_external_blob_transfer(abandoned_id.clone(), "abandoned-owner".to_string())
+        .unwrap();
+    assert!(!target
+        .has_external_blob(abandoned_id, abandoned.len() as u64)
+        .unwrap());
 }
 
 #[test]
@@ -1010,6 +1424,108 @@ fn attachment_facade_rejects_oversized_content_without_side_effects() {
         .contains("attachment plaintext bytes"));
     assert_eq!(ffi_test_count(&vault, "commits"), commits_before);
     assert_eq!(ffi_test_count(&vault, "attachments"), attachments_before);
+}
+
+#[test]
+fn external_attachment_facade_accepts_hard_max_content_with_bounded_sync_delta() {
+    const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+    const CHUNK_SIZE: u64 = 256 * 1024;
+    const PASSWORD: &str = "external-boundary-password";
+
+    let directory = tempfile::tempdir().unwrap();
+    let vault_path = directory.path().join("external-boundary.mdbx");
+    let vault = create_vault(
+        vault_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "external-boundary-device".to_string(),
+    )
+    .unwrap();
+    let project = vault
+        .create_project("Boundary attachment".to_string())
+        .unwrap();
+    let attachment_id = Uuid::new_v4().to_string();
+    let created = vault
+        .create_attachment_with_external_content(
+            Uuid::new_v4().to_string(),
+            MdbxAttachmentCreateRequest {
+                attachment_id: attachment_id.clone(),
+                project_id: project.project_id,
+                entry_id: None,
+                file_name: "exact-64-mib.bin".to_string(),
+                media_type: Some("application/octet-stream".to_string()),
+            },
+            vec![0; MAX_ATTACHMENT_BYTES],
+            MdbxAttachmentContentLimits {
+                chunk_size: CHUNK_SIZE,
+                max_plaintext_bytes: MAX_ATTACHMENT_BYTES as u64,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        created.attachment.original_size,
+        MAX_ATTACHMENT_BYTES as u64
+    );
+    assert_eq!(created.attachment.stored_size, MAX_ATTACHMENT_BYTES as u64);
+    assert_eq!(created.attachment.chunk_count, 256);
+    assert_eq!(created.attachment.storage_mode, "external-hash-ref");
+    let delta_payload_bytes: i64 = vault
+        .conn
+        .lock()
+        .unwrap()
+        .inner()
+        .query_row(
+            "SELECT length(payload) FROM sync_delta_batches ORDER BY batch_seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(delta_payload_bytes < 16 * 1024 * 1024);
+    assert!(std::path::PathBuf::from(format!("{}.blobs", vault_path.display())).is_dir());
+    assert_eq!(
+        vault
+            .read_attachment_content(attachment_id.clone(), MAX_ATTACHMENT_BYTES as u64)
+            .unwrap()
+            .len(),
+        MAX_ATTACHMENT_BYTES
+    );
+    assert!(vault
+        .verify_attachment_integrity(attachment_id.clone())
+        .unwrap());
+
+    drop(vault);
+    let reopened = open_vault(
+        vault_path.to_string_lossy().into_owned(),
+        PASSWORD.to_string(),
+        "external-boundary-reopen".to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .read_attachment_content(attachment_id.clone(), MAX_ATTACHMENT_BYTES as u64)
+            .unwrap()
+            .len(),
+        MAX_ATTACHMENT_BYTES
+    );
+
+    let replacement = b"replacement content".to_vec();
+    reopened
+        .replace_attachment_external_content(
+            Uuid::new_v4().to_string(),
+            attachment_id.clone(),
+            replacement.clone(),
+            MdbxAttachmentContentLimits {
+                chunk_size: CHUNK_SIZE,
+                max_plaintext_bytes: MAX_ATTACHMENT_BYTES as u64,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .read_attachment_content(attachment_id, MAX_ATTACHMENT_BYTES as u64)
+            .unwrap(),
+        replacement
+    );
 }
 
 #[test]
@@ -3540,6 +4056,26 @@ fn every_write_command_has_a_typed_change_summary() {
             project_id: "project".to_string(),
             title: "Project".to_string(),
         },
+        MdbxWriteCommand::CreateProjectWithParent {
+            project_id: "project-child".to_string(),
+            title: "Child".to_string(),
+            parent_project_id: Some("project".to_string()),
+        },
+        MdbxWriteCommand::RenameProject {
+            project_id: "project-renamed".to_string(),
+            title: "Renamed".to_string(),
+        },
+        MdbxWriteCommand::MoveProject {
+            project_id: "project-moved".to_string(),
+            parent_project_id: Some("project".to_string()),
+        },
+        MdbxWriteCommand::DeleteProject {
+            project_id: "project-deleted".to_string(),
+        },
+        MdbxWriteCommand::RestoreProject {
+            project_id: "project-restored".to_string(),
+            parent_project_id: None,
+        },
         MdbxWriteCommand::CreateEntry {
             entry_id: "created".to_string(),
             project_id: "project".to_string(),
@@ -3618,21 +4154,27 @@ fn every_write_command_has_a_typed_change_summary() {
     assert_eq!(
         actions,
         vec![
-            "create", "create", "update", "delete", "restore", "move", "create", "update",
-            "delete", "create", "update", "delete", "create", "delete"
+            "create", "create", "update", "move", "delete", "restore", "create", "update",
+            "delete", "restore", "move", "create", "update", "delete", "create", "update",
+            "delete", "create", "delete"
         ]
     );
     assert_eq!(changes[0].fields, vec!["title"]);
-    assert_eq!(
-        changes[1].fields,
-        vec!["project_id", "entry_type", "title", "payload"]
-    );
-    assert_eq!(changes[2].fields, vec!["title", "payload"]);
-    assert_eq!(changes[3].fields, vec!["deleted"]);
+    assert_eq!(changes[1].fields, vec!["title", "group_id"]);
+    assert_eq!(changes[2].fields, vec!["title"]);
+    assert_eq!(changes[3].fields, vec!["group_id"]);
     assert_eq!(changes[4].fields, vec!["deleted"]);
-    assert_eq!(changes[5].fields, vec!["project_id"]);
+    assert_eq!(changes[5].fields, vec!["deleted", "group_id"]);
     assert_eq!(
         changes[6].fields,
+        vec!["project_id", "entry_type", "title", "payload"]
+    );
+    assert_eq!(changes[7].fields, vec!["title", "payload"]);
+    assert_eq!(changes[8].fields, vec!["deleted"]);
+    assert_eq!(changes[9].fields, vec!["deleted"]);
+    assert_eq!(changes[10].fields, vec!["project_id"]);
+    assert_eq!(
+        changes[11].fields,
         vec![
             "source_object_id",
             "target_object_id",
@@ -3642,19 +4184,19 @@ fn every_write_command_has_a_typed_change_summary() {
         ]
     );
     assert_eq!(
-        changes[7].fields,
+        changes[12].fields,
         vec!["relation_kind", "payload", "payload_schema_version"]
     );
-    assert_eq!(changes[8].fields, vec!["deleted"]);
+    assert_eq!(changes[13].fields, vec!["deleted"]);
     assert_eq!(
-        changes[9].fields,
+        changes[14].fields,
         vec!["collection_id", "name", "payload", "payload_schema_version"]
     );
     assert_eq!(
-        changes[10].fields,
+        changes[15].fields,
         vec!["name", "payload", "payload_schema_version"]
     );
-    assert_eq!(changes[11].fields, vec!["deleted"]);
-    assert_eq!(changes[12].fields, vec!["object_id", "label_id"]);
-    assert_eq!(changes[13].fields, vec!["deleted"]);
+    assert_eq!(changes[16].fields, vec!["deleted"]);
+    assert_eq!(changes[17].fields, vec!["object_id", "label_id"]);
+    assert_eq!(changes[18].fields, vec!["deleted"]);
 }

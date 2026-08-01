@@ -13,6 +13,7 @@ use crate::repo::commit_ctx::CommitContext;
 use crate::repo::object_version::ObjectVersionRepo;
 use crate::repo::CollectionProfileRepo;
 use crate::repo::TombstoneRepo;
+use crate::sync_state::EntryRow;
 
 /// Entry 的持久化仓库。
 ///
@@ -491,6 +492,27 @@ impl EntryRepo {
         ctx: &CommitContext,
         entry: &Entry,
     ) -> StorageResult<Entry> {
+        conn.with_immediate_transaction(|| {
+            Self::update_loaded_in_transaction(conn, ctx, entry)?;
+
+            Self::get_by_id(conn, &entry.entry_id)?
+                .ok_or_else(|| StorageError::NotFound(entry.entry_id.clone()))
+        })
+    }
+
+    /// Update an entry that the caller has already loaded while participating
+    /// in the caller-owned transaction. OperationCoordinator uses this path to
+    /// avoid materializing the same encrypted entry again after a write.
+    pub(crate) fn update_loaded_in_transaction(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        entry: &Entry,
+    ) -> StorageResult<()> {
+        if conn.inner().is_autocommit() {
+            return Err(StorageError::ConstraintViolation(
+                "update_loaded_in_transaction requires an active transaction".to_string(),
+            ));
+        }
         entry
             .entry_type
             .validate()
@@ -505,49 +527,45 @@ impl EntryRepo {
             &entry.project_id,
             &entry.entry_type,
         )?;
-        conn.with_immediate_transaction(|| {
-            let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
 
-            let commit_id =
-                ctx.commit_object_change(conn, "entries", &entry.entry_id, "change", "entry")?;
+        let commit_id =
+            ctx.commit_object_change(conn, "entries", &entry.entry_id, "change", "entry")?;
 
-            let object_clock = bump_clock(&entry.object_clock);
+        let object_clock = bump_clock(&entry.object_clock);
 
-            let title_ct = entry
-                .title_ct
-                .as_ref()
-                .map(|t| Self::encrypt_metadata(conn, &entry.entry_id, "title", t))
-                .transpose()?;
-            let payload_ct =
-                Self::encrypt_record(conn, &entry.entry_id, "payload", &entry.payload_ct)?;
+        let title_ct = entry
+            .title_ct
+            .as_ref()
+            .map(|t| Self::encrypt_metadata(conn, &entry.entry_id, "title", t))
+            .transpose()?;
+        let payload_ct = Self::encrypt_record(conn, &entry.entry_id, "payload", &entry.payload_ct)?;
 
-            conn.inner().execute(
-                "UPDATE entries SET
+        conn.inner().execute(
+            "UPDATE entries SET
                 title_ct = ?2, payload_ct = ?3, payload_schema_version = ?4,
                 entry_type = ?5, tiga_mode_override = ?6, object_clock = ?7,
                 head_commit_id = ?8, deleted = ?9,
                 updated_at = ?10, updated_by_device_id = ?11
              WHERE entry_id = ?1",
-                params![
-                    entry.entry_id,
-                    title_ct,
-                    payload_ct,
-                    entry.payload_schema_version as i64,
-                    entry.entry_type.to_string(),
-                    entry.tiga_mode_override.as_ref().map(|m| m.to_string()),
-                    object_clock,
-                    commit_id,
-                    entry.deleted as i32,
-                    now,
-                    ctx.device_id,
-                ],
-            )?;
+            params![
+                entry.entry_id,
+                title_ct,
+                payload_ct,
+                entry.payload_schema_version as i64,
+                entry.entry_type.to_string(),
+                entry.tiga_mode_override.as_ref().map(|m| m.to_string()),
+                object_clock,
+                commit_id,
+                entry.deleted as i32,
+                now,
+                ctx.device_id,
+            ],
+        )?;
 
-            ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry.entry_id)?;
+        ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry.entry_id)?;
 
-            EntryRepo::get_by_id(conn, &entry.entry_id)?
-                .ok_or_else(|| StorageError::NotFound(entry.entry_id.clone()))
-        })
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -688,39 +706,56 @@ impl EntryRepo {
         entry_id: &str,
     ) -> StorageResult<()> {
         conn.with_immediate_transaction(|| {
-            let entry = EntryRepo::get_by_id(conn, entry_id)?
+            let entry = Self::get_by_id(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))?;
 
-            if entry.deleted {
-                return Err(StorageError::ConstraintViolation(
-                    "entry is already deleted".to_string(),
-                ));
-            }
-            CollectionProfileRepo::ensure_object_write_allowed(
-                conn,
-                &entry.project_id,
-                &entry.entry_type,
-            )?;
+            Self::soft_delete_loaded_in_transaction(conn, ctx, &entry)
+        })
+    }
 
-            let now = chrono::Utc::now().to_rfc3339();
+    /// Soft-delete an entry already loaded by the caller inside the current
+    /// write transaction, preserving the normal commit, tombstone and version
+    /// bookkeeping without a second full entry read.
+    pub(crate) fn soft_delete_loaded_in_transaction(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        entry: &Entry,
+    ) -> StorageResult<()> {
+        if conn.inner().is_autocommit() {
+            return Err(StorageError::ConstraintViolation(
+                "soft_delete_loaded_in_transaction requires an active transaction".to_string(),
+            ));
+        }
 
-            let commit_id =
-                ctx.commit_object_change(conn, "entries", entry_id, "change", "entry")?;
-            ctx.create_tombstone_for_commit(conn, "entry", entry_id, &commit_id)?;
+        if entry.deleted {
+            return Err(StorageError::ConstraintViolation(
+                "entry is already deleted".to_string(),
+            ));
+        }
+        CollectionProfileRepo::ensure_object_write_allowed(
+            conn,
+            &entry.project_id,
+            &entry.entry_type,
+        )?;
 
-            let object_clock = bump_clock(&entry.object_clock);
+        let now = chrono::Utc::now().to_rfc3339();
 
-            conn.inner().execute(
-                "UPDATE entries SET deleted = 1, object_clock = ?2,
+        let commit_id =
+            ctx.commit_object_change(conn, "entries", &entry.entry_id, "change", "entry")?;
+        ctx.create_tombstone_for_commit(conn, "entry", &entry.entry_id, &commit_id)?;
+
+        let object_clock = bump_clock(&entry.object_clock);
+
+        conn.inner().execute(
+            "UPDATE entries SET deleted = 1, object_clock = ?2,
              head_commit_id = ?3, updated_at = ?4, updated_by_device_id = ?5
              WHERE entry_id = ?1",
-                params![entry_id, object_clock, commit_id, now, ctx.device_id],
-            )?;
+            params![entry.entry_id, object_clock, commit_id, now, ctx.device_id],
+        )?;
 
-            ObjectVersionRepo::record_entry_current(conn, &commit_id, entry_id)?;
+        ObjectVersionRepo::record_entry_current(conn, &commit_id, &entry.entry_id)?;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     pub fn restore(
@@ -761,6 +796,88 @@ impl EntryRepo {
             EntryRepo::get_by_id(conn, entry_id)?
                 .ok_or_else(|| StorageError::NotFound(entry_id.to_string()))
         })
+    }
+
+    /// Apply a previously recorded encrypted entry row as a new commit state.
+    ///
+    /// This is reserved for engine-owned history and snapshot recovery. The
+    /// caller must create the recovery commit first and keep the whole action
+    /// inside one immediate transaction.
+    pub(crate) fn apply_version_for_commit(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        row: &EntryRow,
+        commit_id: &str,
+    ) -> StorageResult<()> {
+        if TombstoneRepo::is_permanently_purged(conn, "entry", &row.entry_id)? {
+            return Err(StorageError::ConstraintViolation(format!(
+                "entry ID {} has a permanent purge receipt",
+                row.entry_id
+            )));
+        }
+        let entry_type: EntryType = row.entry_type.parse().map_err(StorageError::Validation)?;
+        if row.payload_schema_version == 0 {
+            return Err(StorageError::Validation(
+                "payload_schema_version must be greater than zero".to_string(),
+            ));
+        }
+        if !row.deleted {
+            ensure_active_project(conn, &row.project_id)?;
+            CollectionProfileRepo::ensure_object_write_allowed(conn, &row.project_id, &entry_type)?;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let current_clock = conn
+            .inner()
+            .query_row(
+                "SELECT object_clock FROM entries WHERE entry_id = ?1",
+                params![row.entry_id],
+                |result| result.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| row.object_clock.clone());
+        let object_clock = bump_clock(&current_clock);
+        if row.deleted {
+            ctx.create_tombstone_for_commit(conn, "entry", &row.entry_id, commit_id)?;
+        }
+
+        conn.inner().execute(
+            "INSERT INTO entries
+                (entry_id, project_id, entry_type, title_ct, payload_ct,
+                 payload_schema_version, tiga_mode_override, object_clock,
+                 head_commit_id, deleted, created_at, updated_at,
+                 created_by_device_id, updated_by_device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                entry_type = excluded.entry_type,
+                title_ct = excluded.title_ct,
+                payload_ct = excluded.payload_ct,
+                payload_schema_version = excluded.payload_schema_version,
+                tiga_mode_override = excluded.tiga_mode_override,
+                object_clock = excluded.object_clock,
+                head_commit_id = excluded.head_commit_id,
+                deleted = excluded.deleted,
+                updated_at = excluded.updated_at,
+                updated_by_device_id = excluded.updated_by_device_id",
+            params![
+                row.entry_id,
+                row.project_id,
+                row.entry_type,
+                row.title_ct,
+                row.payload_ct,
+                row.payload_schema_version as i64,
+                row.tiga_mode_override,
+                object_clock,
+                commit_id,
+                i32::from(row.deleted),
+                row.created_at,
+                now,
+                row.created_by_device_id,
+                ctx.device_id,
+            ],
+        )?;
+        ObjectVersionRepo::record_entry_current(conn, commit_id, &row.entry_id)
     }
     // -----------------------------------------------------------------------
     // ENCRYPTION HELPERS

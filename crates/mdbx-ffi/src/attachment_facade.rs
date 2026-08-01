@@ -104,7 +104,9 @@ pub fn default_attachment_batch_limits() -> MdbxAttachmentBatchLimits {
 use std::io::{self, Cursor, Write};
 use std::sync::Mutex;
 
+use mdbx_core::model::attachment::StorageMode;
 use mdbx_core::model::Attachment;
+use mdbx_storage::blob_store::FileSystemBlobStore;
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::{StorageError, StorageResult};
 use mdbx_storage::repo::{
@@ -122,6 +124,22 @@ pub(crate) struct AttachmentContentOperation<'a> {
     pub(crate) attachment_id: String,
     pub(crate) fields: Vec<&'a str>,
     pub(crate) intent_hash: Vec<u8>,
+}
+
+pub(crate) fn vault_blob_store(conn: &VaultConnection) -> StorageResult<FileSystemBlobStore> {
+    let mut statement = conn.inner().prepare("PRAGMA database_list")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (name, path) = row?;
+        if name == "main" && !path.is_empty() {
+            return Ok(FileSystemBlobStore::new(format!("{path}.blobs")));
+        }
+    }
+    Err(StorageError::Validation(
+        "external attachment storage requires a file-backed vault".to_string(),
+    ))
 }
 
 pub(crate) fn execute_attachment_content_operation<F>(
@@ -931,6 +949,97 @@ impl MdbxVault {
         )
     }
 
+    /// Store attachment ciphertext in the vault's content-addressed Blob sidecar.
+    ///
+    /// The transactional state delta contains only encrypted Blob references, so
+    /// maximum-size attachments do not inflate the delta payload.
+    pub fn create_attachment_with_external_content(
+        &self,
+        operation_id: String,
+        request: MdbxAttachmentCreateRequest,
+        content: Vec<u8>,
+        limits: MdbxAttachmentContentLimits,
+    ) -> Result<MdbxAttachmentWriteResult, MdbxFfiError> {
+        let MdbxAttachmentCreateRequest {
+            attachment_id,
+            project_id,
+            entry_id,
+            file_name,
+            media_type,
+        } = request;
+        validate_attachment_operation_inputs(
+            &operation_id,
+            &attachment_id,
+            &project_id,
+            entry_id.as_deref(),
+            &file_name,
+            content.len(),
+            limits,
+        )?;
+        let chunk_size = attachment_chunk_size(limits)?;
+        let intent_hash = hash_attachment_intent(
+            "create-external",
+            &operation_id,
+            &attachment_id,
+            &project_id,
+            entry_id.as_deref(),
+            &file_name,
+            media_type.as_deref(),
+            chunk_size,
+            &content,
+        );
+        let attachment_id_for_closure = attachment_id.clone();
+        let project_id_for_closure = project_id.clone();
+        let file_name_for_closure = file_name.clone();
+        let media_type_for_closure = media_type.clone();
+        let content_for_closure = content;
+        execute_attachment_content_operation(
+            &self.conn,
+            &self.device_id,
+            AttachmentContentOperation {
+                operation_id,
+                operation_kind: "attachment-create-external".to_string(),
+                attachment_id: attachment_id.clone(),
+                fields: vec![
+                    "project_id",
+                    "entry_id",
+                    "file_name",
+                    "media_type",
+                    "content",
+                ],
+                intent_hash,
+            },
+            move |conn, ctx| {
+                let original_size = content_for_closure.len() as u64;
+                AttachmentRepo::add_with_id(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    mdbx_storage::repo::AttachmentCreateRequest {
+                        project_id: &project_id_for_closure,
+                        entry_id: entry_id.as_deref(),
+                        file_name: &file_name_for_closure,
+                        media_type: media_type_for_closure.as_deref(),
+                        content_hash: "",
+                        original_size,
+                    },
+                )?;
+                let blob_store = vault_blob_store(conn)?;
+                let mut reader = Cursor::new(content_for_closure);
+                AttachmentRepo::write_external_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                    &blob_store,
+                )?;
+                AttachmentRepo::get_by_id(conn, &attachment_id_for_closure)?
+                    .ok_or_else(|| StorageError::NotFound(attachment_id_for_closure.clone()))
+            },
+        )
+    }
+
     pub fn replace_attachment_content(
         &self,
         operation_id: String,
@@ -985,6 +1094,69 @@ impl MdbxVault {
                     &attachment_id_for_closure,
                     &mut reader,
                     AttachmentWriteOptions::exact(chunk_size, original_size),
+                )?;
+                AttachmentRepo::get_by_id(conn, &attachment_id_for_closure)?
+                    .ok_or_else(|| StorageError::NotFound(attachment_id_for_closure.clone()))
+            },
+        )
+    }
+
+    pub fn replace_attachment_external_content(
+        &self,
+        operation_id: String,
+        attachment_id: String,
+        content: Vec<u8>,
+        limits: MdbxAttachmentContentLimits,
+    ) -> Result<MdbxAttachmentWriteResult, MdbxFfiError> {
+        if operation_id.trim().is_empty() {
+            return Err(
+                StorageError::Validation("operation_id must not be empty".to_string()).into(),
+            );
+        }
+        validate_uuid(&attachment_id, "attachment_id")?;
+        let chunk_size = attachment_chunk_size(limits)?;
+        if content.len() > attachment_max_plaintext_bytes(limits)? {
+            return Err(StorageError::ResourceLimit {
+                resource: "attachment plaintext bytes".to_string(),
+                actual: content.len() as u64,
+                limit: limits.max_plaintext_bytes,
+            }
+            .into());
+        }
+        let intent_hash = hash_attachment_intent(
+            "replace-external",
+            &operation_id,
+            &attachment_id,
+            "",
+            None,
+            "",
+            None,
+            chunk_size,
+            &content,
+        );
+        let attachment_id_for_closure = attachment_id.clone();
+        let content_for_closure = content;
+        execute_attachment_content_operation(
+            &self.conn,
+            &self.device_id,
+            AttachmentContentOperation {
+                operation_id,
+                operation_kind: "attachment-replace-external".to_string(),
+                attachment_id: attachment_id.clone(),
+                fields: vec!["content"],
+                intent_hash,
+            },
+            move |conn, ctx| {
+                let original_size = content_for_closure.len() as u64;
+                let blob_store = vault_blob_store(conn)?;
+                let mut reader = Cursor::new(content_for_closure);
+                AttachmentRepo::write_external_content_from_reader_with_options(
+                    conn,
+                    ctx,
+                    &attachment_id_for_closure,
+                    &mut reader,
+                    AttachmentWriteOptions::exact(chunk_size, original_size),
+                    &blob_store,
                 )?;
                 AttachmentRepo::get_by_id(conn, &attachment_id_for_closure)?
                     .ok_or_else(|| StorageError::NotFound(attachment_id_for_closure.clone()))
@@ -1061,8 +1233,20 @@ impl MdbxVault {
             .map_err(|error| {
                 StorageError::Validation(format!("cannot allocate attachment content: {error}"))
             })?;
-        let read_result =
-            AttachmentRepo::read_content_to_writer(&conn, &attachment_id, &mut content);
+        let read_result = match attachment.storage_mode {
+            StorageMode::ExternalHashRef => {
+                let blob_store = vault_blob_store(&conn)?;
+                AttachmentRepo::read_content_to_writer_with_blob_store(
+                    &conn,
+                    &attachment_id,
+                    &blob_store,
+                    &mut content,
+                )
+            }
+            StorageMode::EmbeddedInline | StorageMode::EmbeddedChunked => {
+                AttachmentRepo::read_content_to_writer(&conn, &attachment_id, &mut content)
+            }
+        };
         if let Some(actual) = content.exceeded_at {
             return Err(StorageError::ResourceLimit {
                 resource: "attachment plaintext bytes".to_string(),
@@ -1077,6 +1261,20 @@ impl MdbxVault {
 
     pub fn verify_attachment_integrity(&self, attachment_id: String) -> Result<bool, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
-        Ok(AttachmentRepo::verify_integrity(&conn, &attachment_id)?)
+        let attachment = AttachmentRepo::get_by_id(&conn, &attachment_id)?
+            .ok_or_else(|| StorageError::NotFound(attachment_id.clone()))?;
+        Ok(match attachment.storage_mode {
+            StorageMode::ExternalHashRef => {
+                let blob_store = vault_blob_store(&conn)?;
+                AttachmentRepo::verify_integrity_with_blob_store(
+                    &conn,
+                    &attachment_id,
+                    &blob_store,
+                )?
+            }
+            StorageMode::EmbeddedInline | StorageMode::EmbeddedChunked => {
+                AttachmentRepo::verify_integrity(&conn, &attachment_id)?
+            }
+        })
     }
 }

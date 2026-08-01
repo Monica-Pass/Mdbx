@@ -979,6 +979,100 @@ fn commit_history_preserves_extended_commit_kind_at_ffi_boundary() {
 }
 
 #[test]
+fn project_hierarchy_commands_round_trip_at_ffi_boundary() {
+    let vault_path = temp_vault_path("project-hierarchy");
+    let vault = create_vault(
+        vault_path.as_path_string(),
+        "project hierarchy password 12345!".to_string(),
+        "ffi-project-hierarchy-device".to_string(),
+    )
+    .unwrap();
+    let parent_id = Uuid::new_v4().to_string();
+    let child_id = Uuid::new_v4().to_string();
+
+    vault
+        .execute_write_operation(
+            "ffi-project-hierarchy-create".to_string(),
+            "project-hierarchy".to_string(),
+            vec![
+                MdbxWriteCommand::CreateProjectWithParent {
+                    project_id: parent_id.clone(),
+                    title: "Parent".to_string(),
+                    parent_project_id: None,
+                },
+                MdbxWriteCommand::CreateProjectWithParent {
+                    project_id: child_id.clone(),
+                    title: "Child".to_string(),
+                    parent_project_id: Some(parent_id.clone()),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .get_collection_summary(child_id.clone())
+            .unwrap()
+            .unwrap()
+            .group_id
+            .as_deref(),
+        Some(parent_id.as_str())
+    );
+
+    let cycle = vault
+        .execute_write_operation(
+            "ffi-project-hierarchy-cycle".to_string(),
+            "project-hierarchy".to_string(),
+            vec![MdbxWriteCommand::MoveProject {
+                project_id: parent_id.clone(),
+                parent_project_id: Some(child_id.clone()),
+            }],
+        )
+        .unwrap_err();
+    assert!(cycle.to_string().contains("cycle"));
+
+    vault
+        .execute_write_operation(
+            "ffi-project-hierarchy-rename".to_string(),
+            "project-hierarchy".to_string(),
+            vec![MdbxWriteCommand::RenameProject {
+                project_id: child_id.clone(),
+                title: "Renamed child".to_string(),
+            }],
+        )
+        .unwrap();
+    vault
+        .execute_write_operation(
+            "ffi-project-hierarchy-delete".to_string(),
+            "project-hierarchy".to_string(),
+            vec![MdbxWriteCommand::DeleteProject {
+                project_id: child_id.clone(),
+            }],
+        )
+        .unwrap();
+    assert!(
+        vault
+            .get_collection_summary(child_id.clone())
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    vault
+        .execute_write_operation(
+            "ffi-project-hierarchy-restore".to_string(),
+            "project-hierarchy".to_string(),
+            vec![MdbxWriteCommand::RestoreProject {
+                project_id: child_id.clone(),
+                parent_project_id: Some(parent_id.clone()),
+            }],
+        )
+        .unwrap();
+    let restored = vault.get_collection_summary(child_id).unwrap().unwrap();
+    assert!(!restored.deleted);
+    assert_eq!(restored.title, "Renamed child");
+    assert_eq!(restored.group_id.as_deref(), Some(parent_id.as_str()));
+}
+
+#[test]
 fn creates_reopens_and_preserves_generic_entries() {
     let vault_path = temp_vault_path("roundtrip");
     let path = vault_path.as_path_string();

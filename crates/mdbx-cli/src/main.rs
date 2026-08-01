@@ -1,11 +1,12 @@
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(not(feature = "external-blob-store"), test))]
 use mdbx_core::model::attachment::StorageMode;
-use mdbx_core::model::{ChangeScope, Commit, CommitKind, Entry, EntryType, ObjectSummary};
+#[cfg(test)]
+use mdbx_core::model::{ChangeScope, CommitKind};
+use mdbx_core::model::{Entry, EntryType, ObjectSummary};
 use mdbx_core::tiga::{DeviceAssurance, DeviceContext, TigaMode};
 use mdbx_storage::backup::BackupService;
 #[cfg(feature = "benchmark")]
@@ -45,6 +46,7 @@ use mdbx_storage::integrity_root::{
     IntegrityRootService, IntegrityRootState, IntegrityRootStatus, IntegrityRootVerification,
 };
 use mdbx_storage::object_disclosure::ObjectDisclosureService;
+use mdbx_storage::peer_sync::{PeerSyncSegmentOptions, PeerSyncService};
 use mdbx_storage::recovery::{IssueSeverity, RecoveryVerifier};
 #[cfg(not(test))]
 use mdbx_storage::repo::MAX_COMMIT_INVENTORY_PAGE_SIZE;
@@ -55,36 +57,26 @@ use mdbx_storage::repo::{
     MAX_COLLECTION_SUMMARY_PAGE_SIZE, MAX_SNAPSHOT_PRUNE_CANDIDATES,
     MAX_SNAPSHOT_PRUNE_KEEP_LATEST, MAX_SNAPSHOT_SUMMARY_PAGE_SIZE,
 };
-use mdbx_storage::repo::{
-    CommitContext, CommitInventoryItem, CommitInventoryRepo, CommitOperation, OperationExecution,
-    SyncDeltaInventoryItem, SyncDeltaInventoryRepo, MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE,
-};
+use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
 use mdbx_storage::rollback_anchor::{RollbackAnchorService, MAX_ROLLBACK_ANCHOR_BYTES};
 #[cfg(feature = "search")]
 use mdbx_storage::search::SearchService;
 use mdbx_storage::sync_apply::{ApplyBatchResult, SyncApplyRepo};
-use mdbx_storage::sync_delta::{
-    decode_sync_delta_object_payload, load_sync_delta_envelope, sync_delta_object_payload,
-    SyncDeltaBatchKind, SyncDeltaLimits,
-};
-use mdbx_storage::sync_state::collect_sync_state_payload as collect_core_sync_state_payload;
 use mdbx_storage::tiga_policy::TigaAuthorizationContext;
 use mdbx_storage::unlock::UnlockService;
 use mdbx_storage::vault_content_manifest::{
     VaultContentManifestService, MAX_VAULT_CONTENT_MANIFEST_BYTES,
 };
+#[cfg(test)]
+use mdbx_sync::SerializedCommit;
 use mdbx_sync::{
-    build_bundle, incremental_bundle_payload_sha256, read_bundle_file_with_limits_authenticated,
-    write_bundle_with_compression, write_bundle_with_compression_authenticated,
-    write_incremental_bundle_with_compression,
+    read_bundle_file_with_limits_authenticated, write_bundle_with_compression,
+    write_bundle_with_compression_authenticated, write_incremental_bundle_with_compression,
     write_incremental_bundle_with_compression_authenticated, BundleCompression, BundleReadLimits,
-    CommitBatch, CommitOperationMetadata, IncrementalBundleCheckpoint, IncrementalBundleManifest,
-    IncrementalBundleResume, IncrementalCommitInventoryEntry, IncrementalDeltaInventoryEntry,
-    IncrementalDeltaKind, IncrementalSyncBundle, SerializedCommit, SyncBundleFile, TombstoneRecord,
-    INCREMENTAL_BUNDLE_FORMAT, MAX_INCREMENTAL_BUNDLE_COMMITS,
+    CommitBatch, IncrementalBundleCheckpoint, IncrementalBundleResume, IncrementalSyncBundle,
+    SyncBundleFile,
 };
 use rusqlite::{params, OptionalExtension};
-use sha2::{Digest, Sha256};
 #[cfg(any(feature = "kdbx-binary-import", feature = "kdbx-binary-export"))]
 use zeroize::Zeroizing;
 
@@ -3096,16 +3088,9 @@ fn cmd_export_kdbx_json(conn: &VaultConnection, output: PathBuf) -> Result<(), S
 }
 
 fn export_sync_bundle(conn: &VaultConnection) -> Result<mdbx_sync::SyncBundle, String> {
-    let vault_id = vault_id(conn)?;
     let source_device_id = latest_device_id(conn)?.unwrap_or_else(|| "cli-device".to_string());
-    let mut commits = load_serialized_commits(conn)?;
-    if let Some(last) = commits.last_mut() {
-        last.object_payloads.push(
-            collect_core_sync_state_payload(conn)
-                .map_err(|e| format!("failed to serialize core sync state: {}", e))?,
-        );
-    }
-    Ok(build_bundle(&vault_id, &source_device_id, commits))
+    PeerSyncService::export_complete_bundle(conn, &source_device_id)
+        .map_err(|error| format!("complete sync export failed: {error}"))
 }
 
 #[cfg(test)]
@@ -3121,206 +3106,24 @@ fn export_incremental_sync_segment(
     base: &IncrementalBundleCheckpoint,
     resume: Option<&CliSyncResume>,
 ) -> Result<IncrementalSyncBundle, String> {
-    if base.commit_inventory.is_none() || base.delta_inventory.is_none() {
-        return Err(
-            "incremental export requires a completed bootstrap checkpoint pair".to_string(),
-        );
-    }
-    let vault_id = vault_id(conn)?;
     let source_device_id = latest_device_id(conn)?.unwrap_or_else(|| "cli-device".to_string());
-    let (commit_items, commit_checkpoint, more_commits) =
-        load_commit_inventory_after(conn, base.commit_inventory.as_deref())?;
-    let (delta_items, delta_checkpoint, more_deltas) =
-        load_delta_inventory_after(conn, base.delta_inventory.as_deref())?;
-
-    let mut transported = Vec::with_capacity(commit_items.len());
-    for item in commit_items {
-        let commit = load_serialized_commit(conn, &item.commit_id)?;
-        transported.push((item, commit));
-    }
-    let mut transported_ids = transported
-        .iter()
-        .map(|(_, commit)| commit.commit.commit_id.clone())
-        .collect::<HashSet<_>>();
-    let mut delta_inventory = Vec::with_capacity(delta_items.len());
-    let mut auxiliary_deltas = Vec::new();
-
-    for item in delta_items {
-        let envelope = load_sync_delta_envelope(conn, &item.batch_id, SyncDeltaLimits::default())
-            .map_err(|error| format!("failed to load sync delta {}: {error}", item.batch_id))?
-            .ok_or_else(|| {
-                format!(
-                    "sync delta batch {} disappeared during export",
-                    item.batch_id
-                )
-            })?;
-        let payload = sync_delta_object_payload(&envelope, SyncDeltaLimits::default())
-            .map_err(|error| format!("failed to encode sync delta {}: {error}", item.batch_id))?;
-        let payload_digest = Sha256::digest(&payload.ciphertext).to_vec();
-        match envelope.batch_kind {
-            SyncDeltaBatchKind::Commit => {
-                let final_commit_id = envelope.commit_ids.last().ok_or_else(|| {
-                    format!("commit delta batch {} has no final commit", item.batch_id)
-                })?;
-                if transported_ids.insert(final_commit_id.clone()) {
-                    let inventory_seq = commit_inventory_sequence(conn, final_commit_id)?;
-                    transported.push((
-                        CommitInventoryItem {
-                            inventory_seq,
-                            commit_id: final_commit_id.clone(),
-                        },
-                        load_serialized_commit(conn, final_commit_id)?,
-                    ));
-                }
-                let final_commit = transported
-                    .iter_mut()
-                    .find(|(_, commit)| commit.commit.commit_id == *final_commit_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "commit delta batch {} final commit could not be loaded",
-                            item.batch_id
-                        )
-                    })?;
-                final_commit.1.object_payloads.push(payload);
-                delta_inventory.push(IncrementalDeltaInventoryEntry {
-                    batch_seq: item.batch_seq,
-                    batch_id: item.batch_id,
-                    batch_kind: IncrementalDeltaKind::Commit,
-                    commit_ids: envelope.commit_ids,
-                    object_payload_sha256: payload_digest,
-                });
-            }
-            SyncDeltaBatchKind::Auxiliary => {
-                auxiliary_deltas.push(payload);
-                delta_inventory.push(IncrementalDeltaInventoryEntry {
-                    batch_seq: item.batch_seq,
-                    batch_id: item.batch_id,
-                    batch_kind: IncrementalDeltaKind::Auxiliary,
-                    commit_ids: Vec::new(),
-                    object_payload_sha256: payload_digest,
-                });
-            }
-        }
-    }
-
-    transported.sort_by_key(|(inventory, _)| inventory.inventory_seq);
-    if transported.len() > MAX_INCREMENTAL_BUNDLE_COMMITS {
-        return Err(format!(
-            "incremental export requires {} commits; maximum per bundle is {}",
-            transported.len(),
-            MAX_INCREMENTAL_BUNDLE_COMMITS
-        ));
-    }
-    let (commit_inventory, commits): (Vec<_>, Vec<_>) = transported
-        .into_iter()
-        .map(|(inventory, commit)| {
-            (
-                IncrementalCommitInventoryEntry {
-                    inventory_seq: inventory.inventory_seq,
-                    commit_id: inventory.commit_id,
-                },
-                commit,
-            )
-        })
-        .unzip();
-    let (transfer_id, segment_index, previous_segment_sha256) = match resume {
-        Some(resume) => (
-            resume.transfer_id.clone(),
-            resume.next_segment_index,
-            Some(resume.previous_segment_sha256.clone()),
-        ),
-        None => (uuid::Uuid::new_v4().to_string(), 0, None),
-    };
-    let bundle = IncrementalSyncBundle {
-        manifest: IncrementalBundleManifest {
-            format: INCREMENTAL_BUNDLE_FORMAT.to_string(),
-            vault_id,
-            source_device_id,
-            exported_at: chrono::Utc::now().to_rfc3339(),
-            transfer_id,
-            segment_index,
-            previous_segment_sha256,
-            is_last: !more_commits && !more_deltas,
-            base: base.clone(),
-            result: IncrementalBundleCheckpoint {
-                commit_inventory: Some(commit_checkpoint),
-                delta_inventory: Some(delta_checkpoint),
-            },
-            commit_inventory,
-            delta_inventory,
+    PeerSyncService::export_incremental_segment(
+        conn,
+        &source_device_id,
+        base,
+        resume,
+        PeerSyncSegmentOptions {
+            page_size: CLI_INCREMENTAL_SEGMENT_PAGE_SIZE,
         },
-        commits,
-        auxiliary_deltas,
-    };
-    bundle
-        .validate()
-        .map_err(|error| format!("invalid incremental bundle export: {error}"))?;
-    Ok(bundle)
+    )
+    .map_err(|error| format!("incremental sync export failed: {error}"))
 }
 
 fn current_incremental_checkpoint(
     conn: &VaultConnection,
 ) -> Result<IncrementalBundleCheckpoint, String> {
-    Ok(IncrementalBundleCheckpoint {
-        commit_inventory: Some(
-            CommitInventoryRepo::checkpoint(conn)
-                .map_err(|error| format!("failed to create commit checkpoint: {error}"))?,
-        ),
-        delta_inventory: Some(
-            SyncDeltaInventoryRepo::checkpoint(conn)
-                .map_err(|error| format!("failed to create delta checkpoint: {error}"))?,
-        ),
-    })
-}
-
-fn load_commit_inventory_after(
-    conn: &VaultConnection,
-    checkpoint: Option<&str>,
-) -> Result<(Vec<CommitInventoryItem>, String, bool), String> {
-    let page = CommitInventoryRepo::list(conn, checkpoint, CLI_INCREMENTAL_SEGMENT_PAGE_SIZE, None)
-        .map_err(|error| format!("failed to page commit inventory: {error}"))?;
-    let has_more = page.next_cursor.is_some();
-    let result_checkpoint = if has_more {
-        CommitInventoryRepo::checkpoint_after(conn, page.items.last())
-            .map_err(|error| format!("failed to checkpoint commit segment: {error}"))?
-    } else {
-        page.checkpoint
-    };
-    Ok((page.items, result_checkpoint, has_more))
-}
-
-fn load_delta_inventory_after(
-    conn: &VaultConnection,
-    checkpoint: Option<&str>,
-) -> Result<(Vec<SyncDeltaInventoryItem>, String, bool), String> {
-    let page = SyncDeltaInventoryRepo::list(
-        conn,
-        checkpoint,
-        CLI_INCREMENTAL_SEGMENT_PAGE_SIZE.min(MAX_SYNC_DELTA_INVENTORY_PAGE_SIZE),
-        None,
-    )
-    .map_err(|error| format!("failed to page sync delta inventory: {error}"))?;
-    let has_more = page.next_cursor.is_some();
-    let result_checkpoint = if has_more {
-        SyncDeltaInventoryRepo::checkpoint_after(conn, page.items.last())
-            .map_err(|error| format!("failed to checkpoint sync delta segment: {error}"))?
-    } else {
-        page.checkpoint
-    };
-    Ok((page.items, result_checkpoint, has_more))
-}
-
-fn commit_inventory_sequence(conn: &VaultConnection, commit_id: &str) -> Result<u64, String> {
-    let sequence = conn
-        .inner()
-        .query_row(
-            "SELECT inventory_seq FROM commit_inventory WHERE commit_id = ?1",
-            [commit_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("failed to locate commit {commit_id} in inventory: {error}"))?;
-    u64::try_from(sequence)
-        .map_err(|error| format!("invalid inventory sequence for commit {commit_id}: {error}"))
+    PeerSyncService::current_checkpoint(conn)
+        .map_err(|error| format!("failed to create incremental checkpoint: {error}"))
 }
 
 #[cfg(test)]
@@ -3338,83 +3141,20 @@ fn apply_incremental_sync_segment(
     expected_base: &IncrementalBundleCheckpoint,
     expected_resume: Option<&CliSyncResume>,
 ) -> Result<ApplyBatchResult, String> {
-    bundle
-        .validate()
-        .map_err(|error| format!("invalid incremental bundle: {error}"))?;
-    let local_vault_id = vault_id(conn)?;
-    if bundle.manifest.vault_id != local_vault_id {
-        return Err(format!(
-            "bundle vault_id {} does not match local vault_id {}",
-            bundle.manifest.vault_id, local_vault_id
-        ));
-    }
-    if &bundle.manifest.base != expected_base {
-        return Err(
-            "incremental bundle base checkpoint does not match local peer state".to_string(),
-        );
-    }
-    if bundle.manifest.base.commit_inventory.is_none() {
-        return Err("incremental bundle cannot replace complete-state bootstrap".to_string());
-    }
-    match expected_resume {
-        Some(resume)
-            if resume.transfer_id == bundle.manifest.transfer_id
-                && resume.next_segment_index == bundle.manifest.segment_index
-                && bundle.manifest.previous_segment_sha256.as_deref()
-                    == Some(resume.previous_segment_sha256.as_slice()) => {}
-        Some(_) => {
-            return Err(
-                "incremental bundle does not match the saved transfer resume state".to_string(),
-            )
-        }
-        None if bundle.manifest.segment_index == 0
-            && bundle.manifest.previous_segment_sha256.is_none() => {}
-        None => {
-            return Err("resumed incremental bundle requires matching transfer state".to_string())
-        }
-    }
-
     let device_id = latest_device_id(conn)?.unwrap_or_else(|| "mdbx-cli-sync".to_string());
-    let ctx = CommitContext::new(device_id);
-    let mut auxiliary_envelopes = Vec::with_capacity(bundle.auxiliary_deltas.len());
-    for delta in &bundle.manifest.delta_inventory {
-        if delta.batch_kind != IncrementalDeltaKind::Auxiliary {
-            continue;
-        }
-        let payload = bundle
-            .auxiliary_deltas
-            .iter()
-            .find(|payload| payload.object_id == delta.batch_id)
-            .ok_or_else(|| format!("missing auxiliary delta payload {}", delta.batch_id))?;
-        let envelope = decode_sync_delta_object_payload(conn, payload, SyncDeltaLimits::default())
-            .map_err(|error| format!("invalid auxiliary delta {}: {error}", delta.batch_id))?
-            .ok_or_else(|| format!("unrecognized auxiliary delta payload {}", delta.batch_id))?;
-        auxiliary_envelopes.push(envelope);
-    }
-    SyncApplyRepo::apply_incremental_batch_mut(
+    PeerSyncService::apply_incremental_segment(
         conn,
-        &ctx,
-        &CommitBatch::new(bundle.commits.clone(), 0, true),
-        &auxiliary_envelopes,
+        &device_id,
+        bundle,
+        expected_base,
+        expected_resume,
     )
     .map_err(|error| format!("storage-core incremental segment apply failed: {error}"))
 }
 
 fn next_cli_sync_resume(bundle: &IncrementalSyncBundle) -> Result<Option<CliSyncResume>, String> {
-    if bundle.manifest.is_last {
-        return Ok(None);
-    }
-    let next_segment_index = bundle
-        .manifest
-        .segment_index
-        .checked_add(1)
-        .ok_or_else(|| "incremental segment index overflow".to_string())?;
-    Ok(Some(CliSyncResume {
-        transfer_id: bundle.manifest.transfer_id.clone(),
-        next_segment_index,
-        previous_segment_sha256: incremental_bundle_payload_sha256(bundle)
-            .map_err(|error| format!("failed to digest incremental segment: {error}"))?,
-    }))
+    PeerSyncService::next_resume(bundle)
+        .map_err(|error| format!("failed to calculate incremental resume state: {error}"))
 }
 
 fn read_cli_sync_checkpoint(
@@ -3528,170 +3268,14 @@ fn latest_device_id(conn: &VaultConnection) -> Result<Option<String>, String> {
         .map_err(|e| format!("failed to read device head: {}", e))
 }
 
+#[cfg(test)]
 fn load_serialized_commits(conn: &VaultConnection) -> Result<Vec<SerializedCommit>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT commit_id, device_id, local_seq, commit_kind, change_scope,
-                    changed_object_ids_ct, vector_clock, message_ct, created_at, integrity_tag
-             FROM commits
-             ORDER BY created_at ASC, device_id ASC, local_seq ASC",
-        )
-        .map_err(|e| format!("failed to query commits: {}", e))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let commit_id: String = row.get(0)?;
-            let operation = operation_for_commit(conn, &commit_id)?;
-            Ok(SerializedCommit {
-                parent_ids: parent_ids_for_commit(conn, &commit_id).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)),
-                    )
-                })?,
-                tombstones: Vec::new(),
-                object_payloads: Vec::new(),
-                commit: Commit {
-                    commit_id,
-                    device_id: row.get(1)?,
-                    local_seq: row.get::<_, i64>(2)? as u64,
-                    commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
-                    change_scope: parse_change_scope_from_sql(row.get::<_, String>(4)?)?,
-                    changed_object_ids_ct: row.get(5)?,
-                    vector_clock: row.get(6)?,
-                    message_ct: row.get(7)?,
-                    created_at: row.get(8)?,
-                    integrity_tag: row.get(9)?,
-                },
-                operation,
-            })
-        })
-        .map_err(|e| format!("failed to map commits: {}", e))?;
-
-    let mut commits = Vec::new();
-    for row in rows {
-        commits.push(row.map_err(|e| format!("failed to read commit: {}", e))?);
-    }
-
-    let tombstones = load_tombstones(conn)?;
-    if let Some(first) = commits.first_mut() {
-        first.tombstones = tombstones;
-    }
-    Ok(commits)
+    PeerSyncService::export_complete_bundle(conn, "cli-test-device")
+        .map(|bundle| bundle.commits)
+        .map_err(|error| format!("failed to load serialized commits: {error}"))
 }
 
-fn load_serialized_commit(
-    conn: &VaultConnection,
-    commit_id: &str,
-) -> Result<SerializedCommit, String> {
-    let commit = conn
-        .inner()
-        .query_row(
-            "SELECT commit_id, device_id, local_seq, commit_kind, change_scope,
-                    changed_object_ids_ct, vector_clock, message_ct, created_at, integrity_tag
-             FROM commits WHERE commit_id = ?1",
-            [commit_id],
-            |row| {
-                Ok(Commit {
-                    commit_id: row.get(0)?,
-                    device_id: row.get(1)?,
-                    local_seq: row.get::<_, i64>(2)? as u64,
-                    commit_kind: parse_commit_kind_from_sql(row.get::<_, String>(3)?)?,
-                    change_scope: parse_change_scope_from_sql(row.get::<_, String>(4)?)?,
-                    changed_object_ids_ct: row.get(5)?,
-                    vector_clock: row.get(6)?,
-                    message_ct: row.get(7)?,
-                    created_at: row.get(8)?,
-                    integrity_tag: row.get(9)?,
-                })
-            },
-        )
-        .map_err(|error| format!("failed to read commit {commit_id}: {error}"))?;
-    Ok(SerializedCommit {
-        operation: operation_for_commit(conn, commit_id)
-            .map_err(|error| format!("failed to read operation for {commit_id}: {error}"))?,
-        parent_ids: parent_ids_for_commit(conn, commit_id)?,
-        tombstones: Vec::new(),
-        object_payloads: Vec::new(),
-        commit,
-    })
-}
-
-fn operation_for_commit(
-    conn: &VaultConnection,
-    commit_id: &str,
-) -> rusqlite::Result<Option<CommitOperationMetadata>> {
-    conn.inner()
-        .query_row(
-            "SELECT operation_id, operation_kind, branch_id, branch_name,
-                    change_summary_ct, request_hash, integrity_tag
-             FROM commit_operations WHERE commit_id = ?1",
-            params![commit_id],
-            |row| {
-                Ok(CommitOperationMetadata {
-                    operation_id: row.get(0)?,
-                    operation_kind: row.get(1)?,
-                    branch_id: row.get(2)?,
-                    branch_name: row.get(3)?,
-                    change_summary_ct: row.get(4)?,
-                    request_hash: row.get(5)?,
-                    integrity_tag: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-}
-
-fn parent_ids_for_commit(conn: &VaultConnection, commit_id: &str) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT parent_commit_id FROM commit_parents
-             WHERE commit_id = ?1
-             ORDER BY parent_commit_id",
-        )
-        .map_err(|e| format!("failed to query commit parents: {}", e))?;
-    let rows = stmt
-        .query_map(params![commit_id], |row| row.get(0))
-        .map_err(|e| format!("failed to map commit parents: {}", e))?;
-    let mut parents = Vec::new();
-    for row in rows {
-        parents.push(row.map_err(|e| format!("failed to read commit parent: {}", e))?);
-    }
-    Ok(parents)
-}
-
-fn load_tombstones(conn: &VaultConnection) -> Result<Vec<TombstoneRecord>, String> {
-    let mut stmt = conn
-        .inner()
-        .prepare(
-            "SELECT tombstone_id, target_object_type, target_object_id,
-                    delete_clock, deleted_by_device_id, deleted_at
-             FROM tombstones
-             ORDER BY deleted_at ASC, tombstone_id ASC",
-        )
-        .map_err(|e| format!("failed to query tombstones: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(TombstoneRecord {
-                tombstone_id: row.get(0)?,
-                target_object_type: row.get(1)?,
-                target_object_id: row.get(2)?,
-                delete_clock: row.get(3)?,
-                deleted_by_device_id: row.get(4)?,
-                deleted_at: row.get(5)?,
-            })
-        })
-        .map_err(|e| format!("failed to map tombstones: {}", e))?;
-    let mut tombstones = Vec::new();
-    for row in rows {
-        tombstones.push(row.map_err(|e| format!("failed to read tombstone: {}", e))?);
-    }
-    Ok(tombstones)
-}
-
+#[cfg(test)]
 fn parse_commit_kind_from_sql(value: String) -> rusqlite::Result<CommitKind> {
     value.parse().map_err(|error: String| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -3702,6 +3286,7 @@ fn parse_commit_kind_from_sql(value: String) -> rusqlite::Result<CommitKind> {
     })
 }
 
+#[cfg(test)]
 fn parse_change_scope_from_sql(value: String) -> rusqlite::Result<ChangeScope> {
     value.parse().map_err(|error: String| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -3719,7 +3304,8 @@ mod tests {
     use mdbx_storage::sync_apply::SyncApplyRepo;
     use mdbx_storage::sync_state::SYNC_STATE_OBJECT_TYPE;
     use mdbx_storage::tiga::TigaService;
-    use mdbx_sync::CommitBatch;
+    use mdbx_sync::{CommitBatch, IncrementalDeltaKind};
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
     #[test]

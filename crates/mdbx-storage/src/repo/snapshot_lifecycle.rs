@@ -12,6 +12,7 @@ use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 use crate::repo::commit_ctx::{CommitChange, CommitContext, CommitOperation};
 use crate::repo::snapshot_summary::{SnapshotSummaryRepo, MAX_SNAPSHOT_SUMMARY_TEXT_BYTES};
+use crate::repo::SnapshotMetadataRepo;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
 
@@ -450,6 +451,10 @@ impl SnapshotLifecycleRepo {
                 let commit_id = ctx.create_operation_commit(conn, &operation)?;
                 let mut deleted_snapshot_ids = Vec::with_capacity(plan.candidates.len());
                 for candidate in &plan.candidates {
+                    SnapshotMetadataRepo::delete_in_transaction(
+                        conn,
+                        &candidate.summary.snapshot_id,
+                    )?;
                     let affected = conn.inner().execute(
                         "DELETE FROM snapshots WHERE snapshot_id = ?1",
                         params![candidate.summary.snapshot_id],

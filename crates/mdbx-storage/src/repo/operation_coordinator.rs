@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
 use mdbx_core::model::{ObjectTypeId, RelationKindId};
@@ -9,9 +9,10 @@ use crate::connection::VaultConnection;
 use crate::error::{StorageError, StorageResult};
 
 use super::{
-    CommitChange, CommitContext, CommitOperation, EntryRepo, ObjectLabelAssignmentCreateRequest,
-    ObjectLabelAssignmentRepo, ObjectLabelCreateRequest, ObjectLabelRepo,
-    ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution, ProjectRepo,
+    AttachmentRepo, CommitChange, CommitContext, CommitOperation, EntryRepo,
+    ObjectLabelAssignmentCreateRequest, ObjectLabelAssignmentRepo, ObjectLabelCreateRequest,
+    ObjectLabelRepo, ObjectRelationCreateRequest, ObjectRelationRepo, OperationExecution,
+    ProjectRepo,
 };
 
 pub const DEFAULT_MAX_WRITE_COMMANDS: usize = 256;
@@ -35,6 +36,26 @@ pub enum WriteCommand {
     CreateProject {
         project_id: String,
         title: String,
+    },
+    CreateProjectWithParent {
+        project_id: String,
+        title: String,
+        parent_project_id: Option<String>,
+    },
+    RenameProject {
+        project_id: String,
+        title: String,
+    },
+    MoveProject {
+        project_id: String,
+        parent_project_id: Option<String>,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    RestoreProject {
+        project_id: String,
+        parent_project_id: Option<String>,
     },
     CreateEntry {
         entry_id: String,
@@ -116,6 +137,11 @@ impl WriteCommand {
             | Self::CreateObjectLabel { payload_json, .. }
             | Self::UpdateObjectLabel { payload_json, .. } => Some(payload_json),
             Self::CreateProject { .. }
+            | Self::CreateProjectWithParent { .. }
+            | Self::RenameProject { .. }
+            | Self::MoveProject { .. }
+            | Self::DeleteProject { .. }
+            | Self::RestoreProject { .. }
             | Self::DeleteEntry { .. }
             | Self::RestoreEntry { .. }
             | Self::MoveEntry { .. }
@@ -522,12 +548,28 @@ impl Write for LimitedIntentHashWriter {
 }
 
 pub fn write_operation_changes(commands: &[WriteCommand]) -> Vec<CommitChange> {
-    let mut changes = Vec::new();
+    let mut changes: Vec<CommitChange> = Vec::new();
+    let mut change_indexes: HashMap<(&str, &str), usize> = HashMap::new();
     for command in commands {
         let (object_type, object_id, action, fields): (&str, &String, &str, &[&str]) = match command
         {
             WriteCommand::CreateProject { project_id, .. } => {
                 ("project", project_id, "create", &["title"])
+            }
+            WriteCommand::CreateProjectWithParent { project_id, .. } => {
+                ("project", project_id, "create", &["title", "group_id"])
+            }
+            WriteCommand::RenameProject { project_id, .. } => {
+                ("project", project_id, "update", &["title"])
+            }
+            WriteCommand::MoveProject { project_id, .. } => {
+                ("project", project_id, "move", &["group_id"])
+            }
+            WriteCommand::DeleteProject { project_id } => {
+                ("project", project_id, "delete", &["deleted"])
+            }
+            WriteCommand::RestoreProject { project_id, .. } => {
+                ("project", project_id, "restore", &["deleted", "group_id"])
             }
             WriteCommand::CreateEntry { entry_id, .. } => (
                 "entry",
@@ -602,9 +644,9 @@ pub fn write_operation_changes(commands: &[WriteCommand]) -> Vec<CommitChange> {
             action: action.to_string(),
             fields: fields.iter().map(|field| (*field).to_string()).collect(),
         };
-        if let Some(existing) = changes.iter_mut().find(|change: &&mut CommitChange| {
-            change.object_type == object_type && change.object_id == *object_id
-        }) {
+        let key = (object_type, object_id.as_str());
+        if let Some(existing_index) = change_indexes.get(&key).copied() {
+            let existing = &mut changes[existing_index];
             if existing.action != incoming.action {
                 existing.action = "change".to_string();
             }
@@ -614,6 +656,7 @@ pub fn write_operation_changes(commands: &[WriteCommand]) -> Vec<CommitChange> {
                 }
             }
         } else {
+            change_indexes.insert(key, changes.len());
             changes.push(incoming);
         }
     }
@@ -639,6 +682,26 @@ enum PreparedWriteCommand {
     CreateProject {
         project_id: String,
         title: String,
+    },
+    CreateProjectWithParent {
+        project_id: String,
+        title: String,
+        parent_project_id: Option<String>,
+    },
+    RenameProject {
+        project_id: String,
+        title: String,
+    },
+    MoveProject {
+        project_id: String,
+        parent_project_id: Option<String>,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    RestoreProject {
+        project_id: String,
+        parent_project_id: Option<String>,
     },
     CreateEntry {
         entry_id: String,
@@ -713,9 +776,12 @@ enum PreparedWriteCommand {
 impl PreparedWriteCommand {
     fn commit_kind(&self) -> &'static str {
         match self {
-            Self::RestoreEntry { .. } => "restore",
-            Self::MoveEntry { .. } => "move",
+            Self::RestoreProject { .. } | Self::RestoreEntry { .. } => "restore",
+            Self::MoveProject { .. } | Self::MoveEntry { .. } => "move",
             Self::CreateProject { .. }
+            | Self::CreateProjectWithParent { .. }
+            | Self::RenameProject { .. }
+            | Self::DeleteProject { .. }
             | Self::CreateEntry { .. }
             | Self::UpdateEntry { .. }
             | Self::DeleteEntry { .. }
@@ -741,6 +807,56 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                 Ok(Self::CreateProject {
                     project_id: project_id.clone(),
                     title: title.clone(),
+                })
+            }
+            WriteCommand::CreateProjectWithParent {
+                project_id,
+                title,
+                parent_project_id,
+            } => {
+                validate_uuid(project_id, "project_id")?;
+                validate_project_title(title)?;
+                validate_optional_uuid(parent_project_id.as_deref(), "parent_project_id")?;
+                Ok(Self::CreateProjectWithParent {
+                    project_id: project_id.clone(),
+                    title: title.trim().to_string(),
+                    parent_project_id: parent_project_id.clone(),
+                })
+            }
+            WriteCommand::RenameProject { project_id, title } => {
+                validate_uuid(project_id, "project_id")?;
+                validate_project_title(title)?;
+                Ok(Self::RenameProject {
+                    project_id: project_id.clone(),
+                    title: title.trim().to_string(),
+                })
+            }
+            WriteCommand::MoveProject {
+                project_id,
+                parent_project_id,
+            } => {
+                validate_uuid(project_id, "project_id")?;
+                validate_optional_uuid(parent_project_id.as_deref(), "parent_project_id")?;
+                Ok(Self::MoveProject {
+                    project_id: project_id.clone(),
+                    parent_project_id: parent_project_id.clone(),
+                })
+            }
+            WriteCommand::DeleteProject { project_id } => {
+                validate_uuid(project_id, "project_id")?;
+                Ok(Self::DeleteProject {
+                    project_id: project_id.clone(),
+                })
+            }
+            WriteCommand::RestoreProject {
+                project_id,
+                parent_project_id,
+            } => {
+                validate_uuid(project_id, "project_id")?;
+                validate_optional_uuid(parent_project_id.as_deref(), "parent_project_id")?;
+                Ok(Self::RestoreProject {
+                    project_id: project_id.clone(),
+                    parent_project_id: parent_project_id.clone(),
                 })
             }
             WriteCommand::CreateEntry {
@@ -935,6 +1051,23 @@ fn validate_uuid(value: &str, field: &str) -> StorageResult<()> {
         .map_err(|_| StorageError::Validation(format!("{field} {value} must be a UUID")))
 }
 
+fn validate_optional_uuid(value: Option<&str>, field: &str) -> StorageResult<()> {
+    if let Some(value) = value {
+        validate_uuid(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_project_title(value: &str) -> StorageResult<()> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4_096 {
+        return Err(StorageError::Validation(
+            "project title must contain 1 to 4096 UTF-8 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_object_type_id(value: &str) -> Result<ObjectTypeId, OperationCoordinatorError> {
     value
         .parse()
@@ -979,6 +1112,72 @@ fn execute_prepared_commands(
             PreparedWriteCommand::CreateProject { project_id, title } => {
                 ProjectRepo::create_with_id(conn, ctx, project_id, title, None, None)?;
             }
+            PreparedWriteCommand::CreateProjectWithParent {
+                project_id,
+                title,
+                parent_project_id,
+            } => {
+                validate_project_parent(conn, project_id, parent_project_id.as_deref())?;
+                ensure_unique_project_title(conn, None, parent_project_id.as_deref(), title)?;
+                ProjectRepo::create_with_id(
+                    conn,
+                    ctx,
+                    project_id,
+                    title,
+                    parent_project_id.as_deref(),
+                    None,
+                )?;
+            }
+            PreparedWriteCommand::RenameProject { project_id, title } => {
+                let mut project = active_project(conn, project_id)?;
+                ensure_unique_project_title(
+                    conn,
+                    Some(project_id),
+                    project.group_id.as_deref(),
+                    title,
+                )?;
+                project.title_ct = title.as_bytes().to_vec();
+                ProjectRepo::update(conn, ctx, &project)?;
+            }
+            PreparedWriteCommand::MoveProject {
+                project_id,
+                parent_project_id,
+            } => {
+                let project = active_project(conn, project_id)?;
+                validate_project_parent(conn, project_id, parent_project_id.as_deref())?;
+                ensure_unique_project_title(
+                    conn,
+                    Some(project_id),
+                    parent_project_id.as_deref(),
+                    &String::from_utf8_lossy(&project.title_ct),
+                )?;
+                ProjectRepo::move_to_group(conn, ctx, project_id, parent_project_id.as_deref())?;
+            }
+            PreparedWriteCommand::DeleteProject { project_id } => {
+                active_project(conn, project_id)?;
+                ensure_project_empty(conn, project_id)?;
+                ProjectRepo::soft_delete(conn, ctx, project_id)?;
+            }
+            PreparedWriteCommand::RestoreProject {
+                project_id,
+                parent_project_id,
+            } => {
+                let project = ProjectRepo::get_by_id(conn, project_id)?
+                    .ok_or_else(|| StorageError::NotFound(project_id.clone()))?;
+                if !project.deleted {
+                    return Err(StorageError::ConstraintViolation(format!(
+                        "project {project_id} is not deleted"
+                    )));
+                }
+                validate_project_parent(conn, project_id, parent_project_id.as_deref())?;
+                ensure_unique_project_title(
+                    conn,
+                    Some(project_id),
+                    parent_project_id.as_deref(),
+                    &String::from_utf8_lossy(&project.title_ct),
+                )?;
+                ProjectRepo::restore(conn, ctx, project_id, parent_project_id.as_deref())?;
+            }
             PreparedWriteCommand::CreateEntry {
                 entry_id,
                 project_id,
@@ -1012,14 +1211,14 @@ fn execute_prepared_commands(
                 entry.title_ct = Some(title.as_bytes().to_vec());
                 entry.payload_ct = serde_json::to_vec(payload)
                     .map_err(|error| StorageError::Validation(error.to_string()))?;
-                EntryRepo::update(conn, ctx, &entry)?;
+                EntryRepo::update_loaded_in_transaction(conn, ctx, &entry)?;
             }
             PreparedWriteCommand::DeleteEntry {
                 entry_id,
                 project_id,
             } => {
-                entry_for_project(conn, project_id, entry_id)?;
-                EntryRepo::soft_delete(conn, ctx, entry_id)?;
+                let entry = entry_for_project(conn, project_id, entry_id)?;
+                EntryRepo::soft_delete_loaded_in_transaction(conn, ctx, &entry)?;
             }
             PreparedWriteCommand::RestoreEntry {
                 entry_id,
@@ -1141,6 +1340,101 @@ fn entry_for_project(
     Ok(entry)
 }
 
+fn active_project(
+    conn: &VaultConnection,
+    project_id: &str,
+) -> StorageResult<mdbx_core::model::Project> {
+    let project = ProjectRepo::get_by_id(conn, project_id)?
+        .ok_or_else(|| StorageError::NotFound(project_id.to_string()))?;
+    if project.deleted {
+        return Err(StorageError::ConstraintViolation(format!(
+            "project {project_id} is deleted"
+        )));
+    }
+    Ok(project)
+}
+
+fn validate_project_parent(
+    conn: &VaultConnection,
+    project_id: &str,
+    parent_project_id: Option<&str>,
+) -> StorageResult<()> {
+    let Some(parent_project_id) = parent_project_id else {
+        return Ok(());
+    };
+    if parent_project_id == project_id {
+        return Err(StorageError::ConstraintViolation(
+            "a project cannot be its own parent".to_string(),
+        ));
+    }
+
+    let mut current = Some(parent_project_id.to_string());
+    let mut visited = BTreeSet::new();
+    while let Some(current_id) = current {
+        if current_id == project_id {
+            return Err(StorageError::ConstraintViolation(
+                "moving the project would create a hierarchy cycle".to_string(),
+            ));
+        }
+        if !visited.insert(current_id.clone()) {
+            return Err(StorageError::ConstraintViolation(
+                "the existing project hierarchy contains a cycle".to_string(),
+            ));
+        }
+        let parent = ProjectRepo::get_by_id(conn, &current_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("parent project {current_id}")))?;
+        if parent.deleted {
+            return Err(StorageError::ConstraintViolation(format!(
+                "parent project {current_id} is deleted"
+            )));
+        }
+        current = parent.group_id;
+    }
+    Ok(())
+}
+
+fn ensure_unique_project_title(
+    conn: &VaultConnection,
+    excluded_project_id: Option<&str>,
+    parent_project_id: Option<&str>,
+    title: &str,
+) -> StorageResult<()> {
+    let normalized = title.trim();
+    let duplicate = ProjectRepo::list_all(conn)?.into_iter().any(|project| {
+        project.group_id.as_deref() == parent_project_id
+            && excluded_project_id != Some(project.project_id.as_str())
+            && String::from_utf8_lossy(&project.title_ct).eq_ignore_ascii_case(normalized)
+    });
+    if duplicate {
+        return Err(StorageError::ConstraintViolation(format!(
+            "a project named {normalized} already exists under the selected parent"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_project_empty(conn: &VaultConnection, project_id: &str) -> StorageResult<()> {
+    if ProjectRepo::list_all(conn)?
+        .iter()
+        .any(|project| project.group_id.as_deref() == Some(project_id))
+    {
+        return Err(StorageError::ConstraintViolation(
+            "a project with active child projects cannot be deleted".to_string(),
+        ));
+    }
+    if !EntryRepo::list_by_project(conn, project_id)?.is_empty() {
+        return Err(StorageError::ConstraintViolation(
+            "a project with active entries cannot be deleted".to_string(),
+        ));
+    }
+    if !AttachmentRepo::list_by_project(conn, project_id)?.is_empty() {
+        return Err(StorageError::ConstraintViolation(
+            "a project with active attachments cannot be deleted".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::params;
@@ -1189,6 +1483,144 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("serialized intent bytes"));
+    }
+
+    #[test]
+    fn change_summary_coalesces_fields_in_first_seen_object_order() {
+        let first_entry = "00000000-0000-4000-8000-000000000060".to_string();
+        let second_entry = "00000000-0000-4000-8000-000000000061".to_string();
+        let project_id = "00000000-0000-4000-8000-000000000062".to_string();
+        let changes = write_operation_changes(&[
+            WriteCommand::CreateEntry {
+                entry_id: first_entry.clone(),
+                project_id: project_id.clone(),
+                entry_type: "login".to_string(),
+                title: "First".to_string(),
+                payload_json: "{}".to_string(),
+            },
+            WriteCommand::CreateProject {
+                project_id: project_id.clone(),
+                title: "Project".to_string(),
+            },
+            WriteCommand::UpdateEntry {
+                entry_id: first_entry.clone(),
+                project_id: project_id.clone(),
+                entry_type: "login".to_string(),
+                title: "Updated".to_string(),
+                payload_json: "{}".to_string(),
+            },
+            WriteCommand::DeleteEntry {
+                entry_id: first_entry.clone(),
+                project_id: project_id.clone(),
+            },
+            WriteCommand::UpdateEntry {
+                entry_id: second_entry.clone(),
+                project_id: project_id.clone(),
+                entry_type: "login".to_string(),
+                title: "Second".to_string(),
+                payload_json: "{}".to_string(),
+            },
+        ]);
+
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].object_type, "entry");
+        assert_eq!(changes[0].object_id, first_entry);
+        assert_eq!(changes[0].action, "change");
+        assert_eq!(
+            changes[0].fields,
+            vec!["project_id", "entry_type", "title", "payload", "deleted"]
+        );
+        assert_eq!(changes[1].object_type, "project");
+        assert_eq!(changes[1].object_id, project_id);
+        assert_eq!(changes[2].object_type, "entry");
+        assert_eq!(changes[2].object_id, second_entry);
+    }
+
+    #[test]
+    fn batch_update_delete_preserves_versions_tombstone_and_exact_retry() {
+        let (conn, ctx, _) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Batch semantics", None, None).unwrap();
+        let updated_entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            ObjectTypeId::Login,
+            Some("Before update"),
+            &serde_json::json!({"revision": 0}),
+        )
+        .unwrap();
+        let deleted_entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            ObjectTypeId::Login,
+            Some("Before delete"),
+            &serde_json::json!({"revision": 0}),
+        )
+        .unwrap();
+        let commits_before = count(&conn, "commits");
+        let request = WriteOperationRequest::new(
+            "native-batch-update-delete-semantics",
+            "batch-update-delete",
+            vec![
+                WriteCommand::UpdateEntry {
+                    entry_id: updated_entry.entry_id.clone(),
+                    project_id: project.project_id.clone(),
+                    entry_type: "login".to_string(),
+                    title: "After update".to_string(),
+                    payload_json: r#"{"revision":1}"#.to_string(),
+                },
+                WriteCommand::DeleteEntry {
+                    entry_id: deleted_entry.entry_id.clone(),
+                    project_id: project.project_id.clone(),
+                },
+            ],
+        );
+
+        let first = OperationCoordinator::execute(&conn, &ctx, request.clone()).unwrap();
+        assert!(!first.already_committed);
+        assert_eq!(count(&conn, "commits"), commits_before + 1);
+        let updated = EntryRepo::get_by_id(&conn, &updated_entry.entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.title_ct, Some(b"After update".to_vec()));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&updated.payload_ct).unwrap(),
+            serde_json::json!({"revision": 1})
+        );
+        assert_eq!(updated.head_commit_id, first.commit_id);
+        let deleted = EntryRepo::get_by_id(&conn, &deleted_entry.entry_id)
+            .unwrap()
+            .unwrap();
+        assert!(deleted.deleted);
+        assert_eq!(deleted.head_commit_id, first.commit_id);
+        assert_eq!(
+            conn.inner()
+                .query_row(
+                    "SELECT COUNT(*) FROM tombstones
+                     WHERE target_object_type = 'entry' AND target_object_id = ?1
+                           AND delete_commit_id = ?2",
+                    params![deleted_entry.entry_id, first.commit_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.inner()
+                .query_row(
+                    "SELECT COUNT(*) FROM object_versions WHERE commit_id = ?1",
+                    params![first.commit_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+
+        let retry = OperationCoordinator::execute(&conn, &ctx, request).unwrap();
+        assert!(retry.already_committed);
+        assert_eq!(retry.commit_id, first.commit_id);
+        assert_eq!(count(&conn, "commits"), commits_before + 1);
     }
 
     #[test]
@@ -1378,6 +1810,238 @@ mod tests {
                 .project_id,
             target.project_id
         );
+    }
+
+    #[test]
+    fn project_hierarchy_commands_round_trip_parent_rename_delete_and_restore() {
+        let (conn, ctx, _) = setup();
+        let parent_id = "00000000-0000-4000-8000-000000000040".to_string();
+        let child_id = "00000000-0000-4000-8000-000000000041".to_string();
+        let other_id = "00000000-0000-4000-8000-000000000042".to_string();
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-create",
+                "project-hierarchy",
+                vec![
+                    WriteCommand::CreateProjectWithParent {
+                        project_id: parent_id.clone(),
+                        title: "Parent".to_string(),
+                        parent_project_id: None,
+                    },
+                    WriteCommand::CreateProjectWithParent {
+                        project_id: child_id.clone(),
+                        title: "Child".to_string(),
+                        parent_project_id: Some(parent_id.clone()),
+                    },
+                    WriteCommand::CreateProjectWithParent {
+                        project_id: other_id.clone(),
+                        title: "Other".to_string(),
+                        parent_project_id: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ProjectRepo::get_by_id(&conn, &child_id)
+                .unwrap()
+                .unwrap()
+                .group_id
+                .as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-rename",
+                "project-hierarchy",
+                vec![WriteCommand::RenameProject {
+                    project_id: child_id.clone(),
+                    title: "Renamed child".to_string(),
+                }],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ProjectRepo::get_by_id(&conn, &child_id)
+                .unwrap()
+                .unwrap()
+                .title_ct,
+            b"Renamed child"
+        );
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-move",
+                "project-hierarchy",
+                vec![WriteCommand::MoveProject {
+                    project_id: child_id.clone(),
+                    parent_project_id: Some(other_id),
+                }],
+            ),
+        )
+        .unwrap();
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-delete",
+                "project-hierarchy",
+                vec![WriteCommand::DeleteProject {
+                    project_id: child_id.clone(),
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(
+            ProjectRepo::get_by_id(&conn, &child_id)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-restore",
+                "project-hierarchy",
+                vec![WriteCommand::RestoreProject {
+                    project_id: child_id.clone(),
+                    parent_project_id: Some(parent_id.clone()),
+                }],
+            ),
+        )
+        .unwrap();
+        let restored = ProjectRepo::get_by_id(&conn, &child_id).unwrap().unwrap();
+        assert!(!restored.deleted);
+        assert_eq!(restored.group_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[test]
+    fn project_hierarchy_rejects_missing_deleted_and_cyclic_parents() {
+        let (conn, ctx, _) = setup();
+        let parent_id = "00000000-0000-4000-8000-000000000050".to_string();
+        let child_id = "00000000-0000-4000-8000-000000000051".to_string();
+        let missing_id = "00000000-0000-4000-8000-000000000052".to_string();
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-constraints-create",
+                "project-hierarchy",
+                vec![
+                    WriteCommand::CreateProjectWithParent {
+                        project_id: parent_id.clone(),
+                        title: "Parent".to_string(),
+                        parent_project_id: None,
+                    },
+                    WriteCommand::CreateProjectWithParent {
+                        project_id: child_id.clone(),
+                        title: "Child".to_string(),
+                        parent_project_id: Some(parent_id.clone()),
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+
+        let cycle = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-cycle",
+                "project-hierarchy",
+                vec![WriteCommand::MoveProject {
+                    project_id: parent_id.clone(),
+                    parent_project_id: Some(child_id.clone()),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(cycle.to_string().contains("cycle"));
+
+        let missing = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-missing-parent",
+                "project-hierarchy",
+                vec![WriteCommand::CreateProjectWithParent {
+                    project_id: missing_id.clone(),
+                    title: "Missing parent".to_string(),
+                    parent_project_id: Some("00000000-0000-4000-8000-000000000053".to_string()),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("parent project"));
+
+        let non_empty = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-delete-non-empty",
+                "project-hierarchy",
+                vec![WriteCommand::DeleteProject {
+                    project_id: parent_id.clone(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(non_empty.to_string().contains("child projects"));
+
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-delete-child",
+                "project-hierarchy",
+                vec![WriteCommand::DeleteProject {
+                    project_id: child_id.clone(),
+                }],
+            ),
+        )
+        .unwrap();
+        OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-delete-parent",
+                "project-hierarchy",
+                vec![WriteCommand::DeleteProject {
+                    project_id: parent_id.clone(),
+                }],
+            ),
+        )
+        .unwrap();
+
+        let deleted_parent = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new(
+                "native-project-hierarchy-restore-under-deleted-parent",
+                "project-hierarchy",
+                vec![WriteCommand::RestoreProject {
+                    project_id: child_id,
+                    parent_project_id: Some(parent_id),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(deleted_parent.to_string().contains("deleted"));
+        assert!(ProjectRepo::get_by_id(&conn, &missing_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

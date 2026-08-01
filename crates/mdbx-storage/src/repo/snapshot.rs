@@ -1,6 +1,7 @@
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
@@ -15,10 +16,13 @@ use crate::connection::VaultConnection;
 use crate::crypto_layer::{decrypt_field, encrypt_field, FieldKeyPurpose};
 use crate::error::{StorageError, StorageResult};
 use crate::migration::SNAPSHOT_RECORD_AUTH_EXTENSION;
-use crate::repo::commit_ctx::CommitContext;
+use crate::repo::commit_ctx::{CommitChange, CommitContext, CommitOperation};
 use crate::repo::object_version::ObjectVersionRepo;
 use crate::repo::snapshot_integrity::{self, SnapshotIntegrityInput};
-use crate::repo::{CollectionProfileRepo, SnapshotLifecycleRepo, TombstoneRepo};
+use crate::repo::{
+    CollectionProfileRepo, EntryRepo, ProjectRepo, SnapshotLifecycleRepo, SnapshotMetadataRepo,
+    SnapshotSummaryRepo, TombstoneRepo,
+};
 use crate::sync_state::ProjectTagSetRow;
 use crate::tiga::TigaService;
 use crate::tiga_policy::TigaAuthorizationContext;
@@ -55,6 +59,41 @@ pub(crate) struct SnapshotExternalBlobReference {
     pub external_uri_ct: Vec<u8>,
     pub stored_size: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreResult {
+    pub commit_id: String,
+    pub affected_object_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotDeleteResult {
+    pub commit_id: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStructureNode {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub node_type: String,
+    pub path: String,
+    pub status: String,
+    pub child_count: usize,
+    pub metadata: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStructurePreview {
+    pub snapshot_id: String,
+    pub current_nodes: Vec<SnapshotStructureNode>,
+    pub snapshot_nodes: Vec<SnapshotStructureNode>,
+    pub current_item_count: usize,
+    pub snapshot_item_count: usize,
+}
+
+const MAX_SNAPSHOT_STRUCTURE_NODES: usize = 10_000;
 
 /// Snapshot 持久化仓库。
 ///
@@ -119,6 +158,45 @@ impl SnapshotRepo {
             context,
             || {
                 let snapshot = Self::create_automatic_snapshot(conn, ctx, retention_eligible_at)?;
+                let commit_id = snapshot.base_commit_id.clone();
+                Ok((snapshot, commit_id))
+            },
+        )?;
+        Ok((snapshot, decision))
+    }
+
+    pub fn create_manual_snapshot_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        display_name: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(Snapshot, AuthorizationDecision)> {
+        let (snapshot, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::CreateSnapshot,
+            context,
+            || {
+                let snapshot = conn.with_immediate_transaction(|| {
+                    let snapshot = Self::create_snapshot_inner(conn, ctx)?;
+                    SnapshotLifecycleRepo::register_from_snapshot_in_transaction(
+                        conn,
+                        &snapshot,
+                        SnapshotKind::Manual,
+                        None,
+                    )?;
+                    let fallback = format!("Snapshot {}", snapshot.created_at);
+                    SnapshotMetadataRepo::register_from_snapshot_in_transaction(
+                        conn,
+                        &snapshot,
+                        if display_name.trim().is_empty() {
+                            &fallback
+                        } else {
+                            display_name
+                        },
+                    )?;
+                    Ok(snapshot)
+                })?;
                 let commit_id = snapshot.base_commit_id.clone();
                 Ok((snapshot, commit_id))
             },
@@ -219,11 +297,39 @@ impl SnapshotRepo {
         Ok(decision)
     }
 
+    pub fn restore_snapshot_with_result_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        snapshot_id: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(SnapshotRestoreResult, AuthorizationDecision)> {
+        let (result, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::RestoreSnapshot,
+            context,
+            || {
+                let result = Self::restore_snapshot_with_result(conn, ctx, snapshot_id)?;
+                let commit_id = result.commit_id.clone();
+                Ok((result, commit_id))
+            },
+        )?;
+        Ok((result, decision))
+    }
+
     pub(crate) fn restore_snapshot(
         conn: &VaultConnection,
         ctx: &CommitContext,
         snapshot_id: &str,
     ) -> StorageResult<String> {
+        Self::restore_snapshot_with_result(conn, ctx, snapshot_id).map(|result| result.commit_id)
+    }
+
+    fn restore_snapshot_with_result(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        snapshot_id: &str,
+    ) -> StorageResult<SnapshotRestoreResult> {
         let snap = SnapshotRepo::get_by_id(conn, snapshot_id)?
             .ok_or_else(|| StorageError::NotFound(snapshot_id.to_string()))?;
 
@@ -310,6 +416,7 @@ impl SnapshotRepo {
             changed_ids.extend(removed_assignments.iter().cloned());
             changed_ids.sort();
             changed_ids.dedup();
+            let affected_object_count = changed_ids.len().saturating_sub(1);
 
             let restore_commit_id = ctx.create_commit(
                 conn,
@@ -522,8 +629,60 @@ impl SnapshotRepo {
                 ObjectVersionRepo::record_project_current(conn, &restore_commit_id, id)?;
             }
 
-            Ok(restore_commit_id)
+            Ok(SnapshotRestoreResult {
+                commit_id: restore_commit_id,
+                affected_object_count,
+            })
         })
+    }
+
+    pub fn delete_snapshot_authorized(
+        conn: &VaultConnection,
+        ctx: &CommitContext,
+        snapshot_id: &str,
+        context: TigaAuthorizationContext<'_>,
+    ) -> StorageResult<(SnapshotDeleteResult, AuthorizationDecision)> {
+        let (result, decision) = TigaService::execute_authorized_with_commit(
+            conn,
+            &TigaScope::Vault,
+            TigaOperation::ManageSnapshotRetention,
+            context,
+            || {
+                SnapshotSummaryRepo::get(conn, snapshot_id)?
+                    .ok_or_else(|| StorageError::NotFound(snapshot_id.to_string()))?;
+                let operation = CommitOperation::new(
+                    Uuid::new_v4().to_string(),
+                    "delete-snapshot",
+                    "main",
+                    "change",
+                    "snapshot",
+                    vec![CommitChange {
+                        object_type: "snapshot".to_string(),
+                        object_id: snapshot_id.to_string(),
+                        action: "delete".to_string(),
+                        fields: vec!["snapshot".to_string(), "snapshot-metadata".to_string()],
+                    }],
+                )
+                .with_message(format!("delete snapshot {snapshot_id}"));
+                let commit_id = ctx.create_operation_commit(conn, &operation)?;
+                SnapshotMetadataRepo::delete_in_transaction(conn, snapshot_id)?;
+                let affected = conn.inner().execute(
+                    "DELETE FROM snapshots WHERE snapshot_id = ?1",
+                    params![snapshot_id],
+                )?;
+                if affected != 1 {
+                    return Err(StorageError::NotFound(snapshot_id.to_string()));
+                }
+                Ok((
+                    SnapshotDeleteResult {
+                        commit_id: commit_id.clone(),
+                        snapshot_id: snapshot_id.to_string(),
+                    },
+                    commit_id,
+                ))
+            },
+        )?;
+        Ok((result, decision))
     }
 
     // -----------------------------------------------------------------------
@@ -575,6 +734,41 @@ impl SnapshotRepo {
             snapshots.push(row?);
         }
         Ok(snapshots)
+    }
+
+    pub fn get_structure_preview(
+        conn: &VaultConnection,
+        snapshot_id: &str,
+    ) -> StorageResult<SnapshotStructurePreview> {
+        let snapshot = Self::get_by_id(conn, snapshot_id)?
+            .ok_or_else(|| StorageError::NotFound(snapshot_id.to_string()))?;
+        if !snapshot_integrity::verify_descriptor(
+            conn,
+            &SnapshotIntegrityInput {
+                snapshot_id: &snapshot.snapshot_id,
+                base_commit_id: &snapshot.base_commit_id,
+                snapshot_ct: &snapshot.snapshot_ct,
+                created_at: &snapshot.created_at,
+                created_by_device_id: &snapshot.created_by_device_id,
+            },
+            &snapshot.snapshot_hash,
+        )? {
+            return Err(StorageError::ConstraintViolation(
+                "snapshot integrity descriptor mismatch".to_string(),
+            ));
+        }
+        let payload = Self::decrypt_payload(conn, snapshot_id, &snapshot.snapshot_ct)?;
+        let payload: SnapshotPayload = serde_json::from_slice(&payload).map_err(|error| {
+            StorageError::Validation(format!("invalid snapshot payload: {error}"))
+        })?;
+        build_structure_preview(
+            conn,
+            snapshot_id,
+            read_all_active_projects(conn)?,
+            read_all_active_entries(conn)?,
+            payload.projects,
+            payload.entries,
+        )
     }
 
     /// 校验 snapshot 密文摘要、记录描述和解锁后的 payload 完整性。
@@ -801,6 +995,171 @@ fn snapshot_auth_extension_enabled(conn: &VaultConnection) -> StorageResult<bool
     Ok(extensions
         .iter()
         .any(|extension| extension == SNAPSHOT_RECORD_AUTH_EXTENSION))
+}
+
+#[derive(Debug, Clone)]
+struct RawStructureNode {
+    key: String,
+    id: String,
+    parent_id: Option<String>,
+    name: String,
+    node_type: String,
+    path: String,
+    signature: Vec<u8>,
+    child_count: usize,
+    metadata: String,
+}
+
+fn build_structure_preview(
+    conn: &VaultConnection,
+    snapshot_id: &str,
+    current_projects: Vec<Project>,
+    current_entries: Vec<Entry>,
+    snapshot_projects: Vec<Project>,
+    snapshot_entries: Vec<Entry>,
+) -> StorageResult<SnapshotStructurePreview> {
+    let total_nodes = current_projects
+        .len()
+        .saturating_add(current_entries.len())
+        .saturating_add(snapshot_projects.len())
+        .saturating_add(snapshot_entries.len());
+    if total_nodes > MAX_SNAPSHOT_STRUCTURE_NODES {
+        return Err(StorageError::ResourceLimit {
+            resource: "snapshot structure nodes".to_string(),
+            actual: total_nodes as u64,
+            limit: MAX_SNAPSHOT_STRUCTURE_NODES as u64,
+        });
+    }
+
+    let current = raw_structure_nodes(conn, &current_projects, &current_entries)?;
+    let snapshot = raw_structure_nodes(conn, &snapshot_projects, &snapshot_entries)?;
+    Ok(SnapshotStructurePreview {
+        snapshot_id: snapshot_id.to_string(),
+        current_nodes: materialize_structure_nodes(&current, &snapshot, true),
+        snapshot_nodes: materialize_structure_nodes(&snapshot, &current, false),
+        current_item_count: current_entries.len(),
+        snapshot_item_count: snapshot_entries.len(),
+    })
+}
+
+fn raw_structure_nodes(
+    conn: &VaultConnection,
+    projects: &[Project],
+    entries: &[Entry],
+) -> StorageResult<BTreeMap<String, RawStructureNode>> {
+    let mut project_names = BTreeMap::new();
+    let mut child_counts = BTreeMap::<String, usize>::new();
+    for entry in entries {
+        *child_counts.entry(entry.project_id.clone()).or_default() += 1;
+    }
+    for project in projects {
+        let title =
+            ProjectRepo::decrypt_metadata(conn, &project.project_id, "title", &project.title_ct)?;
+        project_names.insert(project.project_id.clone(), decode_snapshot_text(title)?);
+    }
+
+    let mut nodes = BTreeMap::new();
+    for project in projects {
+        let name = project_names
+            .get(&project.project_id)
+            .cloned()
+            .unwrap_or_else(|| project.project_id.chars().take(8).collect());
+        let child_count = child_counts.get(&project.project_id).copied().unwrap_or(0);
+        let key = format!("folder:{}", project.project_id);
+        nodes.insert(
+            key.clone(),
+            RawStructureNode {
+                key,
+                id: project.project_id.clone(),
+                parent_id: project.group_id.clone(),
+                name: name.clone(),
+                node_type: "folder".to_string(),
+                path: name,
+                signature: structure_signature(project)?,
+                child_count,
+                metadata: format!("{child_count} items"),
+            },
+        );
+    }
+    for entry in entries {
+        let name = entry
+            .title_ct
+            .as_deref()
+            .map(|title| EntryRepo::decrypt_metadata(conn, &entry.entry_id, "title", title))
+            .transpose()?
+            .map(decode_snapshot_text)
+            .transpose()?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| entry.entry_type.to_string());
+        let parent_name = project_names
+            .get(&entry.project_id)
+            .cloned()
+            .unwrap_or_else(|| entry.project_id.chars().take(8).collect());
+        let key = format!("entry:{}", entry.entry_id);
+        nodes.insert(
+            key.clone(),
+            RawStructureNode {
+                key,
+                id: entry.entry_id.clone(),
+                parent_id: Some(entry.project_id.clone()),
+                name: name.clone(),
+                node_type: "entry".to_string(),
+                path: format!("{parent_name}/{name}"),
+                signature: structure_signature(entry)?,
+                child_count: 0,
+                metadata: entry.entry_type.to_string(),
+            },
+        );
+    }
+    Ok(nodes)
+}
+
+fn materialize_structure_nodes(
+    source: &BTreeMap<String, RawStructureNode>,
+    compare: &BTreeMap<String, RawStructureNode>,
+    current_side: bool,
+) -> Vec<SnapshotStructureNode> {
+    let mut nodes = source
+        .values()
+        .map(|node| {
+            let status = match compare.get(&node.key) {
+                None if current_side => "added",
+                None => "removed",
+                Some(other) if other.signature == node.signature => "unchanged",
+                Some(_) => "modified",
+            };
+            SnapshotStructureNode {
+                id: node.id.clone(),
+                parent_id: node.parent_id.clone(),
+                name: node.name.clone(),
+                node_type: node.node_type.clone(),
+                path: node.path.clone(),
+                status: status.to_string(),
+                child_count: node.child_count,
+                metadata: node.metadata.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.node_type
+            .cmp(&right.node_type)
+            .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    nodes
+}
+
+fn structure_signature(value: &impl Serialize) -> StorageResult<Vec<u8>> {
+    let serialized = serde_json::to_vec(value).map_err(|error| {
+        StorageError::Validation(format!("snapshot structure serialization failed: {error}"))
+    })?;
+    Ok(Sha256::digest(serialized).to_vec())
+}
+
+fn decode_snapshot_text(value: Vec<u8>) -> StorageResult<String> {
+    String::from_utf8(value).map_err(|error| {
+        StorageError::Validation(format!("snapshot structure text is not UTF-8: {error}"))
+    })
 }
 
 // ---------------------------------------------------------------------------

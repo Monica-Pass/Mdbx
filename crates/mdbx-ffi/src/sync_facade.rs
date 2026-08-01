@@ -1,13 +1,202 @@
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use mdbx_sync::{
-    BlobChunkRequest, BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState,
-    BlobManifestPageRequest, BlobManifestPageResponse, BlobSyncPhase, BlobSyncResume, BranchHead,
-    HelloRequest, HelloResponse, SyncClient, SyncMessage, SyncNegotiator, SyncWireFrame,
-    SyncWireLimits, SyncWireResume, SyncWireSession,
+use mdbx_storage::backup::BackupService;
+use mdbx_storage::blob_lifecycle::{collect_external_blob_references, BlobLifecycleLimits};
+use mdbx_storage::blob_store::{
+    validate_blob_id, EncryptedBlobTransferStore, RecoverableEncryptedBlobTransferStore,
+    MAX_BLOB_PAGE_SIZE, MAX_BLOB_TRANSFER_CHUNK_SIZE,
 };
+use mdbx_storage::error::StorageError;
+use mdbx_storage::peer_sync::{PeerSyncSegmentOptions, PeerSyncService};
+use mdbx_storage::repo::{CommitContext, CommitOperation, OperationExecution};
+use mdbx_storage::sync_apply::SyncApplyRepo;
+use mdbx_sync::{
+    incremental_bundle_payload_sha256, read_bundle_file_with_limits_authenticated,
+    write_bundle_authenticated, write_incremental_bundle_authenticated, BlobChunkRequest,
+    BlobChunkResponse, BlobManifestEntry, BlobManifestEntryState, BlobManifestPageRequest,
+    BlobManifestPageResponse, BlobSyncPhase, BlobSyncResume, BranchHead, BundleReadLimits,
+    CommitBatch, HelloRequest, HelloResponse, IncrementalBundleCheckpoint, IncrementalBundleResume,
+    IncrementalSyncBundle, SyncBundle, SyncBundleFile, SyncClient, SyncMessage, SyncNegotiator,
+    SyncWireFrame, SyncWireLimits, SyncWireResume, SyncWireSession,
+};
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use super::{MdbxAuthenticatedStateRootCheckpoint, MdbxFfiError};
+use crate::attachment_facade::vault_blob_store;
+
+use super::{MdbxAuthenticatedStateRootCheckpoint, MdbxBackupInfo, MdbxFfiError, MdbxVault};
+
+pub(crate) const MAX_METADATA_BENCHMARK_OPERATIONS: u32 = 500;
+const FILE_HASH_BUFFER_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIncrementalSyncCheckpoint {
+    pub commit_inventory: String,
+    pub delta_inventory: String,
+}
+
+impl From<IncrementalBundleCheckpoint> for MdbxIncrementalSyncCheckpoint {
+    fn from(value: IncrementalBundleCheckpoint) -> Self {
+        Self {
+            commit_inventory: value.commit_inventory.unwrap_or_default(),
+            delta_inventory: value.delta_inventory.unwrap_or_default(),
+        }
+    }
+}
+
+impl MdbxIncrementalSyncCheckpoint {
+    fn into_core(self) -> Result<IncrementalBundleCheckpoint, MdbxFfiError> {
+        if self.commit_inventory.is_empty() || self.delta_inventory.is_empty() {
+            return Err(MdbxFfiError::SyncProtocol {
+                message: "incremental checkpoint tokens must not be empty".to_string(),
+            });
+        }
+        Ok(IncrementalBundleCheckpoint {
+            commit_inventory: Some(self.commit_inventory),
+            delta_inventory: Some(self.delta_inventory),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIncrementalSyncResume {
+    pub transfer_id: String,
+    pub next_segment_index: u32,
+    pub previous_segment_sha256: Vec<u8>,
+}
+
+impl From<IncrementalBundleResume> for MdbxIncrementalSyncResume {
+    fn from(value: IncrementalBundleResume) -> Self {
+        Self {
+            transfer_id: value.transfer_id,
+            next_segment_index: value.next_segment_index,
+            previous_segment_sha256: value.previous_segment_sha256,
+        }
+    }
+}
+
+impl MdbxIncrementalSyncResume {
+    fn into_core(self) -> Result<IncrementalBundleResume, MdbxFfiError> {
+        if self.transfer_id.is_empty()
+            || self.next_segment_index == 0
+            || self.previous_segment_sha256.len() != 32
+        {
+            return Err(MdbxFfiError::SyncProtocol {
+                message: "invalid incremental transfer resume state".to_string(),
+            });
+        }
+        Ok(IncrementalBundleResume {
+            transfer_id: self.transfer_id,
+            next_segment_index: self.next_segment_index,
+            previous_segment_sha256: self.previous_segment_sha256,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIncrementalSyncBootstrapInfo {
+    pub backup: MdbxBackupInfo,
+    pub checkpoint: MdbxIncrementalSyncCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIncrementalSyncSegmentInfo {
+    pub vault_id: String,
+    pub source_device_id: String,
+    pub transfer_id: String,
+    pub segment_index: u32,
+    pub is_last: bool,
+    pub base: MdbxIncrementalSyncCheckpoint,
+    pub result: MdbxIncrementalSyncCheckpoint,
+    pub next_resume: Option<MdbxIncrementalSyncResume>,
+    pub commit_count: u32,
+    pub delta_count: u32,
+    pub payload_sha256: Vec<u8>,
+    pub file_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxIncrementalSyncApplyResult {
+    pub result: MdbxIncrementalSyncCheckpoint,
+    pub next_resume: Option<MdbxIncrementalSyncResume>,
+    pub applied_commits: u32,
+    pub skipped_commits: u32,
+    pub conflict_count: u32,
+    pub missing_parent_count: u32,
+}
+
+/// Metadata for one authenticated complete bundle intended for explicit,
+/// user-mediated transfer. The binary payload remains in the caller-owned
+/// file so UniFFI never needs to allocate an unbounded byte vector.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxManualSyncBundleInfo {
+    pub vault_id: String,
+    pub source_device_id: String,
+    pub head_commit_id: String,
+    pub commit_count: u32,
+    pub exported_at: String,
+    pub payload_sha256: Vec<u8>,
+    pub file_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxManualSyncApplyResult {
+    pub bundle: MdbxManualSyncBundleInfo,
+    pub applied_commits: u32,
+    pub skipped_commits: u32,
+    pub conflict_count: u32,
+    pub missing_parent_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxMetadataBenchmarkResult {
+    pub operation_count: u32,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxExternalBlobState {
+    Available,
+    Missing,
+    SizeMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxExternalBlobReference {
+    pub blob_id: String,
+    pub total_size: Option<u64>,
+    pub state: MdbxExternalBlobState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxExternalBlobReferencePage {
+    pub raw_reference_count: u64,
+    pub unique_reference_count: u64,
+    pub items: Vec<MdbxExternalBlobReference>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxExternalBlobChunk {
+    pub blob_id: String,
+    pub total_size: u64,
+    pub offset: u64,
+    pub ciphertext: Vec<u8>,
+    pub is_last: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxExternalBlobLease {
+    pub blob_id: String,
+    pub owner_id: String,
+    pub expires_at_unix_secs: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdbxSyncBranchHead {
@@ -936,6 +1125,614 @@ impl MdbxBlobSyncSession {
         client.restart_blob_transfer_after_abort(&blob_id, total_size)?;
         Ok(())
     }
+}
+
+#[uniffi::export]
+impl MdbxVault {
+    /// Create the complete bootstrap and its exact incremental starting point
+    /// while holding the vault session lock. Ordinary synchronization uses
+    /// immutable incremental segments after this one-time operation.
+    pub fn create_incremental_sync_bootstrap(
+        &self,
+        destination: String,
+    ) -> Result<MdbxIncrementalSyncBootstrapInfo, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let backup = BackupService::create_portable_copy(&conn, Path::new(&destination))?;
+        let checkpoint = PeerSyncService::current_checkpoint(&conn)?;
+        Ok(MdbxIncrementalSyncBootstrapInfo {
+            backup: backup.into(),
+            checkpoint: checkpoint.into(),
+        })
+    }
+
+    pub fn incremental_sync_checkpoint(
+        &self,
+    ) -> Result<MdbxIncrementalSyncCheckpoint, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(PeerSyncService::current_checkpoint(&conn)?.into())
+    }
+
+    /// Export an authenticated complete bundle for explicit user-mediated
+    /// transfer. The destination is written through a sibling temporary file,
+    /// fsynced, and published without overwriting an existing file.
+    pub fn export_manual_sync_bundle(
+        &self,
+        destination: String,
+    ) -> Result<MdbxManualSyncBundleInfo, MdbxFfiError> {
+        let destination = Path::new(&destination);
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let bundle = PeerSyncService::export_complete_bundle(&conn, &self.device_id)?;
+        let integrity_key = sync_integrity_key(&conn)?;
+        let mut temporary = NamedTempFile::new_in(parent).map_err(StorageError::from)?;
+        write_bundle_authenticated(&bundle, &mut temporary, integrity_key.as_slice())?;
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .map_err(StorageError::from)?;
+        let info = manual_bundle_info(&bundle, temporary.path())?;
+        match temporary.persist_noclobber(destination) {
+            Ok(_) => Ok(info),
+            Err(error) => Err(StorageError::Io(error.error).into()),
+        }
+    }
+
+    /// Authenticate and atomically apply one complete manual bundle. Complete
+    /// bundles are deliberately distinct from incremental transport segments:
+    /// callers do not construct or persist peer checkpoints for this path.
+    pub fn apply_manual_sync_bundle(
+        &self,
+        source: String,
+    ) -> Result<MdbxManualSyncApplyResult, MdbxFfiError> {
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let (bundle, info) = read_manual_bundle(&conn, Path::new(&source))?;
+        if bundle.vault_id != self.vault_id {
+            return Err(StorageError::ConstraintViolation(format!(
+                "bundle vault_id {} does not match local vault_id {}",
+                bundle.vault_id, self.vault_id
+            ))
+            .into());
+        }
+        let applied = SyncApplyRepo::apply_incremental_batch_mut(
+            &mut conn,
+            &CommitContext::new(self.device_id.clone()),
+            &CommitBatch::new(bundle.commits, 0, true),
+            &[],
+        )?;
+        Ok(MdbxManualSyncApplyResult {
+            bundle: info,
+            applied_commits: applied.applied_commits,
+            skipped_commits: applied.skipped_commits,
+            conflict_count: applied.conflict_count,
+            missing_parent_count: applied.missing_parent_count,
+        })
+    }
+
+    /// Append a bounded number of metadata-only commits to measure the real
+    /// unlocked engine path without creating user-visible objects.
+    pub fn run_metadata_benchmark(
+        &self,
+        operation_count: u32,
+    ) -> Result<MdbxMetadataBenchmarkResult, MdbxFfiError> {
+        if !(1..=MAX_METADATA_BENCHMARK_OPERATIONS).contains(&operation_count) {
+            return Err(StorageError::Validation(format!(
+                "metadata benchmark operation count must be between 1 and {MAX_METADATA_BENCHMARK_OPERATIONS}"
+            ))
+            .into());
+        }
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        if conn.keyring().is_none() {
+            return Err(StorageError::Validation(
+                "metadata benchmark requires an unlocked vault".to_string(),
+            )
+            .into());
+        }
+        let context = CommitContext::new(self.device_id.clone());
+        let started = Instant::now();
+        let mut completed = 0_u32;
+        for index in 0..operation_count {
+            let operation = CommitOperation::new(
+                Uuid::new_v4().to_string(),
+                "monica-metadata-benchmark",
+                "main",
+                "change",
+                "vault-meta",
+                Vec::new(),
+            )
+            .with_message(format!("metadata benchmark operation {}", index + 1));
+            let execution = context.run_operation(&conn, operation, |scoped| {
+                scoped
+                    .create_commit(&conn, "change", "vault-meta", &[], &[])
+                    .map(|_| ())
+            })?;
+            if matches!(execution, OperationExecution::Applied { .. }) {
+                completed = completed.checked_add(1).ok_or_else(|| {
+                    StorageError::Validation("metadata benchmark count overflow".to_string())
+                })?;
+            }
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(MdbxMetadataBenchmarkResult {
+            operation_count: completed,
+            elapsed_ms,
+        })
+    }
+
+    /// Write one authenticated v8 segment to a new app-private file. The
+    /// destination is published atomically and is never overwritten.
+    pub fn export_incremental_sync_segment(
+        &self,
+        destination: String,
+        base: MdbxIncrementalSyncCheckpoint,
+        resume: Option<MdbxIncrementalSyncResume>,
+        page_size: u32,
+    ) -> Result<MdbxIncrementalSyncSegmentInfo, MdbxFfiError> {
+        let base = base.into_core()?;
+        let resume = resume
+            .map(MdbxIncrementalSyncResume::into_core)
+            .transpose()?;
+        let page_size = usize::try_from(page_size).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "incremental page size cannot be represented locally".to_string(),
+        })?;
+        let destination = Path::new(&destination);
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let bundle = PeerSyncService::export_incremental_segment(
+            &conn,
+            &self.device_id,
+            &base,
+            resume.as_ref(),
+            PeerSyncSegmentOptions { page_size },
+        )?;
+        let integrity_key = sync_integrity_key(&conn)?;
+        let mut temporary = NamedTempFile::new_in(parent).map_err(StorageError::from)?;
+        write_incremental_bundle_authenticated(&bundle, &mut temporary, integrity_key.as_slice())?;
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .map_err(StorageError::from)?;
+        let file_size_bytes = temporary
+            .as_file()
+            .metadata()
+            .map_err(StorageError::from)?
+            .len();
+        match temporary.persist_noclobber(destination) {
+            Ok(_) => segment_info(&bundle, file_size_bytes),
+            Err(error) => Err(StorageError::Io(error.error).into()),
+        }
+    }
+
+    /// Authenticate and inspect a pending segment without changing vault
+    /// state. This lets Android recover a durably written pending file after a
+    /// process restart instead of regenerating different bytes.
+    pub fn inspect_incremental_sync_segment(
+        &self,
+        source: String,
+    ) -> Result<MdbxIncrementalSyncSegmentInfo, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let (bundle, file_size_bytes) = read_incremental_segment(&conn, Path::new(&source))?;
+        segment_info(&bundle, file_size_bytes)
+    }
+
+    /// Authenticate and atomically apply one immutable segment. The caller
+    /// advances its durable per-stream cursor only after this method returns.
+    pub fn apply_incremental_sync_segment(
+        &self,
+        source: String,
+        expected_base: MdbxIncrementalSyncCheckpoint,
+        expected_resume: Option<MdbxIncrementalSyncResume>,
+    ) -> Result<MdbxIncrementalSyncApplyResult, MdbxFfiError> {
+        let expected_base = expected_base.into_core()?;
+        let expected_resume = expected_resume
+            .map(MdbxIncrementalSyncResume::into_core)
+            .transpose()?;
+        let mut conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let (bundle, _) = read_incremental_segment(&conn, Path::new(&source))?;
+        let applied = PeerSyncService::apply_incremental_segment(
+            &mut conn,
+            &self.device_id,
+            &bundle,
+            &expected_base,
+            expected_resume.as_ref(),
+        )?;
+        let next_resume = PeerSyncService::next_resume(&bundle)?;
+        Ok(MdbxIncrementalSyncApplyResult {
+            result: bundle.manifest.result.into(),
+            next_resume: next_resume.map(Into::into),
+            applied_commits: applied.applied_commits,
+            skipped_commits: applied.skipped_commits,
+            conflict_count: applied.conflict_count,
+            missing_parent_count: applied.missing_parent_count,
+        })
+    }
+
+    /// Page only Blob IDs that are referenced by current objects or retained
+    /// snapshots. Orphans are intentionally excluded from remote publication.
+    pub fn list_external_blob_references(
+        &self,
+        cursor: Option<String>,
+        page_size: u32,
+    ) -> Result<MdbxExternalBlobReferencePage, MdbxFfiError> {
+        if let Some(cursor) = cursor.as_deref() {
+            validate_blob_id(cursor)?;
+        }
+        let page_size = usize::try_from(page_size).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "Blob page size cannot be represented locally".to_string(),
+        })?;
+        if !(1..=MAX_BLOB_PAGE_SIZE).contains(&page_size) {
+            return Err(StorageError::Validation(format!(
+                "Blob page size must be between 1 and {MAX_BLOB_PAGE_SIZE}"
+            ))
+            .into());
+        }
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let references = collect_external_blob_references(&conn, BlobLifecycleLimits::default())?;
+        let blob_store = vault_blob_store(&conn)?;
+        let mut items = Vec::with_capacity(page_size.saturating_add(1));
+        for (blob_id, maximum_bytes) in references.blobs.iter().filter(|(blob_id, _)| {
+            cursor
+                .as_deref()
+                .is_none_or(|cursor| blob_id.as_str() > cursor)
+        }) {
+            let maximum_bytes = u64::try_from(*maximum_bytes).map_err(|_| {
+                StorageError::Validation("Blob reference size cannot be represented".to_string())
+            })?;
+            let (state, total_size) =
+                external_blob_reference_state(&blob_store, blob_id, maximum_bytes)?;
+            items.push(MdbxExternalBlobReference {
+                blob_id: blob_id.clone(),
+                total_size,
+                state,
+            });
+            if items.len() > page_size {
+                break;
+            }
+        }
+        let next_cursor = if items.len() > page_size {
+            items.truncate(page_size);
+            items.last().map(|item| item.blob_id.clone())
+        } else {
+            None
+        };
+        Ok(MdbxExternalBlobReferencePage {
+            raw_reference_count: references.raw_reference_count as u64,
+            unique_reference_count: references.blobs.len() as u64,
+            items,
+            next_cursor,
+        })
+    }
+
+    pub fn has_external_blob(
+        &self,
+        blob_id: String,
+        total_size: u64,
+    ) -> Result<bool, MdbxFfiError> {
+        validate_blob_id(&blob_id)?;
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        Ok(matches!(
+            external_blob_state(&blob_store, &blob_id, total_size)?,
+            MdbxExternalBlobState::Available
+        ))
+    }
+
+    pub fn read_external_blob_chunk(
+        &self,
+        blob_id: String,
+        total_size: u64,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<MdbxExternalBlobChunk, MdbxFfiError> {
+        validate_blob_id(&blob_id)?;
+        let max_bytes = usize::try_from(max_bytes).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "Blob chunk size cannot be represented locally".to_string(),
+        })?;
+        if !(1..=MAX_BLOB_TRANSFER_CHUNK_SIZE).contains(&max_bytes) {
+            return Err(StorageError::Validation(format!(
+                "Blob chunk size must be between 1 and {MAX_BLOB_TRANSFER_CHUNK_SIZE}"
+            ))
+            .into());
+        }
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        if external_blob_state(&blob_store, &blob_id, total_size)?
+            != MdbxExternalBlobState::Available
+        {
+            return Err(StorageError::BlobStore(format!(
+                "Blob {blob_id} is unavailable or has an unexpected size"
+            ))
+            .into());
+        }
+        let ciphertext = blob_store.read_chunk(&blob_id, offset, max_bytes)?;
+        if ciphertext.is_empty() {
+            return Err(StorageError::Validation(
+                "Blob chunk offset must be below the total size".to_string(),
+            )
+            .into());
+        }
+        let end = offset
+            .checked_add(ciphertext.len() as u64)
+            .ok_or_else(|| StorageError::Validation("Blob chunk offset overflow".to_string()))?;
+        Ok(MdbxExternalBlobChunk {
+            blob_id,
+            total_size,
+            offset,
+            ciphertext,
+            is_last: end == total_size,
+        })
+    }
+
+    pub fn write_external_blob_chunk(
+        &self,
+        blob_id: String,
+        total_size: u64,
+        offset: u64,
+        ciphertext: Vec<u8>,
+        finalize: bool,
+    ) -> Result<(), MdbxFfiError> {
+        validate_blob_id(&blob_id)?;
+        if ciphertext.is_empty() || ciphertext.len() > MAX_BLOB_TRANSFER_CHUNK_SIZE {
+            return Err(StorageError::Validation(format!(
+                "Blob chunk must contain 1 to {MAX_BLOB_TRANSFER_CHUNK_SIZE} bytes"
+            ))
+            .into());
+        }
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        blob_store.write_chunk(&blob_id, total_size, offset, &ciphertext, finalize)?;
+        Ok(())
+    }
+
+    pub fn acquire_external_blob_lease(
+        &self,
+        blob_id: String,
+        owner_id: String,
+        now_unix_secs: i64,
+        ttl_secs: i64,
+    ) -> Result<MdbxExternalBlobLease, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        let lease = blob_store.acquire_lease(&blob_id, &owner_id, now_unix_secs, ttl_secs)?;
+        Ok(MdbxExternalBlobLease {
+            blob_id: lease.blob_id,
+            owner_id: lease.owner_id,
+            expires_at_unix_secs: lease.expires_at_unix_secs,
+        })
+    }
+
+    pub fn renew_external_blob_lease(
+        &self,
+        blob_id: String,
+        owner_id: String,
+        now_unix_secs: i64,
+        ttl_secs: i64,
+    ) -> Result<MdbxExternalBlobLease, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        let lease = blob_store.renew_lease(&blob_id, &owner_id, now_unix_secs, ttl_secs)?;
+        Ok(MdbxExternalBlobLease {
+            blob_id: lease.blob_id,
+            owner_id: lease.owner_id,
+            expires_at_unix_secs: lease.expires_at_unix_secs,
+        })
+    }
+
+    pub fn release_external_blob_lease(
+        &self,
+        blob_id: String,
+        owner_id: String,
+    ) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        blob_store.release_lease(&blob_id, &owner_id)?;
+        Ok(())
+    }
+
+    pub fn abort_external_blob_transfer(
+        &self,
+        blob_id: String,
+        owner_id: String,
+    ) -> Result<(), MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let blob_store = vault_blob_store(&conn)?;
+        blob_store.abort_transfer(&blob_id, &owner_id)?;
+        blob_store.release_lease(&blob_id, &owner_id)?;
+        Ok(())
+    }
+}
+
+fn external_blob_state(
+    blob_store: &mdbx_storage::blob_store::FileSystemBlobStore,
+    blob_id: &str,
+    total_size: u64,
+) -> Result<MdbxExternalBlobState, MdbxFfiError> {
+    let path = blob_store.blob_path(blob_id)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MdbxExternalBlobState::Missing)
+        }
+        Err(error) => return Err(StorageError::Io(error).into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(
+            StorageError::BlobStore(format!("Blob {blob_id} is not a regular file")).into(),
+        );
+    }
+    if metadata.len() == total_size {
+        Ok(MdbxExternalBlobState::Available)
+    } else {
+        Ok(MdbxExternalBlobState::SizeMismatch)
+    }
+}
+
+fn external_blob_reference_state(
+    blob_store: &mdbx_storage::blob_store::FileSystemBlobStore,
+    blob_id: &str,
+    maximum_bytes: u64,
+) -> Result<(MdbxExternalBlobState, Option<u64>), MdbxFfiError> {
+    let path = blob_store.blob_path(blob_id)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((MdbxExternalBlobState::Missing, None))
+        }
+        Err(error) => return Err(StorageError::Io(error).into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(
+            StorageError::BlobStore(format!("Blob {blob_id} is not a regular file")).into(),
+        );
+    }
+    let total_size = metadata.len();
+    let state = if total_size == 0 || total_size > maximum_bytes {
+        MdbxExternalBlobState::SizeMismatch
+    } else {
+        MdbxExternalBlobState::Available
+    };
+    Ok((state, Some(total_size)))
+}
+
+fn sync_integrity_key(
+    conn: &mdbx_storage::connection::VaultConnection,
+) -> Result<Zeroizing<Vec<u8>>, MdbxFfiError> {
+    conn.keyring()
+        .map(|keyring| keyring.integrity_subkey.clone())
+        .ok_or_else(|| MdbxFfiError::SyncProtocol {
+            message: "authenticated synchronization requires an unlocked vault".to_string(),
+        })
+}
+
+fn read_manual_bundle(
+    conn: &mdbx_storage::connection::VaultConnection,
+    source: &Path,
+) -> Result<(SyncBundle, MdbxManualSyncBundleInfo), MdbxFfiError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(StorageError::from)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(StorageError::Validation(
+            "manual sync bundle must be a regular file".to_string(),
+        )
+        .into());
+    }
+    let file = File::open(source).map_err(StorageError::from)?;
+    let integrity_key = sync_integrity_key(conn)?;
+    let mut reader = BufReader::new(file);
+    let bundle = match read_bundle_file_with_limits_authenticated(
+        &mut reader,
+        BundleReadLimits::default(),
+        integrity_key.as_slice(),
+    )? {
+        SyncBundleFile::Complete(bundle) => bundle,
+        SyncBundleFile::Incremental(_) => {
+            return Err(MdbxFfiError::SyncProtocol {
+                message: "incremental segment cannot be applied as a complete manual bundle"
+                    .to_string(),
+            })
+        }
+    };
+    let info = manual_bundle_info(&bundle, source)?;
+    Ok((bundle, info))
+}
+
+fn manual_bundle_info(
+    bundle: &SyncBundle,
+    path: &Path,
+) -> Result<MdbxManualSyncBundleInfo, MdbxFfiError> {
+    let head_commit_id = bundle
+        .commits
+        .last()
+        .map(|commit| commit.commit.commit_id.clone())
+        .ok_or_else(|| {
+            StorageError::Validation("complete manual bundle contains no commits".to_string())
+        })?;
+    let commit_count =
+        u32::try_from(bundle.commits.len()).map_err(|_| StorageError::ResourceLimit {
+            resource: "manual sync bundle commits".to_string(),
+            actual: bundle.commits.len() as u64,
+            limit: u32::MAX as u64,
+        })?;
+    let file_size_bytes = std::fs::metadata(path).map_err(StorageError::from)?.len();
+    if file_size_bytes == 0 {
+        return Err(StorageError::Validation("manual sync bundle is empty".to_string()).into());
+    }
+    Ok(MdbxManualSyncBundleInfo {
+        vault_id: bundle.vault_id.clone(),
+        source_device_id: bundle.source_device_id.clone(),
+        head_commit_id,
+        commit_count,
+        exported_at: bundle.exported_at.clone(),
+        payload_sha256: sha256_file(path)?,
+        file_size_bytes,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<Vec<u8>, MdbxFfiError> {
+    let mut reader = BufReader::new(File::open(path).map_err(StorageError::from)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; FILE_HASH_BUFFER_BYTES];
+    loop {
+        let count = reader.read(&mut buffer).map_err(StorageError::from)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+fn read_incremental_segment(
+    conn: &mdbx_storage::connection::VaultConnection,
+    source: &Path,
+) -> Result<(IncrementalSyncBundle, u64), MdbxFfiError> {
+    let file = File::open(source).map_err(StorageError::from)?;
+    let file_size_bytes = file.metadata().map_err(StorageError::from)?.len();
+    let integrity_key = sync_integrity_key(conn)?;
+    let mut reader = BufReader::new(file);
+    match read_bundle_file_with_limits_authenticated(
+        &mut reader,
+        BundleReadLimits::default(),
+        integrity_key.as_slice(),
+    )? {
+        SyncBundleFile::Incremental(bundle) => Ok((*bundle, file_size_bytes)),
+        SyncBundleFile::Complete(_) => Err(MdbxFfiError::SyncProtocol {
+            message: "complete bootstrap cannot be applied as an incremental segment".to_string(),
+        }),
+    }
+}
+
+fn segment_info(
+    bundle: &IncrementalSyncBundle,
+    file_size_bytes: u64,
+) -> Result<MdbxIncrementalSyncSegmentInfo, MdbxFfiError> {
+    let commit_count =
+        u32::try_from(bundle.commits.len()).map_err(|_| MdbxFfiError::SyncProtocol {
+            message: "incremental commit count cannot be represented".to_string(),
+        })?;
+    let delta_count = u32::try_from(bundle.manifest.delta_inventory.len()).map_err(|_| {
+        MdbxFfiError::SyncProtocol {
+            message: "incremental delta count cannot be represented".to_string(),
+        }
+    })?;
+    Ok(MdbxIncrementalSyncSegmentInfo {
+        vault_id: bundle.manifest.vault_id.clone(),
+        source_device_id: bundle.manifest.source_device_id.clone(),
+        transfer_id: bundle.manifest.transfer_id.clone(),
+        segment_index: bundle.manifest.segment_index,
+        is_last: bundle.manifest.is_last,
+        base: bundle.manifest.base.clone().into(),
+        result: bundle.manifest.result.clone().into(),
+        next_resume: PeerSyncService::next_resume(bundle)?.map(Into::into),
+        commit_count,
+        delta_count,
+        payload_sha256: incremental_bundle_payload_sha256(bundle)?,
+        file_size_bytes,
+    })
 }
 
 #[uniffi::export]

@@ -9,12 +9,14 @@ mod capability_facade;
 mod collection_facade;
 mod conflict_facade;
 mod extension_facade;
+mod history_action_facade;
 mod history_facade;
 mod integrity_root_facade;
 mod lifecycle_facade;
 mod object_facade;
 mod security_facade;
 mod snapshot_lifecycle_facade;
+mod snapshot_management_facade;
 mod snapshot_summary_facade;
 mod sync_facade;
 mod vault_facade;
@@ -26,6 +28,7 @@ pub use capability_facade::*;
 pub use collection_facade::*;
 pub use conflict_facade::*;
 pub use extension_facade::*;
+pub use history_action_facade::*;
 pub use history_facade::*;
 pub use integrity_root_facade::*;
 pub use lifecycle_facade::*;
@@ -36,6 +39,7 @@ pub(crate) use security_facade::scope_from_core;
 pub use security_facade::*;
 pub(crate) use security_facade::{conservative_ffi_device_context, unix_now};
 pub use snapshot_lifecycle_facade::*;
+pub use snapshot_management_facade::*;
 pub use snapshot_summary_facade::*;
 pub use sync_facade::*;
 pub use vault_facade::*;
@@ -50,13 +54,11 @@ pub(crate) use write_facade::{
 use std::sync::Mutex;
 
 #[cfg(test)]
-use mdbx_core::model::{EntryType, RelationKindId};
+use mdbx_core::model::RelationKindId;
 #[cfg(test)]
 use mdbx_core::tiga::{TigaMode, TigaScope};
 use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::StorageError;
-#[cfg(test)]
-use mdbx_storage::repo::EntryRepo;
 #[cfg(test)]
 use uuid::Uuid;
 
