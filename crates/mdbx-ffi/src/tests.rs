@@ -3262,6 +3262,69 @@ fn health_check_returns_structured_tombstone_issues() {
 }
 
 #[test]
+fn health_repair_plan_and_conflict_choices_are_available_to_native_clients() {
+    let vault = ffi_test_vault();
+    let entry_id = {
+        let conn = vault.conn.lock().unwrap();
+        let ctx = CommitContext::new(vault.device_id.clone());
+        let project = ProjectRepo::create(&conn, &ctx, "Repair", None, None).unwrap();
+        let entry = EntryRepo::create(
+            &conn,
+            &ctx,
+            &project.project_id,
+            EntryType::Login,
+            Some("Conflicting marker"),
+            &serde_json::json!({"username":"active"}),
+        )
+        .unwrap();
+        ctx.create_tombstone(&conn, "entry", &entry.entry_id)
+            .unwrap();
+        entry.entry_id
+    };
+
+    let plan = vault.plan_health_repair().unwrap();
+    assert!(plan.can_apply);
+    assert!(plan.automatic_items.is_empty());
+    assert_eq!(plan.conflict_items.len(), 1);
+    assert_eq!(plan.conflict_items[0].object_id, entry_id);
+
+    let before_commits = ffi_test_count(&vault, "commits");
+    let before_snapshots = ffi_test_count(&vault, "snapshots");
+    let cancelled = vault
+        .apply_health_repair(
+            plan.token.clone(),
+            "ffi-cancel-health-repair".to_string(),
+            vec![MdbxHealthRepairDecision {
+                repair_id: plan.conflict_items[0].repair_id.clone(),
+                choice: MdbxHealthRepairChoice::Cancel,
+            }],
+        )
+        .unwrap();
+    assert_eq!(cancelled.status, MdbxHealthRepairStatus::Cancelled);
+    assert_eq!(ffi_test_count(&vault, "commits"), before_commits);
+    assert_eq!(ffi_test_count(&vault, "snapshots"), before_snapshots);
+
+    let applied = vault
+        .apply_health_repair(
+            plan.token,
+            "ffi-keep-health-repair".to_string(),
+            vec![MdbxHealthRepairDecision {
+                repair_id: plan.conflict_items[0].repair_id.clone(),
+                choice: MdbxHealthRepairChoice::KeepContent,
+            }],
+        )
+        .unwrap();
+    assert_eq!(applied.status, MdbxHealthRepairStatus::Applied);
+    assert!(applied.snapshot_id.is_some());
+    assert!(applied.commit_id.is_some());
+    assert!(applied
+        .health
+        .issues
+        .iter()
+        .all(|issue| issue.category != "tombstones"));
+}
+
+#[test]
 fn tombstone_purge_eligibility_is_available_to_native_clients() {
     let conn = VaultConnection::open_in_memory().unwrap();
     initialize_vault(

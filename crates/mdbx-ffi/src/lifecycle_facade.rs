@@ -65,6 +65,67 @@ pub struct MdbxHealthCheckResult {
     pub issues: Vec<MdbxHealthIssue>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxHealthRepairItemKind {
+    MissingTombstone,
+    DuplicateTombstones,
+    ActiveObjectTombstoneConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthRepairItem {
+    pub repair_id: String,
+    pub kind: MdbxHealthRepairItemKind,
+    pub object_type: String,
+    pub object_id: String,
+    pub tombstone_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthRepairBlocker {
+    pub category: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthRepairPlan {
+    pub token: String,
+    pub automatic_items: Vec<MdbxHealthRepairItem>,
+    pub conflict_items: Vec<MdbxHealthRepairItem>,
+    pub blockers: Vec<MdbxHealthRepairBlocker>,
+    pub can_apply: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxHealthRepairChoice {
+    KeepContent,
+    DeleteObject,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthRepairDecision {
+    pub repair_id: String,
+    pub choice: MdbxHealthRepairChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MdbxHealthRepairStatus {
+    Applied,
+    Cancelled,
+    NoChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdbxHealthRepairApplyResult {
+    pub status: MdbxHealthRepairStatus,
+    pub snapshot_id: Option<String>,
+    pub commit_id: Option<String>,
+    pub repaired_count: u64,
+    pub already_committed: bool,
+    pub health: MdbxHealthCheckResult,
+}
+
 /// Constant-time aggregate metadata used by client diagnostics screens.
 ///
 /// Counts are read directly from authenticated vault tables while the vault
@@ -93,6 +154,85 @@ impl From<HealthCheckResult> for MdbxHealthCheckResult {
         Self {
             healthy: value.healthy,
             issues: value.issues.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<HealthRepairItemKind> for MdbxHealthRepairItemKind {
+    fn from(value: HealthRepairItemKind) -> Self {
+        match value {
+            HealthRepairItemKind::MissingTombstone => Self::MissingTombstone,
+            HealthRepairItemKind::DuplicateTombstones => Self::DuplicateTombstones,
+            HealthRepairItemKind::ActiveObjectTombstoneConflict => {
+                Self::ActiveObjectTombstoneConflict
+            }
+        }
+    }
+}
+
+impl From<HealthRepairItem> for MdbxHealthRepairItem {
+    fn from(value: HealthRepairItem) -> Self {
+        Self {
+            repair_id: value.repair_id,
+            kind: value.kind.into(),
+            object_type: value.object_type,
+            object_id: value.object_id,
+            tombstone_count: u64::from(value.tombstone_count),
+        }
+    }
+}
+
+impl From<HealthRepairBlocker> for MdbxHealthRepairBlocker {
+    fn from(value: HealthRepairBlocker) -> Self {
+        Self {
+            category: value.category,
+            description: value.description,
+        }
+    }
+}
+
+impl From<HealthRepairPlan> for MdbxHealthRepairPlan {
+    fn from(value: HealthRepairPlan) -> Self {
+        let can_apply = value.can_apply();
+        Self {
+            token: value.token,
+            automatic_items: value.automatic_items.into_iter().map(Into::into).collect(),
+            conflict_items: value.conflict_items.into_iter().map(Into::into).collect(),
+            blockers: value.blockers.into_iter().map(Into::into).collect(),
+            can_apply,
+        }
+    }
+}
+
+impl From<MdbxHealthRepairChoice> for HealthRepairChoice {
+    fn from(value: MdbxHealthRepairChoice) -> Self {
+        match value {
+            MdbxHealthRepairChoice::KeepContent => Self::KeepContent,
+            MdbxHealthRepairChoice::DeleteObject => Self::DeleteObject,
+            MdbxHealthRepairChoice::Cancel => Self::Cancel,
+        }
+    }
+}
+
+impl From<HealthRepairStatus> for MdbxHealthRepairStatus {
+    fn from(value: HealthRepairStatus) -> Self {
+        match value {
+            HealthRepairStatus::Applied => Self::Applied,
+            HealthRepairStatus::Cancelled => Self::Cancelled,
+            HealthRepairStatus::NoChanges => Self::NoChanges,
+        }
+    }
+}
+
+impl From<HealthRepairApplyResult> for MdbxHealthRepairApplyResult {
+    fn from(value: HealthRepairApplyResult) -> Self {
+        Self {
+            status: value.status.into(),
+            snapshot_id: value.snapshot_id,
+            commit_id: value.commit_id,
+            repaired_count: u64::from(value.repaired_count),
+            already_committed: value.already_committed,
+            health: value.health.into(),
         }
     }
 }
@@ -253,6 +393,11 @@ use std::path::Path;
 use mdbx_core::model::Tombstone;
 use mdbx_storage::backup::{BackupService, VaultBackupInfo};
 use mdbx_storage::error::StorageError;
+use mdbx_storage::health_repair::{
+    HealthRepairApplyResult, HealthRepairBlocker, HealthRepairChoice, HealthRepairDecision,
+    HealthRepairItem, HealthRepairItemKind, HealthRepairPlan, HealthRepairService,
+    HealthRepairStatus,
+};
 use mdbx_storage::recovery::{HealthCheckResult, HealthIssue, IssueSeverity, RecoveryVerifier};
 use mdbx_storage::repo::{
     CommitContext, PermanentPurgeReceipt, TombstonePurgeBlocker, TombstonePurgeEligibility,
@@ -279,6 +424,29 @@ impl MdbxVault {
     pub fn health_check(&self) -> Result<MdbxHealthCheckResult, MdbxFfiError> {
         let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
         Ok(RecoveryVerifier::full_health_check(&conn)?.into())
+    }
+
+    pub fn plan_health_repair(&self) -> Result<MdbxHealthRepairPlan, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        Ok(HealthRepairService::plan(&conn)?.into())
+    }
+
+    pub fn apply_health_repair(
+        &self,
+        plan_token: String,
+        operation_id: String,
+        decisions: Vec<MdbxHealthRepairDecision>,
+    ) -> Result<MdbxHealthRepairApplyResult, MdbxFfiError> {
+        let conn = self.conn.lock().map_err(|_| MdbxFfiError::LockPoisoned)?;
+        let ctx = CommitContext::new(self.device_id.clone());
+        let decisions = decisions
+            .into_iter()
+            .map(|decision| HealthRepairDecision {
+                repair_id: decision.repair_id,
+                choice: decision.choice.into(),
+            })
+            .collect::<Vec<_>>();
+        Ok(HealthRepairService::apply(&conn, &ctx, &plan_token, &operation_id, &decisions)?.into())
     }
 
     pub fn diagnostics_summary(&self) -> Result<MdbxVaultDiagnosticsSummary, MdbxFfiError> {
