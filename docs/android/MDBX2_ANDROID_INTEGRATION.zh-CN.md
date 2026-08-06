@@ -81,6 +81,28 @@ src/main/jniLibs/
 
 `x86_64` 仅用于模拟器，可在 release 变体中排除。
 
+### 2.1.1 发布资产打包（不重新构建）
+
+发布前使用仓库中的打包脚本从已有的 `target/android-jniLibs` 读取库文件，
+不会重新运行 Cargo 或重新编译：
+
+```powershell
+pwsh -File scripts/package-mdbx2-android-release.ps1
+```
+
+脚本会在 `target/release-assets/` 生成固定命名的发布资产：
+
+```text
+libmdbx_ffi_arm64-v8a.so
+libmdbx_ffi_armeabi-v7a.so
+libmdbx_ffi_x86_x64.so
+mdbx2-android-release.zip
+```
+
+其中 `x86_x64` 是对外资产的历史命名，压缩包内部仍保持 Android 标准的
+`x86_64/` ABI 目录和 `libmdbx_ffi.so` 文件名。脚本只会覆盖上述发布资产，
+不会修改 `jniLibs` 中供 Android/Gradle 使用的规范文件。
+
 ### 2.2 生成 Kotlin 绑定
 
 MDBX2 使用 **UniFFI 0.31.1 proc-macro 模式**（`uniffi::setup_scaffolding!()`），

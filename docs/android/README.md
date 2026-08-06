@@ -10,6 +10,29 @@ rules live in [`CLIENT_INTEGRATION_GUIDE.md`](../../CLIENT_INTEGRATION_GUIDE.md)
 The generic UniFFI boundary lives in
 [`crates/mdbx-ffi/README.md`](../../crates/mdbx-ffi/README.md).
 
+## Android Release Assets
+
+To package already-built ABI libraries without compiling again, run:
+
+```powershell
+pwsh -File scripts/package-mdbx2-android-release.ps1
+```
+
+The script writes the four stable release names under
+`target/release-assets/`:
+
+```text
+libmdbx_ffi_arm64-v8a.so
+libmdbx_ffi_armeabi-v7a.so
+libmdbx_ffi_x86_x64.so
+mdbx2-android-release.zip
+```
+
+The public `x86_x64` spelling is kept for compatibility; the ZIP keeps the
+standard Android `x86_64/` directory and `libmdbx_ffi.so` filename inside.
+Only release staging assets are replaced; the canonical `jniLibs` files are
+left unchanged.
+
 ## Principles
 
 Android MDBX integration must preserve:
