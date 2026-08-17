@@ -81,4 +81,3 @@ MDBX3 与 MDBX2 peer 交互时必须：
 3. 比较 MDBX2 与 MDBX3 的导出符号清单，旧符号集合必须是新符号集合的子集。
 4. 比较 UniFFI metadata，既有类型与函数签名必须完全一致。
 5. 对每个 ABI 检查 ELF 类型、架构、SONAME、动态依赖、页大小兼容和 SHA-256。
-
