@@ -4,13 +4,13 @@
 
 形态：`single-full`
 
-进度：3/4
+进度：4/4
 
-当前：执行最终差异校验、提交和推送。
+当前：子任务完成。
 
 事实文件：`mdbx3-runtime-design/implementation/tasks/01-runtime-identity/TODO.csv`
 
-下一步：暂存子任务文件，确认修改范围后提交到 `origin/master`。
+下一步：父 Epic 进入 ABI 快照和兼容测试子任务。
 
 ## 约束
 
@@ -26,3 +26,4 @@
 3. `cargo check -p mdbx-ffi --no-default-features`：通过。
 4. `cargo fmt --all -- --check`：通过。
 5. `git diff --check`：通过。
+6. 提交 `d6076b0` 已推送到 `origin/master`，远端差异为 0/0。

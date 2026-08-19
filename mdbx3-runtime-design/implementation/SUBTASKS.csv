@@ -1,6 +1,6 @@
 id,task_type,title,status,depends_on,task_dir,acceptance_criteria,validation_command,notes
-1,single-full,"Runtime identity and manifest",IN_PROGRESS,,tasks/01-runtime-identity,"新增 MDBX3 runtime manifest 和 ABI profile，旧 FFI 测试保持通过","cargo test -p mdbx-ffi","第一段代码"
-2,single-full,"ABI snapshot and compatibility tests",TODO,1,tasks/02-abi-compatibility,"旧 bindings、导出符号、MDBX1/MDBX2 fixture 和混合同步测试存在","cargo test --workspace --no-fail-fast",""
+1,single-full,"Runtime identity and manifest",DONE,,tasks/01-runtime-identity,"新增 MDBX3 runtime manifest 和 ABI profile，旧 FFI 测试保持通过","cargo test -p mdbx-ffi","提交 d6076b0 已推送"
+2,single-full,"ABI snapshot and compatibility tests",IN_PROGRESS,1,tasks/02-abi-compatibility,"旧 bindings、导出符号、MDBX1/MDBX2 fixture 和混合同步测试存在","cargo test --workspace --no-fail-fast","当前子任务"
 3,single-full,"Production build profile and size instrumentation",TODO,1,tasks/03-build-profile,"三 ABI release profile、size report 和 capability profile 可重复生成","cargo check --workspace --all-targets",""
 4,single-full,"Vault runtime boundary and read/write model",TODO,2;3,tasks/04-runtime-boundary,"storage-owned queries、single writer 和 reader generation 通过并发回归","cargo test -p mdbx-storage --no-default-features --features core",""
 5,single-full,"Incremental bootstrap and history lifecycle",TODO,4,tasks/05-sync-lifecycle,"checkpoint、分段 bootstrap、resume 和保留规则保持 MDBX2 peer 回退","cargo test -p mdbx-sync --all-features",""
