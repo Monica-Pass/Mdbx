@@ -14,6 +14,7 @@ mod history_facade;
 mod integrity_root_facade;
 mod lifecycle_facade;
 mod object_facade;
+mod runtime_facade;
 mod security_facade;
 mod snapshot_lifecycle_facade;
 mod snapshot_management_facade;
@@ -34,6 +35,7 @@ pub use integrity_root_facade::*;
 pub use lifecycle_facade::*;
 pub use object_facade::*;
 pub(crate) use object_facade::{parse_object_type_id, parse_payload_json, parse_relation_kind};
+pub use runtime_facade::*;
 #[cfg(test)]
 pub(crate) use security_facade::scope_from_core;
 pub use security_facade::*;

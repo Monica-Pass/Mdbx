@@ -218,6 +218,39 @@ fn build_capability_manifest_is_available_without_a_vault() {
 }
 
 #[test]
+fn runtime_manifest_is_available_without_a_vault_and_preserves_mdbx2_storage() {
+    let manifest = mdbx_runtime_manifest();
+
+    assert_eq!(manifest.profile, "mdbx-runtime-manifest-v1");
+    assert_eq!(manifest.runtime_name, "MDBX3");
+    assert_eq!(manifest.runtime_version, "3.0.0-alpha.1");
+    assert_eq!(manifest.implementation_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(manifest.build_profile, "mdbx3-ffi-compatible-v1");
+    assert_eq!(manifest.storage_format, mdbx_storage::migration::FORMAT_V2);
+    assert_eq!(
+        manifest.current_schema_version,
+        mdbx_storage::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        manifest.readable_storage_formats,
+        vec![
+            mdbx_storage::migration::FORMAT_V1,
+            mdbx_storage::migration::FORMAT_V1_DRAFT,
+            mdbx_storage::migration::FORMAT_V2,
+        ]
+    );
+    assert_eq!(
+        manifest.writable_storage_format,
+        mdbx_storage::migration::FORMAT_V2
+    );
+    assert_eq!(manifest.ffi_abi_profile, "mdbx-ffi-abi-v1");
+    assert_eq!(manifest.ffi_namespace, "mdbx_ffi");
+    assert_eq!(manifest.native_library_name, "mdbx_ffi");
+    assert_eq!(manifest.android_shared_object_name, "libmdbx_ffi.so");
+    assert_eq!(manifest.compatibility_profile, "mdbx3-mdbx2-drop-in-v1");
+}
+
+#[test]
 fn authenticated_manual_bundle_round_trip_replay_and_tamper_guard() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source.mdbx");
