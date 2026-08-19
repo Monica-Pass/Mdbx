@@ -8,6 +8,7 @@ import ctypes
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,22 @@ def load_baseline(path: Path) -> dict[str, Any]:
     return baseline
 
 
+def parse_labeled_library(value: str) -> tuple[str, Path]:
+    label, separator, raw_path = value.partition("=")
+    if not separator or not label or not raw_path:
+        raise argparse.ArgumentTypeError("library must use LABEL=PATH")
+    return label, Path(raw_path).resolve()
+
+
+def emit_report(report: dict[str, Any], output: str | None, *, error: bool = False) -> None:
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if output:
+        output_path = Path(output).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
+    print(rendered, end="", file=sys.stderr if error else sys.stdout)
+
+
 def require_symbol(library: ctypes.CDLL, name: str) -> Any:
     try:
         return getattr(library, name)
@@ -152,24 +169,86 @@ def verify_library(args: argparse.Namespace) -> int:
                 "actual": actual_contract,
             },
             "checksum_mismatches": checksum_mismatches,
+            "status": "incompatible",
         }
-        print(json.dumps(report, indent=2, sort_keys=True), file=sys.stderr)
+        emit_report(report, args.output, error=True)
         return 1
 
-    print(
-        json.dumps(
-            {
-                "profile": baseline["profile"],
-                "library": str(library_path),
-                "verified_symbols": len(baseline["required_symbols"]),
-                "verified_checksums": len(baseline["checksums"]),
-                "uniffi_contract_version": actual_contract,
-                "status": "compatible",
-            },
-            sort_keys=True,
-        )
+    emit_report(
+        {
+            "profile": baseline["profile"],
+            "library": str(library_path),
+            "verified_symbols": len(baseline["required_symbols"]),
+            "verified_checksums": len(baseline["checksums"]),
+            "uniffi_contract_version": actual_contract,
+            "status": "compatible",
+        },
+        args.output,
     )
     return 0
+
+
+def exported_symbols(nm_path: Path, library_path: Path) -> set[str]:
+    completed = subprocess.run(
+        [str(nm_path), "-D", "--defined-only", str(library_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            f"dynamic symbol inspection failed for {library_path}: {detail}"
+        )
+
+    symbols: set[str] = set()
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if fields:
+            symbols.add(fields[-1].split("@", 1)[0])
+    return symbols
+
+
+def verify_exports(args: argparse.Namespace) -> int:
+    baseline_path = Path(args.baseline).resolve()
+    nm_path = Path(args.nm).resolve()
+    baseline = load_baseline(baseline_path)
+    libraries = args.library
+    labels = [label for label, _ in libraries]
+    if len(labels) != len(set(labels)):
+        raise ValueError("library labels must be unique")
+
+    required_symbols = set(baseline["required_symbols"])
+    artifacts: list[dict[str, Any]] = []
+    incompatible = False
+    for label, library_path in libraries:
+        symbols = exported_symbols(nm_path, library_path)
+        missing_symbols = sorted(required_symbols - symbols)
+        incompatible = incompatible or bool(missing_symbols)
+        artifacts.append(
+            {
+                "label": label,
+                "library": str(library_path),
+                "exported_symbols": len(symbols),
+                "verified_symbols": len(required_symbols) - len(missing_symbols),
+                "missing_symbols": missing_symbols,
+                "status": "incompatible" if missing_symbols else "compatible",
+            }
+        )
+
+    report = {
+        "profile": "mdbx2-uniffi-dynamic-exports-v1",
+        "abi_baseline_profile": baseline["profile"],
+        "abi_baseline_source_commit": baseline["source_commit"],
+        "symbol_inspector": str(nm_path),
+        "required_symbols": len(required_symbols),
+        "artifacts": artifacts,
+        "status": "incompatible" if incompatible else "compatible",
+    }
+    emit_report(report, args.output, error=incompatible)
+    return 1 if incompatible else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -190,7 +269,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--baseline", required=True)
     verify.add_argument("--library", required=True)
+    verify.add_argument("--output")
     verify.set_defaults(handler=verify_library)
+
+    exports = subparsers.add_parser(
+        "verify-exports",
+        help="verify cross-compiled dynamic exports with llvm-nm",
+    )
+    exports.add_argument("--baseline", required=True)
+    exports.add_argument("--nm", required=True)
+    exports.add_argument(
+        "--library",
+        action="append",
+        required=True,
+        type=parse_labeled_library,
+    )
+    exports.add_argument("--output")
+    exports.set_defaults(handler=verify_exports)
     return parser
 
 

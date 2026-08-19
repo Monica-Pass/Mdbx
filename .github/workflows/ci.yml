@@ -132,11 +132,11 @@ jobs:
           key: ffi-abi-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ffi-abi-${{ env.RUST_VERSION }}-
 
-      - name: Build MDBX3-compatible UniFFI library
-        run: cargo build -p mdbx-ffi
+      - name: Build MDBX3 production UniFFI library
+        run: cargo build -p mdbx-ffi --profile mdbx3-release
 
       - name: Verify frozen MDBX2 bindings against current library
         run: |
           python3 scripts/verify-mdbx3-ffi-abi.py verify \
             --baseline crates/mdbx-ffi/abi/mdbx2-uniffi-bindings-v1.json \
-            --library target/debug/libmdbx_ffi.so
+            --library target/mdbx3-release/libmdbx_ffi.so

@@ -1,2 +1,4 @@
 /target/
 /target-cli-sync/
+__pycache__/
+*.pyc
