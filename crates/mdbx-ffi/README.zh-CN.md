@@ -65,6 +65,10 @@ vault critical extension、授予密钥访问或协商 peer 会话。
 `mdbx-ffi-abi-v1`、`mdbx_ffi` namespace 和 Android `libmdbx_ffi.so` 文件名。该函数采用附加
 接口，现有 MDBX2 bindings 和 `MdbxBuildCapabilityManifest` 保持原样。
 
+`abi/mdbx2-uniffi-bindings-v1.json` 冻结 MDBX2 Kotlin bindings 声明的全部 native symbol、
+UniFFI contract version 和 237 个 API checksum。`scripts/verify-mdbx3-ffi-abi.py` 动态加载当前
+DLL、SO 或 dylib 并逐项验证；新增接口可以附加，任一旧接口缺失或 checksum 变化都会使构建失败。
+
 `MdbxExtensionProfile` 是一个已加载 Adapter 的规范化进程内描述符。它声明 Adapter 拥有的
 命名空间 Collection 类型、自定义 Object 类型、relation kind、写入门禁能力、可选索引、
 导入/导出路径和展示提示。`MdbxExtensionRegistration` 用于区分首次注册与完全相同的幂等

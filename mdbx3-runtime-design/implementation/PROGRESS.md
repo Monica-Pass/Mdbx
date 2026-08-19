@@ -4,13 +4,13 @@
 
 形态：`epic`
 
-进度：1/7 子任务完成
+进度：2/7 子任务完成
 
-当前：子任务 2，建立 ABI 快照和兼容测试。
+当前：子任务 3，建立生产构建 profile 和体积测量。
 
 事实文件：`mdbx3-runtime-design/implementation/SUBTASKS.csv`
 
-下一步：冻结当前 UniFFI 公开表面，并建立机器可读的兼容检查。
+下一步：以当前 MDBX2 release 产物为基准，建立可重复的 production profile、size report 和 capability report。
 
 ## 实施证据
 
@@ -19,3 +19,4 @@
 3. 当前 FFI build manifest 已经提供 storage 与 sync capability inventory。
 4. 当前存储格式为 `MDBX-2`，schema 版本由 vault header 维护。
 5. 子任务 1 提交 `d6076b0` 已推送，完整 `mdbx-ffi` 测试通过。
+6. 子任务 2 已完成 ABI 冻结、负向校验、fixture 回归和 workspace 回归，准备提交。
