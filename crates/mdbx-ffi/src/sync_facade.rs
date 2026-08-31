@@ -52,14 +52,16 @@ impl From<IncrementalBundleCheckpoint> for MdbxIncrementalSyncCheckpoint {
 
 impl MdbxIncrementalSyncCheckpoint {
     fn into_core(self) -> Result<IncrementalBundleCheckpoint, MdbxFfiError> {
-        if self.commit_inventory.is_empty() || self.delta_inventory.is_empty() {
+        let commit_empty = self.commit_inventory.is_empty();
+        let delta_empty = self.delta_inventory.is_empty();
+        if commit_empty != delta_empty {
             return Err(MdbxFfiError::SyncProtocol {
-                message: "incremental checkpoint tokens must not be empty".to_string(),
+                message: "incremental checkpoint tokens must be paired".to_string(),
             });
         }
         Ok(IncrementalBundleCheckpoint {
-            commit_inventory: Some(self.commit_inventory),
-            delta_inventory: Some(self.delta_inventory),
+            commit_inventory: (!commit_empty).then_some(self.commit_inventory),
+            delta_inventory: (!delta_empty).then_some(self.delta_inventory),
         })
     }
 }

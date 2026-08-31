@@ -831,6 +831,7 @@ fn ffi_incremental_segment_files_are_authenticated_atomic_and_idempotent() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source.mdbx");
     let target_path = directory.path().join("target.mdbx");
+    let bootstrap_segment_path = directory.path().join("bootstrap-pending.mdbxsync");
     let segment_path = directory.path().join("pending.mdbxsync");
     let tampered_path = directory.path().join("tampered.mdbxsync");
     let source = create_vault(
@@ -845,6 +846,19 @@ fn ffi_incremental_segment_files_are_authenticated_atomic_and_idempotent() {
     source
         .create_project("Incremental project".to_string())
         .unwrap();
+    let bootstrap_segment = source
+        .export_incremental_sync_segment(
+            bootstrap_segment_path.to_string_lossy().into_owned(),
+            MdbxIncrementalSyncCheckpoint {
+                commit_inventory: String::new(),
+                delta_inventory: String::new(),
+            },
+            None,
+            128,
+        )
+        .unwrap();
+    assert_eq!(bootstrap_segment.segment_index, 0);
+    assert!(bootstrap_segment.is_last);
     let exported = source
         .export_incremental_sync_segment(
             segment_path.to_string_lossy().into_owned(),
@@ -890,8 +904,11 @@ fn ffi_incremental_segment_files_are_authenticated_atomic_and_idempotent() {
     .unwrap();
     let applied = target
         .apply_incremental_sync_segment(
-            segment_path.to_string_lossy().into_owned(),
-            bootstrap.checkpoint.clone(),
+            bootstrap_segment_path.to_string_lossy().into_owned(),
+            MdbxIncrementalSyncCheckpoint {
+                commit_inventory: String::new(),
+                delta_inventory: String::new(),
+            },
             None,
         )
         .unwrap();
