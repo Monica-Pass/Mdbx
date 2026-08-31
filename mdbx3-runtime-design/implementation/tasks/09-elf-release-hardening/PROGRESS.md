@@ -1,6 +1,6 @@
 # Android ELF release hardening 进度
 
-进度：4/5
+进度：5/5
 
 已完成：
 
@@ -10,4 +10,4 @@
 - ARM64/x86_64 LOAD segment 至少 16 KiB 对齐；ARM32 使用 4 KiB legacy profile。
 - ABI split gate 消费同一份 ELF 证据并完成 ZIP/独立 SO 哈希绑定。
 
-当前：提交并推送本阶段；随后基于最终 clean HEAD 重建正式产物。
+当前：提交 `15227a6` 已推送；随后基于最终 clean HEAD 重建正式产物。
