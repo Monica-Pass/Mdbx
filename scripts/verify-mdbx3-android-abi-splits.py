@@ -17,6 +17,11 @@ EXPECTED_MACHINES = {
     "armeabi-v7a": "arm",
     "x86_64": "x86_64",
 }
+EXPECTED_MIN_LOAD_ALIGNMENT = {
+    "arm64-v8a": 16 * 1024,
+    "armeabi-v7a": 4 * 1024,
+    "x86_64": 16 * 1024,
+}
 LIBRARY_NAME = "libmdbx_ffi.so"
 REPORT_NAMES = (
     "mdbx3-build-manifest.json",
@@ -91,6 +96,30 @@ def validate_release_reports(
         raise ValueError("packaged ABI or release report is not ready")
     if gate.get("verified_symbols") != 535 or gate.get("verified_checksums") != 237:
         raise ValueError("packaged release report does not prove the frozen MDBX2 ABI")
+    gate_artifacts = {
+        entry.get("label"): entry for entry in gate.get("artifacts", [])
+    }
+    if set(gate_artifacts) != set(EXPECTED_ABIS):
+        raise ValueError("packaged release gate does not contain all supported ABIs")
+    build_ids = []
+    for abi, entry in gate_artifacts.items():
+        if entry.get("soname") is not None:
+            raise ValueError(f"packaged release gate changed the SONAME contract for {abi}")
+        if set(entry.get("needed", [])) != {"libc.so", "libdl.so", "libm.so"}:
+            raise ValueError(f"packaged release gate has unexpected dependencies for {abi}")
+        if int(entry.get("minimum_load_alignment_bytes", 0)) < EXPECTED_MIN_LOAD_ALIGNMENT[abi]:
+            raise ValueError(f"packaged release gate has insufficient alignment for {abi}")
+        expected_page_profile = (
+            "android-16k" if abi != "armeabi-v7a" else "android-4k-arm32"
+        )
+        if entry.get("page_size_compatibility") != expected_page_profile:
+            raise ValueError(f"packaged release gate has a wrong page profile for {abi}")
+        build_id = entry.get("build_id")
+        if not isinstance(build_id, str) or len(build_id) != 40:
+            raise ValueError(f"packaged release gate lacks a SHA-1 build ID for {abi}")
+        build_ids.append(build_id)
+    if len(build_ids) != len(set(build_ids)):
+        raise ValueError("packaged release gate build IDs are not unique")
     artifacts = {
         entry.get("label"): entry for entry in artifact_report.get("artifacts", [])
     }

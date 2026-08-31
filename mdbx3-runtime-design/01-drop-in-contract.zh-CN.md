@@ -13,7 +13,7 @@ MDBX3 完整兼容构建必须满足：
 1. `[lib].name` 继续为 `mdbx_ffi`。
 2. Android ABI 目录继续使用 `arm64-v8a`、`armeabi-v7a` 和 `x86_64`。
 3. 动态库 basename 继续为 `libmdbx_ffi.so`。
-4. SONAME 保持兼容；首次实施必须保存 MDBX2 与 MDBX3 的 `readelf -d` 报告并比较 `SONAME`、`NEEDED` 和目标 ABI。
+4. SONAME 保持 MDBX2 的未设置状态；每次发布必须比较 `SONAME`、`NEEDED` 和目标 ABI。
 5. 既有 UniFFI scaffolding namespace 保持不变。
 6. 既有导出符号不得删除或改名。
 7. 新符号只能附加，禁止复用旧符号表达不同语义。
@@ -80,4 +80,4 @@ MDBX3 与 MDBX2 peer 交互时必须：
 2. 使用 MDBX2 Android 示例应用替换 SO，完成创建、打开、写入、删除、恢复、同步和 Tiga 操作。
 3. 比较 MDBX2 与 MDBX3 的导出符号清单，旧符号集合必须是新符号集合的子集。
 4. 比较 UniFFI metadata，既有类型与函数签名必须完全一致。
-5. 对每个 ABI 检查 ELF 类型、架构、SONAME、动态依赖、页大小兼容和 SHA-256。
+5. 对每个 ABI 检查 ELF 类型、架构、SONAME、动态依赖、页大小兼容、唯一 GNU build ID 和 SHA-256。

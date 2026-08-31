@@ -14,7 +14,7 @@ MDBX3 候选 SO 只有在本矩阵全部强制项通过后才能替代 MDBX2 SO�
 | ABI-04 | 导出符号 | MDBX2 符号集合为 MDBX3 符号集合子集 |
 | ABI-05 | UniFFI metadata | 既有函数、Record、Enum 和 Error 完全一致 |
 | ABI-06 | 动态依赖 | 不增加未声明的 MDBX 动态库 |
-| ABI-07 | Android 页大小 | 支持目标 Android 的 16 KiB page size 要求 |
+| ABI-07 | Android 页大小 | ARM64/x86_64 支持 16 KiB page；仅面向旧 32 位进程的 ARM32 保持 NDK 4 KiB 对齐 |
 | ABI-08 | build ID | 每个 strip 后 SO 保留唯一 build ID |
 
 ## 3. 零客户端修改

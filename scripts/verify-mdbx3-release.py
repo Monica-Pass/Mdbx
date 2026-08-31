@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +19,12 @@ EXPECTED_ABIS = {
     "x86_64": ("elf", "x86_64"),
 }
 EXPECTED_LIBRARY_NAME = "libmdbx_ffi.so"
+EXPECTED_NEEDED = {"libc.so", "libdl.so", "libm.so"}
+EXPECTED_MIN_LOAD_ALIGNMENT = {
+    "arm64-v8a": 16 * 1024,
+    "armeabi-v7a": 4 * 1024,
+    "x86_64": 16 * 1024,
+}
 
 
 def sha256(path: Path) -> str:
@@ -47,12 +56,92 @@ def load_json(path: Path) -> dict:
     return value
 
 
-def verify(root: Path, abi_baseline_path: Path) -> dict:
+def resolve_readelf(requested: Path | None, artifacts: dict) -> Path:
+    if requested is not None:
+        path = requested.resolve()
+        if not path.is_file():
+            raise ValueError(f"llvm-readelf does not exist: {path}")
+        return path
+    nm_value = artifacts.get("ffi_abi", {}).get("symbol_inspector")
+    if isinstance(nm_value, str) and nm_value:
+        nm_path = Path(nm_value)
+        suffix = ".exe" if nm_path.suffix.lower() == ".exe" else ""
+        sibling = nm_path.with_name(f"llvm-readelf{suffix}")
+        if sibling.is_file():
+            return sibling.resolve()
+    discovered = shutil.which("llvm-readelf")
+    if discovered:
+        return Path(discovered).resolve()
+    raise ValueError("llvm-readelf is required to verify Android ELF release properties")
+
+
+def inspect_elf_contract(path: Path, readelf: Path, minimum_alignment: int) -> dict:
+    completed = subprocess.run(
+        [str(readelf), "-d", "-n", "-lW", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise ValueError(f"llvm-readelf failed for {path}: {detail}")
+    output = completed.stdout
+    needed = sorted(set(re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", output)))
+    sonames = re.findall(r"\(SONAME\).*?\[([^\]]+)\]", output)
+    if len(sonames) > 1:
+        raise ValueError(f"multiple SONAME entries found in {path}")
+    build_ids = re.findall(r"Build ID:\s*([0-9A-Fa-f]+)", output)
+    if len(build_ids) != 1 or len(build_ids[0]) != 40:
+        raise ValueError(f"{path} must retain exactly one SHA-1 GNU build ID")
+
+    load_segments = []
+    pattern = re.compile(
+        r"^\s*LOAD\s+(0x[0-9A-Fa-f]+)\s+(0x[0-9A-Fa-f]+)\s+"
+        r"0x[0-9A-Fa-f]+\s+0x[0-9A-Fa-f]+\s+0x[0-9A-Fa-f]+\s+.*?"
+        r"(0x[0-9A-Fa-f]+)\s*$"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            offset, virtual_address, alignment = (
+                int(value, 16) for value in match.groups()
+            )
+            load_segments.append((offset, virtual_address, alignment))
+    if not load_segments:
+        raise ValueError(f"no ELF LOAD segments found in {path}")
+    for offset, virtual_address, alignment in load_segments:
+        if alignment < minimum_alignment:
+            raise ValueError(
+                f"{path} has LOAD alignment below {minimum_alignment} bytes"
+            )
+        if (virtual_address - offset) % minimum_alignment != 0:
+            raise ValueError(
+                f"{path} has a LOAD segment incompatible with "
+                f"{minimum_alignment}-byte pages"
+            )
+    return {
+        "needed": needed,
+        "soname": sonames[0] if sonames else None,
+        "build_id": build_ids[0].lower(),
+        "minimum_load_alignment_bytes": min(
+            alignment for _, _, alignment in load_segments
+        ),
+        "load_segments": len(load_segments),
+        "page_size_compatibility": (
+            "android-16k" if minimum_alignment == 16 * 1024 else "android-4k-arm32"
+        ),
+    }
+
+
+def verify(root: Path, abi_baseline_path: Path, requested_readelf: Path | None) -> dict:
     root = root.resolve()
     report_root = root / "reports"
     manifest = load_json(report_root / "mdbx3-build-manifest.json")
     abi = load_json(report_root / "mdbx3-android-ffi-abi.json")
     artifacts = load_json(report_root / "mdbx3-android-artifacts.json")
+    readelf = resolve_readelf(requested_readelf, artifacts)
     abi_baseline = load_json(abi_baseline_path)
     if abi_baseline.get("uniffi_contract_version") != 30:
         raise ValueError("ABI baseline contract version must be 30")
@@ -117,7 +206,30 @@ def verify(root: Path, abi_baseline_path: Path) -> dict:
         actual_hash = sha256(library)
         if entry.get("sha256") != actual_hash:
             raise ValueError(f"artifact SHA-256 does not match {label}")
-        verified.append({"label": label, "bytes": library.stat().st_size, "sha256": actual_hash})
+        elf = inspect_elf_contract(
+            library, readelf, EXPECTED_MIN_LOAD_ALIGNMENT[label]
+        )
+        if set(elf["needed"]) != EXPECTED_NEEDED:
+            raise ValueError(
+                f"{label} dynamic dependencies differ from the MDBX2 baseline: "
+                f"{elf['needed']}"
+            )
+        if elf["soname"] is not None:
+            raise ValueError(
+                f"{label} must preserve the MDBX2 absent-SONAME contract"
+            )
+        verified.append(
+            {
+                "label": label,
+                "bytes": library.stat().st_size,
+                "sha256": actual_hash,
+                **elf,
+            }
+        )
+
+    build_ids = [entry["build_id"] for entry in verified]
+    if len(build_ids) != len(set(build_ids)):
+        raise ValueError("each Android ABI artifact must have a unique build ID")
 
     comparison = artifacts.get("comparison", {})
     totals = comparison.get("totals", {})
@@ -134,6 +246,7 @@ def verify(root: Path, abi_baseline_path: Path) -> dict:
         "verified_symbols": 535,
         "verified_checksums": 237,
         "uniffi_contract_version": 30,
+        "elf_inspector": str(readelf),
         "artifacts": verified,
     }
 
@@ -147,6 +260,7 @@ def main() -> int:
         help="staged MDBX3 Android output root",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--readelf", type=Path)
     parser.add_argument(
         "--abi-baseline",
         type=Path,
@@ -154,7 +268,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        result = verify(args.root, args.abi_baseline)
+        result = verify(args.root, args.abi_baseline, args.readelf)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"MDBX3 release gate failed: {error}", file=sys.stderr)
         return 1

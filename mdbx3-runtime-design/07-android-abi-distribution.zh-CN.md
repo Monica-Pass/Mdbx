@@ -69,6 +69,8 @@ F-Droid 或直接分发 APK 时，推荐构建三个 ABI APK variant。每个 va
 6. ABI report 与 release gate 仍证明 535 个冻结符号、237 个 checksum 和 UniFFI contract 30。
 7. 所有薄包携带同一组不可变 release reports 和源码 commit。
 
+页面兼容按 ABI 验证：`arm64-v8a` 与 `x86_64` 的 LOAD segment 至少 16 KiB 对齐；`armeabi-v7a` 是旧 32 位进程产物，按 NDK 的 4 KiB 对齐验证。16 KiB-only Android 设备使用 64 位薄包，不加载 ARM32 SO。
+
 `scripts/build-mdbx3-android.ps1` 在完整 release gate 通过后默认生成这些薄包；仅诊断底层构建时可传入 `-SkipAbiSplitPackaging`。
 
 ## 6. 体积口径

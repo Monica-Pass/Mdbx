@@ -118,6 +118,7 @@ if ($cargoNdkVersion -ne "cargo-ndk $ExpectedCargoNdkVersion") {
 }
 $stripTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'llvm-strip'
 $nmTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'llvm-nm'
+$readelfTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'llvm-readelf'
 $linkerTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'ld.lld'
 $abiVerifierPath = Join-Path $RepoRoot 'scripts\verify-mdbx3-ffi-abi.py'
 $artifactReportScript = Join-Path $RepoRoot 'scripts\report-mdbx3-runtime.py'
@@ -145,9 +146,16 @@ foreach ($path in @($jniRoot, $reportRoot, $manifestPath, $reportPath, $abiRepor
 New-Item -ItemType Directory -Force -Path $jniRoot, $reportRoot | Out-Null
 
 $previousNdkHome = $env:ANDROID_NDK_HOME
+$previousRustFlags = $env:RUSTFLAGS
 Push-Location $RepoRoot
 try {
     $env:ANDROID_NDK_HOME = $NdkPath
+    $buildIdFlag = '-C link-arg=-Wl,--build-id=sha1'
+    $env:RUSTFLAGS = if ([string]::IsNullOrWhiteSpace($previousRustFlags)) {
+        $buildIdFlag
+    } else {
+        "$previousRustFlags $buildIdFlag"
+    }
     & cargo ndk `
         -t arm64-v8a `
         -t armeabi-v7a `
@@ -162,6 +170,7 @@ try {
 finally {
     Pop-Location
     $env:ANDROID_NDK_HOME = $previousNdkHome
+    $env:RUSTFLAGS = $previousRustFlags
 }
 
 foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64')) {
@@ -215,6 +224,7 @@ $sourceChanges = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
 $sourceTreeState = if ($sourceChanges.Count -eq 0) { 'clean' } else { 'dirty' }
 $stripVersion = (& $stripTool --version | Select-Object -First 1).Trim()
 $nmVersion = (& $nmTool --version | Select-Object -First 1).Trim()
+$readelfVersion = (& $readelfTool --version | Select-Object -First 1).Trim()
 $linkerVersion = (& $linkerTool --version | Select-Object -First 1).Trim()
 $reportArgs = @(
     $artifactReportScript,
@@ -236,6 +246,7 @@ $reportArgs = @(
     '--toolchain-detail', "linker=$linkerVersion",
     '--toolchain-detail', "strip=$stripVersion",
     '--toolchain-detail', "symbol_inspector=$nmVersion",
+    '--toolchain-detail', "readelf=$readelfVersion",
     '--input-file', "cargo_lock=$(Join-Path $RepoRoot 'Cargo.lock')"
 )
 if ($BaselineReport) {
@@ -255,6 +266,7 @@ if ($LASTEXITCODE -ne 0) {
 & python $releaseGateScript `
     --root $OutputRoot `
     --abi-baseline (Join-Path $RepoRoot 'crates\mdbx-ffi\abi\mdbx2-uniffi-bindings-v1.json') `
+    --readelf $readelfTool `
     --output $gateReportPath | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "MDBX3 release gate failed with exit code $LASTEXITCODE"

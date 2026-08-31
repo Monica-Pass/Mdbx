@@ -4,9 +4,9 @@
 
 形态：`epic`
 
-进度：8/8 子任务完成
+进度：8/9 子任务完成
 
-当前：全部实施子任务完成，进入最终验收审计。
+当前：Android ELF release hardening 已实现并验证，等待独立提交推送。
 
 事实文件：`mdbx3-runtime-design/implementation/SUBTASKS.csv`
 
@@ -22,3 +22,4 @@
 6. 子任务 2 已完成 ABI 冻结、负向校验、fixture 回归和 workspace 回归，准备提交。
 7. 子任务 8 已生成三个单 ABI 薄包、独立 SO、发布索引和兼容全量包；每个薄包与正式 artifact report、ELF machine 和冻结 ABI 绑定。
 8. MDBX3 Android 正式构建已端到端执行，release gate 与 ABI split gate 均返回 `status=ready`，artifact report 记录 clean source tree。
+9. 强化 release gate 已验证 SONAME、NEEDED、ABI page alignment 和 strip 后唯一 SHA-1 build ID；旧无 build ID 产物会被明确拒绝。
