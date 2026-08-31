@@ -225,6 +225,12 @@ $reportArgs = @(
 )
 if ($BaselineReport) {
     $reportArgs += @('--baseline', (Resolve-ExistingPath -Path $BaselineReport))
+} else {
+    $defaultBaselineReport = Join-Path $RepoRoot 'target\mdbx2-android-baseline\reports\mdbx2-android-artifacts.json'
+    if (-not (Test-Path -LiteralPath $defaultBaselineReport -PathType Leaf)) {
+        throw "MDBX2 baseline report is required for the MDBX3 release gate; pass -BaselineReport explicitly"
+    }
+    $reportArgs += @('--baseline', (Resolve-ExistingPath -Path $defaultBaselineReport))
 }
 & python @reportArgs | Out-Null
 if ($LASTEXITCODE -ne 0) {
