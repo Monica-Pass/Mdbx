@@ -6,9 +6,9 @@
 
 进度：6/6
 
-当前：已完成并通过全量验证，等待本阶段提交推送记录。
+当前：已完成并通过全量验证，提交 `ac7ebd6` 已推送。
 
-验证：storage core 681+4 项通过；runtime 3 项和 clippy 通过。
+验证：storage core 683+4 项通过；runtime 5 项、FFI 58 项、workspace clippy 与 ABI gate 通过。
 
 文件：`mdbx3-runtime-design/implementation/tasks/04-runtime-boundary/TODO.csv`
 
@@ -17,12 +17,12 @@
 ## Context Recovery
 
 - 当前里程碑：4 — 将兼容 FFI 迁移到 Runtime 且冻结 ABI
-- 当前状态：IN_PROGRESS
+- 当前状态：DONE
 - 上一项：3 — storage-owned VaultRuntime 与 single writer
 - 当前事实文件：`TODO.csv`
 - 关键上下文：新增 `mdbx_storage::runtime::VaultRuntime`，兼容后端先保持一个串行连接；generation 合约独立于后续 read snapshot 实现。
-- 已知问题：生产 FFI 仍有 142 个 `.lock()` 访问点，raw SQL 仍有 6 处。
-- 下一动作：用兼容 guard 迁移内部字段和构造路径，再移除 raw SQL。
+- 已知边界：生产 FFI 保留 142 个兼容 `.lock()` 调用，但锁定对象已是 `VaultRuntime`；后续可按模块继续显式分类。
+- 下一动作：进入父任务 05：Incremental bootstrap and history lifecycle。
 
 ## 已确认基线
 

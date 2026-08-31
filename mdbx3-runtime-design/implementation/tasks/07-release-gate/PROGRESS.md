@@ -10,4 +10,4 @@
 - 三 ABI、basename、ELF 架构、manifest、SHA-256、535 symbols、237 checksums、
   contract 30 和体积比较均已验证。
 
-当前：已完成实现与验证，等待本阶段提交推送记录。
+当前：已完成实现与验证，提交 `c2cfc3e` 与 `56bf9a3` 已推送。
