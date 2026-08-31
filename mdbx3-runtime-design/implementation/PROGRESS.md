@@ -21,3 +21,4 @@
 5. 子任务 1 提交 `d6076b0` 已推送，完整 `mdbx-ffi` 测试通过。
 6. 子任务 2 已完成 ABI 冻结、负向校验、fixture 回归和 workspace 回归，准备提交。
 7. 子任务 8 已生成三个单 ABI 薄包、独立 SO、发布索引和兼容全量包；每个薄包与正式 artifact report、ELF machine 和冻结 ABI 绑定。
+8. MDBX3 Android 正式构建已端到端执行，release gate 与 ABI split gate 均返回 `status=ready`，artifact report 记录 clean source tree。

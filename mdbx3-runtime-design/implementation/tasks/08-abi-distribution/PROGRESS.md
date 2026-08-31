@@ -10,4 +10,4 @@
 - `build-mdbx3-android.ps1` 在完整 release gate 后默认生成薄包。
 - 现有正式产物验证为 ready；薄包压缩大小约 3.1-3.6 MB，全量包约 10.1 MB。
 
-当前：实现提交 `fa5e8b6` 已推送；下一步用最终 HEAD 重建正式 Android 产物。
+当前：实现提交 `fa5e8b6` 已推送；正式 Android 三 ABI 构建、release gate、薄包生成和 ABI split gate 已端到端通过。
