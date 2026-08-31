@@ -26,6 +26,51 @@ EXPECTED_MIN_LOAD_ALIGNMENT = {
     "x86_64": 16 * 1024,
 }
 
+# These sets are the MDBX2 mdbx-ffi release profile (baseline commit
+# 1070dee739dbe564806654359b6c6caa68156de5). They intentionally cover the
+# compiled capability manifest, not CLI-only or development-only features.
+EXPECTED_ENABLED_STORAGE_CAPABILITIES = {
+    "mdbx.storage.authenticated-encryption",
+    "mdbx.storage.bounded-sync-state",
+    "mdbx.storage.collection-profiles",
+    "mdbx.storage.commit-history",
+    "mdbx.storage.conflicts",
+    "mdbx.storage.external-blob-lifecycle",
+    "mdbx.storage.external-blob-references",
+    "mdbx.storage.external-blob-replication",
+    "mdbx.storage.external-blob-transfer",
+    "mdbx.storage.filesystem-blob-store",
+    "mdbx.storage.generic-metadata",
+    "mdbx.storage.generic-objects",
+    "mdbx.storage.key-epochs",
+    "mdbx.storage.mdbx1-compatibility",
+    "mdbx.storage.payload-migrations",
+    "mdbx.storage.recovery",
+    "mdbx.storage.snapshots",
+    "mdbx.storage.synchronization",
+    "mdbx.storage.tiga-policy",
+}
+EXPECTED_DISABLED_STORAGE_CAPABILITIES = {
+    "mdbx.storage.benchmarks",
+    "mdbx.storage.derived-search-index",
+    "mdbx.storage.kdbx-binary-export",
+    "mdbx.storage.kdbx-binary-import",
+    "mdbx.storage.kdbx-json-export",
+    "mdbx.storage.kdbx-json-import",
+}
+EXPECTED_ENABLED_SYNC_CAPABILITIES = {
+    "authenticated-bundle-v1",
+    "authenticated-state-root-v1",
+    "blob-chunk-transfer-v1",
+    "blob-manifest-paging-v1",
+    "blob-transfer-resume-v1",
+    "commit-inventory-paging-v1",
+    "delta-inventory-paging-v1",
+    "incremental-bundle-v4",
+    "incremental-resume-v1",
+}
+EXPECTED_DISABLED_SYNC_CAPABILITIES = {"bundle-zstd-v1"}
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -165,6 +210,40 @@ def verify(root: Path, abi_baseline_path: Path, requested_readelf: Path | None) 
         if runtime.get(key) != expected:
             raise ValueError(f"manifest runtime {key} must be {expected!r}")
 
+    capabilities = manifest.get("capabilities", {})
+    actual_enabled_storage = set(capabilities.get("enabled_storage_capability_ids", []))
+    actual_disabled_storage = set(
+        capabilities.get("disabled_optional_storage_capability_ids", [])
+    )
+    actual_enabled_sync = set(capabilities.get("enabled_sync_capability_ids", []))
+    actual_disabled_sync = set(
+        capabilities.get("disabled_optional_sync_capability_ids", [])
+    )
+    if actual_enabled_storage != EXPECTED_ENABLED_STORAGE_CAPABILITIES:
+        raise ValueError(
+            "MDBX3 enabled storage capabilities differ from the MDBX2 release profile: "
+            f"missing={sorted(EXPECTED_ENABLED_STORAGE_CAPABILITIES - actual_enabled_storage)}, "
+            f"unexpected={sorted(actual_enabled_storage - EXPECTED_ENABLED_STORAGE_CAPABILITIES)}"
+        )
+    if actual_disabled_storage != EXPECTED_DISABLED_STORAGE_CAPABILITIES:
+        raise ValueError(
+            "MDBX3 disabled storage capabilities differ from the MDBX2 release profile: "
+            f"missing={sorted(EXPECTED_DISABLED_STORAGE_CAPABILITIES - actual_disabled_storage)}, "
+            f"unexpected={sorted(actual_disabled_storage - EXPECTED_DISABLED_STORAGE_CAPABILITIES)}"
+        )
+    if actual_enabled_sync != EXPECTED_ENABLED_SYNC_CAPABILITIES:
+        raise ValueError(
+            "MDBX3 enabled sync capabilities differ from the MDBX2 release profile: "
+            f"missing={sorted(EXPECTED_ENABLED_SYNC_CAPABILITIES - actual_enabled_sync)}, "
+            f"unexpected={sorted(actual_enabled_sync - EXPECTED_ENABLED_SYNC_CAPABILITIES)}"
+        )
+    if actual_disabled_sync != EXPECTED_DISABLED_SYNC_CAPABILITIES:
+        raise ValueError(
+            "MDBX3 disabled sync capabilities differ from the MDBX2 release profile: "
+            f"missing={sorted(EXPECTED_DISABLED_SYNC_CAPABILITIES - actual_disabled_sync)}, "
+            f"unexpected={sorted(actual_disabled_sync - EXPECTED_DISABLED_SYNC_CAPABILITIES)}"
+        )
+
     if abi.get("status") != "compatible":
         raise ValueError("Android ABI report is not compatible")
     if abi.get("required_symbols") != 535:
@@ -246,6 +325,13 @@ def verify(root: Path, abi_baseline_path: Path, requested_readelf: Path | None) 
         "verified_symbols": 535,
         "verified_checksums": 237,
         "uniffi_contract_version": 30,
+        "capabilities": {
+            "enabled_storage": len(actual_enabled_storage),
+            "disabled_storage_optional": len(actual_disabled_storage),
+            "enabled_sync": len(actual_enabled_sync),
+            "disabled_sync_optional": len(actual_disabled_sync),
+            "status": "compatible-with-mdbx2-profile",
+        },
         "elf_inspector": str(readelf),
         "artifacts": verified,
     }

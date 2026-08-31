@@ -109,6 +109,8 @@ mdbx3-native-universal-v1
 
 每个配置仍然只生成一个 `libmdbx_ffi.so`，并通过 build capability manifest 报告实际模块。
 
+发布 gate 还会把 MDBX2 `mdbx-ffi` profile 的启用和禁用 capability ID 作为冻结集合逐项比较。任何已发布能力从启用集合移出、或被错误加入禁用集合，都会使构建失败；LTO、strip 和链接优化不能绕过这项检查。
+
 ## 6. 体积预算
 
 每个 ABI 使用当前 MDBX2 的正式 release、strip 后 SO 作为基准 `B0`。同时记录 raw ELF、strip 后 ELF、发布 ZIP、APK 内压缩值和安装后占用。
