@@ -111,6 +111,7 @@ $nmTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'llvm-nm'
 $linkerTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'ld.lld'
 $abiVerifierPath = Join-Path $RepoRoot 'scripts\verify-mdbx3-ffi-abi.py'
 $artifactReportScript = Join-Path $RepoRoot 'scripts\report-mdbx3-runtime.py'
+$releaseGateScript = Join-Path $RepoRoot 'scripts\verify-mdbx3-release.py'
 
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $RepoRoot 'target\mdbx3-android'
@@ -122,7 +123,8 @@ $reportRoot = Join-Path $OutputRoot 'reports'
 $manifestPath = Join-Path $reportRoot 'mdbx3-build-manifest.json'
 $reportPath = Join-Path $reportRoot 'mdbx3-android-artifacts.json'
 $abiReportPath = Join-Path $reportRoot 'mdbx3-android-ffi-abi.json'
-foreach ($path in @($jniRoot, $reportRoot, $manifestPath, $reportPath, $abiReportPath)) {
+$gateReportPath = Join-Path $reportRoot 'mdbx3-release-gate.json'
+foreach ($path in @($jniRoot, $reportRoot, $manifestPath, $reportPath, $abiReportPath, $gateReportPath)) {
     Assert-UnderRoot -Path $path -Root $RepoRoot
 }
 New-Item -ItemType Directory -Force -Path $jniRoot, $reportRoot | Out-Null
@@ -227,6 +229,14 @@ if ($BaselineReport) {
 & python @reportArgs | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "MDBX3 artifact report failed with exit code $LASTEXITCODE"
+}
+
+& python $releaseGateScript `
+    --root $OutputRoot `
+    --abi-baseline (Join-Path $RepoRoot 'crates\mdbx-ffi\abi\mdbx2-uniffi-bindings-v1.json') `
+    --output $gateReportPath | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "MDBX3 release gate failed with exit code $LASTEXITCODE"
 }
 
 Get-Content -Raw -LiteralPath $reportPath

@@ -4,13 +4,13 @@
 
 形态：`epic`
 
-进度：2/7 子任务完成
+进度：7/7 子任务完成
 
-当前：子任务 3，建立生产构建 profile 和体积测量。
+当前：全部实施子任务完成，进入最终验收审计。
 
 事实文件：`mdbx3-runtime-design/implementation/SUBTASKS.csv`
 
-下一步：以当前 MDBX2 release 产物为基准，建立可重复的 production profile、size report 和 capability report。
+下一步：执行最终全量验收矩阵并核对远端提交状态。
 
 ## 实施证据
 
