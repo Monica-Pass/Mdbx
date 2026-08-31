@@ -1,0 +1,3 @@
+C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/.cxx/Debug/595602g4/arm64-v8a/CMakeFiles/mdbx3_smoke.dir
+C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/.cxx/Debug/595602g4/arm64-v8a/CMakeFiles/edit_cache.dir
+C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/.cxx/Debug/595602g4/arm64-v8a/CMakeFiles/rebuild_cache.dir

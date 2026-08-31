@@ -1,0 +1,60 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Debug-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.10.0"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "mdbx3_smoke",
+					"targetIndexes" : 
+					[
+						0
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "mdbx3_smoke::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-mdbx3_smoke-Debug-dd4aa019c906851ca99e.json",
+					"name" : "mdbx3_smoke",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/.cxx/Debug/595602g4/x86",
+		"source" : "C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/src/main/cpp"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

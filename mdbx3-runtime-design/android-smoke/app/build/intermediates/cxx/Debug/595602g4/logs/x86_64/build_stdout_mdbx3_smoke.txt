@@ -1,0 +1,2 @@
+ninja: Entering directory `C:\Users\joyins\Desktop\Monica-all\mdbx\mdbx3-runtime-design\android-smoke\app\.cxx\Debug\595602g4\x86_64'
+ninja: no work to do.

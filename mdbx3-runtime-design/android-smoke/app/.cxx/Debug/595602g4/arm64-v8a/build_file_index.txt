@@ -1,0 +1,1 @@
+C:\Users\joyins\Desktop\Monica-all\mdbx\mdbx3-runtime-design\android-smoke\app\src\main\cpp\CMakeLists.txt
