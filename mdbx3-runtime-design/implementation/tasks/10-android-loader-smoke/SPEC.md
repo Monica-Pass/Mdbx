@@ -19,3 +19,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-mdbx3-android-lo
 ```
 
 The tested APK must contain only `lib/x86_64/libmdbx_ffi.so` and the matching shim. Other ABI variants use the same project and selected library source.
+
+For a release-specific or physical-device check, pass the artifact root and ADB serial:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-mdbx3-android-loader-smoke.ps1 `
+  -Abi arm64-v8a -LibraryRoot target/mdbx3-android-final-88058b9 `
+  -DeviceSerial <adb-serial> -InstallAndRun
+```

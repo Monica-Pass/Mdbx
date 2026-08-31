@@ -4,6 +4,12 @@ param(
     [string] $RepoRoot,
 
     [Parameter()]
+    [string] $LibraryRoot,
+
+    [Parameter()]
+    [string] $DeviceSerial,
+
+    [Parameter()]
     [ValidateSet('arm64-v8a', 'armeabi-v7a', 'x86_64')]
     [string] $Abi = 'x86_64',
 
@@ -19,6 +25,10 @@ if (-not $RepoRoot) {
     $RepoRoot = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..'
 }
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+if (-not $LibraryRoot) {
+    $LibraryRoot = Join-Path $RepoRoot 'target\mdbx3-android-final'
+}
+$LibraryRoot = (Resolve-Path -LiteralPath $LibraryRoot).Path
 $projectRoot = Join-Path $RepoRoot 'mdbx3-runtime-design\android-smoke'
 $gradle = if ($env:GRADLE_HOME) {
     Join-Path $env:GRADLE_HOME 'bin\gradle.bat'
@@ -28,7 +38,7 @@ $gradle = if ($env:GRADLE_HOME) {
 
 Push-Location $projectRoot
 try {
-    $gradleArguments = @("-PmdbxAbi=$Abi", 'assembleDebug')
+    $gradleArguments = @("-PmdbxAbi=$Abi", "-PmdbxLibraryRoot=$LibraryRoot", 'assembleDebug')
     if ($Offline) {
         $gradleArguments += '--offline'
     }
@@ -45,16 +55,20 @@ try {
     }
     Write-Output "APK: $apk"
     if ($InstallAndRun) {
-        & adb install -r $apk
+        $adbPrefix = @()
+        if ($DeviceSerial) {
+            $adbPrefix = @('-s', $DeviceSerial)
+        }
+        & adb @adbPrefix install -r $apk
         if ($LASTEXITCODE -ne 0) {
             throw "adb install failed with exit code $LASTEXITCODE"
         }
-        & adb shell am force-stop com.monica.mdbx3.smoke
-        & adb shell monkey -p com.monica.mdbx3.smoke 1
+        & adb @adbPrefix shell am force-stop com.monica.mdbx3.smoke
+        & adb @adbPrefix shell monkey -p com.monica.mdbx3.smoke 1
         if ($LASTEXITCODE -ne 0) {
             throw "adb launch failed with exit code $LASTEXITCODE"
         }
-        & adb logcat -d -s AndroidRuntime:I mdbx3_smoke:I '*:S'
+        & adb @adbPrefix logcat -d -s AndroidRuntime:I mdbx3_smoke:I '*:S'
     }
 }
 finally {

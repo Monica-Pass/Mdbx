@@ -4,6 +4,9 @@ plugins {
 
 val repoRoot = rootProject.projectDir.resolve("../..")
 val selectedAbi = providers.gradleProperty("mdbxAbi").orElse("x86_64")
+val libraryRoot = providers.gradleProperty("mdbxLibraryRoot")
+    .map { project.file(it) }
+    .orElse(repoRoot.resolve("target/mdbx3-android-final"))
 
 android {
     namespace = "com.monica.mdbx3.smoke"
@@ -38,7 +41,7 @@ android {
 
 tasks.register<Sync>("stageMdbx3Library") {
     val abi = selectedAbi.get()
-    from(repoRoot.resolve("target/mdbx3-android-final/android-jniLibs/$abi"))
+    from(libraryRoot.map { it.resolve("android-jniLibs/$abi") })
     into(layout.buildDirectory.dir("generated/mdbx3-jniLibs/$abi"))
     include("libmdbx_ffi.so")
     doFirst {
