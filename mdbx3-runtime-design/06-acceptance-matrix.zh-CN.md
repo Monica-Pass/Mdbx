@@ -145,6 +145,7 @@ Android 的单个 ELF SO 不得声明为跨 CPU 通用库。正式发布还必�
 | DIST-04 | ABI 一致 | 三个薄包均通过同一 MDBX2 ABI baseline |
 | DIST-05 | 全量回退 | universal ZIP 仍含三 ABI 标准 jniLibs 结构 |
 | DIST-06 | 单设备口径 | 单设备下载与安装体积只统计一个 ABI |
+| DIST-07 | APK linker smoke | `android-smoke` APK 只加载匹配 ABI 的 `libmdbx_ffi.so`，并读到 contract 30 |
 
 完整分发规则见 `07-android-abi-distribution.zh-CN.md`。
 
