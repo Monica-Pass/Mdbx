@@ -6,13 +6,13 @@
 
 形态：`single-full`
 
-进度：4/4
+进度：设计 4/4；实施 10/10
 
-当前：设计任务完成。
+当前：MDBX3 runtime 实施完成，进入真实设备和产品客户端的发布验收。
 
 事实文件：`mdbx3-runtime-design/TODO.csv`
 
-下一步：MDBX3 实施开始时按 `05-implementation-plan.zh-CN.md` 的阶段零冻结 MDBX2 基准。
+下一步：按 `06-acceptance-matrix.zh-CN.md` 执行真实 ARM64/ARM32 设备、冻结客户端和多设备同步验收。
 
 ## 核查证据
 
