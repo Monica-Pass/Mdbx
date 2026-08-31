@@ -4,15 +4,15 @@
 
 形态：`single-full`
 
-进度：3/6
+进度：6/6
 
-当前：将兼容 FFI 迁移到 Runtime 且冻结 ABI。
+当前：已完成并通过全量验证，等待本阶段提交推送记录。
 
 验证：storage core 681+4 项通过；runtime 3 项和 clippy 通过。
 
 文件：`mdbx3-runtime-design/implementation/tasks/04-runtime-boundary/TODO.csv`
 
-下一步：把 `MdbxVault.conn` 类型替换为 `VaultRuntime`，保持 facade 调用和 UniFFI 签名不变。
+下一步：进入父任务 05：Incremental bootstrap and history lifecycle。
 
 ## Context Recovery
 
@@ -27,7 +27,7 @@
 ## 已确认基线
 
 1. `MdbxVault` 当前直接拥有 `Mutex<VaultConnection>`。
-2. production FFI 有 142 个锁访问点、3 个 `inner()` 访问点、6 个 SQL 调用点。
+2. production FFI 的 142 个旧式 `.lock()` 调用现在锁定 `VaultRuntime`；生产 raw SQL 查询已下沉为 0 处。
 3. `VaultConnection` 同时拥有 SQLite、keyring、active session、epoch keyrings 和 extension registry，不能无验证地拆成多个连接。
 4. 第一兼容后端保留串行连接，以 storage-owned `read/write/reader generation` 接口隐藏实现。
 

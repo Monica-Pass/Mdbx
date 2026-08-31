@@ -53,14 +53,12 @@ pub(crate) use write_facade::{
     HARD_MAX_WRITE_COMMANDS,
 };
 
-use std::sync::Mutex;
-
 #[cfg(test)]
 use mdbx_core::model::RelationKindId;
 #[cfg(test)]
 use mdbx_core::tiga::{TigaMode, TigaScope};
-use mdbx_storage::connection::VaultConnection;
 use mdbx_storage::error::StorageError;
+use mdbx_storage::runtime::VaultRuntime;
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -120,7 +118,7 @@ impl From<mdbx_sync::SyncError> for MdbxFfiError {
 
 #[derive(uniffi::Object)]
 pub struct MdbxVault {
-    conn: Mutex<VaultConnection>,
+    pub(crate) conn: VaultRuntime,
     device_id: String,
     vault_id: String,
 }

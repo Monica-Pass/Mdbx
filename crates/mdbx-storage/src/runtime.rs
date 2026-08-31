@@ -47,6 +47,7 @@ pub struct VaultRuntimeGuard<'a> {
     guard: MutexGuard<'a, VaultConnection>,
     state: &'a RuntimeState,
     advance_generation: bool,
+    initial_total_changes: i64,
 }
 
 impl VaultRuntime {
@@ -60,40 +61,38 @@ impl VaultRuntime {
         }
     }
 
-    /// Legacy serialized access. Existing FFI operations use this method and
-    /// are conservatively treated as writer-side operations so no reader can
-    /// outlive an operation that may have changed authenticated state.
+    /// Legacy serialized access for compatibility facade code. Generation is
+    /// advanced only if the operation mutates SQLite or takes mutable access
+    /// to connection-owned authenticated state.
     pub fn lock(&self) -> Result<VaultRuntimeGuard<'_>, RuntimeLockPoisoned> {
-        self.write()
+        self.access()
     }
 
     /// Read-side access. The compatibility backend serializes this access with
     /// writes; the generation contract is independent of that implementation.
     pub fn read(&self) -> Result<VaultRuntimeGuard<'_>, RuntimeLockPoisoned> {
+        self.access()
+    }
+
+    fn access(&self) -> Result<VaultRuntimeGuard<'_>, RuntimeLockPoisoned> {
         let guard = self
             .state
             .connection
             .lock()
             .map_err(|_| RuntimeLockPoisoned)?;
+        let initial_total_changes = sqlite_total_changes(&guard);
         Ok(VaultRuntimeGuard {
             guard,
             state: &self.state,
             advance_generation: false,
+            initial_total_changes,
         })
     }
 
-    /// Writer-side access. A completed guard advances the reader generation.
+    /// Writer-side access. A guard advances the reader generation when it
+    /// mutates SQLite or connection-owned authenticated state.
     pub fn write(&self) -> Result<VaultRuntimeGuard<'_>, RuntimeLockPoisoned> {
-        let guard = self
-            .state
-            .connection
-            .lock()
-            .map_err(|_| RuntimeLockPoisoned)?;
-        Ok(VaultRuntimeGuard {
-            guard,
-            state: &self.state,
-            advance_generation: true,
-        })
+        self.access()
     }
 
     /// Run one read operation without exposing the connection lock to callers.
@@ -165,22 +164,34 @@ impl Deref for VaultRuntimeGuard<'_> {
 
 impl DerefMut for VaultRuntimeGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.advance_generation = true;
         &mut self.guard
     }
 }
 
 impl Drop for VaultRuntimeGuard<'_> {
     fn drop(&mut self) {
-        if self.advance_generation {
+        if self.advance_generation
+            || sqlite_total_changes(&self.guard) != self.initial_total_changes
+        {
             self.state.reader_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
+}
+
+fn sqlite_total_changes(connection: &VaultConnection) -> i64 {
+    connection
+        .inner()
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::VaultConnection;
+    use mdbx_core::model::{UnlockMethodType, VaultSession};
+    use mdbx_core::tiga::SessionAssurance;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
     use std::thread;
@@ -224,6 +235,45 @@ mod tests {
 
         let error = runtime.validate_reader(lease).unwrap_err();
         assert!(matches!(error, StorageError::StaleReaderGeneration { .. }));
+    }
+
+    #[test]
+    fn no_op_writer_and_legacy_read_keep_generation_stable() {
+        let runtime = VaultRuntime::from_connection(VaultConnection::open_in_memory().unwrap());
+        let before = runtime.reader_generation();
+
+        drop(runtime.write().unwrap());
+        assert_eq!(runtime.reader_generation(), before);
+
+        let guard = runtime.lock().unwrap();
+        assert!(guard.inner().is_autocommit());
+        drop(guard);
+        assert_eq!(runtime.reader_generation(), before);
+    }
+
+    #[test]
+    fn clearing_authenticated_state_invalidates_reader_lease_without_sql_changes() {
+        let mut connection = VaultConnection::open_in_memory().unwrap();
+        connection.attach_session(VaultSession {
+            session_id: "runtime-session".to_string(),
+            unlock_method: UnlockMethodType::Password,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            assurance: SessionAssurance::from_unlock_method(UnlockMethodType::Password, 1),
+        });
+        let runtime = VaultRuntime::from_connection(connection);
+        let lease = runtime.acquire_reader();
+
+        runtime
+            .with_write(|connection| {
+                connection.clear_session();
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            runtime.validate_reader(lease),
+            Err(StorageError::StaleReaderGeneration { .. })
+        ));
     }
 
     #[test]
