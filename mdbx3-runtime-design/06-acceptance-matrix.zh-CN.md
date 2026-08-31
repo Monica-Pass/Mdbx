@@ -133,6 +133,21 @@ android-jniLibs/x86_64/libmdbx_ffi.so
 
 每个资产同时发布 SHA-256、runtime manifest、ABI manifest、capability manifest、工具链版本和体积性能报告。
 
+### 10.1 ABI 薄包
+
+Android 的单个 ELF SO 不得声明为跨 CPU 通用库。正式发布还必须生成三个独立薄包，使 APK、F-Droid variant 或 App Bundle split 只安装一个匹配 ABI 的 `libmdbx_ffi.so`。
+
+| 编号 | 测试 | 通过条件 |
+|---|---|---|
+| DIST-01 | 薄包成员 | 每个 ZIP 恰好包含一个 ABI 的 SO |
+| DIST-02 | ELF 身份 | SO 的 machine 与包名、目录一致 |
+| DIST-03 | 报告绑定 | ZIP、独立 SO 与 artifact report 的 SHA-256 一致 |
+| DIST-04 | ABI 一致 | 三个薄包均通过同一 MDBX2 ABI baseline |
+| DIST-05 | 全量回退 | universal ZIP 仍含三 ABI 标准 jniLibs 结构 |
+| DIST-06 | 单设备口径 | 单设备下载与安装体积只统计一个 ABI |
+
+完整分发规则见 `07-android-abi-distribution.zh-CN.md`。
+
 ## 11. 完成定义
 
 MDBX3 Runtime 进入正式发布状态需要同时满足：

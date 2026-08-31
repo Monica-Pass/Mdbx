@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string] $RepoRoot = (Join-Path $PSScriptRoot '..'),
+    [string] $RepoRoot,
 
     [Parameter()]
     [string] $NdkPath,
@@ -23,7 +23,13 @@ param(
     [string] $OutputRoot,
 
     [Parameter()]
-    [string] $BaselineReport
+    [string] $BaselineReport,
+
+    [Parameter()]
+    [string] $AbiSplitOutputRoot,
+
+    [Parameter()]
+    [switch] $SkipAbiSplitPackaging
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +98,10 @@ function Resolve-LlvmTool {
     throw "$ToolName was not found under $hostRoot\bin"
 }
 
+if (-not $RepoRoot) {
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $RepoRoot = Join-Path $scriptDirectory '..'
+}
 $RepoRoot = Resolve-ExistingPath -Path $RepoRoot
 $NdkPath = Resolve-NdkPath -RequestedPath $NdkPath -ExpectedVersion $ExpectedNdkVersion
 if ([IO.Path]::GetFileName($NdkPath.TrimEnd('\')) -ne $ExpectedNdkVersion) {
@@ -112,11 +122,16 @@ $linkerTool = Resolve-LlvmTool -NdkRoot $NdkPath -ToolName 'ld.lld'
 $abiVerifierPath = Join-Path $RepoRoot 'scripts\verify-mdbx3-ffi-abi.py'
 $artifactReportScript = Join-Path $RepoRoot 'scripts\report-mdbx3-runtime.py'
 $releaseGateScript = Join-Path $RepoRoot 'scripts\verify-mdbx3-release.py'
+$abiSplitPackageScript = Join-Path $RepoRoot 'scripts\package-mdbx3-android-abi-splits.ps1'
 
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $RepoRoot 'target\mdbx3-android'
 }
+if (-not $AbiSplitOutputRoot) {
+    $AbiSplitOutputRoot = Join-Path $RepoRoot 'target\mdbx3-android-abi-splits'
+}
 Assert-UnderRoot -Path $OutputRoot -Root $RepoRoot
+Assert-UnderRoot -Path $AbiSplitOutputRoot -Root $RepoRoot
 
 $jniRoot = Join-Path $OutputRoot 'android-jniLibs'
 $reportRoot = Join-Path $OutputRoot 'reports'
@@ -196,7 +211,7 @@ $manifestText = ($manifestJson -join "`n") + "`n"
 )
 
 $sourceCommit = (& git -C $RepoRoot rev-parse HEAD).Trim()
-$sourceChanges = @(& git -C $RepoRoot status --porcelain)
+$sourceChanges = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
 $sourceTreeState = if ($sourceChanges.Count -eq 0) { 'clean' } else { 'dirty' }
 $stripVersion = (& $stripTool --version | Select-Object -First 1).Trim()
 $nmVersion = (& $nmTool --version | Select-Object -First 1).Trim()
@@ -243,6 +258,17 @@ if ($LASTEXITCODE -ne 0) {
     --output $gateReportPath | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "MDBX3 release gate failed with exit code $LASTEXITCODE"
+}
+
+if (-not $SkipAbiSplitPackaging) {
+    & $abiSplitPackageScript `
+        -RepoRoot $RepoRoot `
+        -SourceRoot $OutputRoot `
+        -OutputRoot $AbiSplitOutputRoot `
+        -AbiBaseline (Join-Path $RepoRoot 'crates\mdbx-ffi\abi\mdbx2-uniffi-bindings-v1.json') | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "MDBX3 ABI split packaging failed with exit code $LASTEXITCODE"
+    }
 }
 
 Get-Content -Raw -LiteralPath $reportPath

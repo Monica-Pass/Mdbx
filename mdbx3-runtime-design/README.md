@@ -28,6 +28,7 @@ MDBX3 定义为第三代运行库，继续使用 `MDBX-2` 文件格式。Android
 | `04-performance-and-experience.zh-CN.md` | 启动、读写、同步、内存和长操作体验 |
 | `05-implementation-plan.zh-CN.md` | 分阶段实施顺序和提交边界 |
 | `06-acceptance-matrix.zh-CN.md` | 兼容、ABI、安全、性能和发布验收矩阵 |
+| `07-android-abi-distribution.zh-CN.md` | Android/F-Droid 单 ABI 薄包、全量包和跨架构边界 |
 
 ## 规范优先级
 
