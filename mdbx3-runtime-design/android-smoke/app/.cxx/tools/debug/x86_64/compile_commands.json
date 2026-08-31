@@ -1,7 +1,0 @@
-[
-{
-  "directory": "C:/Users/joyins/Desktop/Monica-all/mdbx/mdbx3-runtime-design/android-smoke/app/.cxx/Debug/595602g4/x86_64",
-  "command": "D:\\AndroidSDK\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=x86_64-none-linux-android21 --sysroot=D:/AndroidSDK/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -Dmdbx3_smoke_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-exceptions -fno-rtti -fno-limit-debug-info  -fPIC -o CMakeFiles\\mdbx3_smoke.dir\\smoke.cpp.o -c C:\\Users\\joyins\\Desktop\\Monica-all\\mdbx\\mdbx3-runtime-design\\android-smoke\\app\\src\\main\\cpp\\smoke.cpp",
-  "file": "C:\\Users\\joyins\\Desktop\\Monica-all\\mdbx\\mdbx3-runtime-design\\android-smoke\\app\\src\\main\\cpp\\smoke.cpp"
-}
-]

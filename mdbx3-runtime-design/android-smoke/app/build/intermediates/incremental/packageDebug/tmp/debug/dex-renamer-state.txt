@@ -1,7 +1,0 @@
-#Mon Aug 31 23:16:41 CST 2026
-base.1=C\:\\Users\\joyins\\Desktop\\Monica-all\\mdbx\\mdbx3-runtime-design\\android-smoke\\app\\build\\intermediates\\dex\\debug\\mergeProjectDexDebug\\5\\classes.dex
-path.1=5/classes.dex
-base.0=C\:\\Users\\joyins\\Desktop\\Monica-all\\mdbx\\mdbx3-runtime-design\\android-smoke\\app\\build\\intermediates\\dex\\debug\\mergeProjectDexDebug\\0\\classes.dex
-renamed.1=classes2.dex
-renamed.0=classes.dex
-path.0=0/classes.dex

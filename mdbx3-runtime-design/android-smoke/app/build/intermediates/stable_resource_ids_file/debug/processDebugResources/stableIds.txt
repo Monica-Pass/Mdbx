@@ -1,1 +1,0 @@
-com.monica.mdbx3.smoke:style/AppTheme = 0x7f010000

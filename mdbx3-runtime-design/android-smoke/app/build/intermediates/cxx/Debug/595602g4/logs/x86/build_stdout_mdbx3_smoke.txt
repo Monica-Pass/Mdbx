@@ -1,3 +1,0 @@
-ninja: Entering directory `C:\Users\joyins\Desktop\Monica-all\mdbx\mdbx3-runtime-design\android-smoke\app\.cxx\Debug\595602g4\x86'
-[1/2] Building CXX object CMakeFiles/mdbx3_smoke.dir/smoke.cpp.o
-[2/2] Linking CXX shared library C:\Users\joyins\Desktop\Monica-all\mdbx\mdbx3-runtime-design\android-smoke\app\build\intermediates\cxx\Debug\595602g4\obj\x86\libmdbx3_smoke.so
