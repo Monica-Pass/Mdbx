@@ -27,6 +27,7 @@ pub struct VaultConnection {
     pub(crate) active_key_epoch_id: Option<String>,
     pub(crate) epoch_keyrings: HashMap<String, Keyring>,
     pub(crate) active_session: Option<VaultSession>,
+    pub(crate) credential_use_epoch: uuid::Uuid,
     pub(crate) extension_capabilities: BTreeSet<ExtensionCapabilityId>,
     pub(crate) extension_registry: ExtensionRegistry,
 }
@@ -117,6 +118,7 @@ impl VaultConnection {
             active_key_epoch_id: None,
             epoch_keyrings: HashMap::new(),
             active_session: None,
+            credential_use_epoch: uuid::Uuid::new_v4(),
             extension_capabilities: BTreeSet::new(),
             extension_registry: ExtensionRegistry::default(),
         })
@@ -144,6 +146,7 @@ impl VaultConnection {
                 active_key_epoch_id: None,
                 epoch_keyrings: HashMap::new(),
                 active_session: None,
+                credential_use_epoch: uuid::Uuid::new_v4(),
                 extension_capabilities: BTreeSet::new(),
                 extension_registry: ExtensionRegistry::default(),
             })
@@ -169,6 +172,7 @@ impl VaultConnection {
             active_key_epoch_id: None,
             epoch_keyrings: HashMap::new(),
             active_session: None,
+            credential_use_epoch: uuid::Uuid::new_v4(),
             extension_capabilities: BTreeSet::new(),
             extension_registry: ExtensionRegistry::default(),
         })
@@ -409,6 +413,7 @@ impl VaultConnection {
     ///
     /// 在解锁成功后调用。此后所有 `_ct` 字段在写入时加密、读取时解密。
     pub fn attach_keyring(&mut self, keyring: Keyring) {
+        self.credential_use_epoch = uuid::Uuid::new_v4();
         self.keyring = Some(keyring);
         self.active_key_epoch_id = None;
         self.epoch_keyrings.clear();
@@ -421,11 +426,13 @@ impl VaultConnection {
         epoch_keyrings: HashMap<String, Keyring>,
     ) {
         self.keyring = Some(keyring);
+        self.credential_use_epoch = uuid::Uuid::new_v4();
         self.active_key_epoch_id = Some(active_key_epoch_id);
         self.epoch_keyrings = epoch_keyrings;
     }
 
     pub fn attach_session(&mut self, session: VaultSession) {
+        self.credential_use_epoch = uuid::Uuid::new_v4();
         self.active_session = Some(session);
     }
 
@@ -488,6 +495,7 @@ impl VaultConnection {
     }
 
     pub fn clear_session(&mut self) {
+        self.credential_use_epoch = uuid::Uuid::new_v4();
         self.active_session = None;
         self.keyring = None;
         self.active_key_epoch_id = None;

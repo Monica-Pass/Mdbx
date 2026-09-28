@@ -21,6 +21,8 @@ use crate::repo::project::ProjectRepo;
 use crate::tiga::{bump_clock, current_device_head, TigaService};
 
 const STATUS_COMPLIANT: &str = "compliant";
+mod credential_use;
+pub use credential_use::CredentialUseLease;
 const STATUS_EXCEPTION: &str = "exception";
 const STATUS_REMEDIATION: &str = "remediation-required";
 
