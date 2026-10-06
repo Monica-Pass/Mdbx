@@ -178,6 +178,9 @@ foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64')) {
     if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
         throw "Missing MDBX3 Android library: $libraryPath"
     }
+    # Keep the GNU build-id note while removing symbols/debug sections.  The
+    # release gate uses the build-id to tie a packaged library back to its
+    # reproducible build; plain --strip-all removes that note on LLVM 19.
     & $stripTool --strip-all --keep-section=.note.gnu.build-id $libraryPath
     if ($LASTEXITCODE -ne 0) {
         throw "llvm-strip failed for ${abi}: exit code $LASTEXITCODE"
