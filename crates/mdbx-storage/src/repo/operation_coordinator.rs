@@ -289,6 +289,11 @@ impl PreparedWriteOperation {
         &self.operation_kind
     }
 
+    /// Semantic repository kind, also used when composing attachment writes.
+    pub fn commit_kind(&self) -> String {
+        write_operation_commit_kind(&self.commands)
+    }
+
     pub fn branch_id(&self) -> Option<&str> {
         self.branch_id.as_deref()
     }
@@ -317,7 +322,7 @@ impl PreparedWriteOperation {
             self.operation_id.clone(),
             self.operation_kind.clone(),
             if self.branch_id.is_some() { "" } else { "main" },
-            write_operation_commit_kind(&self.commands),
+            self.commit_kind(),
             self.change_scope.clone(),
             self.changed_objects.clone(),
         )
@@ -873,7 +878,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                     project_id: project_id.clone(),
                     entry_type: parse_object_type_id(entry_type)?,
                     title: title.clone(),
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                 })
             }
             WriteCommand::UpdateEntry {
@@ -890,7 +895,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                     project_id: project_id.clone(),
                     entry_type: parse_object_type_id(entry_type)?,
                     title: title.clone(),
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                 })
             }
             WriteCommand::DeleteEntry {
@@ -954,7 +959,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                     source_object_id: source_object_id.clone(),
                     target_object_id: target_object_id.clone(),
                     relation_kind,
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                     payload_schema_version: *payload_schema_version,
                 })
             }
@@ -970,7 +975,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                 Ok(Self::UpdateObjectRelation {
                     relation_id: relation_id.clone(),
                     relation_kind,
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                     payload_schema_version: *payload_schema_version,
                 })
             }
@@ -995,7 +1000,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                     label_id: label_id.clone(),
                     collection_id: collection_id.clone(),
                     name: name.clone(),
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                     payload_schema_version: *payload_schema_version,
                 })
             }
@@ -1011,7 +1016,7 @@ impl TryFrom<&WriteCommand> for PreparedWriteCommand {
                 Ok(Self::UpdateObjectLabel {
                     label_id: label_id.clone(),
                     name: name.clone(),
-                    payload: serde_json::from_str(payload_json)?,
+                    payload: mdbx_core::json::from_str(payload_json)?,
                     payload_schema_version: *payload_schema_version,
                 })
             }
@@ -2042,6 +2047,69 @@ mod tests {
         assert!(ProjectRepo::get_by_id(&conn, &missing_id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn oversized_sync_envelope_rolls_back_and_split_operations_remain_exportable() {
+        use crate::sync_delta::{load_sync_delta_envelope, SyncDeltaLimits};
+
+        let (conn, ctx, _) = setup();
+        let project = ProjectRepo::create(&conn, &ctx, "Large import", None, None).unwrap();
+        let commits_before = count(&conn, "commits");
+        let operations_before = count(&conn, "commit_operations");
+        let deltas_before = count(&conn, "sync_delta_batches");
+        let payload_json = serde_json::json!({ "notes": "x".repeat(700_000) }).to_string();
+        let commands = (1..=3)
+            .map(|index| WriteCommand::CreateEntry {
+                entry_id: format!("00000000-0000-4000-8000-{index:012}"),
+                project_id: project.project_id.clone(),
+                entry_type: "login".to_string(),
+                title: format!("Large {index}"),
+                payload_json: payload_json.clone(),
+            })
+            .collect::<Vec<_>>();
+        let error = OperationCoordinator::execute(
+            &conn,
+            &ctx,
+            WriteOperationRequest::new("large-import", "import", commands.clone()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("sync delta payload bytes"));
+        assert!(conn.inner().is_autocommit());
+        assert_eq!(count(&conn, "entries"), 0);
+        assert_eq!(count(&conn, "commits"), commits_before);
+        assert_eq!(count(&conn, "commit_operations"), operations_before);
+        assert_eq!(count(&conn, "sync_delta_batches"), deltas_before);
+        assert_eq!(count(&conn, "sync_delta_mutations"), 0);
+
+        for (index, command) in commands.into_iter().enumerate() {
+            let request = WriteOperationRequest::new(
+                format!("large-import-{index}"),
+                "import",
+                vec![command],
+            );
+            let prepared = OperationCoordinator::prepare(request).unwrap();
+            let first = OperationCoordinator::execute_prepared(&conn, &ctx, &prepared).unwrap();
+            let retry = OperationCoordinator::execute_prepared(&conn, &ctx, &prepared).unwrap();
+            assert!(!first.already_committed);
+            assert!(retry.already_committed);
+            assert_eq!(first.commit_id, retry.commit_id);
+            let batch_id: String = conn
+                .inner()
+                .query_row(
+                    "SELECT batch_id FROM sync_delta_batches ORDER BY batch_seq DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let envelope = load_sync_delta_envelope(&conn, &batch_id, SyncDeltaLimits::default())
+                .unwrap()
+                .unwrap();
+            envelope.encode(SyncDeltaLimits::default()).unwrap();
+        }
+        assert_eq!(count(&conn, "entries"), 3);
+        assert_eq!(count(&conn, "commits"), commits_before + 3);
+        assert_eq!(count(&conn, "sync_delta_batches"), deltas_before + 3);
     }
 
     #[test]

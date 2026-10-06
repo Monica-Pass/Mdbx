@@ -21,6 +21,8 @@ use crate::repo::project::ProjectRepo;
 use crate::tiga::{bump_clock, current_device_head, TigaService};
 
 const STATUS_COMPLIANT: &str = "compliant";
+mod credential_use;
+pub use credential_use::CredentialUseLease;
 const STATUS_EXCEPTION: &str = "exception";
 const STATUS_REMEDIATION: &str = "remediation-required";
 
@@ -366,7 +368,10 @@ impl TigaService {
             )
             .map_err(StorageError::Database)
             .and_then(|(policy_version, status)| {
-                if policy_version != TIGA_POLICY_VERSION {
+                let expected = if crate::unlock::UnlockService::is_glitter(conn)? {
+                    mdbx_core::tiga::GLITTER_POLICY_VERSION
+                } else { TIGA_POLICY_VERSION };
+                if policy_version != expected {
                     return Err(StorageError::Validation(format!(
                         "unsupported Tiga policy version {policy_version}; expected {TIGA_POLICY_VERSION}"
                     )));
@@ -380,6 +385,16 @@ impl TigaService {
 
     pub fn resolve_vault_policy(conn: &VaultConnection) -> StorageResult<ResolvedTigaPolicy> {
         let base = Self::get_global_default(conn)?.policy();
+        // Recheck at operation-policy resolution too: the runtime's earlier
+        // access check must never allow a later read of a downgraded base.
+        if conn.is_glitter_session()
+            && (base.profile != mdbx_core::tiga::TigaMode::Glitter
+                || !crate::unlock::UnlockService::is_glitter(conn)?)
+        {
+            return Err(StorageError::Validation(
+                "a live Glitter session cannot adopt a different format policy".to_string(),
+            ));
+        }
         let resolved = ResolvedTigaPolicy {
             policy: base,
             compliance: Self::get_policy_state(conn)?.compliance,
@@ -553,6 +568,7 @@ impl TigaService {
         let mut resolved = resolve_scope_policy(conn, scope)?;
         if operation == TigaOperation::ChangeUnlockMethods
             && resolved.compliance == PolicyCompliance::RemediationRequired
+            && !crate::unlock::UnlockService::is_glitter(conn)?
         {
             resolved.policy.unlock.minimum_auth_factors = 1;
             resolved.policy.unlock.security_key_required = false;
@@ -601,6 +617,44 @@ impl TigaService {
             })?;
         }
         Ok(evaluated.decision)
+    }
+
+    /// Conservative lifetime for reusing an unlocked disclosure reader.
+    ///
+    /// This is a lifecycle hint, not an authorization decision. It reads only
+    /// policy/session metadata, does not renew authentication or idle activity,
+    /// and does not decrypt or audit a payload. Every disclosure must still use
+    /// its normal authorization path. Resource overrides can shorten this
+    /// window below the vault default.
+    pub fn read_session_remaining_secs(
+        conn: &VaultConnection,
+        scope: &TigaScope,
+        now_unix_secs: i64,
+    ) -> StorageResult<u64> {
+        let Some(session) = conn.active_session() else {
+            return Ok(0);
+        };
+        let policy = resolve_scope_policy(conn, scope)?.policy;
+        let assurance = &session.assurance;
+        if assurance.is_expired(&policy.session, now_unix_secs) {
+            return Ok(0);
+        }
+        let mut deadline = assurance
+            .authenticated_at_unix_secs
+            .saturating_add(i64::from(policy.session.max_lifetime_secs))
+            .min(
+                assurance
+                    .last_activity_at_unix_secs
+                    .saturating_add(i64::from(policy.session.idle_timeout_secs)),
+            );
+        if policy.disclosure.reveal_requires_fresh_auth {
+            deadline = deadline.min(
+                assurance
+                    .authenticated_at_unix_secs
+                    .saturating_add(i64::from(policy.session.fresh_auth_window_secs)),
+            );
+        }
+        Ok(deadline.saturating_sub(now_unix_secs).max(0) as u64)
     }
 
     /// Authorize a client-owned operation using the connection's active
@@ -949,7 +1003,7 @@ impl TigaService {
                 "UPDATE vault_meta SET tiga_policy_version = ?1,
                  tiga_compliance_status = ?2",
                 params![
-                    TIGA_POLICY_VERSION,
+                    resolved.policy.policy_version,
                     compliance_storage_value(resolved.compliance)
                 ],
             )?;
@@ -1840,6 +1894,112 @@ mod tests {
                 .last_activity_at_unix_secs,
             750
         );
+    }
+
+    #[test]
+    fn read_session_window_survives_browsing_without_renewing_or_auditing() {
+        let (mut conn, _, _, entry_id) = setup();
+        let original = session(UnlockMethodType::Password, 100);
+        conn.attach_session(original.clone());
+        let changes = || {
+            conn.inner()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = changes();
+        let scope = TigaScope::Entry { entry_id };
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &scope, 131).unwrap(),
+            269
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &scope, 399).unwrap(),
+            1
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &scope, 400).unwrap(),
+            0
+        );
+        assert_eq!(changes(), before);
+        assert_eq!(conn.active_session().unwrap().assurance, original.assurance);
+    }
+
+    #[test]
+    fn read_session_window_respects_stricter_resource_policy_without_payload_reads() {
+        let (mut conn, ctx, project_id, entry_id) = setup();
+        TigaService::set_project_override(&conn, &ctx, &project_id, Some(TigaMode::Power)).unwrap();
+        conn.attach_session(session(UnlockMethodType::PasswordSecurityKey, 100));
+        conn.inner()
+            .execute(
+                "UPDATE entries SET payload_ct = X'00' WHERE entry_id = ?1",
+                [&entry_id],
+            )
+            .unwrap();
+        let scope = TigaScope::Entry { entry_id };
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 131).unwrap(),
+            269
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &scope, 131).unwrap(),
+            29
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &scope, 160).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn read_session_window_never_extends_idle_or_absolute_expiry() {
+        let (mut conn, ctx, _, _) = setup();
+        TigaService::set_global_default(&conn, &ctx, TigaMode::Sky).unwrap();
+        conn.attach_session(session(UnlockMethodType::Password, 100));
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 1_899).unwrap(),
+            1
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 1_900).unwrap(),
+            0
+        );
+        let mut active = session(UnlockMethodType::Password, 100);
+        active.assurance.last_activity_at_unix_secs = 43_000;
+        conn.attach_session(active);
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 43_299).unwrap(),
+            1
+        );
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 43_300).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn read_session_window_fails_closed_for_lock_clock_rollback_and_unknown_policy() {
+        let (mut conn, _, _, _) = setup();
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 100).unwrap(),
+            0
+        );
+        conn.attach_session(session(UnlockMethodType::Password, 100));
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 99).unwrap(),
+            0
+        );
+        conn.touch_active_session(120);
+        assert_eq!(
+            TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 110).unwrap(),
+            0
+        );
+        conn.inner()
+            .execute(
+                "UPDATE vault_meta SET tiga_policy_version = ?1",
+                [i64::from(TIGA_POLICY_VERSION + 1)],
+            )
+            .unwrap();
+        assert!(TigaService::read_session_remaining_secs(&conn, &TigaScope::Vault, 131).is_err());
     }
 
     #[test]
